@@ -1,0 +1,64 @@
+#!/bin/bash
+# Draft only. Claude must review cluster state, node choice, quota, and Vulkan
+# availability before converting this file to a real .sbatch submission.
+#SBATCH --job-name=robotwin_env
+#SBATCH -p h200
+#SBATCH -w h200-ali-01
+#SBATCH --gres=gpu:h200:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=06:00:00
+#SBATCH --output=/DATA/NAS/GPUServer/sunny/setup_jobs/logs/robotwin_env_setup_%j.out
+#SBATCH --error=/DATA/NAS/GPUServer/sunny/setup_jobs/logs/robotwin_env_setup_%j.err
+
+set -euo pipefail
+
+echo "=== PRE-RUN CHECKS ==="
+hostname
+date
+pwd
+resources || true
+myquota || true
+
+export PROJECT_ROOT=/DATA/disk0/$USER/projects/robotwin_stage2
+export REPO_DIR="$PROJECT_ROOT/RoboTwin"
+export LOG_ROOT=/DATA/NAS/GPUServer/sunny/setup_jobs
+export XDG_CACHE_HOME=/DATA/disk0/$USER/.cache
+export PIP_CACHE_DIR=/DATA/disk0/$USER/.cache/pip/cache
+export TMPDIR=/DATA/disk0/$USER/.cache/pip/tmp
+export HF_HOME=/DATA/disk0/$USER/.cache/huggingface
+
+mkdir -p "$PROJECT_ROOT" "$LOG_ROOT/logs" "$LOG_ROOT/outputs"
+mkdir -p "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$TMPDIR" "$HF_HOME"
+
+source /DATA/disk0/$USER/miniconda3/bin/activate
+
+if ! conda env list | awk '{print $1}' | grep -Fxq robotwin_py310; then
+  conda create -y -n robotwin_py310 python=3.10
+fi
+
+conda activate robotwin_py310
+
+python --version
+conda info --envs
+
+if [ ! -d "$REPO_DIR/.git" ]; then
+  git clone https://github.com/RoboTwin-Platform/RoboTwin.git "$REPO_DIR"
+else
+  git -C "$REPO_DIR" status --short
+fi
+
+cd "$REPO_DIR"
+
+# TODO(Claude): 确认节点 Vulkan 可用性 before submitting a real setup job.
+if command -v vulkaninfo >/dev/null 2>&1; then
+  vulkaninfo --summary || true
+else
+  echo "WARN: vulkaninfo not found; Vulkan availability still needs Claude review."
+fi
+
+echo "=== INSTALL ROBOTWIN ==="
+srun bash script/_install.sh
+
+echo "=== SETUP COMPLETE ==="
+date

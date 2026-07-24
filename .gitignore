@@ -1,0 +1,18 @@
+# 敏感凭据，绝对不要提交
+server.env
+
+# Claude 内部目录
+.claude/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 临时文件
+*.log
+*.tmp
+.monitor_jobs.json
+
+# 本地汇报文档（可选，按需去掉注释保留）
+# daily_report_*.md

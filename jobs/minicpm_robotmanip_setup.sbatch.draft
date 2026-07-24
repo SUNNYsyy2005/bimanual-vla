@@ -1,0 +1,64 @@
+#!/bin/bash
+# 草稿：MiniCPM-RobotManip 环境搭建（conda + 官方 environment.yml）
+# 待事项（Claude 审核后填充/提交，不要直接 sbatch）：
+#   - 确认部署节点（H200 / 4090，取决于该阶段计算资源归属决策）
+#   - 确认 conda 路径（复用阶段二 RoboTwin 那次装的 miniconda3，还是单独装）
+#   - 确认权重下载方式（HuggingFace 直连 or hf-mirror.com，参考阶段一 GCS 并行下载脚本的经验，
+#     若直连慢/卡死，同样要考虑绕开官方下载逻辑手写并行下载）
+#
+# 已确认事实（来源：调研 OpenBMB/MiniCPM-RobotManip 官方 README + HuggingFace model card，
+# 2026-07-21，非直接验证，建议关键版本号等在实际执行前用 curl 复核一次）：
+#   - 官方仓库: https://github.com/OpenBMB/MiniCPM-Robot (子目录 MiniCPM-RobotManip)
+#   - 安装: conda env create -f environment.yml
+#   - Python 3.10.20, PyTorch 2.6.0, CUDA 12.4, transformers==5.7.0, diffusers==0.38.0
+#   - 权重: https://huggingface.co/openbmb/MiniCPM-RobotManip (约 3.6GB)
+
+#SBATCH --job-name=minicpm_robotmanip_setup
+#SBATCH -p h200
+#SBATCH -w h200-ali-02   # TODO(Claude): 确认部署节点
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=32G
+#SBATCH --time=03:00:00
+#SBATCH --output=/DATA/NAS/GPUServer/sunny/setup_jobs/logs/minicpm_setup_%j.out
+#SBATCH --error=/DATA/NAS/GPUServer/sunny/setup_jobs/logs/minicpm_setup_%j.err
+
+set -uo pipefail
+
+retry() {
+  local max=5
+  local n=1
+  until "$@"; do
+    if [ "$n" -ge "$max" ]; then
+      return 1
+    fi
+    sleep $((n * 20))
+    n=$((n + 1))
+  done
+}
+
+echo "=== setting up directories ==="
+mkdir -p /DATA/disk0/sunny/projects/minicpm_robotmanip
+
+echo "=== activating existing conda (reuse from stage-2 RoboTwin setup if present) ==="
+source /DATA/disk0/sunny/miniconda3/bin/activate
+
+echo "=== cloning MiniCPM-Robot repo ==="
+cd /DATA/disk0/sunny/projects/minicpm_robotmanip
+if [ ! -d MiniCPM-Robot/.git ]; then
+  retry git clone https://github.com/OpenBMB/MiniCPM-Robot.git
+fi
+cd MiniCPM-Robot/MiniCPM-RobotManip
+
+echo "=== creating conda env from official environment.yml ==="
+retry conda env create -f environment.yml -n MiniCPMRobotManip
+
+echo "=== downloading pretrained weights (HF, fallback to hf-mirror.com if direct fails) ==="
+conda activate MiniCPMRobotManip
+export HF_ENDPOINT=https://hf-mirror.com
+retry python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('openbmb/MiniCPM-RobotManip', local_dir='/DATA/disk0/sunny/.cache/minicpm_robotmanip')
+"
+conda deactivate
+
+echo "=== SETUP DONE ==="
