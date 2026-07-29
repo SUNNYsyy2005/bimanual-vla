@@ -240,16 +240,86 @@ python teleop_single.py \
 
 ---
 
-## 6. 相关脚本
+## 6. 测试脚本
+
+### 6.1 机械臂 / 相机 smoke test
+
+最安全的只读测试：
+
+```bash
+python robot_smoke_test.py
+```
+
+如果还想验证控制链路可用，但尽量不让机械臂产生明显运动，可以重发当前位姿：
+
+```bash
+python robot_smoke_test.py --send-current
+```
+
+可选参数：
+
+```bash
+--left-can can0
+--right-can can1
+--cam-high-id 0
+--cam-left-wrist-id 2
+--cam-right-wrist-id 4
+--skip-cameras
+--skip-arms
+```
+
+### 6.2 与远程 policy server 联合推理 smoke test
+
+只做相机 + server 推理，不发动作到机械臂：
+
+```bash
+python policy_server_smoke_test.py \
+  --server 192.168.101.9 \
+  --port 8000 \
+  --shadow \
+  --steps 10
+```
+
+shadow 模式下也读取真实机械臂状态：
+
+```bash
+python policy_server_smoke_test.py \
+  --server 192.168.101.9 \
+  --port 8000 \
+  --shadow \
+  --read-arms-in-shadow \
+  --steps 10
+```
+
+确认 shadow 没问题后，才建议做真实动作联调：
+
+```bash
+python policy_server_smoke_test.py \
+  --server 192.168.101.9 \
+  --port 8000 \
+  --steps 5
+```
+
+该脚本会检查：
+
+- 相机可读
+- policy server 连通性
+- 原始 action chunk 形状是否正常
+- broker 循环推理是否正常
+- 非 shadow 模式下是否能通过 SafetyChecker 再下发动作
+
+## 8. 相关脚本
 
 - `serve_piper.py`：加载 pi0.5 / openpi policy 并启动服务
 - `run.py`：实机循环，读取观测并请求 policy 动作
+- `robot_smoke_test.py`：机械臂 / 相机 smoke 测试
+- `policy_server_smoke_test.py`：与远程 policy server 联合推理 smoke 测试
 - `inference_smoke_test.py`：本地推理冒烟测试
 - `dl_pi05_base.py` / `dl_hf_chunks.py` / `dl_chunks.py`：模型下载辅助脚本
 
 ---
 
-## 7. 注意事项
+## 9. 注意事项
 
 - 实机采集前先确认 CAN 口和相机编号
 - 起始位错误时请重新执行 `--capture-start`

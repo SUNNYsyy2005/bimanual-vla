@@ -42,7 +42,7 @@ ACTION_HORIZON = 25   # re-query policy every 25 steps
 TARGET_HZ = 10        # control loop frequency (conservative for first deployment)
 
 
-def build_obs(qpos: np.ndarray, images: dict) -> dict:
+def build_obs(qpos: np.ndarray, images: dict, prompt: str = TASK_INSTRUCTION) -> dict:
     """Build observation dict matching π0.5 AlohaInputs format.
 
     AlohaInputs expects images keyed as cam_high / cam_left_wrist / cam_right_wrist,
@@ -55,7 +55,7 @@ def build_obs(qpos: np.ndarray, images: dict) -> dict:
             "cam_left_wrist":  images["cam_left_wrist"],
             "cam_right_wrist": images["cam_right_wrist"],
         },
-        "prompt": TASK_INSTRUCTION,
+        "prompt": prompt,
     }
 
 
@@ -113,7 +113,7 @@ def run(args):
                 print(f"[warn] stale cameras: {stale}")
 
             # --- infer ---
-            obs = build_obs(qpos, images)
+            obs = build_obs(qpos, images, prompt=args.instruction)
             result = broker.infer(obs)          # {"actions": (14,), ...} after AlohaOutputs
             action = np.asarray(result["actions"], dtype=np.float32)
 
@@ -159,6 +159,8 @@ def main():
     ap.add_argument("--right-can", default="can1")
     ap.add_argument("--shadow",    action="store_true",
                     help="Run policy but do not send actions to arms")
+    ap.add_argument("--instruction", default=TASK_INSTRUCTION,
+                    help="language instruction sent to the policy server")
     ap.add_argument("--save-traj", action="store_true",
                     help="Save trajectory to episodes/ when loop ends")
     args = ap.parse_args()
