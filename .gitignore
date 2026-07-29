@@ -4,15 +4,22 @@ server.env
 # Claude 内部目录
 .claude/
 
-# Python 缓存
+# Python 缓存 / 虚拟环境
 __pycache__/
 *.pyc
 *.pyo
+.venv/
 
-# 临时文件
+# 运行产物
 *.log
 *.tmp
 .monitor_jobs.json
+start_pose*.npy
+episodes/
+episodes_single/
+pi0_dataset_bimanual/
+pi0_dataset_single/
+eval_videos/
 
 # 本地汇报文档（可选，按需去掉注释保留）
 # daily_report_*.md
