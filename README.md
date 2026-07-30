@@ -10,6 +10,7 @@
 - 单 CAN 执行输出臂 + 双 RGB 相机反馈采集：`collect_output_arm.py`
 - episode 双视角 + 关节角回放：`view_episode.py`
 - 图形化采集界面：`collect_gui.py` / `start_gui.sh`
+- LeRobot v2.1 导出：`export_lerobot.py`
 
 ### 图形化采集界面
 
@@ -30,6 +31,32 @@ bash start_gui.sh
 - 停止后标记成功、失败或丢弃
 - 自动从已有编号继续保存，避免覆盖旧数据
 - 选择已保存的 episode 并启动双视角回放
+
+采集频率默认是交付规范要求的 `20 Hz`，可在 GUI 的 `Capture FPS` 中切换。最终导出到 Piper 训练集时必须使用 `20 Hz`。
+
+### Piper delivery schema
+
+新采集的 NPZ episode 包含：
+
+```text
+image:       (T, 256, 256, 3) uint8 RGB HWC
+wrist_image: (T, 256, 256, 3) uint8 RGB HWC
+state:       (T, 10) float32
+actions:     (T, 7) float32
+task:        UTF-8 string
+```
+
+`state` 是 EEF base-frame position、rotation 6D 和 gripper closed fraction；`actions[t]` 是从当前帧到下一帧的 base-frame position/rotation delta 和下一帧夹爪目标。每个 episode 最后自动增加 terminal no-op frame。
+
+导出 LeRobot v2.1：
+
+```bash
+python export_lerobot.py \
+  --input-dir episodes_output_arm \
+  --repo-id piper/piper_v1 \
+  --root piper/piper_v1 \
+  --fps 20
+```
 - 轨迹保存 / 回放：`trajectory.py`
 - 导出可直接用于 pi0.5 / openpi 训练的 LeRobot 风格数据集：`pi0_dataset.py`
 - openpi / pi0.5 实机推理桥接：`serve_piper.py`、`run.py`

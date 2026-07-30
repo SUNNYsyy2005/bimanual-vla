@@ -25,9 +25,10 @@ from collect_output_arm import (
     DEFAULT_HIGH_DEVICE,
     DEFAULT_WRIST_DEVICE,
     EpisodeBuffer,
+    IMAGE_HW,
     connect,
     next_episode_index,
-    read_output_qpos,
+    read_output_state,
     reset_output_arm,
 )
 
@@ -54,7 +55,7 @@ class CollectorGUI:
         self.can_var = tk.StringVar(value=DEFAULT_CAN)
         self.high_var = tk.StringVar(value="/dev/video8")
         self.wrist_var = tk.StringVar(value="/dev/video16")
-        self.fps_var = tk.StringVar(value="30")
+        self.fps_var = tk.StringVar(value="20")
         self.out_var = tk.StringVar(value="episodes_output_arm")
         self.task_var = tk.StringVar(value="pick_cube")
         self.instruction_var = tk.StringVar(value="pick up the cube")
@@ -135,6 +136,7 @@ class CollectorGUI:
             self.cameras = CameraCapture(
                 cam_ids={"cam_high": self.high_var.get().strip(), "cam_wrist": self.wrist_var.get().strip()},
                 fps=fps,
+                image_hw=IMAGE_HW,
             )
             self.cameras.open()
             checks = self.cameras.verify()
@@ -172,17 +174,17 @@ class CollectorGUI:
         try:
             while not self.capture_stop.is_set():
                 t0 = time.time()
-                qpos = read_output_qpos(self.piper)
+                state, qpos = read_output_state(self.piper)
                 images, image_ts = self.cameras.read()
                 with self.data_lock:
                     self.latest_images = {key: value.copy() for key, value in images.items()}
                     if self.recording and self.buffer is not None:
-                        self.buffer.add(qpos, images, image_ts)
+                        self.buffer.add(state, images, image_ts, qpos=qpos)
                         count = len(self.buffer)
                     else:
                         count = 0
                 if self.recording:
-                    self.messages.put(("progress", count, qpos.copy()))
+                    self.messages.put(("progress", count, state.copy()))
                 delay = dt - (time.time() - t0)
                 if delay > 0:
                     time.sleep(delay)
@@ -276,7 +278,7 @@ class CollectorGUI:
                 kind, *payload = self.messages.get_nowait()
                 if kind == "progress":
                     count, qpos = payload
-                    self.progress_var.set(f"Frames: {count} | J1={qpos[0]:.3f} rad | gripper={qpos[6] * 1000:.1f} mm")
+                    self.progress_var.set(f"Frames: {count} | EEF xyz={qpos[:3].round(3)} | gripper fraction={qpos[9]:.3f}")
                 elif kind == "error":
                     self.status_var.set(f"Capture error: {payload[0]}")
                     if self.recording:
