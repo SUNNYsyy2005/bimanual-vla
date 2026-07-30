@@ -7,6 +7,29 @@
 - 双臂主从遥操作采集：`teleop.py`
 - 单臂主从遥操作采集：`teleop_single.py`
 - 3 路相机采集：`camera.py`
+- 单 CAN 执行输出臂 + 双 RGB 相机反馈采集：`collect_output_arm.py`
+- episode 双视角 + 关节角回放：`view_episode.py`
+- 图形化采集界面：`collect_gui.py` / `start_gui.sh`
+
+### 图形化采集界面
+
+启动：
+
+```bash
+cd /home/user/dual_ARM_project/bimanual-vla
+bash start_gui.sh
+```
+
+界面支持：
+
+- 配置 `can0`、`/dev/video8`、`/dev/video16` 和任务信息
+- 放大字体、窗口和按钮，方便现场操作
+- 连接/断开机械臂与相机
+- 连接成功后弹出两个实时预览窗口：第三视角和腕部第一视角
+- 开始/停止 episode
+- 停止后标记成功、失败或丢弃
+- 自动从已有编号继续保存，避免覆盖旧数据
+- 选择已保存的 episode 并启动双视角回放
 - 轨迹保存 / 回放：`trajectory.py`
 - 导出可直接用于 pi0.5 / openpi 训练的 LeRobot 风格数据集：`pi0_dataset.py`
 - openpi / pi0.5 实机推理桥接：`serve_piper.py`、`run.py`
@@ -14,6 +37,31 @@
 ---
 
 ## 1. 采集数据格式
+
+### 1.0 当前硬件的推荐采集方式
+
+如果电脑只通过 `can0` 连接执行输出臂，不读取示教臂和控制指令，使用：
+
+```bash
+python collect_output_arm.py \
+  --can can0 \
+  --cam-high-device /dev/video12 \
+  --cam-wrist-device /dev/video4 \
+  --task-name pick_cube \
+  --instruction "pick up the cube"
+```
+
+该脚本只保存执行输出臂的 7 维反馈：
+
+```text
+[joint_1, joint_2, joint_3, joint_4, joint_5, joint_6, gripper]
+```
+
+以及 `cam_high`（第三视角）和 `cam_wrist`（腕部第一视角）两路 RGB 图像。它不读取示教臂、不读取关节控制指令，也不执行自动复位。
+
+按键：`SPACE` 结束 episode，`S` 保存成功，`F` 保存失败，`D` 丢弃，`Q` 退出。
+
+如果 `/dev/video12` 或 `/dev/video4` 不是 RGB 节点，先用 `v4l2-ctl --list-formats-ext -d /dev/videoN` 确认后替换参数。
 
 当前采集脚本在录制时会同时产出两类数据：
 

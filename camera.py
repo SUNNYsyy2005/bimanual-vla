@@ -1,9 +1,9 @@
-"""3-camera capture for π0.5 inference.
+"""RGB camera capture for π0.5 inference and output-arm data collection.
 
 Camera keys match AlohaInputs convention (what the policy server expects):
   cam_high        – head / front camera     (device ID UNKNOWN)
-  cam_left_wrist  – left wrist camera       (device ID UNKNOWN)
-  cam_right_wrist – right wrist camera      (device ID UNKNOWN)
+  cam_left_wrist  – left wrist camera       (device path/index)
+  cam_right_wrist – right wrist camera      (device path/index)
 
 Images returned as (C, H, W) uint8 RGB  ← AlohaInputs expected format.
 
@@ -44,7 +44,7 @@ class CameraCapture:
         for key, dev_id in self._ids.items():
             cap = cv2.VideoCapture(dev_id)
             if not cap.isOpened():
-                raise RuntimeError(f"Cannot open camera {key} at /dev/video{dev_id}")
+                raise RuntimeError(f"Cannot open camera {key} at {dev_id}")
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  IMG_W)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMG_H)
             cap.set(cv2.CAP_PROP_FPS, self._fps)

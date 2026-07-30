@@ -17,6 +17,7 @@ __pycache__/
 start_pose*.npy
 episodes/
 episodes_single/
+episodes_output_arm/
 pi0_dataset_bimanual/
 pi0_dataset_single/
 eval_videos/
