@@ -34,7 +34,7 @@ from collect_output_arm import (
 class CollectorGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Piper 数据采集工具")
+        self.root.title("Piper Data Collection Tool")
         self.root.geometry("1000x780")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -56,8 +56,8 @@ class CollectorGUI:
         self.out_var = tk.StringVar(value="episodes_output_arm")
         self.task_var = tk.StringVar(value="pick_cube")
         self.instruction_var = tk.StringVar(value="pick up the cube")
-        self.status_var = tk.StringVar(value="未连接")
-        self.progress_var = tk.StringVar(value="未采集")
+        self.status_var = tk.StringVar(value="Disconnected")
+        self.progress_var = tk.StringVar(value="No active episode")
 
         self._build_ui()
         self.refresh_files()
@@ -72,17 +72,17 @@ class CollectorGUI:
         style.configure("TLabel", font=("Sans", 13))
         style.configure("TLabelframe.Label", font=("Sans", 14, "bold"))
 
-        config = ttk.LabelFrame(self.root, text="设备与任务配置", padding=10)
+        config = ttk.LabelFrame(self.root, text="Device and Task Configuration", padding=10)
         config.pack(fill="x", padx=12, pady=10)
 
         rows = [
-            ("CAN 接口", self.can_var),
-            ("第三视角 RGB", self.high_var),
-            ("腕部第一视角 RGB", self.wrist_var),
-            ("采样频率", self.fps_var),
-            ("输出目录", self.out_var),
-            ("任务名称", self.task_var),
-            ("任务指令", self.instruction_var),
+            ("CAN interface", self.can_var),
+            ("Third-person RGB", self.high_var),
+            ("Wrist RGB", self.wrist_var),
+            ("Capture FPS", self.fps_var),
+            ("Output directory", self.out_var),
+            ("Task name", self.task_var),
+            ("Instruction", self.instruction_var),
         ]
         for row, (label, var) in enumerate(rows):
             ttk.Label(config, text=label, width=18).grid(row=row, column=0, sticky="w", pady=6)
@@ -91,21 +91,21 @@ class CollectorGUI:
 
         controls = ttk.Frame(self.root)
         controls.pack(fill="x", padx=12, pady=2)
-        self.connect_button = ttk.Button(controls, text="连接设备", command=self.toggle_connection)
+        self.connect_button = ttk.Button(controls, text="Connect devices", command=self.toggle_connection)
         self.connect_button.pack(side="left", padx=3)
-        self.start_button = ttk.Button(controls, text="开始采集", command=self.start_episode, state="disabled")
+        self.start_button = ttk.Button(controls, text="Start episode", command=self.start_episode, state="disabled")
         self.start_button.pack(side="left", padx=3)
-        self.stop_button = ttk.Button(controls, text="停止采集", command=self.stop_episode, state="disabled")
+        self.stop_button = ttk.Button(controls, text="Stop episode", command=self.stop_episode, state="disabled")
         self.stop_button.pack(side="left", padx=3)
-        ttk.Button(controls, text="刷新文件", command=self.refresh_files).pack(side="left", padx=3)
-        ttk.Button(controls, text="回放选中 episode", command=self.replay_selected).pack(side="left", padx=3)
+        ttk.Button(controls, text="Refresh files", command=self.refresh_files).pack(side="left", padx=3)
+        ttk.Button(controls, text="Replay selected", command=self.replay_selected).pack(side="left", padx=3)
 
-        status = ttk.LabelFrame(self.root, text="运行状态", padding=10)
+        status = ttk.LabelFrame(self.root, text="Status", padding=10)
         status.pack(fill="x", padx=12, pady=10)
         ttk.Label(status, textvariable=self.status_var).pack(anchor="w")
         ttk.Label(status, textvariable=self.progress_var).pack(anchor="w", pady=4)
 
-        files = ttk.LabelFrame(self.root, text="已保存数据", padding=8)
+        files = ttk.LabelFrame(self.root, text="Saved episodes", padding=8)
         files.pack(fill="both", expand=True, padx=12, pady=(0, 10))
         self.listbox = tk.Listbox(files, height=10)
         self.listbox.pack(side="left", fill="both", expand=True)
@@ -125,7 +125,7 @@ class CollectorGUI:
             return
         try:
             fps = int(self.fps_var.get())
-            self.status_var.set("正在连接机械臂和相机...")
+            self.status_var.set("Connecting to robot and cameras...")
             self.root.update_idletasks()
             self.piper = connect(self.can_var.get().strip())
             self.cameras = CameraCapture(
@@ -136,18 +136,18 @@ class CollectorGUI:
             checks = self.cameras.verify()
             bad = [key for key, info in checks.items() if not info["ok"]]
             if bad:
-                raise RuntimeError(f"摄像头测试失败: {bad}")
+                raise RuntimeError(f"Camera verification failed: {bad}")
             self.episode_index = next_episode_index(self.out_dir)
             self.capture_stop = threading.Event()
             self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
             self.capture_thread.start()
-            self.status_var.set(f"已连接: {self.can_var.get()} | 下一个 episode: {self.episode_index:04d}")
-            self.connect_button.configure(text="断开设备")
+            self.status_var.set(f"Connected: {self.can_var.get()} | Next episode: {self.episode_index:04d}")
+            self.connect_button.configure(text="Disconnect devices")
             self.start_button.configure(state="normal")
         except Exception as exc:
-            self.status_var.set(f"连接失败: {exc}")
+            self.status_var.set(f"Connection failed: {exc}")
             self._cleanup_devices()
-            messagebox.showerror("连接失败", str(exc))
+            messagebox.showerror("Connection failed", str(exc))
 
     def start_episode(self):
         if self.piper is None or self.cameras is None or self.recording:
@@ -156,8 +156,8 @@ class CollectorGUI:
         self.recording = True
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
-        self.status_var.set(f"正在采集 episode {self.episode_index:04d}")
-        self.progress_var.set("帧数: 0")
+        self.status_var.set(f"Recording episode {self.episode_index:04d}")
+        self.progress_var.set("Frames: 0")
 
     def _capture_loop(self):
         assert self.capture_stop is not None
@@ -189,22 +189,22 @@ class CollectorGUI:
         with self.data_lock:
             self.recording = False
         self.stop_button.configure(state="disabled")
-        self.status_var.set("正在停止并整理当前 episode...")
+        self.status_var.set("Stopping and preparing the current episode...")
         self.root.after(100, self._finish_stop)
 
     def _finish_stop(self):
         self.start_button.configure(state="normal" if self.piper is not None else "disabled")
         if self.buffer is None or len(self.buffer) == 0:
-            self.status_var.set("当前 episode 为空，未保存")
+            self.status_var.set("The episode is empty and was not saved")
             return
         self._ask_label_and_save()
 
     def _ask_label_and_save(self):
         dialog = tk.Toplevel(self.root)
-        dialog.title("标注当前 episode")
+        dialog.title("Label current episode")
         dialog.transient(self.root)
         dialog.grab_set()
-        ttk.Label(dialog, text=f"episode {self.episode_index:04d}，共 {len(self.buffer)} 帧").pack(padx=20, pady=15)
+        ttk.Label(dialog, text=f"Episode {self.episode_index:04d} | {len(self.buffer)} frames").pack(padx=20, pady=15)
         buttons = ttk.Frame(dialog)
         buttons.pack(pady=(0, 15))
 
@@ -212,19 +212,19 @@ class CollectorGUI:
             dialog.destroy()
             if choice == "discard":
                 self.buffer = None
-                self.status_var.set("已丢弃当前 episode")
+                self.status_var.set("Current episode discarded")
                 return
             path = self.out_dir / f"ep_{self.episode_index:04d}.npz"
             instruction = self.instruction_var.get().strip() or self.task_var.get().replace("_", " ")
             self.buffer.save(path, self.task_var.get().strip(), instruction, choice == "success")
             self.episode_index += 1
             self.buffer = None
-            self.status_var.set(f"已保存 {path}")
+            self.status_var.set(f"Saved: {path}")
             self.refresh_files()
 
-        ttk.Button(buttons, text="保存为成功", command=lambda: finish("success")).pack(side="left", padx=5)
-        ttk.Button(buttons, text="保存为失败", command=lambda: finish("failure")).pack(side="left", padx=5)
-        ttk.Button(buttons, text="丢弃", command=lambda: finish("discard")).pack(side="left", padx=5)
+        ttk.Button(buttons, text="Save as success", command=lambda: finish("success")).pack(side="left", padx=5)
+        ttk.Button(buttons, text="Save as failure", command=lambda: finish("failure")).pack(side="left", padx=5)
+        ttk.Button(buttons, text="Discard", command=lambda: finish("discard")).pack(side="left", padx=5)
 
     def _poll_messages(self):
         with self.data_lock:
@@ -236,12 +236,12 @@ class CollectorGUI:
                 kind, *payload = self.messages.get_nowait()
                 if kind == "progress":
                     count, qpos = payload
-                    self.progress_var.set(f"帧数: {count} | J1={qpos[0]:.3f} rad | gripper={qpos[6] * 1000:.1f} mm")
+                    self.progress_var.set(f"Frames: {count} | J1={qpos[0]:.3f} rad | gripper={qpos[6] * 1000:.1f} mm")
                 elif kind == "error":
-                    self.status_var.set(f"采集错误: {payload[0]}")
+                    self.status_var.set(f"Capture error: {payload[0]}")
                     if self.recording:
                         self.stop_episode()
-                    messagebox.showerror("采集错误", payload[0])
+                    messagebox.showerror("Capture error", payload[0])
         except queue.Empty:
             pass
         self.root.after(100, self._poll_messages)
@@ -270,7 +270,7 @@ class CollectorGUI:
     def replay_selected(self):
         selection = self.listbox.curselection()
         if not selection:
-            messagebox.showinfo("回放", "请先选择一个 episode 文件")
+            messagebox.showinfo("Replay", "Select an episode first")
             return
         path = self.listbox.get(selection[0])
         viewer = pathlib.Path(__file__).with_name("view_episode.py")
@@ -293,16 +293,16 @@ class CollectorGUI:
 
     def disconnect(self):
         if self.recording:
-            messagebox.showwarning("无法断开", "请先停止当前采集")
+            messagebox.showwarning("Cannot disconnect", "Stop the current episode first")
             return
         self._cleanup_devices()
-        self.connect_button.configure(text="连接设备")
+        self.connect_button.configure(text="Connect devices")
         self.start_button.configure(state="disabled")
-        self.status_var.set("未连接")
+        self.status_var.set("Disconnected")
 
     def close(self):
         if self.recording:
-            if not messagebox.askyesno("退出", "当前 episode 尚未保存，确定退出吗？"):
+            if not messagebox.askyesno("Exit", "The current episode is unsaved. Exit anyway?"):
                 return
             with self.data_lock:
                 self.recording = False
