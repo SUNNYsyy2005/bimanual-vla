@@ -20,8 +20,10 @@ import numpy as np
 RAD_TO_DEG = 180.0 / np.pi
 
 
-def _to_bgr(frame_chw: np.ndarray, size: tuple[int, int]) -> np.ndarray:
-    frame = np.asarray(frame_chw).transpose(1, 2, 0)
+def _to_bgr(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    frame = np.asarray(frame)
+    if frame.shape[0] == 3:
+        frame = frame.transpose(1, 2, 0)
     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     return cv2.resize(frame, size, interpolation=cv2.INTER_NEAREST)
 
@@ -31,7 +33,7 @@ def _put_text(image, text, xy, color=(255, 255, 255), scale=0.65, thickness=2):
     cv2.putText(image, text, xy, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
 
 
-def _make_panel(qpos: np.ndarray, task: str, instruction: str, high: np.ndarray, wrist: np.ndarray) -> np.ndarray:
+def _make_panel(qpos: np.ndarray | None, state: np.ndarray | None, task: str, instruction: str, high: np.ndarray, wrist: np.ndarray) -> np.ndarray:
     view_w, view_h = 480, 480
     high = _to_bgr(high, (view_w, view_h))
     wrist = _to_bgr(wrist, (view_w, view_h))
@@ -47,9 +49,14 @@ def _make_panel(qpos: np.ndarray, task: str, instruction: str, high: np.ndarray,
     _put_text(panel, f"instruction: {instruction}", (15, 545), (210, 210, 210), 0.55)
     _put_text(panel, "Output-arm feedback", (15, 580), (0, 220, 255), 0.68)
 
-    labels = ["J1", "J2", "J3", "J4", "J5", "J6", "Grip"]
-    values = list(np.asarray(qpos[:6]) * RAD_TO_DEG) + [float(qpos[6]) * 1000.0]
-    units = ["deg"] * 6 + ["mm"]
+    if qpos is not None:
+        labels = ["J1", "J2", "J3", "J4", "J5", "J6", "Grip"]
+        values = list(np.asarray(qpos[:6]) * RAD_TO_DEG) + [float(qpos[6]) * 1000.0]
+        units = ["deg"] * 6 + ["mm"]
+    else:
+        labels = ["EEF X", "EEF Y", "EEF Z", "Grip"]
+        values = list(np.asarray(state[:3])) + [float(state[9])]
+        units = ["m", "m", "m", "closed"]
     x0 = 230
     for i, (label, value, unit) in enumerate(zip(labels, values, units)):
         x = x0 + (i % 4) * 180
@@ -61,14 +68,22 @@ def _make_panel(qpos: np.ndarray, task: str, instruction: str, high: np.ndarray,
 def run(args):
     path = Path(args.episode)
     with np.load(path, allow_pickle=False) as data:
-        qpos = np.asarray(data["qpos"], dtype=np.float32)
+        if "state" in data:
+            states = np.asarray(data["state"], dtype=np.float32)
+            joint_qpos = np.asarray(data["joint_qpos"], dtype=np.float32) if "joint_qpos" in data else None
+            high = data["image"]
+            wrist = data["wrist_image"]
+            task = str(data["task"].item())
+        else:
+            states = None
+            joint_qpos = np.asarray(data["qpos"], dtype=np.float32)
+            high = data["images_cam_high"]
+            wrist = data["images_cam_wrist"]
+            task = str(data["task_name"].item())
         timestamps = np.asarray(data["timestamps"], dtype=np.float64)
-        high = data["images_cam_high"]
-        wrist = data["images_cam_wrist"]
-        task = str(data["task_name"].item())
-        instruction = str(data["instruction"].item())
+        instruction = str(data["instruction"].item()) if "instruction" in data else task
 
-        n = min(len(qpos), len(timestamps), len(high), len(wrist))
+        n = min(len(timestamps), len(high), len(wrist))
         if n == 0:
             raise ValueError("episode is empty")
 
@@ -86,7 +101,14 @@ def run(args):
         paused = False
         try:
             for i in range(n):
-                panel = _make_panel(qpos[i], task, instruction, high[i], wrist[i])
+                panel = _make_panel(
+                    joint_qpos[i] if joint_qpos is not None else None,
+                    states[i] if states is not None else None,
+                    task,
+                    instruction,
+                    high[i],
+                    wrist[i],
+                )
                 if writer is not None:
                     writer.write(panel)
 
@@ -115,7 +137,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("episode", help="path to ep_XXXX.npz")
     ap.add_argument("--save-video", default=None, help="optional output MP4 path")
-    ap.add_argument("--fps", type=int, default=30, help="FPS when saving MP4")
+    ap.add_argument("--fps", type=int, default=20, help="FPS when saving MP4")
     run(ap.parse_args())
 
 

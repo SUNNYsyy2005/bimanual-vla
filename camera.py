@@ -16,7 +16,7 @@ import time
 import numpy as np
 import cv2
 
-# π0.5 expects 224×224 RGB images
+# Default inference size. The delivery collector overrides this to 256x256.
 IMG_H, IMG_W = 224, 224
 
 # UNKNOWN: set correct device IDs after running `v4l2-ctl --list-devices`
@@ -35,9 +35,10 @@ class CameraCapture:
     cam_ids: dict mapping π0.5 camera key → /dev/videoN index.
     """
 
-    def __init__(self, cam_ids: dict = None, fps: int = 30):
+    def __init__(self, cam_ids: dict = None, fps: int = 30, image_hw: tuple[int, int] = (IMG_H, IMG_W)):
         self._ids = cam_ids or dict(DEFAULT_CAM_IDS)
         self._fps = fps
+        self._image_hw = tuple(image_hw)
         self._caps: dict[str, cv2.VideoCapture] = {}
 
     def open(self):
@@ -45,8 +46,8 @@ class CameraCapture:
             cap = cv2.VideoCapture(dev_id)
             if not cap.isOpened():
                 raise RuntimeError(f"Cannot open camera {key} at {dev_id}")
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  IMG_W)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMG_H)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self._image_hw[1])
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._image_hw[0])
             cap.set(cv2.CAP_PROP_FPS, self._fps)
             # disable internal buffering to reduce latency
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -69,10 +70,20 @@ class CameraCapture:
             timestamps[key] = time.time()
             if not ret:
                 raise RuntimeError(f"Camera {key} read failed")
-            # OpenCV returns BGR HWC → convert to RGB CHW (AlohaInputs expects [C,H,W])
+            # OpenCV returns BGR HWC -> RGB HWC. Preserve aspect ratio and pad
+            # with black before returning RGB CHW for the existing callers.
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            if rgb.shape[:2] != (IMG_H, IMG_W):
-                rgb = cv2.resize(rgb, (IMG_W, IMG_H))
+            target_h, target_w = self._image_hw
+            src_h, src_w = rgb.shape[:2]
+            scale = min(target_w / src_w, target_h / src_h)
+            new_w = max(1, round(src_w * scale))
+            new_h = max(1, round(src_h * scale))
+            resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            padded = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+            y0 = (target_h - new_h) // 2
+            x0 = (target_w - new_w) // 2
+            padded[y0:y0 + new_h, x0:x0 + new_w] = resized
+            rgb = padded
             images[key] = rgb.transpose(2, 0, 1)  # (H,W,C) → (C,H,W)
         return images, timestamps
 
