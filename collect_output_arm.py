@@ -50,6 +50,30 @@ def read_output_qpos(piper: C_PiperInterface_V2) -> np.ndarray:
     return np.append(values, float(gripper.grippers_angle) / GRIPPER_FACTOR)
 
 
+def send_output_qpos(piper: C_PiperInterface_V2, qpos: np.ndarray):
+    """Send one joint/gripper target to the output arm."""
+    joints = [round(float(value) * RAD_FACTOR) for value in qpos[:6]]
+    piper.JointCtrl(*joints)
+    piper.GripperCtrl(round(abs(float(qpos[6])) * GRIPPER_FACTOR), 1000, 0x01, 0)
+
+
+def reset_output_arm(
+    piper: C_PiperInterface_V2,
+    duration_s: float = 4.0,
+    hz: int = 20,
+    speed_pct: int = 10,
+):
+    """Smoothly move the output arm to the all-zero joint pose."""
+    current = read_output_qpos(piper)
+    target = np.zeros(7, dtype=np.float32)
+    piper.ModeCtrl(0x01, 0x01, speed_pct, 0x00)
+    steps = max(1, round(duration_s * hz))
+    for step in range(1, steps + 1):
+        alpha = step / steps
+        send_output_qpos(piper, current + alpha * (target - current))
+        time.sleep(1.0 / hz)
+
+
 class EpisodeBuffer:
     def __init__(self):
         self.start()
