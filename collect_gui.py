@@ -28,6 +28,7 @@ from collect_output_arm import (
     connect,
     next_episode_index,
     read_output_qpos,
+    reset_output_arm,
 )
 
 
@@ -42,6 +43,7 @@ class CollectorGUI:
         self.cameras = None
         self.capture_thread: threading.Thread | None = None
         self.capture_stop: threading.Event | None = None
+        self.reset_thread: threading.Thread | None = None
         self.data_lock = threading.Lock()
         self.latest_images = {}
         self.buffer: EpisodeBuffer | None = None
@@ -97,6 +99,8 @@ class CollectorGUI:
         self.start_button.pack(side="left", padx=3)
         self.stop_button = ttk.Button(controls, text="Stop episode", command=self.stop_episode, state="disabled")
         self.stop_button.pack(side="left", padx=3)
+        self.reset_button = ttk.Button(controls, text="Reset to Home", command=self.reset_arm, state="disabled")
+        self.reset_button.pack(side="left", padx=3)
         ttk.Button(controls, text="Refresh files", command=self.refresh_files).pack(side="left", padx=3)
         ttk.Button(controls, text="Replay selected", command=self.replay_selected).pack(side="left", padx=3)
 
@@ -144,6 +148,7 @@ class CollectorGUI:
             self.status_var.set(f"Connected: {self.can_var.get()} | Next episode: {self.episode_index:04d}")
             self.connect_button.configure(text="Disconnect devices")
             self.start_button.configure(state="normal")
+            self.reset_button.configure(state="normal")
         except Exception as exc:
             self.status_var.set(f"Connection failed: {exc}")
             self._cleanup_devices()
@@ -156,6 +161,7 @@ class CollectorGUI:
         self.recording = True
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
+        self.reset_button.configure(state="disabled")
         self.status_var.set(f"Recording episode {self.episode_index:04d}")
         self.progress_var.set("Frames: 0")
 
@@ -194,6 +200,7 @@ class CollectorGUI:
 
     def _finish_stop(self):
         self.start_button.configure(state="normal" if self.piper is not None else "disabled")
+        self.reset_button.configure(state="normal" if self.piper is not None else "disabled")
         if self.buffer is None or len(self.buffer) == 0:
             self.status_var.set("The episode is empty and was not saved")
             return
@@ -226,6 +233,39 @@ class CollectorGUI:
         ttk.Button(buttons, text="Save as failure", command=lambda: finish("failure")).pack(side="left", padx=5)
         ttk.Button(buttons, text="Discard", command=lambda: finish("discard")).pack(side="left", padx=5)
 
+    def reset_arm(self):
+        if self.piper is None or self.recording or self.reset_thread is not None:
+            return
+        confirmed = messagebox.askyesno(
+            "Reset to Home",
+            "Move the output arm smoothly to the all-zero joint pose and close the gripper?",
+        )
+        if not confirmed:
+            return
+        self.start_button.configure(state="disabled")
+        self.reset_button.configure(state="disabled")
+        self.status_var.set("Resetting output arm to home pose...")
+        self.reset_thread = threading.Thread(target=self._reset_worker, daemon=True)
+        self.reset_thread.start()
+
+    def _reset_worker(self):
+        try:
+            reset_output_arm(self.piper)
+            self.messages.put(("reset_done",))
+        except Exception as exc:
+            self.messages.put(("reset_error", str(exc)))
+
+    def _finish_reset(self, success: bool, error: str | None = None):
+        self.reset_thread = None
+        if success:
+            self.status_var.set("Output arm reset completed")
+        else:
+            self.status_var.set(f"Reset failed: {error}")
+            messagebox.showerror("Reset failed", error or "Unknown reset error")
+        if self.piper is not None and not self.recording:
+            self.start_button.configure(state="normal")
+            self.reset_button.configure(state="normal")
+
     def _poll_messages(self):
         with self.data_lock:
             preview = {key: value.copy() for key, value in self.latest_images.items()}
@@ -242,6 +282,10 @@ class CollectorGUI:
                     if self.recording:
                         self.stop_episode()
                     messagebox.showerror("Capture error", payload[0])
+                elif kind == "reset_done":
+                    self._finish_reset(True)
+                elif kind == "reset_error":
+                    self._finish_reset(False, payload[0])
         except queue.Empty:
             pass
         self.root.after(100, self._poll_messages)
@@ -281,6 +325,9 @@ class CollectorGUI:
             self.capture_stop.set()
         if self.capture_thread is not None and self.capture_thread.is_alive():
             self.capture_thread.join(timeout=2.0)
+        if self.reset_thread is not None and self.reset_thread.is_alive():
+            self.reset_thread.join(timeout=2.0)
+        self.reset_thread = None
         self.capture_thread = None
         self.capture_stop = None
         if self.cameras is not None:
@@ -295,9 +342,13 @@ class CollectorGUI:
         if self.recording:
             messagebox.showwarning("Cannot disconnect", "Stop the current episode first")
             return
+        if self.reset_thread is not None:
+            messagebox.showwarning("Cannot disconnect", "Wait for the reset to finish first")
+            return
         self._cleanup_devices()
         self.connect_button.configure(text="Connect devices")
         self.start_button.configure(state="disabled")
+        self.reset_button.configure(state="disabled")
         self.status_var.set("Disconnected")
 
     def close(self):
