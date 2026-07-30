@@ -56,7 +56,7 @@ class CollectorGUI:
         self.high_var = tk.StringVar(value="/dev/video8")
         self.wrist_var = tk.StringVar(value="/dev/video16")
         self.fps_var = tk.StringVar(value="20")
-        self.out_var = tk.StringVar(value="episodes_output_arm")
+        self.out_var = tk.StringVar(value="episodes_piper_v21")
         self.task_var = tk.StringVar(value="pick_cube")
         self.instruction_var = tk.StringVar(value="pick up the cube")
         self.status_var = tk.StringVar(value="Disconnected")

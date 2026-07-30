@@ -52,7 +52,7 @@ task:        UTF-8 string
 
 ```bash
 python export_lerobot.py \
-  --input-dir episodes_output_arm \
+  --input-dir episodes_piper_v21 \
   --repo-id piper/piper_v1 \
   --root piper/piper_v1 \
   --fps 20
