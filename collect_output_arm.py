@@ -274,7 +274,7 @@ def main():
     ap.add_argument("--cam-high-device", default=DEFAULT_HIGH_DEVICE)
     ap.add_argument("--cam-wrist-device", default=DEFAULT_WRIST_DEVICE)
     ap.add_argument("--fps", type=int, default=DEFAULT_FPS)
-    ap.add_argument("--out-dir", default="episodes_output_arm")
+    ap.add_argument("--out-dir", default="episodes_piper_v21")
     ap.add_argument("--task-name", default="output_arm_task")
     ap.add_argument("--instruction", default=None)
     run(ap.parse_args())

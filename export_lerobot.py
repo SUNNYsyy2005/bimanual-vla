@@ -132,7 +132,7 @@ def run(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input-dir", default="episodes_output_arm")
+    ap.add_argument("--input-dir", default="episodes_piper_v21")
     ap.add_argument("--repo-id", default="piper/piper_v1")
     ap.add_argument("--root", default="piper/piper_v1")
     ap.add_argument("--fps", type=int, default=20)
