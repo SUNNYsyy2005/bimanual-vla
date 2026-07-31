@@ -132,8 +132,7 @@ def run(args):
                 "wrist_image": wrist[i],
                 "state": state[i],
                 "actions": actions[i],
-                "task": task,
-            })
+            }, task=task, timestamp=i / args.fps)
         dataset.save_episode()
         count += 1
         frames += len(state)
