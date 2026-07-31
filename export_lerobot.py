@@ -18,6 +18,16 @@ from pathlib import Path
 
 import numpy as np
 
+from validate_piper_data import (
+    EpisodeStats,
+    EpisodeValidationError,
+    format_dataset_report,
+    format_episode_report,
+    validate_episode,
+    validate_gripper_coverage,
+    validate_instruction_consistency,
+)
+
 
 FEATURES = {
     "image": {
@@ -52,39 +62,62 @@ FEATURES = {
 }
 
 
-def _load_successful(paths: list[Path]):
+def _validate_inputs(paths: list[Path], target_fps: float) -> list[EpisodeStats]:
+    successful: list[EpisodeStats] = []
+    coverage_candidates: list[EpisodeStats] = []
+    failures: list[str] = []
     for path in paths:
-        with np.load(path, allow_pickle=False) as data:
-            if not bool(data["success"].item()):
-                continue
-            required = {"state", "actions", "image", "wrist_image", "task"}
-            missing = required.difference(data.files)
-            if missing:
-                raise ValueError(f"{path}: missing fields {sorted(missing)}")
-            state = np.asarray(data["state"], dtype=np.float32)
-            actions = np.asarray(data["actions"], dtype=np.float32)
-            image = np.asarray(data["image"], dtype=np.uint8)
-            wrist = np.asarray(data["wrist_image"], dtype=np.uint8)
-            if state.ndim != 2 or state.shape[1] != 10:
-                raise ValueError(f"{path}: state shape must be (T,10), got {state.shape}")
-            if actions.shape != (len(state), 7):
-                raise ValueError(f"{path}: actions shape must be ({len(state)},7), got {actions.shape}")
-            if image.shape != (len(state), 256, 256, 3):
-                raise ValueError(f"{path}: image shape mismatch: {image.shape}")
-            if wrist.shape != image.shape:
-                raise ValueError(f"{path}: wrist_image shape mismatch: {wrist.shape}")
-            if not np.isfinite(state).all() or not np.isfinite(actions).all():
-                raise ValueError(f"{path}: non-finite state/action")
-            if not (0.0 <= state[:, 9]).all() or not (state[:, 9] <= 1.0).all():
-                raise ValueError(f"{path}: state gripper fraction out of range")
-            if not (0.0 <= actions[:, 6]).all() or not (actions[:, 6] <= 1.0).all():
-                raise ValueError(f"{path}: action gripper fraction out of range")
-            if not np.allclose(actions[-1, :6], 0.0, atol=1e-6):
-                raise ValueError(f"{path}: terminal action is not a no-op")
-            yield path, state, actions, image, wrist, str(data["task"].item())
+        try:
+            stats = validate_episode(path, target_fps=target_fps)
+            print(format_episode_report(stats))
+            if stats.success:
+                successful.append(stats)
+                coverage_candidates.append(stats)
+        except EpisodeValidationError as exc:
+            failures.append(str(exc))
+            if exc.stats is not None and exc.stats.success:
+                coverage_candidates.append(exc.stats)
+
+    coverage_error = None
+    try:
+        validate_gripper_coverage(coverage_candidates)
+        validate_instruction_consistency(coverage_candidates)
+    except ValueError as exc:
+        coverage_error = str(exc)
+    if failures:
+        details = "Input validation failed:\n\n" + "\n\n".join(failures)
+        if coverage_error:
+            details += f"\n\nDataset validation failed: {coverage_error}"
+        raise SystemExit(details)
+    if coverage_error:
+        raise SystemExit(f"Input validation failed: {coverage_error}")
+    print(format_dataset_report(successful))
+    return successful
+
+
+def _load_episode_arrays(path: Path):
+    with np.load(path, allow_pickle=False) as data:
+        return (
+            np.asarray(data["state"], dtype=np.float32),
+            np.asarray(data["actions"], dtype=np.float32),
+            np.asarray(data["image"], dtype=np.uint8),
+            np.asarray(data["wrist_image"], dtype=np.uint8),
+        )
 
 
 def run(args):
+    if args.fps != 20:
+        raise SystemExit("The Piper delivery format requires fps=20.")
+
+    paths = sorted(Path(args.input_dir).glob("ep_*.npz"))
+    if not paths:
+        raise SystemExit(f"No episodes found in {args.input_dir}")
+
+    successful = _validate_inputs(paths, target_fps=args.fps)
+    if args.validate_only:
+        print("Validation complete; no LeRobot dataset was written.")
+        return
+
     try:
         from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
         codebase_version = "v2.1"
@@ -105,13 +138,6 @@ def run(args):
             "LeRobot environment before exporting."
         )
 
-    if args.fps != 20:
-        raise SystemExit("The Piper delivery format requires fps=20.")
-
-    paths = sorted(Path(args.input_dir).glob("ep_*.npz"))
-    if not paths:
-        raise SystemExit(f"No episodes found in {args.input_dir}")
-
     create_kwargs = {
         "repo_id": args.repo_id,
         "robot_type": "piper",
@@ -125,18 +151,22 @@ def run(args):
 
     count = 0
     frames = 0
-    for path, state, actions, image, wrist, task in _load_successful(paths):
+    for stats in successful:
+        state, actions, image, wrist = _load_episode_arrays(stats.path)
         for i in range(len(state)):
             dataset.add_frame({
                 "image": image[i],
                 "wrist_image": wrist[i],
                 "state": state[i],
                 "actions": actions[i],
-            }, task=task, timestamp=i / args.fps)
+            }, task=stats.instruction, timestamp=i / args.fps)
         dataset.save_episode()
         count += 1
         frames += len(state)
-        print(f"Exported {path} ({len(state)} frames)")
+        print(
+            f"Exported {stats.path} ({len(state)} frames, "
+            f"instruction={stats.instruction!r})"
+        )
 
     print(f"Export complete: episodes={count}, frames={frames}, fps={args.fps}")
 
@@ -147,6 +177,11 @@ def main():
     ap.add_argument("--repo-id", default="piper/piper_v1")
     ap.add_argument("--root", default="piper/piper_v1")
     ap.add_argument("--fps", type=int, default=20)
+    ap.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="validate NPZ episodes without writing a LeRobot dataset",
+    )
     run(ap.parse_args())
 
 

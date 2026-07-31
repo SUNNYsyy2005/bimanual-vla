@@ -39,14 +39,28 @@ bash start_gui.sh
 新采集的 NPZ episode 包含：
 
 ```text
-image:       (T, 256, 256, 3) uint8 RGB HWC
-wrist_image: (T, 256, 256, 3) uint8 RGB HWC
-state:       (T, 10) float32
-actions:     (T, 7) float32
-task:        UTF-8 string
+state                         float32 (T,10)
+actions                       float32 (T,7)
+timestamps                    float64 (T,)
+image                         uint8   (T,256,256,3), RGB HWC
+wrist_image                   uint8   (T,256,256,3), RGB HWC
+task                          Unicode scalar, internal task ID (optional)
+instruction                   Unicode scalar, natural-language prompt
+success                       bool scalar
+joint_qpos                    float32 (T,7), diagnostics (optional)
+image_timestamps_cam_high     float64 (T,)
+image_timestamps_cam_wrist    float64 (T,)
 ```
 
-`state` 是 EEF base-frame position、rotation 6D 和 gripper closed fraction；`actions[t]` 是从当前帧到下一帧的 base-frame position/rotation delta 和下一帧夹爪目标。每个 episode 最后自动增加 terminal no-op frame。
+`state` 是 base-frame EEF position（m）、旋转矩阵前两列组成的 rotation 6D，以及 `0=open, 1=closed` 的夹爪闭合比例。`actions[t]` 是 `state[t] -> state[t+1]` 的 base-frame position delta、左乘旋转增量 rotvec，以及下一帧绝对夹爪目标。每个 episode 最后自动增加 terminal observation，最后动作固定为 `[0,0,0,0,0,0,state[-1,9]]`。
+
+导出前单独验收：
+
+```bash
+python validate_piper_data.py --input-dir episodes_piper_v21 --target-fps 20
+```
+
+验收会检查真实 FPS、两路图像与状态的同步误差、shape/dtype、rotation 6D、动作重算、terminal action、空帧/冻结帧、夹爪覆盖和 no-op/action norm 统计。
 
 导出 LeRobot v2.1：
 
@@ -57,6 +71,8 @@ python export_lerobot.py \
   --root piper/piper_v1 \
   --fps 20
 ```
+
+导出使用 `instruction` 写入 LeRobot `meta/tasks.jsonl`，内部 `task` ID 不会作为训练 prompt。只检查、不写 LeRobot 数据时可在上述命令后加 `--validate-only`。
 - 轨迹保存 / 回放：`trajectory.py`
 - 导出可直接用于 pi0.5 / openpi 训练的 LeRobot 风格数据集：`pi0_dataset.py`
 - openpi / pi0.5 实机推理桥接：`serve_piper.py`、`run.py`
@@ -72,8 +88,8 @@ python export_lerobot.py \
 ```bash
 python collect_output_arm.py \
   --can can0 \
-  --cam-high-device /dev/video12 \
-  --cam-wrist-device /dev/video4 \
+  --cam-high-device /dev/video8 \
+  --cam-wrist-device /dev/video16 \
   --task-name pick_cube \
   --instruction "pick up the cube"
 ```

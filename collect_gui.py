@@ -51,6 +51,7 @@ class CollectorGUI:
         self.messages: queue.Queue = queue.Queue()
         self.recording = False
         self.episode_index = 0
+        self.capture_fps = 20
 
         self.can_var = tk.StringVar(value=DEFAULT_CAN)
         self.high_var = tk.StringVar(value="/dev/video8")
@@ -130,6 +131,9 @@ class CollectorGUI:
             return
         try:
             fps = int(self.fps_var.get())
+            if fps <= 0:
+                raise ValueError("Capture FPS must be positive")
+            self.capture_fps = fps
             self.status_var.set("Connecting to robot and cameras...")
             self.root.update_idletasks()
             self.piper = connect(self.can_var.get().strip())
@@ -137,6 +141,7 @@ class CollectorGUI:
                 cam_ids={"cam_high": self.high_var.get().strip(), "cam_wrist": self.wrist_var.get().strip()},
                 fps=fps,
                 image_hw=IMAGE_HW,
+                parallel_reads=True,
             )
             self.cameras.open()
             checks = self.cameras.verify()
@@ -159,7 +164,7 @@ class CollectorGUI:
     def start_episode(self):
         if self.piper is None or self.cameras is None or self.recording:
             return
-        self.buffer = EpisodeBuffer()
+        self.buffer = EpisodeBuffer(fps=self.capture_fps)
         self.recording = True
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
@@ -169,17 +174,24 @@ class CollectorGUI:
 
     def _capture_loop(self):
         assert self.capture_stop is not None
-        fps = max(1, int(self.fps_var.get()))
+        fps = self.capture_fps
         dt = 1.0 / fps
         try:
             while not self.capture_stop.is_set():
                 t0 = time.time()
                 state, qpos = read_output_state(self.piper)
+                state_timestamp = time.time()
                 images, image_ts = self.cameras.read()
                 with self.data_lock:
                     self.latest_images = {key: value.copy() for key, value in images.items()}
                     if self.recording and self.buffer is not None:
-                        self.buffer.add(state, images, image_ts, qpos=qpos)
+                        self.buffer.add(
+                            state,
+                            images,
+                            image_ts,
+                            qpos=qpos,
+                            state_timestamp=state_timestamp,
+                        )
                         count = len(self.buffer)
                     else:
                         count = 0

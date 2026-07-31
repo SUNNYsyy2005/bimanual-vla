@@ -96,7 +96,10 @@ def reset_output_arm(
 
 
 class EpisodeBuffer:
-    def __init__(self):
+    def __init__(self, fps: int = DEFAULT_FPS):
+        if fps <= 0:
+            raise ValueError("fps must be positive")
+        self.fps = fps
         self.start()
 
     def start(self):
@@ -106,8 +109,15 @@ class EpisodeBuffer:
         self.images: dict[str, list[np.ndarray]] = {}
         self.image_timestamps: dict[str, list[float]] = {}
 
-    def add(self, state: np.ndarray, images: dict[str, np.ndarray], image_ts: dict[str, float], qpos: np.ndarray | None = None):
-        now = time.time()
+    def add(
+        self,
+        state: np.ndarray,
+        images: dict[str, np.ndarray],
+        image_ts: dict[str, float],
+        qpos: np.ndarray | None = None,
+        state_timestamp: float | None = None,
+    ):
+        now = time.time() if state_timestamp is None else float(state_timestamp)
         self.states.append(np.asarray(state, dtype=np.float32).copy())
         if qpos is not None:
             self.joint_qpos.append(np.asarray(qpos, dtype=np.float32).copy())
@@ -124,12 +134,17 @@ class EpisodeBuffer:
         return len(self.states)
 
     def save(self, path: pathlib.Path, task_name: str, instruction: str, success: bool):
+        if not self.states:
+            raise ValueError("cannot save an empty episode")
+        instruction = instruction.strip()
+        if not instruction:
+            raise ValueError("instruction must not be empty")
         states_real = np.asarray(self.states, dtype=np.float32)
         # Add one terminal observation. Its action becomes the required no-op.
         states = np.concatenate((states_real, states_real[-1:]), axis=0)
         actions = _build_actions(states)
         timestamps = np.asarray(self.timestamps, dtype=np.float64)
-        terminal_dt = 1.0 / 20.0 if len(timestamps) < 2 else timestamps[-1] - timestamps[-2]
+        terminal_dt = 1.0 / self.fps
         timestamps = np.concatenate((timestamps, [timestamps[-1] + terminal_dt]))
         payload: dict[str, np.ndarray] = {
             "state": states,
@@ -208,6 +223,8 @@ def next_episode_index(out_dir: pathlib.Path) -> int:
 
 
 def run(args):
+    if args.fps <= 0:
+        raise ValueError("fps must be positive")
     print(f"Connecting to output arm on {args.can} ...")
     piper = connect(args.can)
     cameras = CameraCapture(
@@ -217,6 +234,7 @@ def run(args):
         },
         fps=args.fps,
         image_hw=IMAGE_HW,
+        parallel_reads=True,
     )
     cameras.open()
     for key, info in cameras.verify().items():
@@ -224,7 +242,7 @@ def run(args):
 
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    buffer = EpisodeBuffer()
+    buffer = EpisodeBuffer(fps=args.fps)
     keys = KeyListener()
     episode_index = next_episode_index(out_dir)
     if episode_index:
@@ -237,8 +255,15 @@ def run(args):
         while not keys.quit:
             t0 = time.time()
             state, qpos = read_output_state(piper)
+            state_timestamp = time.time()
             images, image_ts = cameras.read()
-            buffer.add(state, images, image_ts, qpos=qpos)
+            buffer.add(
+                state,
+                images,
+                image_ts,
+                qpos=qpos,
+                state_timestamp=state_timestamp,
+            )
             sys.stdout.write(
                 f"\r[ep {episode_index:04d}] step {len(buffer):04d} "
                 f"eef=({state[:3].round(3)}) g={qpos[6] * 1000:.1f}mm   "
