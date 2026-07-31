@@ -29,6 +29,11 @@ import uuid
 from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.exceptions import HTTPException
 
+try:
+    from .dataset_editor import DatasetEditor, DatasetValidationError
+except ImportError:  # app.py is normally executed directly by start_server.sh
+    from dataset_editor import DatasetEditor, DatasetValidationError
+
 
 APP_DIR = Path(__file__).resolve().parent
 REPO_DIR = APP_DIR.parent
@@ -499,8 +504,9 @@ class TaskManager:
 
 
 class UploadManager:
-    def __init__(self, config: dict[str, Any]):
+    def __init__(self, config: dict[str, Any], dataset_editor: DatasetEditor):
         self.config = config
+        self.dataset_editor = dataset_editor
         self.root = Path(config["workspace_root"]) / "uploads"
         self.root.mkdir(parents=True, exist_ok=True)
         self.dataset_root = Path(config["dataset_root"])
@@ -550,6 +556,9 @@ class UploadManager:
         if not HEX_SHA256.fullmatch(sha256):
             raise ValueError("sha256 must be 64 lowercase hex characters")
         overwrite = bool(payload.get("overwrite", False))
+        merge = bool(payload.get("merge", False))
+        if overwrite and merge:
+            raise ValueError("overwrite and merge are mutually exclusive")
         upload_id = hashlib.sha256(f"{dataset_name}\0{size}\0{sha256}".encode()).hexdigest()[:32]
         upload_dir = self._dir(upload_id)
         upload_dir.mkdir(parents=True, exist_ok=True)
@@ -564,12 +573,14 @@ class UploadManager:
             "chunk_size": chunk_size,
             "chunk_count": (size + chunk_size - 1) // chunk_size,
             "overwrite": overwrite,
+            "merge": merge,
         }
         if isinstance(state, dict):
             for key in ("dataset_name", "size", "sha256", "chunk_size"):
                 if state.get(key) != expected[key]:
                     raise ValueError(f"existing upload metadata mismatch for {key}")
             state["overwrite"] = overwrite
+            state["merge"] = merge
         else:
             state = {**expected, "created_at": now_iso(), "state": "uploading"}
         atomic_json(state_path, state)
@@ -674,50 +685,25 @@ class UploadManager:
 
             dataset_name = state["dataset_name"]
             staging = self.dataset_root / f".{dataset_name}.installing-{uuid.uuid4().hex}"
-            backup = self.dataset_root / f".{dataset_name}.backup-{time.strftime('%Y%m%d-%H%M%S')}"
-            target = self.dataset_root / dataset_name
             try:
                 self._extract_tar(archive, staging)
-                checker = [
-                    self.config["openpi_python"],
-                    str(REPO_DIR / "check_pi05_dataset.py"),
-                    str(staging),
-                ]
-                validation_env = build_environment(self.config, None)
-                structural = subprocess.run(
-                    checker, capture_output=True, text=True, timeout=3600, env=validation_env
+                result = self.dataset_editor.install_upload(
+                    dataset_name,
+                    staging,
+                    overwrite=bool(state.get("overwrite")),
+                    merge=bool(state.get("merge")),
                 )
-                state["structural_validation"] = (structural.stdout + structural.stderr)[-16_000:]
-                if structural.returncode != 0:
-                    raise ValueError("dataset structural validation failed")
-                if target.exists():
-                    if not state.get("overwrite"):
-                        raise FileExistsError(f"dataset already exists: {target}; use --overwrite to replace it")
-                    os.replace(target, backup)
-                os.replace(staging, target)
-                loader_check = subprocess.run(
-                    [self.config["openpi_python"], str(APP_DIR / "validate_lerobot.py"), dataset_name],
-                    cwd=self.config["openpi_repo"],
-                    capture_output=True,
-                    text=True,
-                    timeout=3600,
-                    env=validation_env,
-                )
-                state["loader_validation"] = (loader_check.stdout + loader_check.stderr)[-16_000:]
-                if loader_check.returncode != 0:
-                    failed = self.dataset_root / f".{dataset_name}.failed-{uuid.uuid4().hex}"
-                    os.replace(target, failed)
-                    if backup.exists():
-                        os.replace(backup, target)
-                    raise ValueError("LeRobot/OpenPI loader validation failed")
                 state.pop("error", None)
                 state.pop("failed_at", None)
-                state.update({"state": "installed", "installed_at": now_iso(), "path": str(target)})
+                state.update(result)
+                state.update({"state": "installed", "installed_at": now_iso(), "path": result["path"]})
                 atomic_json(upload_dir / "upload.json", state)
                 return state
             except Exception as exc:
                 if staging.exists():
                     shutil.rmtree(staging)
+                if isinstance(exc, DatasetValidationError):
+                    state[f"{exc.phase}_validation"] = exc.output[-16_000:]
                 state.update({"state": "failed", "error": str(exc), "failed_at": now_iso()})
                 atomic_json(upload_dir / "upload.json", state)
                 raise
@@ -975,20 +961,69 @@ def create_app(config_path: Path) -> Flask:
     token = os.environ.get("BIMANUAL_VLA_SERVER_TOKEN", "")
     if len(token) < 20:
         raise RuntimeError("set BIMANUAL_VLA_SERVER_TOKEN to a random value of at least 20 characters")
+    login_user = os.environ.get("BIMANUAL_VLA_LOGIN_USER", "")
+    login_password = os.environ.get("BIMANUAL_VLA_LOGIN_PASSWORD", "")
     app = Flask(__name__, template_folder=str(APP_DIR / "templates"))
     app.config["MAX_CONTENT_LENGTH"] = int(config["max_chunk_mib"] * 1024**2) + 1024 * 1024
     tasks = TaskManager(config)
-    uploads = UploadManager(config)
+    dataset_root = Path(config["dataset_root"])
+    dataset_root.mkdir(parents=True, exist_ok=True)
+
+    def assert_dataset_idle(dataset_id: str) -> None:
+        active = [
+            task for task in tasks.list()
+            if task.get("metadata", {}).get("dataset_id") == dataset_id
+            and task.get("state") not in TERMINAL_STATES
+        ]
+        if active:
+            summary = ", ".join(f"{task['id']} ({task.get('state')})" for task in active)
+            raise ValueError(f"dataset is in use by active task(s): {summary}")
+
+    def validate_staging_dataset(path: Path) -> str:
+        checker = [config["openpi_python"], str(REPO_DIR / "check_pi05_dataset.py"), str(path)]
+        result = subprocess.run(
+            checker,
+            capture_output=True,
+            text=True,
+            timeout=3600,
+            env=build_environment(config, None),
+        )
+        output = (result.stdout + result.stderr)[-16_000:]
+        if result.returncode != 0:
+            raise DatasetValidationError("structural", "dataset structural validation failed", output)
+        return output
+
+    def validate_installed_dataset(dataset_id: str) -> str:
+        result = subprocess.run(
+            [config["openpi_python"], str(APP_DIR / "validate_lerobot.py"), dataset_id],
+            cwd=config["openpi_repo"],
+            capture_output=True,
+            text=True,
+            timeout=3600,
+            env=build_environment(config, None),
+        )
+        output = (result.stdout + result.stderr)[-16_000:]
+        if result.returncode != 0:
+            raise DatasetValidationError("loader", "LeRobot/OpenPI loader validation failed", output)
+        return output
+
+    dataset_editor = DatasetEditor(
+        dataset_root=dataset_root,
+        assets_base_dir=Path(config["assets_base_dir"]),
+        validate_staging=validate_staging_dataset,
+        validate_installed=validate_installed_dataset,
+        assert_idle=assert_dataset_idle,
+    )
+    uploads = UploadManager(config, dataset_editor)
     observations = PolicyTelemetryStore(config)
     allowed_gpus = set(map(int, config["allowed_gpu_ids"]))
     checkpoint_roots = [Path(item) for item in config["checkpoint_allowed_roots"]]
-    dataset_root = Path(config["dataset_root"])
     openpi_helper = str(APP_DIR / "openpi_single_arm.py")
     checkpoint_size_cache: dict[str, tuple[float, int]] = {}
 
     @app.before_request
     def authenticate():
-        if request.path in {"/", "/healthz"}:
+        if request.path in {"/", "/healthz", "/api/auth/token"}:
             return None
         supplied = request.headers.get("Authorization", "")
         if supplied.startswith("Bearer "):
@@ -1015,6 +1050,27 @@ def create_app(config_path: Path) -> Flask:
     @app.get("/healthz")
     def healthz():
         return jsonify({"ok": True, "time": now_iso()})
+
+    @app.post("/api/auth/token")
+    def issue_token():
+        """Exchange the Dashboard login credentials for the existing Bearer token.
+
+        The login endpoint intentionally accepts credentials only in the request
+        body, never in the URL.  The returned token remains the same token used
+        by the existing Dashboard API and upload clients.
+        """
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            payload = request.form.to_dict()
+        supplied_user = str(payload.get("username", ""))
+        supplied_password = str(payload.get("password", ""))
+        if not login_user or not login_password:
+            return jsonify({"error": "Dashboard login credentials are not configured"}), 503
+        valid_user = hmac.compare_digest(supplied_user, login_user)
+        valid_password = hmac.compare_digest(supplied_password, login_password)
+        if not (valid_user and valid_password):
+            return jsonify({"error": "invalid username or password"}), 401
+        return jsonify({"token": token, "token_type": "Bearer", "username": login_user})
 
     def list_datasets() -> list[dict[str, Any]]:
         datasets = []
@@ -1056,6 +1112,12 @@ def create_app(config_path: Path) -> Flask:
                     "cameras": camera_keys,
                     "action_semantics": action_semantics,
                     "action_offset": action_offset,
+                    "norm_stats_ready": (
+                        Path(config["assets_base_dir"])
+                        / "pi05_piper_single_arm_lora"
+                        / directory.name
+                        / "norm_stats.json"
+                    ).is_file(),
                     "mtime": directory.stat().st_mtime,
                 }
             )
@@ -1162,6 +1224,41 @@ def create_app(config_path: Path) -> Flask:
     @app.post("/api/uploads/<upload_id>/complete")
     def upload_complete(upload_id: str):
         return jsonify(uploads.complete(upload_id))
+
+    @app.get("/api/datasets/<dataset_id>")
+    def dataset_details(dataset_id: str):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        offset = safe_int(request.args.get("offset", 0), "offset", 0, 10**9)
+        limit = safe_int(request.args.get("limit", 200), "limit", 1, 500)
+        return jsonify(dataset_editor.details(dataset_id, offset=offset, limit=limit))
+
+    @app.get("/api/datasets/<dataset_id>/episodes/<int:episode_index>/video/<video_key>")
+    def dataset_episode_video(dataset_id: str, episode_index: int, video_key: str):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        path = dataset_editor.video_path(dataset_id, episode_index, video_key)
+        return send_file(path, mimetype="video/mp4", conditional=True, max_age=0)
+
+    @app.patch("/api/datasets/<dataset_id>/episodes/<int:episode_index>")
+    def update_dataset_episode(dataset_id: str, episode_index: int):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        result = dataset_editor.update_episode(dataset_id, episode_index, request.get_json(force=True))
+        return jsonify(result)
+
+    @app.post("/api/datasets/<dataset_id>/episodes/delete")
+    def delete_dataset_episodes(dataset_id: str):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        payload = request.get_json(force=True)
+        indexes = payload.get("episode_indexes") if isinstance(payload, dict) else None
+        if not isinstance(indexes, list):
+            raise ValueError("episode_indexes must be a list")
+        return jsonify(dataset_editor.delete_episodes(dataset_id, indexes))
+
+    @app.post("/api/datasets/<dataset_id>/merge")
+    def merge_installed_dataset(dataset_id: str):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        payload = request.get_json(force=True)
+        source_id = safe_name(payload.get("source_dataset_id") if isinstance(payload, dict) else None, "source dataset id")
+        return jsonify(dataset_editor.merge_existing(dataset_id, source_id))
 
     def parse_dataset(payload: dict[str, Any]) -> tuple[str, str, str]:
         dataset_id = safe_name(payload.get("dataset_id"), "dataset id")
@@ -1307,9 +1404,23 @@ def create_app(config_path: Path) -> Flask:
         num_workers = safe_int(payload.get("num_workers", 2), "num_workers", 1, 64)
         steps = safe_int(payload.get("num_train_steps", 30_000), "num_train_steps", 1, 10_000_000)
         save_interval = safe_int(payload.get("save_interval", 1_000), "save_interval", 1, steps)
-        mode = str(payload.get("mode", "new"))
-        if mode not in {"new", "resume", "overwrite"}:
-            raise ValueError("mode must be new, resume, or overwrite")
+        mode = str(payload.get("mode", "auto"))
+        if mode not in {"auto", "new", "resume", "overwrite"}:
+            raise ValueError("mode must be auto, new, resume, or overwrite")
+        checkpoint_dir = (
+            Path(config["checkpoint_base_dir"])
+            / "pi05_piper_single_arm_lora"
+            / exp_name
+        )
+        if mode == "new" and checkpoint_dir.exists():
+            raise FileExistsError(
+                f"checkpoint directory already exists: {checkpoint_dir}; "
+                "choose auto/resume to continue it, or overwrite to replace it"
+            )
+        # Upstream --resume is safe for both cases: it resumes the latest
+        # checkpoint when the directory exists, and starts a fresh run when it
+        # does not. Use it as the non-destructive Dashboard default.
+        effective_mode = "resume" if mode == "auto" else mode
         command = [
             config["openpi_python"], openpi_helper, "train",
             "--dataset-id", dataset_id,
@@ -1325,8 +1436,8 @@ def create_app(config_path: Path) -> Flask:
             "--save-interval", str(save_interval),
             "--fsdp-devices", str(fsdp_devices),
         ]
-        if mode != "new":
-            command.append(f"--{mode}")
+        if effective_mode != "new":
+            command.append(f"--{effective_mode}")
         if bool(payload.get("wandb_enabled", False)):
             command.append("--wandb-enabled")
         metadata = {
@@ -1337,6 +1448,9 @@ def create_app(config_path: Path) -> Flask:
             "gpu_ids": gpu_ids,
             "steps": steps,
             "fsdp_devices": fsdp_devices,
+            "mode": mode,
+            "effective_mode": effective_mode,
+            "checkpoint_dir": str(checkpoint_dir),
         }
         with tasks.lock:
             # Re-check while holding the task lock so simultaneous submissions

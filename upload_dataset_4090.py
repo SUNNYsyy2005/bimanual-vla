@@ -181,7 +181,17 @@ def main() -> int:
     parser.add_argument("--cache-dir", type=Path, default=Path.home() / ".cache" / "bimanual-vla" / "uploads")
     parser.add_argument("--archive", action="store_true", help="input is an existing uncompressed .tar")
     parser.add_argument("--rebuild", action="store_true")
-    parser.add_argument("--overwrite", action="store_true", help="replace an existing server dataset after validation")
+    install_mode = parser.add_mutually_exclusive_group()
+    install_mode.add_argument(
+        "--merge",
+        action="store_true",
+        help="append uploaded episodes to an existing compatible dataset; install normally if it does not exist",
+    )
+    install_mode.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace an existing server dataset after validation",
+    )
     args = parser.parse_args()
 
     if not args.token or len(args.token) < 20:
@@ -213,6 +223,7 @@ def main() -> int:
             "sha256": archive_sha,
             "chunk_size": chunk_size,
             "overwrite": args.overwrite,
+            "merge": args.merge,
         },
     )
     upload_id = initialized["id"]
@@ -257,7 +268,8 @@ def main() -> int:
     print("All chunks uploaded; server is assembling, validating, and atomically installing...", flush=True)
     result = client.json("POST", f"/api/uploads/{upload_id}/complete", {})
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    print(f"Installed dataset id: {dataset_name}")
+    operation = result.get("operation", "install")
+    print(f"Dataset {operation} complete: {dataset_name}")
     return 0
 
 
