@@ -87,11 +87,23 @@ def _load_successful(paths: list[Path]):
 def run(args):
     try:
         from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-    except ImportError as exc:
+        codebase_version = "v2.1"
+    except ImportError:
+        try:
+            from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
+            codebase_version = CODEBASE_VERSION
+        except ImportError as exc:
+            raise SystemExit(
+                "LeRobot is not installed in this environment. Install the project "
+                "environment containing lerobot, then rerun this exporter."
+            ) from exc
+
+    if codebase_version != "v2.1":
         raise SystemExit(
-            "LeRobot is not installed in this environment. Install the project "
-            "environment containing lerobot, then rerun this exporter."
-        ) from exc
+            f"Installed LeRobot creates datasets with codebase_version={codebase_version}, "
+            "but this delivery requires LeRobot v2.1. Use the OpenPI-pinned "
+            "LeRobot environment before exporting."
+        )
 
     if args.fps != 20:
         raise SystemExit("The Piper delivery format requires fps=20.")
