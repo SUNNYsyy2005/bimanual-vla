@@ -11,6 +11,11 @@
 - episode 双视角 + 关节角回放：`view_episode.py`
 - 图形化采集界面：`collect_gui.py` / `start_gui.sh`
 - LeRobot v2.1 导出：`export_lerobot.py`
+- 数据验收：`validate_piper_data.py`、`check_pi05_dataset.py`
+- 旧关节空间 NPZ 转换：`convert_output_arm_npz.py`
+- OpenPI 权重并行断点续传：`download_openpi_checkpoint.py`
+- 上传至 4×4090：`upload_dataset_4090.py`
+- 4×4090 数据 / 微调 / Policy / shadow inference 网页：`server_4090/`
 
 ### 图形化采集界面
 
@@ -96,21 +101,15 @@ python collect_output_arm.py \
   --instruction "pick up the cube"
 ```
 
-该脚本只保存执行输出臂的 7 维反馈：
-
-```text
-[joint_1, joint_2, joint_3, joint_4, joint_5, joint_6, gripper]
-```
-
-以及 `cam_high`（第三视角）和 `cam_wrist`（腕部第一视角）两路 RGB 图像。它不读取示教臂、不读取关节控制指令，也不执行自动复位。
+该脚本保存执行输出臂的 10D EEF `state`、7D 增量 `actions`、两路 RGB 图像，并额外保存 7D `joint_qpos` 作为诊断字段。它不读取示教臂，也不读取关节控制指令。
 
 按键：`SPACE` 结束 episode，`S` 保存成功，`F` 保存失败，`D` 丢弃，`Q` 退出。
 
-如果 `/dev/video12` 或 `/dev/video4` 不是 RGB 节点，先用 `v4l2-ctl --list-formats-ext -d /dev/videoN` 确认后替换参数。
+如果 `/dev/video8` 或 `/dev/video16` 不是 RGB 节点，先用 `v4l2-ctl --list-formats-ext -d /dev/videoN` 确认后替换参数。
 
-当前采集脚本在录制时会同时产出两类数据：
+仓库同时保留早期关节空间采集链路；下列 `qpos` / `observation.state` 7D 约定适用于 `teleop.py`、`teleop_single.py` 和旧数据转换器，不等同于上面的 Piper delivery schema。
 
-### 1.1 原始 episode
+### 1.1 旧关节空间原始 episode
 
 默认目录：
 
@@ -130,7 +129,7 @@ episodes_single/
 - `task_name`
 - `success`
 
-### 1.2 可直接训练的 pi0.5 / openpi 数据集
+### 1.2 旧关节空间 pi0.5 / openpi 数据集
 
 双臂默认输出：
 
@@ -401,7 +400,68 @@ python policy_server_smoke_test.py \
 - broker 循环推理是否正常
 - 非 shadow 模式下是否能通过 SafetyChecker 再下发动作
 
-## 8. 相关脚本
+## 7. 下载 π0.5 基座权重
+
+Piper 单臂 LoRA 使用 `pi05_base`。脚本支持 HuggingFace 镜像优先、GCS 回退、多文件并行、单文件 Range 分片和断点续传：
+
+```bash
+/home/sunny/miniconda3/envs/openpi/bin/python download_openpi_checkpoint.py \
+  --checkpoint gs://openpi-assets/checkpoints/pi05_base \
+  --source auto \
+  --workers 16 \
+  --chunks-per-file 16
+```
+
+默认保存到 `~/.cache/openpi/openpi-assets/checkpoints/pi05_base`。重复执行会校验并续传未完成分块。
+
+## 8. 4×4090 数据上传、训练与 Policy 管理网页
+
+部署并启动：
+
+```bash
+bash deploy_4090_server.sh
+```
+
+上传已导出的 LeRobot v2.1 数据集：
+
+```bash
+python upload_dataset_4090.py piper/piper_v1 \
+  --name piper_v1 \
+  --server http://192.168.101.9:8090 \
+  --token "$BIMANUAL_VLA_SERVER_TOKEN" \
+  --workers 4 \
+  --chunk-mib 32
+```
+
+网页地址：`http://192.168.101.9:8090`。页面作为管理面，可执行：
+
+1. 查看数据集、GPU、训练任务和 Policy 进程。
+2. 计算 norm stats，提交白名单参数的 π0.5 LoRA 微调。
+3. 按数据集筛选完整 checkpoint。
+4. 新建 Policy 进程，显示 PID、WebSocket `/healthz`、GPU、端口、schema、checkpoint 和最近 telemetry。
+5. 正常停止或强制结束指定 Policy。
+6. 选择运行中的 Policy，以新 checkpoint 执行“停止旧进程 → 启动替代进程”的模型切换。
+7. 只读显示 Policy 通过官方协议实际收到的 10D state、两路图像、prompt 和预测 action。
+8. 显示并管理短时服务端 EXECUTE 授权，同时显示机械臂客户端本地 `--allow-execution`、双重门结果和实际执行/阻断原因。
+
+真实推理数据面不经过 Dashboard。机械臂控制电脑使用官方 `openpi_client.WebsocketClientPolicy` 直接连接 Policy 端口：
+
+```bash
+python robot_observation_bridge.py \
+  --host 192.168.101.9 \
+  --port 8000 \
+  --can can0 \
+  --cam-high-device /dev/video8 \
+  --cam-wrist-device /dev/video16 \
+  --arm-side right \
+  --instruction "pick up the cube"
+```
+
+bridge 读取与 `collect_output_arm.py` 一致的 10D EEF delivery state，并以 `cam_high`、`cam_wrist` 发送两路 256×256 RGB 图像。默认只打印预测 action；显式追加 `--allow-execution` 后仍需网页对同一 Policy 短时授权 EXECUTE，并通过本地新鲜度、动作幅度、工作空间和 Piper 状态检查才会下发。模型切换导致连接断开后客户端会自动重连并回到 SHADOW。
+
+Dashboard Token 只保护管理 API，机械臂客户端不需要 Dashboard URL 或 Token。首次启动自动生成，保存在 4×4090 的 `~/.config/bimanual-vla/server.env`；可用 `ssh 4x4090 'source ~/.config/bimanual-vla/server.env && printf "%s\n" "$BIMANUAL_VLA_SERVER_TOKEN"'` 读取。上传采用并行分块、SHA256 和断点续传；详细架构和 Policy 生命周期说明见 `server_4090/README.md`。
+
+## 9. 相关脚本
 
 - `serve_piper.py`：加载 pi0.5 / openpi policy 并启动服务
 - `run.py`：实机循环，读取观测并请求 policy 动作
@@ -412,7 +472,7 @@ python policy_server_smoke_test.py \
 
 ---
 
-## 9. 注意事项
+## 10. 注意事项
 
 - 实机采集前先确认 CAN 口和相机编号
 - 起始位错误时请重新执行 `--capture-start`
