@@ -117,8 +117,13 @@ cd /home/sunny/bimanual-vla
 
 1. 输入 Dashboard Token。
 2. 查看数据集结构及 GPU 占用。
-3. 计算 norm stats。
-4. 选择空闲 RTX 4090，提交 FSDP LoRA 微调。
+3. 选择 RTX 4090，提交 FSDP LoRA 微调：
+   - `norm_stats.json` 已存在时直接启动训练；
+   - 缺失时自动启动完整 norm 任务，训练进入持久化 `waiting_norm`；
+   - norm 成功后自动启动训练；GPU 暂忙时进入 `waiting_gpu` 并自动重试；
+   - norm 失败、丢失或未生成统计文件时，训练任务标记失败并显示依赖原因；
+   - 同一数据集已有运行中的 norm 时复用该任务，Dashboard 重启后依赖仍可恢复。
+4. “计算归一化统计”表单保留为手动重算或限制帧数调试入口，正常训练无需预先手动点击。
 5. 页面扫描 `pi05_piper_single_arm_lora/<experiment>/<step>`，按数据集过滤完整 checkpoint。
 6. 在“新建 / 切换 Policy 进程”中选择 GPU、端口和 checkpoint：
    - 留空“操作对象”：新建独立 Policy；

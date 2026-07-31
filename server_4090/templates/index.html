@@ -75,6 +75,7 @@
 
     <div class="card third">
       <h2>1. 计算归一化统计</h2>
+      <p class="muted">可选的手动入口；直接提交训练时，如统计文件缺失，服务端会自动创建完整 norm 任务并在成功后启动训练。</p>
       <form id="normForm">
         <label>数据集</label><select name="dataset_id" class="dataset-select"></select>
         <label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option></select>
@@ -91,7 +92,7 @@
         <div class="row"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option></select></div><div><label>GPU IDs</label><input name="gpu_ids" value="0,1" placeholder="例如 0,1"></div></div>
         <label>实验名</label><input name="exp_name" required placeholder="pick_cube_r1">
         <div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>Batch</label><input name="batch_size" type="number" value="8"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div>
-        <p class="muted">RTX 4090 建议至少 2 张空闲卡；FSDP 等于所选 GPU 数。单卡可能 OOM。</p>
+        <p class="muted">缺少 norm stats 时会自动执行 norm→train 串联；任务持久化，Dashboard 重启后可继续。RTX 4090 建议至少 2 张空闲卡；FSDP 等于所选 GPU 数。</p>
         <div class="row"><div><label>Workers</label><input name="num_workers" type="number" value="2"></div><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div></div>
         <label>启动方式</label><select name="mode"><option value="new">new（目录必须不存在）</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select>
         <p><button type="submit">提交训练</button></p>
@@ -188,11 +189,18 @@ function policyControlButtons(task){
   const execute=`<button class="inline danger" onclick="armPolicy('${esc(task.id)}')" ${canArm&&control.mode!=='execute'?'':`disabled title="${esc(why||'已经授权执行')}"`}>授权执行 5 分钟</button>`;
   return `${shadow}${execute}`;
 }
+function jobDependencySummary(task){
+  const dependency=task.dependency||{};const id=dependency.task_id||(task.metadata||{}).depends_on;if(!id)return '';
+  if(task.dependency_failed)return `<br><span class="bad">norm 串联失败</span><br><span class="muted">${esc(task.dependency_error||'依赖任务失败')}</span>`;
+  if(task.state==='waiting_norm')return `<br><span class="warn">等待 norm</span><br><code>${esc(id)}</code> · ${esc(task.dependency_state||'pending')}`;
+  if(task.state==='waiting_gpu')return `<br><span class="warn">norm 已完成，等待 GPU</span><br><code>${esc(id)}</code><br><span class="muted">${esc(task.waiting_reason||'GPU 暂不可用')}</span>`;
+  return `<br><span class="ok">由 norm 自动串联</span><br><code>${esc(id)}</code>`;
+}
 function fillTasks(items){
   const policies=items.filter(t=>t.type==='policy');
   document.getElementById('policies').innerHTML=policies.map(t=>{const m=t.metadata||{};const active=['starting','running','stopping'].includes(t.state);const health=t.policy_healthy===true?'<span class="ok">/healthz OK</span>':t.state==='running'?'<span class="bad">/healthz FAIL</span>':'<span class="muted">未运行</span>';return `<tr><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid||'-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal?`<br>${esc(t.stop_signal)}`:''}</td><td>GPU ${esc((m.gpu_ids||[]).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.schema||'-')}</span></td><td>dataset=${esc(m.dataset_id)}<br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}')">日志</button>${active?`<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>`:''}${t.state==='stopping'?`<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>`:''}</td></tr>`;}).join('')||'<tr><td colspan="6" class="muted">暂无 Policy 进程；可在上方创建。</td></tr>';
   const jobs=items.filter(t=>t.type!=='policy');
-  document.getElementById('jobs').innerHTML=jobs.map(t=>{const m=t.metadata||{};const active=['starting','running','stopping'].includes(t.state);return `<tr><td><code>${esc(t.id)}</code><br>${esc(t.type)} · PID ${esc(t.pid||'-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}</td><td><code>${esc(JSON.stringify(m))}</code></td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}')">日志</button>${active?`<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>`:''}${t.state==='stopping'?`<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>`:''}</td></tr>`;}).join('')||'<tr><td colspan="4" class="muted">暂无 Norm / Train 任务</td></tr>';
+  document.getElementById('jobs').innerHTML=jobs.map(t=>{const m=t.metadata||{};const active=['starting','running','stopping','waiting_norm','waiting_gpu'].includes(t.state);const params=`dataset=${esc(m.dataset_id||'-')} · schema=${esc(m.schema||'-')}${m.exp_name?`<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids||[]).join(','))}`:`<br>batch=${esc(m.batch_size||'-')} · workers=${esc(m.num_workers||'-')}${m.automatic?' · 自动创建':''}`}`;return `<tr><td><code>${esc(t.id)}</code><br>${esc(t.type)} · PID ${esc(t.pid||'-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${jobDependencySummary(t)}${t.start_error?`<br><span class="bad">${esc(t.start_error)}</span>`:''}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}')">日志</button>${active?`<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_')?'取消':'停止'}</button>`:''}${t.state==='stopping'?`<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>`:''}</td></tr>`;}).join('')||'<tr><td colspan="4" class="muted">暂无 Norm / Train 任务</td></tr>';
   fillReplacePolicies(items);updateClientCommand();
 }
 function updatePolicyOperation(applyTask=true){
@@ -235,7 +243,7 @@ document.getElementById('policyDataset').addEventListener('change',()=>fillCheck
 document.getElementById('replacePolicy').addEventListener('change',()=>updatePolicyOperation(true));
 document.getElementById('policyPort').addEventListener('input',updateClientCommand);
 document.getElementById('normForm').onsubmit=async e=>{e.preventDefault();const p=formJSON(e.target);if(!p.max_frames)delete p.max_frames;try{await api('/api/tasks/norm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});show('norm stats 任务已提交。',false);refreshAll();}catch(err){show(err.message);}};
-document.getElementById('trainForm').onsubmit=async e=>{e.preventDefault();const p=formJSON(e.target);p.gpu_ids=p.gpu_ids.split(',').map(x=>x.trim()).filter(Boolean);try{await api('/api/tasks/train',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});show('训练任务已提交。',false);refreshAll();}catch(err){show(err.message);}};
+document.getElementById('trainForm').onsubmit=async e=>{e.preventDefault();const p=formJSON(e.target);p.gpu_ids=p.gpu_ids.split(',').map(x=>x.trim()).filter(Boolean);try{const task=await api('/api/tasks/train',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});const dep=(task.dependency||{}).task_id;if(task.state==='waiting_norm')show(`训练已排队；正在自动计算 norm stats：${dep}`,false);else if(task.state==='waiting_gpu')show(`norm stats 已就绪；训练正在等待 GPU：${task.waiting_reason||''}`,false);else show(`训练任务已启动：${task.id}`,false);refreshAll();}catch(err){show(err.message);}};
 document.getElementById('policyForm').onsubmit=async e=>{e.preventDefault();const p=formJSON(e.target);p.gpu_ids=p.gpu_ids.split(',').map(x=>x.trim()).filter(Boolean);const switching=Boolean(p.replace_task_id);if(switching&&!confirm(`确认停止 ${p.replace_task_id} 并切换到所选 checkpoint？`))return;try{const task=await api('/api/tasks/policy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});show(`${switching?'Policy 模型已切换':'Policy 进程已创建'}：${task.id}`,false);document.getElementById('replacePolicy').value='';await refreshAll();}catch(err){show(err.message);}};
 if(tokenInput.value){refreshAll();refreshObservation();}
 setInterval(()=>{if(tokenInput.value)refreshAll();},8000);
