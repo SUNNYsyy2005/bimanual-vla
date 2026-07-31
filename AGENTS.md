@@ -2,7 +2,7 @@
 
 Operational rules for AI agents on this Slurm GPU cluster with quota-aware scheduling.
 
-Last updated: 2026-07-29
+Last updated: 2026-07-31
 
 ## Hard Rules
 
@@ -57,6 +57,14 @@ GPU multipliers:
 | H200 | 1.2 |
 
 Recent high usage lowers scheduling priority. Company/business jobs have priority under resource pressure. Student jobs may be requeued, so long training jobs must support checkpoints and resume.
+
+### Training GPU priority
+
+- For formal model training, first check `resources`, `myquota`, and the user queue on the cluster.
+- If suitable GPUs are idle and quota permits, prefer **H100 first, then H200**.
+- Use the standalone `4x4090` and `4090-user` machines mainly for data conversion/collection, simulation evaluation, video recording, environment validation, and as training fallback when H100/H200 cannot be used.
+- Do not start a long formal training run on a 4090 merely because it is immediately available before checking H100/H200 availability.
+- H100/H200 training must still obey Slurm, storage, environment, checkpoint/resume, and per-node staging rules below.
 
 ## Pre-Run Checks
 
@@ -116,6 +124,46 @@ H200 nodes:
 - Alibaba Cloud Linux 3
 - CUDA 13.0
 - Separate environment setup is required per H200 node.
+
+## Conda Environment Quick Reference
+
+Always initialize Conda explicitly instead of assuming `conda` is already on `PATH`:
+
+```bash
+# 4x4090
+source /home/sunny/miniconda3/etc/profile.d/conda.sh
+
+# 4090-user
+source /home/user/anaconda3/etc/profile.d/conda.sh
+
+# Cluster recommended path
+source /DATA/sync/$USER/miniconda3/etc/profile.d/conda.sh
+```
+
+Verified standalone workstation environments:
+
+| Host | Conda root | Env | Verified state / intended use |
+|---|---|---|---|
+| `4x4090` | `/home/sunny/miniconda3` | `RoboTwin2` | Preferred RoboTwin simulation env. Verified imports: Python 3.10, `torch 2.4.1+cu121`, `sapien 3.0.0b1`, `mplib 0.2.1`, `toppra`, `gymnasium 0.29.1`, `open3d 0.18.0`, `pytorch3d 0.7.8`, `curobo` import OK. |
+| `4x4090` | `/home/sunny/miniconda3` | `openpi_eval_cu121` | Preferred OpenPI eval env when a CU121 + curobo stack is needed. Verified imports: `torch 2.4.1+cu121`, `sapien 3.0.0b1`, `mplib 0.2.1`, `toppra`, `gymnasium 0.29.1`, `open3d 0.18.0`, `curobo 0.7.8.post1.dev0+dirty`, `openpi` OK; `pytorch3d` currently missing. |
+| `4x4090` | `/home/sunny/miniconda3` | `openpi` | General OpenPI env. Verified imports: `torch 2.13.0+cu130`, `sapien 3.0.0b1`, `mplib 0.2.1`, `toppra`, `gymnasium 0.29.1`, `open3d 0.18.0`, `openpi` OK; `curobo` missing, so do **not** use it for curobo-only evaluation. |
+| `4x4090` | `/home/sunny/miniconda3` | `tsq-pilot` | Legacy / compatibility env. Avoid unless a task explicitly depends on it. |
+| `4090-user` | `/home/user/anaconda3` | `base`, `MoLe_VLA`, `NavGPT`, `NavGPT2`, `cfc-*`, `co-nav`, `conceptgraph*`, `embodied-generalist`, `py-lacam`, `spatial-lite`, `stla`, etc. | No verified RoboTwin/curobo env yet. Prefer creating a fresh dedicated env instead of reusing these unrelated ones. System `nvcc` was not found in `PATH` during inspection. |
+
+Quick verification commands:
+
+```bash
+conda env list
+python -V
+python -c "import torch, sapien, mplib; print(torch.__version__)"
+python -c "import curobo; print(curobo.__version__)"
+```
+
+Notes:
+
+- For RoboTwin simulation on `4x4090`, start with `conda activate RoboTwin2`.
+- For OpenPI evaluation on `4x4090`, prefer `conda activate openpi_eval_cu121` when curobo is required.
+- Do not assume env parity across machines; re-check with `conda env list` after switching hosts.
 
 ## sbatch Template
 

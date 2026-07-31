@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Run the official OpenPI client from the computer attached to one Piper arm.
 
-The client is fail-closed. By default it only sends real observations and prints
-predictions. Robot motion requires both a time-limited Dashboard ``execute``
-authorization and the local ``--allow-execution`` flag. Only the first action
-of each returned chunk is considered, and every command passes local freshness,
-workspace, delta, gripper, and Piper-status checks.
+The client is fail-closed and automatically follows a validated ``delivery`` or
+``joint`` policy metadata contract. By default it only sends real observations
+and prints predictions. Robot motion requires both a time-limited Dashboard
+``execute`` authorization and the local ``--allow-execution`` flag. Only the
+first action of each returned chunk is considered, and every command passes
+schema-specific freshness, range, delta, and Piper-status checks.
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import logging
 import os
 import socket
@@ -32,6 +34,20 @@ from piper_data_contract import (
 
 RAD_FACTOR = 57295.7795  # Piper unit: 0.001 degree -> rad
 GRIPPER_FACTOR = 1_000_000.0  # Piper unit: 0.001 mm -> metre
+JOINT_LIMITS_RAD = np.array(
+    [
+        (-2.6179, 2.6179),
+        (0.0000, 3.1400),
+        (-2.9670, 0.0000),
+        (-1.7450, 1.7450),
+        (-1.2200, 1.2200),
+        (-2.0944, 2.0944),
+    ],
+    dtype=np.float64,
+)
+JOINT_ACTION_SEMANTICS = frozenset(
+    {"absolute_joint_position", "absolute_next_joint_position"}
+)
 DEFAULT_POLICY_HOST = "192.168.101.9"
 DEFAULT_POLICY_PORT = 8000
 DEFAULT_CAN = "can0"
@@ -42,6 +58,18 @@ CAMERA_SOURCE_HW = (240, 424)
 
 class ExecutionBlocked(RuntimeError):
     """The action was rejected before a robot command was sent."""
+
+
+@dataclass(frozen=True)
+class PolicyProtocol:
+    """Validated observation/action contract advertised by one policy server."""
+
+    schema: str
+    state_dim: int
+    action_dim: int
+    arm_side: str
+    action_semantics: str
+    camera_keys: tuple[str, ...]
 
 
 def connect_piper(can_name: str) -> Any:
@@ -117,29 +145,67 @@ def arm_status_dict(piper: Any) -> dict[str, Any]:
     }
 
 
-def validate_policy_metadata(metadata: dict[str, Any], arm_side: str) -> None:
-    """Fail early if the selected server cannot consume delivery observations."""
-    expected = {
+def validate_policy_metadata(metadata: dict[str, Any], arm_side: str) -> PolicyProtocol:
+    """Validate and normalize a supported delivery or joint server contract."""
+    common_expected = {
         "transport": "openpi_websocket_v1",
-        "schema": "delivery",
-        "state_dim": 10,
         "action_dim": 7,
         "arm_side": arm_side,
-        "action_semantics": "eef_delta_base_xyz_left_rotvec_gripper_target",
     }
     errors = [
         f"{key}={metadata.get(key)!r}, expected {value!r}"
-        for key, value in expected.items()
+        for key, value in common_expected.items()
         if metadata.get(key) != value
     ]
+
+    schema = metadata.get("schema")
+    if schema == "delivery":
+        expected_state_dim = 10
+        expected_semantics = {"eef_delta_base_xyz_left_rotvec_gripper_target"}
+        expected_camera_keys = {"cam_high", "cam_wrist"}
+    elif schema == "joint":
+        expected_state_dim = 7
+        expected_semantics = JOINT_ACTION_SEMANTICS
+        expected_camera_keys = {"cam_high", f"cam_{arm_side}_wrist"}
+    else:
+        expected_state_dim = None
+        expected_semantics = set()
+        expected_camera_keys = set()
+        errors.append(f"schema={schema!r}, expected 'delivery' or 'joint'")
+
+    if expected_state_dim is not None and metadata.get("state_dim") != expected_state_dim:
+        errors.append(
+            f"state_dim={metadata.get('state_dim')!r}, expected {expected_state_dim!r}"
+        )
+    action_semantics = metadata.get("action_semantics")
+    if expected_semantics and action_semantics not in expected_semantics:
+        errors.append(
+            f"action_semantics={action_semantics!r}, expected one of {sorted(expected_semantics)!r}"
+        )
     camera_keys = metadata.get("camera_keys")
-    if camera_keys is not None and set(camera_keys) != {"cam_high", "cam_wrist"}:
-        errors.append(f"camera_keys={camera_keys!r}, expected ['cam_high', 'cam_wrist']")
+    if (
+        expected_camera_keys
+        and (
+            not isinstance(camera_keys, (list, tuple))
+            or len(camera_keys) != len(expected_camera_keys)
+            or set(camera_keys) != expected_camera_keys
+        )
+    ):
+        errors.append(f"camera_keys={camera_keys!r}, expected {sorted(expected_camera_keys)!r}")
     if errors:
         raise RuntimeError("incompatible policy metadata: " + "; ".join(errors))
 
+    return PolicyProtocol(
+        schema=str(schema),
+        state_dim=int(metadata["state_dim"]),
+        action_dim=int(metadata["action_dim"]),
+        arm_side=str(metadata["arm_side"]),
+        action_semantics=str(action_semantics),
+        camera_keys=tuple(str(key) for key in camera_keys),
+    )
 
-def connect_policy(host: str, port: int, arm_side: str):
+
+def connect_policy(host: str, port: int, arm_side: str) -> tuple[Any, PolicyProtocol]:
     """Create the official OpenPI client and validate the server handshake."""
     from openpi_client.websocket_client_policy import WebsocketClientPolicy
 
@@ -149,12 +215,12 @@ def connect_policy(host: str, port: int, arm_side: str):
         metadata = policy.get_server_metadata()
         if not isinstance(metadata, dict):
             raise RuntimeError(f"invalid policy metadata: {type(metadata).__name__}")
-        validate_policy_metadata(metadata, arm_side)
+        protocol = validate_policy_metadata(metadata, arm_side)
     except Exception:
         close_policy(policy)
         raise
     logging.info("Policy connected: %s", metadata)
-    return policy
+    return policy, protocol
 
 
 def close_policy(policy: Any | None) -> None:
@@ -228,6 +294,48 @@ def build_checked_target(
     return target_xyz, target_rpy_deg, target_gripper_m
 
 
+def build_checked_joint_target(
+    qpos: np.ndarray,
+    action: np.ndarray,
+    *,
+    max_joint_step_rad: float,
+    max_gripper_step_m: float,
+) -> tuple[np.ndarray, float]:
+    """Validate one absolute joint action and return joints in rad plus gripper metres."""
+    qpos = np.asarray(qpos, dtype=np.float64)
+    action = np.asarray(action, dtype=np.float64)
+    if qpos.shape != (7,) or not np.all(np.isfinite(qpos)):
+        raise ExecutionBlocked("current joint state is not finite 7D")
+    if action.shape != (7,) or not np.all(np.isfinite(action)):
+        raise ExecutionBlocked("joint action is not finite 7D")
+
+    for index, (value, bounds) in enumerate(zip(action[:6], JOINT_LIMITS_RAD), start=1):
+        if not bounds[0] <= float(value) <= bounds[1]:
+            raise ExecutionBlocked(
+                f"joint{index} target {value:.5f}rad outside "
+                f"[{bounds[0]:.5f}, {bounds[1]:.5f}]"
+            )
+    gripper_m = float(action[6])
+    if not 0.0 <= gripper_m <= GRIPPER_MAX_M:
+        raise ExecutionBlocked(
+            f"gripper target {gripper_m:.5f}m outside [0.00000, {GRIPPER_MAX_M:.5f}]"
+        )
+
+    joint_deltas = np.abs(action[:6] - qpos[:6])
+    worst_joint = int(np.argmax(joint_deltas))
+    if float(joint_deltas[worst_joint]) > max_joint_step_rad:
+        raise ExecutionBlocked(
+            f"joint{worst_joint + 1} step {joint_deltas[worst_joint]:.5f}rad exceeds "
+            f"{max_joint_step_rad:.5f}rad"
+        )
+    gripper_delta = abs(gripper_m - float(qpos[6]))
+    if gripper_delta > max_gripper_step_m:
+        raise ExecutionBlocked(
+            f"gripper step {gripper_delta:.5f}m exceeds {max_gripper_step_m:.5f}m"
+        )
+    return action[:6].copy(), gripper_m
+
+
 class ExecutionController:
     def __init__(self, piper: Any, args: argparse.Namespace):
         self.piper = piper
@@ -266,7 +374,9 @@ class ExecutionController:
     def process(
         self,
         result: dict[str, Any],
-        state: np.ndarray,
+        delivery_state: np.ndarray,
+        qpos: np.ndarray,
+        protocol: PolicyProtocol,
         image_timestamps: dict[str, float],
         infer_elapsed_s: float,
     ) -> bool:
@@ -308,26 +418,44 @@ class ExecutionController:
             self.robot_status = arm_status_dict(self.piper)
             if self.robot_status["arm_status"] != 0 or self.robot_status["err_code"] != 0:
                 raise ExecutionBlocked(f"Piper status is not normal: {self.robot_status}")
-            target_xyz, target_rpy_deg, target_gripper_m = build_checked_target(
-                state,
-                first_action(result),
-                max_translation_step_m=self.args.max_translation_step_m,
-                max_rotation_step_rad=self.args.max_rotation_step_rad,
-                max_gripper_step=self.args.max_gripper_step,
-                workspace_x=tuple(self.args.workspace_x),
-                workspace_y=tuple(self.args.workspace_y),
-                workspace_z=tuple(self.args.workspace_z),
-            )
+            action = first_action(result)
+            if protocol.schema == "delivery":
+                target_xyz, target_rpy_deg, target_gripper_m = build_checked_target(
+                    delivery_state,
+                    action,
+                    max_translation_step_m=self.args.max_translation_step_m,
+                    max_rotation_step_rad=self.args.max_rotation_step_rad,
+                    max_gripper_step=self.args.max_gripper_step,
+                    workspace_x=tuple(self.args.workspace_x),
+                    workspace_y=tuple(self.args.workspace_y),
+                    workspace_z=tuple(self.args.workspace_z),
+                )
+                target_joints = None
+            elif protocol.schema == "joint":
+                target_joints, target_gripper_m = build_checked_joint_target(
+                    qpos,
+                    action,
+                    max_joint_step_rad=self.args.max_joint_step_rad,
+                    max_gripper_step_m=self.args.max_joint_gripper_step_m,
+                )
+                target_xyz = target_rpy_deg = None
+            else:
+                raise ExecutionBlocked(f"unsupported execution schema: {protocol.schema}")
             if not self.robot_enabled:
                 self._enable_robot()
                 self.state = "armed"
                 self.blocked_reason = "Piper enabled; waiting for the next fresh policy response"
                 return False
-            raw_xyz = np.rint(target_xyz * 1_000_000.0).astype(np.int64)
-            raw_rpy = np.rint(target_rpy_deg * 1000.0).astype(np.int64)
             raw_gripper = round(target_gripper_m * GRIPPER_FACTOR)
-            self.piper.MotionCtrl_2(0x01, 0x00, self.args.speed_pct, 0x00)
-            self.piper.EndPoseCtrl(*map(int, np.concatenate((raw_xyz, raw_rpy))))
+            if protocol.schema == "delivery":
+                raw_xyz = np.rint(target_xyz * 1_000_000.0).astype(np.int64)
+                raw_rpy = np.rint(target_rpy_deg * 1000.0).astype(np.int64)
+                self.piper.MotionCtrl_2(0x01, 0x00, self.args.speed_pct, 0x00)
+                self.piper.EndPoseCtrl(*map(int, np.concatenate((raw_xyz, raw_rpy))))
+            else:
+                raw_joints = np.rint(target_joints * RAD_FACTOR).astype(np.int64)
+                self.piper.ModeCtrl(0x01, 0x01, self.args.speed_pct, 0x00)
+                self.piper.JointCtrl(*map(int, raw_joints))
             self.piper.GripperCtrl(int(raw_gripper), self.args.gripper_effort, 0x01, 0)
         except ExecutionBlocked as exc:
             return self._block("blocked", str(exc))
@@ -342,7 +470,9 @@ class ExecutionController:
 
 def build_observation(
     *,
-    state: np.ndarray,
+    delivery_state: np.ndarray,
+    qpos: np.ndarray,
+    protocol: PolicyProtocol,
     images: dict[str, np.ndarray],
     image_timestamps: dict[str, float],
     instruction: str,
@@ -351,11 +481,24 @@ def build_observation(
     execution: ExecutionController,
 ) -> dict[str, Any]:
     captured_at = time.time()
+    if protocol.schema == "delivery":
+        state = np.asarray(delivery_state, dtype=np.float32)
+        wrist_key = "cam_wrist"
+    elif protocol.schema == "joint":
+        state = np.asarray(qpos, dtype=np.float32)
+        wrist_key = f"cam_{protocol.arm_side}_wrist"
+    else:
+        raise RuntimeError(f"unsupported observation schema: {protocol.schema}")
+    if state.shape != (protocol.state_dim,) or not np.all(np.isfinite(state)):
+        raise RuntimeError(
+            f"{protocol.schema} observation state must be finite {protocol.state_dim}D, "
+            f"got {state.shape}"
+        )
     return {
-        "state": np.asarray(state, dtype=np.float32),
+        "state": state,
         "images": {
             "cam_high": np.asarray(images["cam_high"], dtype=np.uint8),
-            "cam_wrist": np.asarray(images["cam_wrist"], dtype=np.uint8),
+            wrist_key: np.asarray(images["cam_wrist"], dtype=np.uint8),
         },
         "prompt": instruction,
         "client_metadata": {
@@ -367,6 +510,8 @@ def build_observation(
             "cam_high_captured_at": float(image_timestamps["cam_high"]),
             "cam_wrist_captured_at": float(image_timestamps["cam_wrist"]),
             "arm_side": args.arm_side,
+            "policy_schema": protocol.schema,
+            "policy_action_semantics": protocol.action_semantics,
             **execution.metadata(),
         },
     }
@@ -376,6 +521,7 @@ def print_result(
     count: int,
     state: np.ndarray,
     qpos: np.ndarray,
+    protocol: PolicyProtocol,
     result: dict[str, Any],
     elapsed_s: float,
     execution: ExecutionController,
@@ -384,9 +530,13 @@ def print_result(
     actions = np.asarray(result.get("actions"), dtype=np.float32)
     first = actions[0] if actions.ndim > 1 and len(actions) else actions
     control = result.get("execution_control", {})
+    if protocol.schema == "delivery":
+        state_summary = f"eef={np.array2string(state[:3], precision=4)}"
+    else:
+        state_summary = f"joints={np.array2string(qpos[:6], precision=4)}"
     print(
-        f"infer={count} elapsed={elapsed_s * 1000:.1f}ms "
-        f"eef={np.array2string(state[:3], precision=4)} "
+        f"infer={count} schema={protocol.schema} elapsed={elapsed_s * 1000:.1f}ms "
+        f"{state_summary} "
         f"gripper={qpos[6] * 1000:.1f}mm actions={actions.shape}\n"
         f"  first_action={np.array2string(first, precision=5, suppress_small=True)}\n"
         f"  server_mode={control.get('mode', 'missing')} local_allow={execution.args.allow_execution} "
@@ -415,6 +565,7 @@ def run(args: argparse.Namespace) -> None:
         parallel_reads=True,
     )
     policy = None
+    protocol = None
     count = 0
     interval = 1.0 / args.hz
     try:
@@ -438,11 +589,15 @@ def run(args: argparse.Namespace) -> None:
             started = time.monotonic()
             try:
                 if policy is None:
-                    policy = connect_policy(args.host, args.port, args.arm_side)
+                    policy, protocol = connect_policy(args.host, args.port, args.arm_side)
+                if protocol is None:
+                    raise RuntimeError("policy protocol is unavailable")
                 state, qpos = read_output_state(piper)
                 images, image_timestamps = cameras.read()
                 observation = build_observation(
-                    state=state,
+                    delivery_state=state,
+                    qpos=qpos,
+                    protocol=protocol,
                     images=images,
                     image_timestamps=image_timestamps,
                     instruction=args.instruction,
@@ -455,9 +610,25 @@ def run(args: argparse.Namespace) -> None:
                 infer_elapsed = time.monotonic() - infer_started
                 if not isinstance(result, dict) or "actions" not in result:
                     raise RuntimeError(f"invalid policy response: {result!r}")
-                command_sent = execution.process(result, state, image_timestamps, infer_elapsed)
+                command_sent = execution.process(
+                    result,
+                    state,
+                    qpos,
+                    protocol,
+                    image_timestamps,
+                    infer_elapsed,
+                )
                 count += 1
-                print_result(count, state, qpos, result, infer_elapsed, execution, command_sent)
+                print_result(
+                    count,
+                    state,
+                    qpos,
+                    protocol,
+                    result,
+                    infer_elapsed,
+                    execution,
+                    command_sent,
+                )
                 if args.once:
                     return
             except KeyboardInterrupt:
@@ -465,6 +636,7 @@ def run(args: argparse.Namespace) -> None:
             except Exception as exc:
                 close_policy(policy)
                 policy = None
+                protocol = None
                 execution._block("blocked", f"policy disconnected: {exc}")
                 logging.warning("Policy inference/connection failed; no command published: %s", exc)
                 if args.once:
@@ -503,7 +675,24 @@ def main() -> None:
     parser.add_argument("--max-action-age-s", type=float, default=2.0)
     parser.add_argument("--max-translation-step-m", type=float, default=0.015)
     parser.add_argument("--max-rotation-step-rad", type=float, default=0.15)
-    parser.add_argument("--max-gripper-step", type=float, default=0.25)
+    parser.add_argument(
+        "--max-gripper-step",
+        type=float,
+        default=0.25,
+        help="maximum delivery-schema gripper closed-fraction change per command",
+    )
+    parser.add_argument(
+        "--max-joint-step-rad",
+        type=float,
+        default=0.3,
+        help="maximum joint-schema absolute target delta per joint",
+    )
+    parser.add_argument(
+        "--max-joint-gripper-step-m",
+        type=float,
+        default=0.02,
+        help="maximum joint-schema gripper opening change per command",
+    )
     parser.add_argument("--workspace-x", type=float, nargs=2, default=(0.05, 0.60), metavar=("MIN", "MAX"))
     parser.add_argument("--workspace-y", type=float, nargs=2, default=(-0.45, 0.45), metavar=("MIN", "MAX"))
     parser.add_argument("--workspace-z", type=float, nargs=2, default=(0.02, 0.60), metavar=("MIN", "MAX"))
@@ -520,6 +709,8 @@ def main() -> None:
         args.max_translation_step_m,
         args.max_rotation_step_rad,
         args.max_gripper_step,
+        args.max_joint_step_rad,
+        args.max_joint_gripper_step_m,
         args.enable_timeout_s,
     )
     if any(value <= 0 for value in positive) or args.reconnect_delay < 0:

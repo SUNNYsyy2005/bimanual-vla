@@ -29,6 +29,7 @@
     pre { background:#070b12; border:1px solid #263244; border-radius:10px; padding:12px; max-height:500px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
     .pill { display:inline-block; border:1px solid #475569; border-radius:999px; padding:2px 8px; margin:2px; color:#cbd5e1; }
     .toolbar { display:flex; gap:8px; align-items:center; } .toolbar input { min-width:310px; }
+    .login-toolbar { margin-top:8px; } .login-toolbar input { min-width:140px; }
     #message { position:sticky; top:8px; z-index:5; display:none; padding:10px 14px; border-radius:9px; margin-bottom:12px; background:#172554; border:1px solid #3b82f6; }
     .preview-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:12px 0; }
     .preview-grid img { width:100%; max-height:360px; object-fit:contain; background:#05080d; border:1px solid #334155; border-radius:10px; }
@@ -36,15 +37,25 @@
     .architecture > span { border:1px solid #334155; border-radius:9px; padding:8px; background:#0b1220; }
     @media(max-width:700px){.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}}
     .path { max-width:460px; overflow-wrap:anywhere; }
+    .episode-editor-grid { display:grid; grid-template-columns:minmax(520px,1.35fr) minmax(360px,.85fr); gap:14px; margin-top:14px; }
+    @media(max-width:1050px){.episode-editor-grid{grid-template-columns:1fr}}
+    .episode-panel { border:1px solid #334155; border-radius:10px; padding:12px; background:#0b1220; }
+    .episode-videos { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+    .episode-videos video { width:100%; max-height:280px; background:#05080d; border:1px solid #334155; border-radius:8px; }
+    .checkbox-cell input { width:auto; }
+    .editor-summary { min-height:22px; margin:8px 0; }
   </style>
 </head>
 <body><main>
   <header>
     <div>
       <h1>4×4090 · π0.5 数据 / 微调 / Policy 管理</h1>
-      <div class="muted">delivery schema：10D EEF state + 7D EEF delta action · cam_high + cam_wrist</div>
+      <div class="muted">Policy 按 checkpoint 固定 schema；机械臂客户端按 metadata 发送对应观测</div>
     </div>
-    <div class="toolbar"><input id="token" type="password" placeholder="Dashboard API Token"><button class="inline" onclick="saveToken()">保存 Token</button><button class="inline secondary" onclick="refreshAll()">刷新</button></div>
+    <div>
+      <div class="toolbar"><input id="token" type="password" placeholder="Dashboard API Token"><button class="inline" onclick="saveToken()">保存 Token</button><button class="inline secondary" onclick="refreshAll()">刷新</button></div>
+      <div class="toolbar login-toolbar"><input id="loginUser" autocomplete="username" placeholder="Dashboard 登录账号"><input id="loginPassword" type="password" autocomplete="current-password" placeholder="Dashboard 登录密码"><button class="inline secondary" onclick="requestToken()">账号密码获取 Token</button></div>
+    </div>
   </header>
   <div id="message"></div>
 
@@ -64,13 +75,50 @@
     <div class="card half">
       <h2>上传数据集</h2>
       <p>后端提供并行分块、SHA256 和断点续传接口。目录数据集请在采集机执行：</p>
-      <pre id="uploadCommand">python upload_dataset_4090.py DATASET_DIR --name my_dataset --server http://192.168.101.9:8090 --token TOKEN --workers 4</pre>
+      <pre id="uploadCommand">python upload_dataset_4090.py DATASET_DIR --name my_dataset --server http://192.168.101.9:8090 --token TOKEN --workers 4 --merge</pre>
+      <p class="muted"><code>--merge</code> 会把上传目录中的全部 episodes 追加到同名兼容数据集；同名数据集不存在时按首次安装处理。<code>--overwrite</code> 与 <code>--merge</code> 互斥。</p>
       <p class="muted">服务端安装前检查 tar 路径安全、LeRobot v2.1 结构、视频帧数，并用实际 LeRobot loader 读取首尾样本。</p>
     </div>
 
     <div class="card">
       <h2>已接收数据集</h2>
-      <div style="overflow:auto"><table><thead><tr><th>ID</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th></tr></thead><tbody id="datasets"></tbody></table></div>
+      <div style="overflow:auto"><table><thead><tr><th>ID</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div>
+    </div>
+
+    <div class="card">
+      <h2>Episode 级数据集编辑</h2>
+      <p class="muted">只修改 episode 的 instruction、task name、success 和附加 metadata；不修改 episode 内的 state/action/图像帧。合并、删除或编辑会先构造临时数据集、重新编号并校验，成功后原子替换；已有 norm stats 会失效。</p>
+      <div class="row3">
+        <div><label>目标数据集</label><select id="editorDataset"></select></div>
+        <div><label>合并来源（已有数据集）</label><select id="mergeSourceDataset"></select></div>
+        <div><label>&nbsp;</label><button type="button" id="mergeDatasetButton" onclick="mergeDatasetEpisodes()">把来源 episodes 增量合并到目标</button></div>
+      </div>
+      <div class="toolbar">
+        <button class="inline secondary" type="button" onclick="loadDatasetEpisodes(0)">刷新 episodes</button>
+        <button class="inline danger" type="button" onclick="deleteSelectedEpisodes()">删除选中 episodes</button>
+      </div>
+      <div id="episodeEditorSummary" class="muted editor-summary">选择数据集后加载。</div>
+      <div class="episode-editor-grid">
+        <div class="episode-panel" style="overflow:auto">
+          <table><thead><tr><th></th><th>Episode</th><th>帧数</th><th>Instruction</th><th>Task</th><th>Success</th><th>操作</th></tr></thead><tbody id="episodeRows"></tbody></table>
+          <div class="toolbar" style="margin-top:10px"><button class="inline secondary" type="button" onclick="changeEpisodePage(-1)">上一页</button><span id="episodePage" class="muted">-</span><button class="inline secondary" type="button" onclick="changeEpisodePage(1)">下一页</button></div>
+        </div>
+        <div class="episode-panel">
+          <h3>编辑 Episode 参数</h3>
+          <form id="episodeForm">
+            <input id="episodeIndex" type="hidden">
+            <label>Episode</label><input id="episodeIndexDisplay" disabled>
+            <label>Instruction</label><textarea id="episodeInstruction" rows="3" required></textarea>
+            <label>Task name</label><input id="episodeTaskName">
+            <label>Success</label><select id="episodeSuccess"><option value="true">true</option><option value="false">false</option></select>
+            <label>附加 metadata（JSON object）</label><textarea id="episodeMetadata" rows="7">{}</textarea>
+            <label>删除 metadata 字段（逗号分隔）</label><input id="episodeRemoveMetadata" placeholder="例如 operator_note, bad_reason">
+            <p><button type="submit">保存 Episode 参数</button></p>
+          </form>
+          <h3>Episode 摄像头视频</h3>
+          <div id="episodeVideos" class="episode-videos"><span class="muted">选择 episode 后加载。</span></div>
+        </div>
+      </div>
     </div>
 
     <div class="card third">
@@ -94,7 +142,7 @@
         <div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>Batch</label><input name="batch_size" type="number" value="8"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div>
         <p class="muted">缺少 norm stats 时会自动执行 norm→train 串联；任务持久化，Dashboard 重启后可继续。RTX 4090 建议至少 2 张空闲卡；FSDP 等于所选 GPU 数。</p>
         <div class="row"><div><label>Workers</label><input name="num_workers" type="number" value="2"></div><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div></div>
-        <label>启动方式</label><select name="mode"><option value="new">new（目录必须不存在）</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select>
+        <label>启动方式</label><select name="mode"><option value="auto">auto（推荐：存在则续训，不存在则新建）</option><option value="new">new（目录必须不存在）</option><option value="resume">resume（续训；目录不存在也会新建）</option><option value="overwrite">overwrite（删除原目录后重训）</option></select>
         <p><button type="submit">提交训练</button></p>
       </form>
     </div>
@@ -133,7 +181,7 @@
       <pre id="policyClientCommand">python robot_observation_bridge.py --host 192.168.101.9 --port 8000 --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16 --instruction "pick up the cube"</pre>
       <div id="robotObservation" class="warn">尚未收到官方 Policy telemetry。</div>
       <div class="row">
-        <div><h3>10D state</h3><pre id="robotState">state: -</pre></div>
+        <div><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div>
         <div><h3>Prompt / predicted action</h3><pre id="policyAction">action: -</pre></div>
       </div>
       <div class="preview-grid"><div><h3>cam_high（Policy 实际收到）</h3><img id="previewHigh" alt="cam_high preview"></div><div><h3>cam_wrist（Policy 实际收到）</h3><img id="previewWrist" alt="cam_wrist preview"></div></div>
@@ -144,19 +192,71 @@
 <script>
 const tokenInput=document.getElementById('token');
 tokenInput.value=localStorage.getItem('bimanualVlaToken')||'';
+const loginUserInput=document.getElementById('loginUser');
+const loginPasswordInput=document.getElementById('loginPassword');
+loginUserInput.value=localStorage.getItem('bimanualVlaLoginUser')||'';
 let latestStatus=null;
 let latestTelemetryKey=null;
 let previewUrls=[];
+let episodeVideoUrls=[];
+let episodeDatasetData=null;
+let episodeOffset=0;
+const episodeLimit=100;
 function saveToken(){localStorage.setItem('bimanualVlaToken',tokenInput.value);show('Token 已保存。',false);refreshAll();refreshObservation();}
 function show(text,bad=true){const el=document.getElementById('message');el.textContent=text;el.style.display='block';el.style.borderColor=bad?'#e11d48':'#10b981';setTimeout(()=>el.style.display='none',6000);}
+async function requestToken(){
+  const username=loginUserInput.value;
+  const password=loginPasswordInput.value;
+  if(!username||!password){show('请输入 Dashboard 登录账号和密码。');return;}
+  try{
+    const response=await fetch('/api/auth/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password})});
+    const body=await response.json().catch(()=>({error:'invalid JSON response'}));
+    if(!response.ok)throw new Error(body.error||`HTTP ${response.status}`);
+    tokenInput.value=body.token||'';
+    localStorage.setItem('bimanualVlaToken',tokenInput.value);
+    localStorage.setItem('bimanualVlaLoginUser',username);
+    loginPasswordInput.value='';
+    show('账号密码验证成功，Token 已获取并保存。',false);
+    await refreshAll();
+    await refreshObservation();
+  }catch(error){show(error.message);}
+}
 async function api(path,options={}){options.headers=options.headers||{};options.headers.Authorization='Bearer '+tokenInput.value;const response=await fetch(path,options);const body=await response.json().catch(()=>({error:'invalid JSON response'}));if(!response.ok)throw new Error(body.error||`HTTP ${response.status}`);return body;}
 async function apiBlob(path){const response=await fetch(path,{headers:{Authorization:'Bearer '+tokenInput.value},cache:'no-store'});if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||`HTTP ${response.status}`);}return response.blob();}
 function esc(value){return String(value??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
 function stateClass(state){return ['completed','running','installed','stopped'].includes(state)?'ok':['failed','lost'].includes(state)?'bad':'warn';}
 function shortPath(path){const parts=String(path||'').split('/').filter(Boolean);return parts.slice(-3).join('/')||'-';}
 function fillDatasets(items){
-  document.getElementById('datasets').innerHTML=items.map(d=>`<tr><td><code>${esc(d.id)}</code><br><span class="muted">${esc(d.robot_type)}</span></td><td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps</td><td><span class="pill">${esc(d.schema)}</span><br>state ${esc(JSON.stringify(d.state_shape))}, action ${esc(JSON.stringify(d.action_shape))}<br>${(d.cameras||[]).map(c=>`<span class="pill">${esc(c.replace('observation.images.',''))}</span>`).join('')}</td><td>${esc(d.action_semantics)}<br>offset=${esc(d.action_offset)}</td></tr>`).join('')||'<tr><td colspan="4" class="muted">暂无数据集</td></tr>';
+  document.getElementById('datasets').innerHTML=items.map(d=>`<tr><td><code>${esc(d.id)}</code><br><span class="muted">${esc(d.robot_type)}</span></td><td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps<br>${d.norm_stats_ready?'<span class="ok">norm ready</span>':'<span class="warn">norm 需计算</span>'}</td><td><span class="pill">${esc(d.schema)}</span><br>state ${esc(JSON.stringify(d.state_shape))}, action ${esc(JSON.stringify(d.action_shape))}<br>${(d.cameras||[]).map(c=>`<span class="pill">${esc(c.replace('observation.images.',''))}</span>`).join('')}</td><td>${esc(d.action_semantics)}<br>offset=${esc(d.action_offset)}</td><td><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button></td></tr>`).join('')||'<tr><td colspan="5" class="muted">暂无数据集</td></tr>';
   document.querySelectorAll('.dataset-select').forEach(select=>{const old=select.value;select.innerHTML=items.map(d=>`<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.schema)}</option>`).join('');if(items.some(d=>d.id===old))select.value=old;});
+  const editor=document.getElementById('editorDataset');const previous=editor.value;editor.innerHTML=items.map(d=>`<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.episodes)} episodes</option>`).join('');if(items.some(d=>d.id===previous))editor.value=previous;updateMergeSourceOptions(items);
+}
+function updateMergeSourceOptions(items=(latestStatus&&latestStatus.datasets)||[]){
+  const target=document.getElementById('editorDataset').value;const source=document.getElementById('mergeSourceDataset');const previous=source.value;const choices=items.filter(d=>d.id!==target);source.innerHTML=choices.map(d=>`<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.episodes)} episodes</option>`).join('');if(choices.some(d=>d.id===previous))source.value=previous;document.getElementById('mergeDatasetButton').disabled=!target||!choices.length;
+}
+async function openDatasetEditor(datasetId){document.getElementById('editorDataset').value=datasetId;updateMergeSourceOptions();await loadDatasetEpisodes(0);document.getElementById('episodeEditorSummary').scrollIntoView({behavior:'smooth',block:'center'});}
+async function loadDatasetEpisodes(offset=episodeOffset){
+  const datasetId=document.getElementById('editorDataset').value;if(!datasetId){document.getElementById('episodeRows').innerHTML='<tr><td colspan="7" class="muted">暂无数据集</td></tr>';return;}
+  try{episodeOffset=Math.max(0,offset);episodeDatasetData=await api(`/api/datasets/${encodeURIComponent(datasetId)}?offset=${episodeOffset}&limit=${episodeLimit}`);renderEpisodeRows();}catch(e){show(e.message);}
+}
+function renderEpisodeRows(){
+  const data=episodeDatasetData||{episodes:[],total:0,offset:0,limit:episodeLimit};document.getElementById('episodeRows').innerHTML=(data.episodes||[]).map(e=>`<tr><td class="checkbox-cell"><input type="checkbox" class="episode-check" value="${esc(e.episode_index)}"></td><td><code>${esc(e.episode_index)}</code></td><td>${esc(e.length)}</td><td>${esc(e.instruction)}</td><td>${esc(e.task_name||'-')}</td><td class="${e.success===false?'bad':e.success===true?'ok':'muted'}">${esc(e.success)}</td><td><button class="inline secondary" onclick="editEpisode(${Number(e.episode_index)})">编辑</button></td></tr>`).join('')||'<tr><td colspan="7" class="muted">没有 episode</td></tr>';
+  const start=data.total?data.offset+1:0;const end=Math.min(data.total,data.offset+data.limit);document.getElementById('episodeEditorSummary').textContent=`dataset=${data.id||'-'} · episodes=${data.total} · frames=${(data.info||{}).total_frames??'-'} · tasks=${(data.info||{}).total_tasks??'-'} · 当前 ${start}-${end}`;document.getElementById('episodePage').textContent=`${start}-${end} / ${data.total}`;
+}
+function changeEpisodePage(direction){if(!episodeDatasetData)return;const next=episodeOffset+direction*episodeLimit;if(next<0||next>=episodeDatasetData.total)return;loadDatasetEpisodes(next);}
+async function editEpisode(index){
+  const episode=(episodeDatasetData&&episodeDatasetData.episodes||[]).find(item=>Number(item.episode_index)===Number(index));if(!episode)return;
+  document.getElementById('episodeIndex').value=episode.episode_index;document.getElementById('episodeIndexDisplay').value=episode.episode_index;document.getElementById('episodeInstruction').value=episode.instruction||'';document.getElementById('episodeTaskName').value=episode.task_name||'';document.getElementById('episodeSuccess').value=episode.success===false?'false':'true';document.getElementById('episodeMetadata').value=JSON.stringify(episode.parameters||{},null,2);document.getElementById('episodeRemoveMetadata').value='';
+  episodeVideoUrls.forEach(URL.revokeObjectURL);episodeVideoUrls=[];const container=document.getElementById('episodeVideos');container.innerHTML='<span class="muted">视频加载中…</span>';
+  try{const datasetId=document.getElementById('editorDataset').value;const entries=await Promise.all((episode.video_keys||[]).map(async key=>[key,await apiBlob(`/api/datasets/${encodeURIComponent(datasetId)}/episodes/${episode.episode_index}/video/${encodeURIComponent(key)}`)]));container.innerHTML='';for(const [key,blob] of entries){const url=URL.createObjectURL(blob);episodeVideoUrls.push(url);const item=document.createElement('div');const label=document.createElement('div');label.className='muted';label.textContent=key.replace('observation.images.','');const video=document.createElement('video');video.controls=true;video.preload='metadata';video.src=url;item.append(label,video);container.appendChild(item);}if(!entries.length)container.innerHTML='<span class="muted">该 schema 没有独立 video 文件。</span>';}catch(e){container.innerHTML=`<span class="bad">${esc(e.message)}</span>`;}
+}
+async function deleteSelectedEpisodes(){
+  const datasetId=document.getElementById('editorDataset').value;const indexes=[...document.querySelectorAll('.episode-check:checked')].map(x=>Number(x.value));if(!indexes.length){show('请先选择要删除的 episodes。');return;}if(!confirm(`将从 ${datasetId} 删除 episodes ${indexes.join(', ')}，其余 episode 会重新编号；确认继续？`))return;
+  try{const result=await api(`/api/datasets/${encodeURIComponent(datasetId)}/episodes/delete`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({episode_indexes:indexes})});show(`已删除 ${indexes.length} 个 episodes；当前共 ${result.episodes} 个。norm stats 已失效。`,false);await refreshAll();await loadDatasetEpisodes(0);}catch(e){show(e.message);}
+}
+async function mergeDatasetEpisodes(){
+  const target=document.getElementById('editorDataset').value;const source=document.getElementById('mergeSourceDataset').value;if(!target||!source)return;if(!confirm(`把 ${source} 的全部 episodes 增量合并到 ${target}？源数据集不会被删除，目标 norm stats 会失效。`))return;
+  try{const result=await api(`/api/datasets/${encodeURIComponent(target)}/merge`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_dataset_id:source})});show(`合并完成：${target} 现有 ${result.episodes} episodes。`,false);await refreshAll();await loadDatasetEpisodes(0);}catch(e){show(e.message);}
 }
 function checkpointLabel(c){const size=c.size_gib==null?'':` · ${Number(c.size_gib).toFixed(1)} GiB`;return `${c.experiment} / step ${c.step} · ${c.updated_at}${size}`;}
 function fillCheckpoints(items){
@@ -218,16 +318,16 @@ async function loadObservationPreviews(obs){
 }
 function fillObservation(obs){
   if(!latestStatus)latestStatus={};latestStatus.robot_observation=obs;const status=document.getElementById('robotObservation');
-  if(!obs){status.className='warn';status.textContent='尚未收到官方 Policy telemetry；请先启动 Policy，再在机械臂控制电脑启动 WebSocket shadow 客户端。';document.getElementById('robotState').textContent='state: -';document.getElementById('policyAction').textContent='action: -';return;}
+  if(!obs){status.className='warn';status.textContent='尚未收到官方 Policy telemetry；请先启动 Policy，再在机械臂控制电脑启动 WebSocket shadow 客户端。';document.getElementById('robotStateTitle').textContent='Policy state';document.getElementById('robotState').textContent='state: -';document.getElementById('policyAction').textContent='action: -';return;}
   const control=obs.execution_control||{};status.className=obs.dual_gate_open?'bad':obs.fresh?'ok':'warn';const captured=new Date(Number(obs.captured_at)*1000).toLocaleString();status.textContent=`${obs.fresh?'官方链路近期有真实推理':'Policy 正常，但最近 telemetry 已过期'} · 服务端=${control.mode||'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open?'OPEN':'CLOSED'} · 实际=${obs.client_execution_state||'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · source=${obs.source_name||'-'} · captured=${captured} · transport=${obs.transport}`;
-  const labels=['x(m)','y(m)','z(m)','r6d_c0_x','r6d_c0_y','r6d_c0_z','r6d_c1_x','r6d_c1_y','r6d_c1_z','gripper_closed'];const values=(obs.state||[]).map((v,i)=>`${labels[i]||i}: ${Number(v).toFixed(6)}`);document.getElementById('robotState').textContent=`schema=${obs.schema} arm=${obs.arm_side} dim=${obs.state_dim}\n${values.join('\n')}`;
+  const joint=obs.schema==='joint';const labels=joint?['joint1(rad)','joint2(rad)','joint3(rad)','joint4(rad)','joint5(rad)','joint6(rad)','gripper_opening(m)']:['x(m)','y(m)','z(m)','r6d_c0_x','r6d_c0_y','r6d_c0_z','r6d_c1_x','r6d_c1_y','r6d_c1_z','gripper_closed'];const values=(obs.state||[]).map((v,i)=>`${labels[i]||i}: ${Number(v).toFixed(6)}`);document.getElementById('robotStateTitle').textContent=joint?'7D joint state':'10D delivery state';document.getElementById('robotState').textContent=`schema=${obs.schema} arm=${obs.arm_side} dim=${obs.state_dim}\n${values.join('\n')}`;
   document.getElementById('policyAction').textContent=`prompt: ${obs.prompt||'-'}\nactions shape: ${JSON.stringify(obs.actions_shape||[])}\nfirst action: ${JSON.stringify(obs.first_action||[])}\nmin/max: ${obs.action_min} / ${obs.action_max}\npolicy elapsed: ${Number(obs.policy_elapsed_s||0).toFixed(4)}s\nserver gate: ${control.mode||'shadow'} (revision ${control.revision||0})\nclient allow: ${Boolean(obs.client_allow_execution)}\nclient state: ${obs.client_execution_state||'unknown'}\nblocked reason: ${obs.client_blocked_reason||'-'}\nlast command: ${fmtTime(obs.client_last_command_at)}`;
   const key=`${obs.telemetry_session}:${obs.sequence}`;if(key!==latestTelemetryKey){latestTelemetryKey=key;loadObservationPreviews(obs);}
 }
 async function refreshObservation(){if(!tokenInput.value)return;try{const data=await api('/api/robot/observation');fillObservation(data.observation);}catch(e){console.warn('telemetry refresh failed',e);}}
 async function refreshAll(){
   if(!tokenInput.value){show('请先输入 Dashboard API Token。');return;}
-  try{const data=await api('/api/status');latestStatus=data;fillDatasets(data.datasets||[]);fillCheckpoints(data.checkpoints||[]);fillGpus(data.gpus||[]);fillTasks(data.tasks||[]);fillObservation(data.robot_observation);document.getElementById('serverInfo').innerHTML=`管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>Base: <code>${esc(data.config.base_checkpoint)}</code>`;}catch(e){show(e.message);}
+  try{const data=await api('/api/status');latestStatus=data;fillDatasets(data.datasets||[]);fillCheckpoints(data.checkpoints||[]);fillGpus(data.gpus||[]);fillTasks(data.tasks||[]);fillObservation(data.robot_observation);document.getElementById('serverInfo').innerHTML=`管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>Base: <code>${esc(data.config.base_checkpoint)}</code>`;if(!episodeDatasetData&&document.getElementById('editorDataset').value)loadDatasetEpisodes(0);}catch(e){show(e.message);}
 }
 async function armPolicy(id){
   const typed=prompt(`这是实机动作授权。请输入完整 Policy task id 以确认：\n${id}`,'');if(typed!==id){if(typed!==null)show('task id 不匹配，未授权执行。');return;}
@@ -242,8 +342,10 @@ function formJSON(form){const out={};new FormData(form).forEach((v,k)=>out[k]=v)
 document.getElementById('policyDataset').addEventListener('change',()=>fillCheckpoints((latestStatus&&latestStatus.checkpoints)||[]));
 document.getElementById('replacePolicy').addEventListener('change',()=>updatePolicyOperation(true));
 document.getElementById('policyPort').addEventListener('input',updateClientCommand);
+document.getElementById('editorDataset').addEventListener('change',()=>{episodeDatasetData=null;updateMergeSourceOptions();loadDatasetEpisodes(0);});
+document.getElementById('episodeForm').onsubmit=async e=>{e.preventDefault();const datasetId=document.getElementById('editorDataset').value;const episodeIndex=document.getElementById('episodeIndex').value;if(episodeIndex===''){show('请先从列表选择一个 episode。');return;}let metadata;try{metadata=JSON.parse(document.getElementById('episodeMetadata').value||'{}');if(!metadata||Array.isArray(metadata)||typeof metadata!=='object')throw new Error('metadata 必须是 JSON object');}catch(err){show(`metadata JSON 无效：${err.message}`);return;}const remove_metadata=document.getElementById('episodeRemoveMetadata').value.split(',').map(x=>x.trim()).filter(Boolean);const payload={instruction:document.getElementById('episodeInstruction').value,task_name:document.getElementById('episodeTaskName').value,success:document.getElementById('episodeSuccess').value==='true',metadata,remove_metadata};if(!confirm(`保存 ${datasetId} episode ${episodeIndex} 的参数？该操作会重新校验数据集并使 norm stats 失效。`))return;try{await api(`/api/datasets/${encodeURIComponent(datasetId)}/episodes/${episodeIndex}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});show(`Episode ${episodeIndex} 参数已保存。`,false);await refreshAll();await loadDatasetEpisodes(episodeOffset);editEpisode(Number(episodeIndex));}catch(err){show(err.message);}};
 document.getElementById('normForm').onsubmit=async e=>{e.preventDefault();const p=formJSON(e.target);if(!p.max_frames)delete p.max_frames;try{await api('/api/tasks/norm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});show('norm stats 任务已提交。',false);refreshAll();}catch(err){show(err.message);}};
-document.getElementById('trainForm').onsubmit=async e=>{e.preventDefault();const p=formJSON(e.target);p.gpu_ids=p.gpu_ids.split(',').map(x=>x.trim()).filter(Boolean);try{const task=await api('/api/tasks/train',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});const dep=(task.dependency||{}).task_id;if(task.state==='waiting_norm')show(`训练已排队；正在自动计算 norm stats：${dep}`,false);else if(task.state==='waiting_gpu')show(`norm stats 已就绪；训练正在等待 GPU：${task.waiting_reason||''}`,false);else show(`训练任务已启动：${task.id}`,false);refreshAll();}catch(err){show(err.message);}};
+document.getElementById('trainForm').onsubmit=async e=>{e.preventDefault();const p=formJSON(e.target);p.gpu_ids=p.gpu_ids.split(',').map(x=>x.trim()).filter(Boolean);if(p.mode==='overwrite'&&!confirm(`overwrite 会删除实验 ${p.exp_name} 的原 checkpoint 目录并重新训练，确认继续？`))return;try{const task=await api('/api/tasks/train',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});const dep=(task.dependency||{}).task_id;if(task.state==='waiting_norm')show(`训练已排队；正在自动计算 norm stats：${dep}`,false);else if(task.state==='waiting_gpu')show(`norm stats 已就绪；训练正在等待 GPU：${task.waiting_reason||''}`,false);else show(`训练任务已启动：${task.id}`,false);refreshAll();}catch(err){show(err.message);}};
 document.getElementById('policyForm').onsubmit=async e=>{e.preventDefault();const p=formJSON(e.target);p.gpu_ids=p.gpu_ids.split(',').map(x=>x.trim()).filter(Boolean);const switching=Boolean(p.replace_task_id);if(switching&&!confirm(`确认停止 ${p.replace_task_id} 并切换到所选 checkpoint？`))return;try{const task=await api('/api/tasks/policy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});show(`${switching?'Policy 模型已切换':'Policy 进程已创建'}：${task.id}`,false);document.getElementById('replacePolicy').value='';await refreshAll();}catch(err){show(err.message);}};
 if(tokenInput.value){refreshAll();refreshObservation();}
 setInterval(()=>{if(tokenInput.value)refreshAll();},8000);

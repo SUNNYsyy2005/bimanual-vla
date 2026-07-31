@@ -31,13 +31,16 @@ bash start_gui.sh
 - 配置 `can0`、`/dev/video8`、`/dev/video16` 和任务信息
 - 放大字体、窗口和按钮，方便现场操作
 - 连接/断开机械臂与相机
-- 连接成功后弹出两个实时预览窗口：第三视角和腕部第一视角
+- 连接成功后在主界面内实时显示顶部全局相机和夹爪上方腕部相机画面
+- 实时显示 J1-J6、夹爪位姿、EEF xyz / rotation-6D 状态
+- 采集前自动检查机械臂是否处于 `Reset to Home` 的全零参考位姿；超出阈值时显示红色警告并禁止开始 episode
+- 关节和夹爪误差阈值可在界面中调整，默认分别为 ±5° 和 ±5 mm
 - 开始/停止 episode
 - 停止后标记成功、失败或丢弃
 - 自动从已有编号继续保存，避免覆盖旧数据
 - 选择已保存的 episode 并启动双视角回放
 
-采集频率默认是交付规范要求的 `20 Hz`，可在 GUI 的 `Capture FPS` 中切换。两台 RealSense 的 `Camera source FPS` 默认是设备稳定支持的 `30 FPS`；采集器每 50 ms 从 30 FPS 相机流中读取一帧。最终导出到 Piper 训练集时必须使用 `20 Hz`。
+采集频率默认是交付规范要求的 `20 Hz`，可在 GUI 的 `Capture FPS` 中切换。两台 RealSense 的 `Camera source FPS` 默认是设备稳定支持的 `30 FPS`；采集器每 50 ms 从 30 FPS 相机流中读取一帧。最终导出到 Piper 训练集时必须使用 `20 Hz`。如果环境没有 Pillow，GUI 会回退到 OpenCV 预览窗口，但推荐在项目环境中安装 Pillow 以使用内嵌双路预览。
 
 ### Piper delivery schema
 
@@ -453,6 +456,19 @@ python upload_dataset_4090.py piper/piper_v1 \
   --chunk-mib 32
 ```
 
+要把新采集的 episodes 追加到服务器同名数据集，增加 `--merge`：
+
+```bash
+python upload_dataset_4090.py piper/piper_v1_increment \
+  --name piper_v1 \
+  --server http://192.168.101.9:8090 \
+  --token "$BIMANUAL_VLA_SERVER_TOKEN" \
+  --workers 4 \
+  --merge
+```
+
+`--merge` 与 `--overwrite` 互斥；目标不存在时 `--merge` 按首次安装处理。服务端会检查两个数据集的版本、robot type、FPS、chunk size、features、action semantics 和 action offset，随后重新编号新增 episode/global/task index，并在临时目录完成结构与 loader 校验后原子替换。
+
 网页地址：`http://192.168.101.9:8090`。页面作为管理面，可执行：
 
 1. 查看数据集、GPU、训练任务和 Policy 进程。
@@ -461,8 +477,9 @@ python upload_dataset_4090.py piper/piper_v1 \
 4. 新建 Policy 进程，显示 PID、WebSocket `/healthz`、GPU、端口、schema、checkpoint 和最近 telemetry。
 5. 正常停止或强制结束指定 Policy。
 6. 选择运行中的 Policy，以新 checkpoint 执行“停止旧进程 → 启动替代进程”的模型切换。
-7. 只读显示 Policy 通过官方协议实际收到的 10D state、两路图像、prompt 和预测 action。
+7. 按 Policy schema 只读显示实际收到的 10D delivery state 或 7D joint state、两路图像、prompt 和预测 action。
 8. 显示并管理短时服务端 EXECUTE 授权，同时显示机械臂客户端本地 `--allow-execution`、双重门结果和实际执行/阻断原因。
+9. 在网页执行 episode 级数据集编辑：修改 instruction、task name、success 和附加 metadata，批量删除 episode，或把另一个兼容数据集的全部 episodes 增量合并进目标数据集。不会修改 episode 内的 state/action/图像帧。
 
 真实推理数据面不经过 Dashboard。机械臂控制电脑使用官方 `openpi_client.WebsocketClientPolicy` 直接连接 Policy 端口：
 
@@ -477,9 +494,9 @@ python robot_observation_bridge.py \
   --instruction "pick up the cube"
 ```
 
-bridge 读取与 `collect_output_arm.py` 一致的 10D EEF delivery state，并以 `cam_high`、`cam_wrist` 发送两路 256×256 RGB 图像。默认只打印预测 action；显式追加 `--allow-execution` 后仍需网页对同一 Policy 短时授权 EXECUTE，并通过本地新鲜度、动作幅度、工作空间和 Piper 状态检查才会下发。模型切换导致连接断开后客户端会自动重连并回到 SHADOW。
+bridge 同时读取 10D EEF delivery state 与 7D 实测 joint qpos，并根据服务端 metadata 自动选择正确的 state 和腕部相机 wire key：delivery 使用 `cam_wrist`，joint 使用 `cam_<arm_side>_wrist`。默认只打印预测 action；显式追加 `--allow-execution` 后仍需网页对同一 Policy 短时授权 EXECUTE，并通过 schema 对应的本地新鲜度、动作幅度/关节限位和 Piper 状态检查才会下发。模型切换导致连接断开后客户端会自动重连、重新协商 schema，并回到 SHADOW。
 
-Dashboard Token 只保护管理 API，机械臂客户端不需要 Dashboard URL 或 Token。首次启动自动生成，保存在 4×4090 的 `~/.config/bimanual-vla/server.env`；可用 `ssh 4x4090 'source ~/.config/bimanual-vla/server.env && printf "%s\n" "$BIMANUAL_VLA_SERVER_TOKEN"'` 读取。上传采用并行分块、SHA256 和断点续传；详细架构和 Policy 生命周期说明见 `server_4090/README.md`。
+Dashboard Token 只保护管理 API，机械臂客户端不需要 Dashboard URL 或 Token。首次启动自动生成，保存在 4×4090 的 `~/.config/bimanual-vla/server.env`；可用 `ssh 4x4090 'source ~/.config/bimanual-vla/server.env && printf "%s\n" "$BIMANUAL_VLA_SERVER_TOKEN"'` 读取。上传采用并行分块、SHA256 和断点续传。任何合并、删除或 episode 参数修改都会保留隐藏备份、重新校验并让旧 norm stats 失效；下一次训练会自动重新执行 norm→train。详细架构和 Policy 生命周期说明见 `server_4090/README.md`。
 
 ## 9. 相关脚本
 

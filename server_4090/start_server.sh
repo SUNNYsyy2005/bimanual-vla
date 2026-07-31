@@ -18,11 +18,29 @@ mkdir -p "$TOKEN_DIR" "$STATE_DIR"
 chmod 700 "$TOKEN_DIR"
 if [[ ! -f "$TOKEN_FILE" ]]; then
   TOKEN="$($PYTHON_DEFAULT -c 'import secrets; print(secrets.token_urlsafe(36))')"
-  printf 'export BIMANUAL_VLA_SERVER_TOKEN=%q\n' "$TOKEN" > "$TOKEN_FILE"
+  LOGIN_USER="${BIMANUAL_VLA_LOGIN_USER:-${USER:-sunny}}"
+  LOGIN_PASSWORD="${BIMANUAL_VLA_LOGIN_PASSWORD:-$($PYTHON_DEFAULT -c 'import secrets; print(secrets.token_urlsafe(24))')}"
+  {
+    printf 'export BIMANUAL_VLA_SERVER_TOKEN=%q\n' "$TOKEN"
+    printf 'export BIMANUAL_VLA_LOGIN_USER=%q\n' "$LOGIN_USER"
+    printf 'export BIMANUAL_VLA_LOGIN_PASSWORD=%q\n' "$LOGIN_PASSWORD"
+  } > "$TOKEN_FILE"
   chmod 600 "$TOKEN_FILE"
 fi
 # shellcheck disable=SC1090
 source "$TOKEN_FILE"
+
+# Migrate an existing server.env created before username/password login was
+# added.  Keep the credentials in the same 0600 file as the API token so the
+# dashboard can be restarted without changing the login pair.
+if [[ -z "${BIMANUAL_VLA_LOGIN_USER:-}" ]]; then
+  export BIMANUAL_VLA_LOGIN_USER="${USER:-sunny}"
+  printf 'export BIMANUAL_VLA_LOGIN_USER=%q\n' "$BIMANUAL_VLA_LOGIN_USER" >> "$TOKEN_FILE"
+fi
+if [[ -z "${BIMANUAL_VLA_LOGIN_PASSWORD:-}" ]]; then
+  export BIMANUAL_VLA_LOGIN_PASSWORD="$($PYTHON_DEFAULT -c 'import secrets; print(secrets.token_urlsafe(24))')"
+  printf 'export BIMANUAL_VLA_LOGIN_PASSWORD=%q\n' "$BIMANUAL_VLA_LOGIN_PASSWORD" >> "$TOKEN_FILE"
+fi
 
 PYTHON="$($PYTHON_DEFAULT - "$CONFIG" <<'PY'
 import json, sys
@@ -40,6 +58,8 @@ if [[ -f "$PID_FILE" ]]; then
   if kill -0 "$PID" 2>/dev/null && tr '\0' ' ' < "/proc/$PID/cmdline" | grep -q 'server_4090/app.py'; then
     echo "Dashboard already running: PID=$PID"
     echo "URL: http://192.168.101.9:${PORT}"
+    echo "Login user: ${BIMANUAL_VLA_LOGIN_USER}"
+    echo "Login password: ${BIMANUAL_VLA_LOGIN_PASSWORD}"
     echo "Token: ${BIMANUAL_VLA_SERVER_TOKEN}"
     exit 0
   fi
@@ -57,5 +77,7 @@ fi
 
 echo "Dashboard started: PID=$PID"
 echo "URL: http://192.168.101.9:${PORT}"
+echo "Login user: ${BIMANUAL_VLA_LOGIN_USER}"
+echo "Login password: ${BIMANUAL_VLA_LOGIN_PASSWORD}"
 echo "Token: ${BIMANUAL_VLA_SERVER_TOKEN}"
 echo "Log: $LOG_FILE"
