@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bimanual-VLA · 4×4090 控制台</title>
+  <style>
+    :root { color-scheme:dark; --bg:#090d14; --card:#111827; --line:#263244; --muted:#94a3b8; --text:#e5edf8; --blue:#38bdf8; --green:#34d399; --yellow:#fbbf24; --red:#fb7185; }
+    * { box-sizing:border-box; }
+    body { margin:0; font:14px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; background:radial-gradient(circle at top,#17213a 0,#090d14 42%); color:var(--text); }
+    main { max-width:1600px; margin:auto; padding:24px; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:18px; }
+    h1 { font-size:24px; margin:0; } h2 { font-size:17px; margin:0 0 14px; } h3 { font-size:14px; margin:12px 0 8px; color:#cbd5e1; }
+    .muted { color:var(--muted); } .ok { color:var(--green); } .bad { color:var(--red); } .warn { color:var(--yellow); }
+    .grid { display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:14px; }
+    .card { grid-column:span 12; background:rgba(17,24,39,.94); border:1px solid var(--line); border-radius:14px; padding:16px; box-shadow:0 14px 38px rgba(0,0,0,.22); }
+    .half { grid-column:span 6; } .third { grid-column:span 4; } .two-third { grid-column:span 8; }
+    @media(max-width:1100px){.half,.third,.two-third{grid-column:span 12}}
+    label { display:block; color:#cbd5e1; margin:9px 0 4px; }
+    input,select,textarea,button { width:100%; border:1px solid #334155; border-radius:8px; background:#0b1220; color:var(--text); padding:9px 10px; font:inherit; }
+    button { cursor:pointer; background:#075985; border-color:#0ea5e9; font-weight:650; }
+    button:hover { filter:brightness(1.18); } button.secondary { background:#1e293b; border-color:#475569; } button.danger { background:#881337; border-color:#e11d48; }
+    button.inline { width:auto; padding:6px 9px; margin:2px; }
+    button:disabled { cursor:not-allowed; opacity:.45; filter:none; }
+    .row { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; } .row3 { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
+    @media(max-width:700px){.row,.row3{grid-template-columns:1fr}}
+    table { width:100%; border-collapse:collapse; font-size:13px; } th,td { border-bottom:1px solid #253044; padding:8px; text-align:left; vertical-align:top; } th { color:#93c5fd; }
+    code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; } code { color:#bae6fd; }
+    pre { background:#070b12; border:1px solid #263244; border-radius:10px; padding:12px; max-height:500px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
+    .pill { display:inline-block; border:1px solid #475569; border-radius:999px; padding:2px 8px; margin:2px; color:#cbd5e1; }
+    .toolbar { display:flex; gap:8px; align-items:center; } .toolbar input { min-width:310px; }
+    #message { position:sticky; top:8px; z-index:5; display:none; padding:10px 14px; border-radius:9px; margin-bottom:12px; background:#172554; border:1px solid #3b82f6; }
+    .preview-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:12px 0; }
+    .preview-grid img { width:100%; max-height:360px; object-fit:contain; background:#05080d; border:1px solid #334155; border-radius:10px; }
+    .architecture { display:grid; grid-template-columns:1fr auto 1fr auto 1fr; gap:8px; align-items:center; text-align:center; }
+    .architecture > span { border:1px solid #334155; border-radius:9px; padding:8px; background:#0b1220; }
+    @media(max-width:700px){.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}}
+    .path { max-width:460px; overflow-wrap:anywhere; }
+  </style>
+</head>
+<body><main>
+  <header>
+    <div>
+      <h1>4×4090 · π0.5 数据 / 微调 / Policy 管理</h1>
+      <div class="muted">delivery schema：10D EEF state + 7D EEF delta action · cam_high + cam_wrist</div>
+    </div>
+    <div class="toolbar"><input id="token" type="password" placeholder="Dashboard API Token"><button class="inline" onclick="saveToken()">保存 Token</button><button class="inline secondary" onclick="refreshAll()">刷新</button></div>
+  </header>
+  <div id="message"></div>
+
+  <section class="grid">
+    <div class="card half">
+      <h2>链路与服务器</h2>
+      <div class="architecture">
+        <span>机械臂控制电脑<br><small class="muted">Piper + 两路相机</small></span><b class="arrow">→</b>
+        <span>OpenPI 官方 WebSocket<br><small class="muted">真实数据面</small></span><b class="arrow">→</b>
+        <span>4×4090 Policy<br><small class="muted">推理 + telemetry 镜像</small></span>
+      </div>
+      <p class="muted">Dashboard 负责进程、GPU、checkpoint、训练和短时执行授权。真实 state / 图像不上传 Dashboard，也不由网页代发推理；机械臂电脑上的本地执行开关始终独立生效。</p>
+      <div id="serverInfo" class="muted">输入 Token 后刷新。</div>
+      <div id="gpuList"></div>
+    </div>
+
+    <div class="card half">
+      <h2>上传数据集</h2>
+      <p>后端提供并行分块、SHA256 和断点续传接口。目录数据集请在采集机执行：</p>
+      <pre id="uploadCommand">python upload_dataset_4090.py DATASET_DIR --name my_dataset --server http://192.168.101.9:8090 --token TOKEN --workers 4</pre>
+      <p class="muted">服务端安装前检查 tar 路径安全、LeRobot v2.1 结构、视频帧数，并用实际 LeRobot loader 读取首尾样本。</p>
+    </div>
+
+    <div class="card">
+      <h2>已接收数据集</h2>
+      <div style="overflow:auto"><table><thead><tr><th>ID</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th></tr></thead><tbody id="datasets"></tbody></table></div>
+    </div>
+
+    <div class="card third">
+      <h2>1. 计算归一化统计</h2>
+      <form id="normForm">
+        <label>数据集</label><select name="dataset_id" class="dataset-select"></select>
+        <label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option></select>
+        <div class="row"><div><label>Batch size</label><input name="batch_size" type="number" value="16" min="1"></div><div><label>Workers</label><input name="num_workers" type="number" value="2" min="1"></div></div>
+        <label>最多帧数（留空=全部）</label><input name="max_frames" type="number" min="1">
+        <p><button type="submit">提交 norm stats</button></p>
+      </form>
+    </div>
+
+    <div class="card third">
+      <h2>2. 提交 LoRA 微调</h2>
+      <form id="trainForm">
+        <label>数据集</label><select name="dataset_id" class="dataset-select"></select>
+        <div class="row"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option></select></div><div><label>GPU IDs</label><input name="gpu_ids" value="0,1" placeholder="例如 0,1"></div></div>
+        <label>实验名</label><input name="exp_name" required placeholder="pick_cube_r1">
+        <div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>Batch</label><input name="batch_size" type="number" value="8"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div>
+        <p class="muted">RTX 4090 建议至少 2 张空闲卡；FSDP 等于所选 GPU 数。单卡可能 OOM。</p>
+        <div class="row"><div><label>Workers</label><input name="num_workers" type="number" value="2"></div><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div></div>
+        <label>启动方式</label><select name="mode"><option value="new">new（目录必须不存在）</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select>
+        <p><button type="submit">提交训练</button></p>
+      </form>
+    </div>
+
+    <div class="card third">
+      <h2>3. 新建 / 切换 Policy 进程</h2>
+      <form id="policyForm">
+        <label>操作对象</label>
+        <select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select>
+        <p id="replaceInfo" class="muted">留空会创建新进程；选择运行中的 Policy 会先停止旧进程，再用下列 checkpoint 启动新进程。</p>
+        <label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select>
+        <div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div>
+        <label>Checkpoint（按数据集过滤，最新完整 step 优先）</label><select name="checkpoint" id="checkpointSelect" required></select>
+        <div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div>
+        <div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div><div><label>默认 prompt（可空）</label><input name="default_prompt"></div></div>
+        <p><button id="policySubmit" type="submit">新建 Policy 进程</button></p>
+        <p class="warn">切换模型会断开旧 WebSocket；机械臂客户端会按配置自动重连。切换不启动动作执行。</p>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>Policy 进程管理</h2>
+      <p class="muted">可新建、检测、正常停止或强制结束 Policy，并为单个 Policy 设置短时 EXECUTE / SHADOW。实际下发必须同时满足服务端授权、客户端 <code>--allow-execution</code> 和本地安全检查。</p>
+      <div style="overflow:auto"><table><thead><tr><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端 / 推理 telemetry</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div>
+      <h3>Policy 日志</h3><pre id="taskLog">点击进程的“日志”。</pre>
+    </div>
+
+    <div class="card">
+      <h2>Norm / Train 任务</h2>
+      <div style="overflow:auto"><table><thead><tr><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div>
+    </div>
+
+    <div class="card">
+      <h2>官方 Policy 链路 · 真实推理只读可视化</h2>
+      <p class="muted">在直接控制机械臂的电脑运行以下默认 shadow 客户端。它通过 <code>openpi_client.WebsocketClientPolicy</code> 直接请求 Policy；Dashboard 仅显示 Policy 镜像出的 observation / action telemetry。</p>
+      <pre id="policyClientCommand">python robot_observation_bridge.py --host 192.168.101.9 --port 8000 --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16 --instruction "pick up the cube"</pre>
+      <div id="robotObservation" class="warn">尚未收到官方 Policy telemetry。</div>
+      <div class="row">
+        <div><h3>10D state</h3><pre id="robotState">state: -</pre></div>
+        <div><h3>Prompt / predicted action</h3><pre id="policyAction">action: -</pre></div>
+      </div>
+      <div class="preview-grid"><div><h3>cam_high（Policy 实际收到）</h3><img id="previewHigh" alt="cam_high preview"></div><div><h3>cam_wrist（Policy 实际收到）</h3><img id="previewWrist" alt="cam_wrist preview"></div></div>
+      <p class="warn">默认命令不会发送动作。只有在机械臂电脑显式追加 <code>--allow-execution</code>、网页为同一 Policy 临时授权 EXECUTE、telemetry 新鲜且所有本地安全检查通过时，客户端才会发布第一步 action。</p>
+    </div>
+  </section>
+</main>
+<script>
+const tokenInput=document.getElementById('token');
+tokenInput.value=localStorage.getItem('bimanualVlaToken')||'';
+let latestStatus=null;
+let latestTelemetryKey=null;
+let previewUrls=[];
+function saveToken(){localStorage.setItem('bimanualVlaToken',tokenInput.value);show('Token 已保存。',false);refreshAll();refreshObservation();}
+function show(text,bad=true){const el=document.getElementById('message');el.textContent=text;el.style.display='block';el.style.borderColor=bad?'#e11d48':'#10b981';setTimeout(()=>el.style.display='none',6000);}
+async function api(path,options={}){options.headers=options.headers||{};options.headers.Authorization='Bearer '+tokenInput.value;const response=await fetch(path,options);const body=await response.json().catch(()=>({error:'invalid JSON response'}));if(!response.ok)throw new Error(body.error||`HTTP ${response.status}`);return body;}
+async function apiBlob(path){const response=await fetch(path,{headers:{Authorization:'Bearer '+tokenInput.value},cache:'no-store'});if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||`HTTP ${response.status}`);}return response.blob();}
+function esc(value){return String(value??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
+function stateClass(state){return ['completed','running','installed','stopped'].includes(state)?'ok':['failed','lost'].includes(state)?'bad':'warn';}
+function shortPath(path){const parts=String(path||'').split('/').filter(Boolean);return parts.slice(-3).join('/')||'-';}
+function fillDatasets(items){
+  document.getElementById('datasets').innerHTML=items.map(d=>`<tr><td><code>${esc(d.id)}</code><br><span class="muted">${esc(d.robot_type)}</span></td><td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps</td><td><span class="pill">${esc(d.schema)}</span><br>state ${esc(JSON.stringify(d.state_shape))}, action ${esc(JSON.stringify(d.action_shape))}<br>${(d.cameras||[]).map(c=>`<span class="pill">${esc(c.replace('observation.images.',''))}</span>`).join('')}</td><td>${esc(d.action_semantics)}<br>offset=${esc(d.action_offset)}</td></tr>`).join('')||'<tr><td colspan="4" class="muted">暂无数据集</td></tr>';
+  document.querySelectorAll('.dataset-select').forEach(select=>{const old=select.value;select.innerHTML=items.map(d=>`<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.schema)}</option>`).join('');if(items.some(d=>d.id===old))select.value=old;});
+}
+function checkpointLabel(c){const size=c.size_gib==null?'':` · ${Number(c.size_gib).toFixed(1)} GiB`;return `${c.experiment} / step ${c.step} · ${c.updated_at}${size}`;}
+function fillCheckpoints(items){
+  const select=document.getElementById('checkpointSelect');const dataset=document.getElementById('policyDataset').value;const old=select.value;const matches=items.filter(c=>Array.isArray(c.dataset_ids)&&c.dataset_ids.includes(dataset));
+  select.innerHTML=matches.map(c=>`<option value="${esc(c.path)}">${esc(checkpointLabel(c))}</option>`).join('');if(matches.some(c=>c.path===old))select.value=old;
+  const selected=matches.find(c=>c.path===select.value);document.getElementById('checkpointInfo').textContent=selected?`完整 checkpoint；当前：${selected.path}`:`数据集 ${dataset||'-'} 暂无完整 checkpoint，请先完成训练。`;document.getElementById('policySubmit').disabled=!selected;
+}
+function fillGpus(items){document.getElementById('gpuList').innerHTML=items.map(g=>`<div><span class="pill">GPU ${g.index}</span> ${esc(g.name)} · ${g.memory_used_mib}/${g.memory_total_mib} MiB · ${g.processes.length?'<span class="warn">busy</span>':'<span class="ok">free</span>'}${g.processes.map(p=>`<div class="muted">PID ${p.pid} ${esc(p.name)} ${p.memory_mib} MiB</div>`).join('')}</div>`).join('')||'<div class="bad">nvidia-smi 不可用</div>';}
+function fillReplacePolicies(items){
+  const select=document.getElementById('replacePolicy');const old=select.value;const active=items.filter(t=>t.type==='policy'&&['starting','running','stopping'].includes(t.state));
+  select.innerHTML='<option value="">新建独立 Policy 进程</option>'+active.map(t=>`<option value="${esc(t.id)}">切换 ${esc(t.id)} · PID ${esc(t.pid)} · port ${esc((t.metadata||{}).port)}</option>`).join('');if(active.some(t=>t.id===old))select.value=old;updatePolicyOperation(false);
+}
+function fmtTime(epoch){return epoch?new Date(Number(epoch)*1000).toLocaleTimeString():'-';}
+function telemetrySummary(t){
+  if(!t)return '<span class="muted">客户端未连接，尚无 telemetry</span>';
+  const control=t.execution_control||{};
+  const connection=t.client_connected?`<span class="ok">WebSocket 已连接 ×${esc(t.active_clients)}</span>`:'<span class="muted">WebSocket 未连接</span>';
+  const freshness=t.received_at==null?'<span class="muted">尚无推理请求</span>':t.fresh?`<span class="ok">近期推理</span> · age=${esc(t.age_s)}s · seq=${esc(t.sequence)}`:`<span class="warn">最近推理已过期</span> · age=${esc(t.age_s)}s`;
+  const serverGate=control.mode==='execute'?`<span class="warn">服务端 EXECUTE</span> · 到期 ${esc(fmtTime(control.expires_at))}`:`<span class="muted">服务端 SHADOW</span>${control.expired?' · 上次授权已过期':''}`;
+  const clientGate=t.client_allow_execution?'<span class="warn">客户端允许执行</span>':'<span class="muted">客户端禁止执行</span>';
+  const dualGate=t.dual_gate_open?'<span class="bad">双重门已打开</span>':'<span class="ok">双重门已关闭</span>';
+  const actual=`实际状态=<code>${esc(t.client_execution_state||'unknown')}</code>${t.client_blocked_reason?`<br>原因=${esc(t.client_blocked_reason)}`:''}${t.client_last_command_at?`<br>最近下发=${esc(fmtTime(t.client_last_command_at))}`:''}`;
+  return `${connection}<br>${freshness}<br>${serverGate}<br>${clientGate} · ${dualGate}<br>${actual}${t.received_at==null?'':`<br>source=${esc(t.source_name||'-')} · action=${esc(JSON.stringify(t.actions_shape||[]))}`}`;
+}
+function policyControlButtons(task){
+  const t=task.telemetry||{};const control=t.execution_control||{};const running=task.state==='running';
+  const canArm=running&&t.client_connected&&t.fresh&&t.client_allow_execution;
+  const why=!running?'Policy 未运行':!t.client_connected?'机械臂客户端未连接':!t.fresh?'telemetry 不新鲜':!t.client_allow_execution?'客户端未使用 --allow-execution':'';
+  const shadow=`<button class="inline secondary" onclick="setPolicyShadow('${esc(task.id)}')" ${control.mode==='shadow'?'disabled':''}>只推理 / SHADOW</button>`;
+  const execute=`<button class="inline danger" onclick="armPolicy('${esc(task.id)}')" ${canArm&&control.mode!=='execute'?'':`disabled title="${esc(why||'已经授权执行')}"`}>授权执行 5 分钟</button>`;
+  return `${shadow}${execute}`;
+}
+function fillTasks(items){
+  const policies=items.filter(t=>t.type==='policy');
+  document.getElementById('policies').innerHTML=policies.map(t=>{const m=t.metadata||{};const active=['starting','running','stopping'].includes(t.state);const health=t.policy_healthy===true?'<span class="ok">/healthz OK</span>':t.state==='running'?'<span class="bad">/healthz FAIL</span>':'<span class="muted">未运行</span>';return `<tr><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid||'-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal?`<br>${esc(t.stop_signal)}`:''}</td><td>GPU ${esc((m.gpu_ids||[]).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.schema||'-')}</span></td><td>dataset=${esc(m.dataset_id)}<br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}')">日志</button>${active?`<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>`:''}${t.state==='stopping'?`<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>`:''}</td></tr>`;}).join('')||'<tr><td colspan="6" class="muted">暂无 Policy 进程；可在上方创建。</td></tr>';
+  const jobs=items.filter(t=>t.type!=='policy');
+  document.getElementById('jobs').innerHTML=jobs.map(t=>{const m=t.metadata||{};const active=['starting','running','stopping'].includes(t.state);return `<tr><td><code>${esc(t.id)}</code><br>${esc(t.type)} · PID ${esc(t.pid||'-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}</td><td><code>${esc(JSON.stringify(m))}</code></td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}')">日志</button>${active?`<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>`:''}${t.state==='stopping'?`<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>`:''}</td></tr>`;}).join('')||'<tr><td colspan="4" class="muted">暂无 Norm / Train 任务</td></tr>';
+  fillReplacePolicies(items);updateClientCommand();
+}
+function updatePolicyOperation(applyTask=true){
+  const id=document.getElementById('replacePolicy').value;const button=document.getElementById('policySubmit');const info=document.getElementById('replaceInfo');button.textContent=id?'停止旧进程并切换 Policy 模型':'新建 Policy 进程';
+  if(!id){info.textContent='将创建新的独立 Policy 进程。多个 Policy 必须使用不同端口和空闲 GPU。';updateClientCommand();return;}
+  const task=latestStatus&&latestStatus.tasks.find(t=>t.id===id);if(!task)return;const m=task.metadata||{};info.textContent=`将停止 PID ${task.pid}，断开 port ${m.port} 的客户端，再使用所选 checkpoint 启动替代进程。`;
+  if(applyTask){if(m.dataset_id)document.getElementById('policyDataset').value=m.dataset_id;if(m.arm_side)document.getElementById('policyArm').value=m.arm_side;if(Array.isArray(m.gpu_ids))document.getElementById('policyGpu').value=m.gpu_ids.join(',');if(m.port)document.getElementById('policyPort').value=m.port;fillCheckpoints((latestStatus&&latestStatus.checkpoints)||[]);}updateClientCommand();
+}
+function updateClientCommand(){
+  let port=document.getElementById('policyPort').value||8000;const selected=document.getElementById('replacePolicy').value;if(selected&&latestStatus){const task=latestStatus.tasks.find(t=>t.id===selected);if(task&&task.metadata&&task.metadata.port)port=task.metadata.port;}
+  document.getElementById('policyClientCommand').textContent=`python robot_observation_bridge.py \\\n  --host 192.168.101.9 \\\n  --port ${port} \\\n  --can can0 \\\n  --cam-high-device /dev/video8 \\\n  --cam-wrist-device /dev/video16 \\\n  --instruction "pick up the cube"`;
+}
+async function loadObservationPreviews(obs){
+  if(!obs||!obs.telemetry_session)return;try{const suffix=`?v=${encodeURIComponent(obs.sequence)}`;const [high,wrist]=await Promise.all([apiBlob(`/api/policy-telemetry/${encodeURIComponent(obs.telemetry_session)}/image/cam_high${suffix}`),apiBlob(`/api/policy-telemetry/${encodeURIComponent(obs.telemetry_session)}/image/cam_wrist${suffix}`)]);previewUrls.forEach(URL.revokeObjectURL);previewUrls=[URL.createObjectURL(high),URL.createObjectURL(wrist)];document.getElementById('previewHigh').src=previewUrls[0];document.getElementById('previewWrist').src=previewUrls[1];}catch(e){console.warn('telemetry preview refresh failed',e);}
+}
+function fillObservation(obs){
+  if(!latestStatus)latestStatus={};latestStatus.robot_observation=obs;const status=document.getElementById('robotObservation');
+  if(!obs){status.className='warn';status.textContent='尚未收到官方 Policy telemetry；请先启动 Policy，再在机械臂控制电脑启动 WebSocket shadow 客户端。';document.getElementById('robotState').textContent='state: -';document.getElementById('policyAction').textContent='action: -';return;}
+  const control=obs.execution_control||{};status.className=obs.dual_gate_open?'bad':obs.fresh?'ok':'warn';const captured=new Date(Number(obs.captured_at)*1000).toLocaleString();status.textContent=`${obs.fresh?'官方链路近期有真实推理':'Policy 正常，但最近 telemetry 已过期'} · 服务端=${control.mode||'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open?'OPEN':'CLOSED'} · 实际=${obs.client_execution_state||'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · source=${obs.source_name||'-'} · captured=${captured} · transport=${obs.transport}`;
+  const labels=['x(m)','y(m)','z(m)','r6d_c0_x','r6d_c0_y','r6d_c0_z','r6d_c1_x','r6d_c1_y','r6d_c1_z','gripper_closed'];const values=(obs.state||[]).map((v,i)=>`${labels[i]||i}: ${Number(v).toFixed(6)}`);document.getElementById('robotState').textContent=`schema=${obs.schema} arm=${obs.arm_side} dim=${obs.state_dim}\n${values.join('\n')}`;
+  document.getElementById('policyAction').textContent=`prompt: ${obs.prompt||'-'}\nactions shape: ${JSON.stringify(obs.actions_shape||[])}\nfirst action: ${JSON.stringify(obs.first_action||[])}\nmin/max: ${obs.action_min} / ${obs.action_max}\npolicy elapsed: ${Number(obs.policy_elapsed_s||0).toFixed(4)}s\nserver gate: ${control.mode||'shadow'} (revision ${control.revision||0})\nclient allow: ${Boolean(obs.client_allow_execution)}\nclient state: ${obs.client_execution_state||'unknown'}\nblocked reason: ${obs.client_blocked_reason||'-'}\nlast command: ${fmtTime(obs.client_last_command_at)}`;
+  const key=`${obs.telemetry_session}:${obs.sequence}`;if(key!==latestTelemetryKey){latestTelemetryKey=key;loadObservationPreviews(obs);}
+}
+async function refreshObservation(){if(!tokenInput.value)return;try{const data=await api('/api/robot/observation');fillObservation(data.observation);}catch(e){console.warn('telemetry refresh failed',e);}}
+async function refreshAll(){
+  if(!tokenInput.value){show('请先输入 Dashboard API Token。');return;}
+  try{const data=await api('/api/status');latestStatus=data;fillDatasets(data.datasets||[]);fillCheckpoints(data.checkpoints||[]);fillGpus(data.gpus||[]);fillTasks(data.tasks||[]);fillObservation(data.robot_observation);document.getElementById('serverInfo').innerHTML=`管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>Base: <code>${esc(data.config.base_checkpoint)}</code>`;}catch(e){show(e.message);}
+}
+async function armPolicy(id){
+  const typed=prompt(`这是实机动作授权。请输入完整 Policy task id 以确认：\n${id}`,'');if(typed!==id){if(typed!==null)show('task id 不匹配，未授权执行。');return;}
+  try{await api(`/api/tasks/${encodeURIComponent(id)}/execution-control`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'execute',expires_in_s:300,confirm_task_id:typed})});show('已授权执行 5 分钟；客户端本地安全门仍独立生效。',false);await refreshAll();}catch(e){show(e.message);}
+}
+async function setPolicyShadow(id){
+  try{await api(`/api/tasks/${encodeURIComponent(id)}/execution-control`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'shadow'})});show('已切回只推理 / SHADOW。',false);await refreshAll();}catch(e){show(e.message);}
+}
+async function loadLog(id){try{const data=await api(`/api/tasks/${encodeURIComponent(id)}/log?max_bytes=131072`);document.getElementById('taskLog').textContent=data.log||'(empty)';}catch(e){show(e.message);}}
+async function stopTask(id,force=false){const verb=force?'强制结束':'停止';if(!confirm(`${verb} ${id}？${force?' 将发送 SIGKILL。':''}`))return;try{await api(`/api/tasks/${encodeURIComponent(id)}/stop`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({force})});show(`${verb}请求已发送。`,false);await refreshAll();}catch(e){show(e.message);}}
+function formJSON(form){const out={};new FormData(form).forEach((v,k)=>out[k]=v);return out;}
+document.getElementById('policyDataset').addEventListener('change',()=>fillCheckpoints((latestStatus&&latestStatus.checkpoints)||[]));
+document.getElementById('replacePolicy').addEventListener('change',()=>updatePolicyOperation(true));
+document.getElementById('policyPort').addEventListener('input',updateClientCommand);
+document.getElementById('normForm').onsubmit=async e=>{e.preventDefault();const p=formJSON(e.target);if(!p.max_frames)delete p.max_frames;try{await api('/api/tasks/norm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});show('norm stats 任务已提交。',false);refreshAll();}catch(err){show(err.message);}};
+document.getElementById('trainForm').onsubmit=async e=>{e.preventDefault();const p=formJSON(e.target);p.gpu_ids=p.gpu_ids.split(',').map(x=>x.trim()).filter(Boolean);try{await api('/api/tasks/train',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});show('训练任务已提交。',false);refreshAll();}catch(err){show(err.message);}};
+document.getElementById('policyForm').onsubmit=async e=>{e.preventDefault();const p=formJSON(e.target);p.gpu_ids=p.gpu_ids.split(',').map(x=>x.trim()).filter(Boolean);const switching=Boolean(p.replace_task_id);if(switching&&!confirm(`确认停止 ${p.replace_task_id} 并切换到所选 checkpoint？`))return;try{const task=await api('/api/tasks/policy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});show(`${switching?'Policy 模型已切换':'Policy 进程已创建'}：${task.id}`,false);document.getElementById('replacePolicy').value='';await refreshAll();}catch(err){show(err.message);}};
+if(tokenInput.value){refreshAll();refreshObservation();}
+setInterval(()=>{if(tokenInput.value)refreshAll();},8000);
+setInterval(refreshObservation,1500);
+</script></body></html>
