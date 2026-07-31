@@ -15,8 +15,8 @@ Verify device IDs before connecting:
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
 import cv2
+import numpy as np
 
 # Default inference size. The delivery collector overrides this to 256x256.
 IMG_H, IMG_W = 224, 224
@@ -42,11 +42,13 @@ class CameraCapture:
         cam_ids: dict = None,
         fps: int = 30,
         image_hw: tuple[int, int] = (IMG_H, IMG_W),
+        capture_hw: tuple[int, int] | None = None,
         parallel_reads: bool = False,
     ):
         self._ids = cam_ids or dict(DEFAULT_CAM_IDS)
         self._fps = fps
         self._image_hw = tuple(image_hw)
+        self._capture_hw = tuple(capture_hw or image_hw)
         self._parallel_reads = parallel_reads
         self._caps: dict[str, cv2.VideoCapture] = {}
         self._executor: ThreadPoolExecutor | None = None
@@ -56,8 +58,8 @@ class CameraCapture:
             cap = cv2.VideoCapture(dev_id)
             if not cap.isOpened():
                 raise RuntimeError(f"Cannot open camera {key} at {dev_id}")
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self._image_hw[1])
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._image_hw[0])
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._capture_hw[1])
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._capture_hw[0])
             cap.set(cv2.CAP_PROP_FPS, self._fps)
             # disable internal buffering to reduce latency
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -84,7 +86,7 @@ class CameraCapture:
     def read(self) -> tuple[dict, dict]:
         """Return (images, timestamps).
 
-        images: {key: np.ndarray (H, W, 3) uint8 RGB}
+        images: {key: np.ndarray (3, H, W) uint8 RGB}
         timestamps: {key: float, unix seconds}
         """
         images, timestamps = {}, {}
@@ -134,8 +136,9 @@ class CameraCapture:
             ret, frame = cap.read()
             latency_ms = (time.time() - t0) * 1000
             results[key] = {
-                "ok":        ret,
-                "shape":     frame.shape if ret else None,   # raw HWC from OpenCV
+                "ok": ret,
+                "shape": frame.shape if ret else None,
                 "latency_ms": round(latency_ms, 1),
+                "fps": float(cap.get(cv2.CAP_PROP_FPS)),
             }
         return results

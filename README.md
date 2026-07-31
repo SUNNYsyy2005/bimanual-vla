@@ -32,7 +32,7 @@ bash start_gui.sh
 - 自动从已有编号继续保存，避免覆盖旧数据
 - 选择已保存的 episode 并启动双视角回放
 
-采集频率默认是交付规范要求的 `20 Hz`，可在 GUI 的 `Capture FPS` 中切换。最终导出到 Piper 训练集时必须使用 `20 Hz`。
+采集频率默认是交付规范要求的 `20 Hz`，可在 GUI 的 `Capture FPS` 中切换。两台 RealSense 的 `Camera source FPS` 默认是设备稳定支持的 `30 FPS`；采集器每 50 ms 从 30 FPS 相机流中读取一帧。最终导出到 Piper 训练集时必须使用 `20 Hz`。
 
 ### Piper delivery schema
 
@@ -90,6 +90,8 @@ python collect_output_arm.py \
   --can can0 \
   --cam-high-device /dev/video8 \
   --cam-wrist-device /dev/video16 \
+  --fps 20 \
+  --camera-fps 30 \
   --task-name pick_cube \
   --instruction "pick up the cube"
 ```

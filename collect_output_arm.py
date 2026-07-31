@@ -32,6 +32,8 @@ DEFAULT_CAN = "can0"
 DEFAULT_HIGH_DEVICE = "/dev/video8"
 DEFAULT_WRIST_DEVICE = "/dev/video16"
 DEFAULT_FPS = 20
+DEFAULT_CAMERA_FPS = 30
+CAMERA_SOURCE_HW = (240, 424)
 IMAGE_HW = (256, 256)
 GRIPPER_MAX_M = 0.07
 
@@ -222,9 +224,37 @@ def next_episode_index(out_dir: pathlib.Path) -> int:
     return max(indices, default=-1) + 1
 
 
+def verify_camera_streams(
+    cameras: CameraCapture,
+    expected_fps: int,
+) -> dict[str, dict]:
+    checks = cameras.verify()
+    failures = []
+    for key, info in checks.items():
+        if not info["ok"]:
+            failures.append(f"{key}: frame read failed")
+            continue
+        actual_fps = float(info["fps"])
+        if (
+            not np.isfinite(actual_fps)
+            or abs(actual_fps - expected_fps) / expected_fps > 0.05
+        ):
+            failures.append(
+                f"{key}: requested {expected_fps} FPS but negotiated "
+                f"{actual_fps:.3f} FPS"
+            )
+    if failures:
+        raise RuntimeError("Camera verification failed: " + "; ".join(failures))
+    return checks
+
+
 def run(args):
     if args.fps <= 0:
         raise ValueError("fps must be positive")
+    if args.camera_fps <= 0:
+        raise ValueError("camera-fps must be positive")
+    if args.fps > args.camera_fps:
+        raise ValueError("dataset fps cannot exceed camera-fps")
     print(f"Connecting to output arm on {args.can} ...")
     piper = connect(args.can)
     cameras = CameraCapture(
@@ -232,13 +262,23 @@ def run(args):
             "cam_high": args.cam_high_device,
             "cam_wrist": args.cam_wrist_device,
         },
-        fps=args.fps,
+        fps=args.camera_fps,
         image_hw=IMAGE_HW,
+        capture_hw=CAMERA_SOURCE_HW,
         parallel_reads=True,
     )
-    cameras.open()
-    for key, info in cameras.verify().items():
-        print(f"  {key}: {'OK' if info['ok'] else 'FAIL'} {info['shape']} {info['latency_ms']} ms")
+    try:
+        cameras.open()
+        checks = verify_camera_streams(cameras, args.camera_fps)
+    except Exception:
+        cameras.close()
+        piper.DisconnectPort()
+        raise
+    for key, info in checks.items():
+        print(
+            f"  {key}: OK {info['shape']} @ {info['fps']:.1f} FPS, "
+            f"read {info['latency_ms']} ms"
+        )
 
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -299,6 +339,7 @@ def main():
     ap.add_argument("--cam-high-device", default=DEFAULT_HIGH_DEVICE)
     ap.add_argument("--cam-wrist-device", default=DEFAULT_WRIST_DEVICE)
     ap.add_argument("--fps", type=int, default=DEFAULT_FPS)
+    ap.add_argument("--camera-fps", type=int, default=DEFAULT_CAMERA_FPS)
     ap.add_argument("--out-dir", default="episodes_piper_v21")
     ap.add_argument("--task-name", default="output_arm_task")
     ap.add_argument("--instruction", default=None)

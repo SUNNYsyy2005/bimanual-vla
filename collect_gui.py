@@ -21,7 +21,9 @@ import cv2
 
 from camera import CameraCapture
 from collect_output_arm import (
+    CAMERA_SOURCE_HW,
     DEFAULT_CAN,
+    DEFAULT_CAMERA_FPS,
     DEFAULT_HIGH_DEVICE,
     DEFAULT_WRIST_DEVICE,
     EpisodeBuffer,
@@ -30,6 +32,7 @@ from collect_output_arm import (
     next_episode_index,
     read_output_state,
     reset_output_arm,
+    verify_camera_streams,
 )
 
 
@@ -37,7 +40,7 @@ class CollectorGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Piper Data Collection Tool")
-        self.root.geometry("1000x780")
+        self.root.geometry("1000x830")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         self.piper = None
@@ -52,11 +55,13 @@ class CollectorGUI:
         self.recording = False
         self.episode_index = 0
         self.capture_fps = 20
+        self.camera_fps = DEFAULT_CAMERA_FPS
 
         self.can_var = tk.StringVar(value=DEFAULT_CAN)
         self.high_var = tk.StringVar(value="/dev/video8")
         self.wrist_var = tk.StringVar(value="/dev/video16")
         self.fps_var = tk.StringVar(value="20")
+        self.camera_fps_var = tk.StringVar(value=str(DEFAULT_CAMERA_FPS))
         self.out_var = tk.StringVar(value="episodes_piper_v21")
         self.task_var = tk.StringVar(value="pick_cube")
         self.instruction_var = tk.StringVar(value="pick up the cube")
@@ -84,6 +89,7 @@ class CollectorGUI:
             ("Third-person RGB", self.high_var),
             ("Wrist RGB", self.wrist_var),
             ("Capture FPS", self.fps_var),
+            ("Camera source FPS", self.camera_fps_var),
             ("Output directory", self.out_var),
             ("Task name", self.task_var),
             ("Instruction", self.instruction_var),
@@ -131,28 +137,38 @@ class CollectorGUI:
             return
         try:
             fps = int(self.fps_var.get())
+            camera_fps = int(self.camera_fps_var.get())
             if fps <= 0:
                 raise ValueError("Capture FPS must be positive")
+            if camera_fps <= 0:
+                raise ValueError("Camera source FPS must be positive")
+            if fps > camera_fps:
+                raise ValueError("Capture FPS cannot exceed camera source FPS")
             self.capture_fps = fps
+            self.camera_fps = camera_fps
             self.status_var.set("Connecting to robot and cameras...")
             self.root.update_idletasks()
             self.piper = connect(self.can_var.get().strip())
             self.cameras = CameraCapture(
                 cam_ids={"cam_high": self.high_var.get().strip(), "cam_wrist": self.wrist_var.get().strip()},
-                fps=fps,
+                fps=camera_fps,
                 image_hw=IMAGE_HW,
+                capture_hw=CAMERA_SOURCE_HW,
                 parallel_reads=True,
             )
             self.cameras.open()
-            checks = self.cameras.verify()
-            bad = [key for key, info in checks.items() if not info["ok"]]
-            if bad:
-                raise RuntimeError(f"Camera verification failed: {bad}")
+            checks = verify_camera_streams(self.cameras, camera_fps)
             self.episode_index = next_episode_index(self.out_dir)
             self.capture_stop = threading.Event()
             self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
             self.capture_thread.start()
-            self.status_var.set(f"Connected: {self.can_var.get()} | Next episode: {self.episode_index:04d}")
+            camera_status = ", ".join(
+                f"{key}={info['fps']:.0f}FPS" for key, info in checks.items()
+            )
+            self.status_var.set(
+                f"Connected: {self.can_var.get()} | Capture={fps}FPS | "
+                f"{camera_status} | Next episode: {self.episode_index:04d}"
+            )
             self.connect_button.configure(text="Disconnect devices")
             self.start_button.configure(state="normal")
             self.reset_button.configure(state="normal")
