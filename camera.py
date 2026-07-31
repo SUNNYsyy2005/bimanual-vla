@@ -13,6 +13,8 @@ Verify device IDs before connecting:
 """
 
 import time
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import cv2
 
@@ -35,11 +37,19 @@ class CameraCapture:
     cam_ids: dict mapping π0.5 camera key → /dev/videoN index.
     """
 
-    def __init__(self, cam_ids: dict = None, fps: int = 30, image_hw: tuple[int, int] = (IMG_H, IMG_W)):
+    def __init__(
+        self,
+        cam_ids: dict = None,
+        fps: int = 30,
+        image_hw: tuple[int, int] = (IMG_H, IMG_W),
+        parallel_reads: bool = False,
+    ):
         self._ids = cam_ids or dict(DEFAULT_CAM_IDS)
         self._fps = fps
         self._image_hw = tuple(image_hw)
+        self._parallel_reads = parallel_reads
         self._caps: dict[str, cv2.VideoCapture] = {}
+        self._executor: ThreadPoolExecutor | None = None
 
     def open(self):
         for key, dev_id in self._ids.items():
@@ -52,11 +62,24 @@ class CameraCapture:
             # disable internal buffering to reduce latency
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             self._caps[key] = cap
+        if self._parallel_reads and len(self._caps) > 1:
+            self._executor = ThreadPoolExecutor(
+                max_workers=len(self._caps),
+                thread_name_prefix="camera-read",
+            )
 
     def close(self):
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
         for cap in self._caps.values():
             cap.release()
         self._caps.clear()
+
+    @staticmethod
+    def _read_frame(cap: cv2.VideoCapture) -> tuple[bool, np.ndarray | None, float]:
+        ret, frame = cap.read()
+        return ret, frame, time.time()
 
     def read(self) -> tuple[dict, dict]:
         """Return (images, timestamps).
@@ -65,9 +88,20 @@ class CameraCapture:
         timestamps: {key: float, unix seconds}
         """
         images, timestamps = {}, {}
-        for key, cap in self._caps.items():
-            ret, frame = cap.read()
-            timestamps[key] = time.time()
+        if self._executor is None:
+            results = {
+                key: self._read_frame(cap)
+                for key, cap in self._caps.items()
+            }
+        else:
+            futures = {
+                key: self._executor.submit(self._read_frame, cap)
+                for key, cap in self._caps.items()
+            }
+            results = {key: future.result() for key, future in futures.items()}
+
+        for key, (ret, frame, timestamp) in results.items():
+            timestamps[key] = timestamp
             if not ret:
                 raise RuntimeError(f"Camera {key} read failed")
             # OpenCV returns BGR HWC -> RGB HWC. Preserve aspect ratio and pad
