@@ -22,7 +22,7 @@
 启动：
 
 ```bash
-cd /home/user/dual_ARM_project/bimanual-vla
+cd /home/user/dual_ARM_project/arm_collect/bimanual-vla
 bash start_gui.sh
 ```
 
@@ -78,6 +78,26 @@ python export_lerobot.py \
 ```
 
 导出使用 `instruction` 写入 LeRobot `meta/tasks.jsonl`，内部 `task` ID 不会作为训练 prompt。只检查、不写 LeRobot 数据时可在上述命令后加 `--validate-only`。
+
+### Collection UI backend
+
+新的采集 UI 不应自行构造 `state`、`actions` 或 NPZ 字典。统一调用：
+
+- `piper_data_contract.py`：唯一的数据协议定义与 episode 序列化实现；
+- `collection_session.py`：连接、开始、采样、停止、保存、丢弃状态机；
+- `validate_piper_data.py`：保存后的强制协议验收；
+- `PIPER_DATA_CONTRACT.md`：UI 事件到后端方法的映射。
+
+运行协议回归测试：
+
+```bash
+python -m unittest -v test_piper_data_contract.py
+```
+
+注意：`convert_output_arm_npz.py`、`check_pi05_dataset.py`、`teleop.py` 和
+`teleop_single.py` 属于旧的 7D 关节空间链路，不能作为新 10D EEF 采集 UI
+的保存后端。
+
 - 轨迹保存 / 回放：`trajectory.py`
 - 导出可直接用于 pi0.5 / openpi 训练的 LeRobot 风格数据集：`pi0_dataset.py`
 - openpi / pi0.5 实机推理桥接：`serve_piper.py`、`run.py`

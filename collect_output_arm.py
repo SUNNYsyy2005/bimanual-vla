@@ -22,6 +22,14 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from camera import CameraCapture
+from piper_data_contract import (
+    DEFAULT_FPS,
+    IMAGE_HW,
+    EpisodeBuffer,
+    build_actions as _build_actions,
+    build_delivery_state,
+    gripper_closed_fraction,
+)
 from piper_sdk import C_PiperInterface_V2
 from teleop import KeyListener
 
@@ -31,11 +39,8 @@ GRIPPER_FACTOR = 1_000_000.0  # Piper unit: 0.001 mm -> metre
 DEFAULT_CAN = "can0"
 DEFAULT_HIGH_DEVICE = "/dev/video8"
 DEFAULT_WRIST_DEVICE = "/dev/video16"
-DEFAULT_FPS = 20
 DEFAULT_CAMERA_FPS = 30
 CAMERA_SOURCE_HW = (240, 424)
-IMAGE_HW = (256, 256)
-GRIPPER_MAX_M = 0.07
 
 
 def read_output_qpos(piper: C_PiperInterface_V2) -> np.ndarray:
@@ -56,11 +61,6 @@ def read_output_qpos(piper: C_PiperInterface_V2) -> np.ndarray:
     return np.append(values, float(gripper.grippers_angle) / GRIPPER_FACTOR)
 
 
-def gripper_closed_fraction(gripper_m: float) -> float:
-    """Map Piper gripper position to 0=open, 1=closed."""
-    return float(np.clip(1.0 - gripper_m / GRIPPER_MAX_M, 0.0, 1.0))
-
-
 def read_output_state(piper: C_PiperInterface_V2) -> tuple[np.ndarray, np.ndarray]:
     """Return delivery state (10D) and diagnostic joint qpos (7D)."""
     qpos = read_output_qpos(piper)
@@ -68,9 +68,8 @@ def read_output_state(piper: C_PiperInterface_V2) -> tuple[np.ndarray, np.ndarra
     xyz_m = np.array([pose.X_axis, pose.Y_axis, pose.Z_axis], dtype=np.float64) / 1_000_000.0
     rpy_rad = np.deg2rad(np.array([pose.RX_axis, pose.RY_axis, pose.RZ_axis], dtype=np.float64) / 1000.0)
     rotation = Rotation.from_euler("xyz", rpy_rad).as_matrix()
-    rotation6d = rotation[:, :2].T.reshape(-1)
-    state = np.concatenate(([xyz_m[0], xyz_m[1], xyz_m[2]], rotation6d, [gripper_closed_fraction(float(qpos[6]))]))
-    return state.astype(np.float32), qpos.astype(np.float32)
+    state = build_delivery_state(xyz_m, rotation, float(qpos[6]))
+    return state, qpos.astype(np.float32)
 
 
 def send_output_qpos(piper: C_PiperInterface_V2, qpos: np.ndarray):
@@ -95,106 +94,6 @@ def reset_output_arm(
         alpha = step / steps
         send_output_qpos(piper, current + alpha * (target - current))
         time.sleep(1.0 / hz)
-
-
-class EpisodeBuffer:
-    def __init__(self, fps: int = DEFAULT_FPS):
-        if fps <= 0:
-            raise ValueError("fps must be positive")
-        self.fps = fps
-        self.start()
-
-    def start(self):
-        self.states: list[np.ndarray] = []
-        self.joint_qpos: list[np.ndarray] = []
-        self.timestamps: list[float] = []
-        self.images: dict[str, list[np.ndarray]] = {}
-        self.image_timestamps: dict[str, list[float]] = {}
-
-    def add(
-        self,
-        state: np.ndarray,
-        images: dict[str, np.ndarray],
-        image_ts: dict[str, float],
-        qpos: np.ndarray | None = None,
-        state_timestamp: float | None = None,
-    ):
-        now = time.time() if state_timestamp is None else float(state_timestamp)
-        self.states.append(np.asarray(state, dtype=np.float32).copy())
-        if qpos is not None:
-            self.joint_qpos.append(np.asarray(qpos, dtype=np.float32).copy())
-        self.timestamps.append(now)
-        for key, image in images.items():
-            # CameraCapture returns CHW; delivery format is RGB HWC.
-            frame = np.asarray(image, dtype=np.uint8)
-            if frame.ndim == 3 and frame.shape[0] == 3:
-                frame = frame.transpose(1, 2, 0)
-            self.images.setdefault(key, []).append(frame.copy())
-            self.image_timestamps.setdefault(key, []).append(float(image_ts.get(key, now)))
-
-    def __len__(self):
-        return len(self.states)
-
-    def save(self, path: pathlib.Path, task_name: str, instruction: str, success: bool):
-        if not self.states:
-            raise ValueError("cannot save an empty episode")
-        instruction = instruction.strip()
-        if not instruction:
-            raise ValueError("instruction must not be empty")
-        states_real = np.asarray(self.states, dtype=np.float32)
-        # Add one terminal observation. Its action becomes the required no-op.
-        states = np.concatenate((states_real, states_real[-1:]), axis=0)
-        actions = _build_actions(states)
-        timestamps = np.asarray(self.timestamps, dtype=np.float64)
-        terminal_dt = 1.0 / self.fps
-        timestamps = np.concatenate((timestamps, [timestamps[-1] + terminal_dt]))
-        payload: dict[str, np.ndarray] = {
-            "state": states,
-            "actions": actions,
-            "timestamps": timestamps,
-            "task": np.asarray(task_name),
-            "instruction": np.asarray(instruction),
-            "success": np.asarray(bool(success), dtype=np.bool_),
-        }
-        if self.joint_qpos:
-            qpos = np.asarray(self.joint_qpos, dtype=np.float32)
-            payload["joint_qpos"] = np.concatenate((qpos, qpos[-1:]), axis=0)
-        high = np.asarray(self.images["cam_high"], dtype=np.uint8)
-        wrist = np.asarray(self.images["cam_wrist"], dtype=np.uint8)
-        payload["image"] = np.concatenate((high, high[-1:]), axis=0)
-        payload["wrist_image"] = np.concatenate((wrist, wrist[-1:]), axis=0)
-        for key, timestamps in self.image_timestamps.items():
-            image_ts = np.asarray(timestamps, dtype=np.float64)
-            payload[f"image_timestamps_{key}"] = np.concatenate((image_ts, [image_ts[-1]]))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(path, **payload)
-        print(f"Saved {len(self)} steps -> {path}")
-
-
-def _rotation_from_state(state: np.ndarray) -> np.ndarray:
-    c0 = np.asarray(state[3:6], dtype=np.float64)
-    c1 = np.asarray(state[6:9], dtype=np.float64)
-    c0 /= max(np.linalg.norm(c0), 1e-12)
-    c1 = c1 - c0 * np.dot(c0, c1)
-    c1 /= max(np.linalg.norm(c1), 1e-12)
-    c2 = np.cross(c0, c1)
-    return np.column_stack((c0, c1, c2))
-
-
-def _build_actions(states: np.ndarray) -> np.ndarray:
-    """Build 7D base-frame delta actions plus a terminal no-op."""
-    count = len(states)
-    actions = np.zeros((count, 7), dtype=np.float32)
-    for i in range(max(0, count - 1)):
-        r_t = _rotation_from_state(states[i])
-        r_next = _rotation_from_state(states[i + 1])
-        delta_rotvec = Rotation.from_matrix(r_next @ r_t.T).as_rotvec()
-        actions[i, :3] = states[i + 1, :3] - states[i, :3]
-        actions[i, 3:6] = delta_rotvec.astype(np.float32)
-        actions[i, 6] = states[i + 1, 9]
-    if count:
-        actions[-1, 6] = states[-1, 9]
-    return actions
 
 
 def connect(can_name: str) -> C_PiperInterface_V2:

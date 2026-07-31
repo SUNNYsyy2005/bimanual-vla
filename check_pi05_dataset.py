@@ -95,14 +95,49 @@ def check_dataset(root: Path) -> list[str]:
     fps = int(info.get("fps", 0))
     if fps <= 0:
         errors.append(f"invalid fps={fps}")
-    offset = int(info.get("action_offset", 0))
-    semantics = info.get("action_semantics")
-    if semantics != "absolute_next_joint_position":
-        errors.append(f"action_semantics={semantics!r}, expected 'absolute_next_joint_position'")
-
-    camera_keys = [key for key, feature in info.get("features", {}).items() if feature.get("dtype") == "video"]
-    if len(camera_keys) != 2 or "observation.images.cam_high" not in camera_keys or not any("wrist" in key for key in camera_keys):
-        errors.append(f"expected cam_high + one wrist video feature, found {camera_keys}")
+    features = info.get("features", {})
+    delivery = (
+        features.get("state", {}).get("shape") == [10]
+        and features.get("actions", {}).get("shape") == [7]
+    )
+    joint = (
+        features.get("observation.state", {}).get("shape") == [7]
+        and features.get("action", {}).get("shape") == [7]
+    )
+    if delivery:
+        schema = "delivery"
+        state_key = "state"
+        action_key = "actions"
+        state_dim = 10
+        semantics = info.get("action_semantics")
+        expected_semantics = "eef_delta_base_xyz_left_rotvec_gripper_target"
+        if semantics not in {None, expected_semantics}:
+            errors.append(f"action_semantics={semantics!r}, expected {expected_semantics!r}")
+        camera_keys = [key for key in ("image", "wrist_image") if key in features]
+        if camera_keys != ["image", "wrist_image"]:
+            errors.append(f"expected image + wrist_image features, found {camera_keys}")
+        offset = None
+    elif joint:
+        schema = "joint"
+        state_key = "observation.state"
+        action_key = "action"
+        state_dim = 7
+        offset = int(info.get("action_offset", 0))
+        semantics = info.get("action_semantics")
+        if semantics != "absolute_next_joint_position":
+            errors.append(f"action_semantics={semantics!r}, expected 'absolute_next_joint_position'")
+        camera_keys = [key for key, feature in features.items() if feature.get("dtype") == "video"]
+        if (
+            len(camera_keys) != 2
+            or "observation.images.cam_high" not in camera_keys
+            or not any("wrist" in key for key in camera_keys)
+        ):
+            errors.append(f"expected cam_high + one wrist video feature, found {camera_keys}")
+    else:
+        return [
+            "unsupported schema: expected delivery state/actions [10]/[7] "
+            "or joint observation.state/action [7]/[7]"
+        ]
 
     parquets = sorted((root / "data").glob("chunk-*/episode_*.parquet"))
     if len(parquets) != int(info.get("total_episodes", -1)):
@@ -110,27 +145,34 @@ def check_dataset(root: Path) -> list[str]:
     total_frames = 0
     for episode_index, path in enumerate(parquets):
         table = pq.read_table(path)
-        required = {"observation.state", "action", "timestamp", "frame_index", "episode_index", "index", "task_index"}
+        required = {state_key, action_key, "timestamp", "frame_index", "episode_index", "index", "task_index"}
+        if delivery:
+            required.update(camera_keys)
         missing = sorted(required - set(table.column_names))
         if missing:
             errors.append(f"{path}: missing columns {missing}")
             continue
-        states = np.asarray(table["observation.state"].to_pylist(), dtype=np.float32)
-        actions = np.asarray(table["action"].to_pylist(), dtype=np.float32)
+        states = np.asarray(table[state_key].to_pylist(), dtype=np.float32)
+        actions = np.asarray(table[action_key].to_pylist(), dtype=np.float32)
         timestamps = np.asarray(table["timestamp"], dtype=np.float32)
         total_frames += len(states)
-        if states.ndim != 2 or states.shape[1] != 7:
-            errors.append(f"{path}: state shape {states.shape}, expected (T, 7)")
-        if actions.shape != states.shape:
-            errors.append(f"{path}: action shape {actions.shape} != state shape {states.shape}")
-        elif not np.array_equal(actions, derive_absolute_actions(states, offset)):
+        if states.ndim != 2 or states.shape[1] != state_dim:
+            errors.append(f"{path}: state shape {states.shape}, expected (T, {state_dim})")
+        expected_action_shape = (len(states), 7)
+        if actions.shape != expected_action_shape:
+            errors.append(f"{path}: action shape {actions.shape}, expected {expected_action_shape}")
+        elif joint and not np.array_equal(actions, derive_absolute_actions(states, offset)):
             errors.append(f"{path}: actions do not match shifted absolute qpos with offset={offset}")
+        if not np.isfinite(states).all() or not np.isfinite(actions).all():
+            errors.append(f"{path}: state/action contains NaN/Inf")
         expected_ts = np.arange(len(states), dtype=np.float32) / fps if fps else np.zeros(len(states), np.float32)
         if not np.allclose(timestamps, expected_ts, atol=1e-6):
             errors.append(f"{path}: timestamps are not frame_index/fps")
 
         chunk = episode_index // int(info.get("chunks_size", 1000))
         for video_key in camera_keys:
+            if features[video_key].get("dtype") != "video":
+                continue
             video = root / info["video_path"].format(
                 episode_chunk=chunk,
                 video_key=video_key,
@@ -150,7 +192,7 @@ def check_dataset(root: Path) -> list[str]:
     if not errors:
         print(
             f"OK LeRobot v2.1: {root} | episodes={len(parquets)} frames={total_frames} "
-            f"fps={fps} cameras={camera_keys} action_offset={offset}"
+            f"fps={fps} schema={schema} cameras={camera_keys} action_offset={offset}"
         )
     return errors
 

@@ -19,20 +19,13 @@ from tkinter import messagebox, ttk
 
 import cv2
 
-from camera import CameraCapture
+from collection_session import CollectionConfig, CollectionSession, SessionState
 from collect_output_arm import (
-    CAMERA_SOURCE_HW,
     DEFAULT_CAN,
     DEFAULT_CAMERA_FPS,
     DEFAULT_HIGH_DEVICE,
     DEFAULT_WRIST_DEVICE,
-    EpisodeBuffer,
-    IMAGE_HW,
-    connect,
-    next_episode_index,
-    read_output_state,
     reset_output_arm,
-    verify_camera_streams,
 )
 
 
@@ -43,6 +36,7 @@ class CollectorGUI:
         self.root.geometry("1000x830")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
+        self.session: CollectionSession | None = None
         self.piper = None
         self.cameras = None
         self.capture_thread: threading.Thread | None = None
@@ -50,7 +44,6 @@ class CollectorGUI:
         self.reset_thread: threading.Thread | None = None
         self.data_lock = threading.Lock()
         self.latest_images = {}
-        self.buffer: EpisodeBuffer | None = None
         self.messages: queue.Queue = queue.Queue()
         self.recording = False
         self.episode_index = 0
@@ -148,17 +141,20 @@ class CollectorGUI:
             self.camera_fps = camera_fps
             self.status_var.set("Connecting to robot and cameras...")
             self.root.update_idletasks()
-            self.piper = connect(self.can_var.get().strip())
-            self.cameras = CameraCapture(
-                cam_ids={"cam_high": self.high_var.get().strip(), "cam_wrist": self.wrist_var.get().strip()},
-                fps=camera_fps,
-                image_hw=IMAGE_HW,
-                capture_hw=CAMERA_SOURCE_HW,
-                parallel_reads=True,
+            self.session = CollectionSession(
+                CollectionConfig(
+                    can_name=self.can_var.get().strip(),
+                    cam_high_device=self.high_var.get().strip(),
+                    cam_wrist_device=self.wrist_var.get().strip(),
+                    capture_fps=fps,
+                    camera_fps=camera_fps,
+                    output_dir=self.out_dir,
+                )
             )
-            self.cameras.open()
-            checks = verify_camera_streams(self.cameras, camera_fps)
-            self.episode_index = next_episode_index(self.out_dir)
+            checks = self.session.connect()
+            self.piper = self.session.piper
+            self.cameras = self.session.cameras
+            self.episode_index = self.session.episode_index
             self.capture_stop = threading.Event()
             self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
             self.capture_thread.start()
@@ -178,14 +174,25 @@ class CollectorGUI:
             messagebox.showerror("Connection failed", str(exc))
 
     def start_episode(self):
-        if self.piper is None or self.cameras is None or self.recording:
+        if self.session is None or self.recording:
             return
-        self.buffer = EpisodeBuffer(fps=self.capture_fps)
+        task_name = self.task_var.get().strip()
+        instruction = self.instruction_var.get().strip() or task_name.replace("_", " ")
+        try:
+            label = self.session.start_episode(task_name, instruction)
+        except Exception as exc:
+            messagebox.showerror("Cannot start episode", str(exc))
+            return
+        self.task_var.set(label.task_name)
+        self.instruction_var.set(label.instruction)
         self.recording = True
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.reset_button.configure(state="disabled")
-        self.status_var.set(f"Recording episode {self.episode_index:04d}")
+        self.status_var.set(
+            f"Recording episode {self.episode_index:04d} | "
+            f"Instruction: {label.instruction}"
+        )
         self.progress_var.set("Frames: 0")
 
     def _capture_loop(self):
@@ -195,22 +202,12 @@ class CollectorGUI:
         try:
             while not self.capture_stop.is_set():
                 t0 = time.time()
-                state, qpos = read_output_state(self.piper)
-                state_timestamp = time.time()
-                images, image_ts = self.cameras.read()
                 with self.data_lock:
+                    sample = self.session.capture_once()
+                    state = sample.state
+                    images = sample.images
                     self.latest_images = {key: value.copy() for key, value in images.items()}
-                    if self.recording and self.buffer is not None:
-                        self.buffer.add(
-                            state,
-                            images,
-                            image_ts,
-                            qpos=qpos,
-                            state_timestamp=state_timestamp,
-                        )
-                        count = len(self.buffer)
-                    else:
-                        count = 0
+                    count = self.session.frame_count if self.recording else 0
                 if self.recording:
                     self.messages.put(("progress", count, state.copy()))
                 delay = dt - (time.time() - t0)
@@ -223,6 +220,7 @@ class CollectorGUI:
         if not self.recording:
             return
         with self.data_lock:
+            self.session.stop_episode()
             self.recording = False
         self.stop_button.configure(state="disabled")
         self.status_var.set("Stopping and preparing the current episode...")
@@ -231,7 +229,9 @@ class CollectorGUI:
     def _finish_stop(self):
         self.start_button.configure(state="normal" if self.piper is not None else "disabled")
         self.reset_button.configure(state="normal" if self.piper is not None else "disabled")
-        if self.buffer is None or len(self.buffer) == 0:
+        if self.session is None or self.session.frame_count == 0:
+            if self.session is not None and self.session.state is SessionState.REVIEW:
+                self.session.discard_episode()
             self.status_var.set("The episode is empty and was not saved")
             return
         self._ask_label_and_save()
@@ -241,22 +241,34 @@ class CollectorGUI:
         dialog.title("Label current episode")
         dialog.transient(self.root)
         dialog.grab_set()
-        ttk.Label(dialog, text=f"Episode {self.episode_index:04d} | {len(self.buffer)} frames").pack(padx=20, pady=15)
+        ttk.Label(
+            dialog,
+            text=f"Episode {self.episode_index:04d} | {self.session.frame_count} frames",
+        ).pack(padx=20, pady=15)
         buttons = ttk.Frame(dialog)
         buttons.pack(pady=(0, 15))
 
         def finish(choice):
-            dialog.destroy()
             if choice == "discard":
-                self.buffer = None
+                self.session.discard_episode()
+                dialog.destroy()
                 self.status_var.set("Current episode discarded")
                 return
-            path = self.out_dir / f"ep_{self.episode_index:04d}.npz"
             instruction = self.instruction_var.get().strip() or self.task_var.get().replace("_", " ")
-            self.buffer.save(path, self.task_var.get().strip(), instruction, choice == "success")
-            self.episode_index += 1
-            self.buffer = None
-            self.status_var.set(f"Saved: {path}")
+            try:
+                path, stats = self.session.save_episode(
+                    success=(choice == "success"),
+                    task_name=self.task_var.get().strip(),
+                    instruction=instruction,
+                )
+            except Exception as exc:
+                messagebox.showerror("Episode validation failed", str(exc), parent=dialog)
+                return
+            self.episode_index = self.session.episode_index
+            dialog.destroy()
+            self.status_var.set(
+                f"Saved and validated: {path} | FPS={stats.actual_fps:.2f}"
+            )
             self.refresh_files()
 
         ttk.Button(buttons, text="Save as success", command=lambda: finish("success")).pack(side="left", padx=5)
@@ -264,7 +276,7 @@ class CollectorGUI:
         ttk.Button(buttons, text="Discard", command=lambda: finish("discard")).pack(side="left", padx=5)
 
     def reset_arm(self):
-        if self.piper is None or self.recording or self.reset_thread is not None:
+        if self.session is None or self.recording or self.reset_thread is not None:
             return
         confirmed = messagebox.askyesno(
             "Reset to Home",
@@ -361,10 +373,10 @@ class CollectorGUI:
         self.capture_thread = None
         self.capture_stop = None
         if self.cameras is not None:
-            self.cameras.close()
-        self.cameras = None
-        if self.piper is not None:
-            self.piper.DisconnectPort()
+            self.cameras = None
+        if self.session is not None:
+            self.session.disconnect(discard_review=True)
+        self.session = None
         self.piper = None
         cv2.destroyAllWindows()
 
@@ -386,6 +398,8 @@ class CollectorGUI:
             if not messagebox.askyesno("Exit", "The current episode is unsaved. Exit anyway?"):
                 return
             with self.data_lock:
+                if self.session is not None and self.session.state is SessionState.RECORDING:
+                    self.session.stop_episode()
                 self.recording = False
         self._cleanup_devices()
         self.root.destroy()

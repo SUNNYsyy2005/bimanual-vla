@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
+from piper_data_contract import LEROBOT_FEATURES
 from validate_piper_data import (
     EpisodeStats,
     EpisodeValidationError,
@@ -29,40 +30,14 @@ from validate_piper_data import (
 )
 
 
-FEATURES = {
-    "image": {
-        "dtype": "image",
-        "shape": (256, 256, 3),
-        "names": ["height", "width", "channel"],
-    },
-    "wrist_image": {
-        "dtype": "image",
-        "shape": (256, 256, 3),
-        "names": ["height", "width", "channel"],
-    },
-    "state": {
-        "dtype": "float32",
-        "shape": (10,),
-        "names": [
-            "eef_x_base_m", "eef_y_base_m", "eef_z_base_m",
-            "rotation6d_col0_x", "rotation6d_col0_y", "rotation6d_col0_z",
-            "rotation6d_col1_x", "rotation6d_col1_y", "rotation6d_col1_z",
-            "gripper_closed_fraction",
-        ],
-    },
-    "actions": {
-        "dtype": "float32",
-        "shape": (7,),
-        "names": [
-            "delta_x_base_m", "delta_y_base_m", "delta_z_base_m",
-            "delta_rx_base_rad", "delta_ry_base_rad", "delta_rz_base_rad",
-            "gripper_target_closed_fraction",
-        ],
-    },
-}
+FEATURES = LEROBOT_FEATURES
 
 
-def _validate_inputs(paths: list[Path], target_fps: float) -> list[EpisodeStats]:
+def _validate_inputs(
+    paths: list[Path],
+    target_fps: float,
+    allow_incomplete_gripper_coverage: bool = False,
+) -> list[EpisodeStats]:
     successful: list[EpisodeStats] = []
     coverage_candidates: list[EpisodeStats] = []
     failures: list[str] = []
@@ -78,19 +53,25 @@ def _validate_inputs(paths: list[Path], target_fps: float) -> list[EpisodeStats]
             if exc.stats is not None and exc.stats.success:
                 coverage_candidates.append(exc.stats)
 
-    coverage_error = None
+    dataset_errors = []
     try:
         validate_gripper_coverage(coverage_candidates)
+    except ValueError as exc:
+        if allow_incomplete_gripper_coverage:
+            print(f"WARNING: ignoring gripper coverage check: {exc}")
+        else:
+            dataset_errors.append(str(exc))
+    try:
         validate_instruction_consistency(coverage_candidates)
     except ValueError as exc:
-        coverage_error = str(exc)
+        dataset_errors.append(str(exc))
     if failures:
         details = "Input validation failed:\n\n" + "\n\n".join(failures)
-        if coverage_error:
-            details += f"\n\nDataset validation failed: {coverage_error}"
+        if dataset_errors:
+            details += f"\n\nDataset validation failed: {'; '.join(dataset_errors)}"
         raise SystemExit(details)
-    if coverage_error:
-        raise SystemExit(f"Input validation failed: {coverage_error}")
+    if dataset_errors:
+        raise SystemExit(f"Input validation failed: {'; '.join(dataset_errors)}")
     print(format_dataset_report(successful))
     return successful
 
@@ -113,7 +94,11 @@ def run(args):
     if not paths:
         raise SystemExit(f"No episodes found in {args.input_dir}")
 
-    successful = _validate_inputs(paths, target_fps=args.fps)
+    successful = _validate_inputs(
+        paths,
+        target_fps=args.fps,
+        allow_incomplete_gripper_coverage=args.allow_incomplete_gripper_coverage,
+    )
     if args.validate_only:
         print("Validation complete; no LeRobot dataset was written.")
         return
@@ -181,6 +166,11 @@ def main():
         "--validate-only",
         action="store_true",
         help="validate NPZ episodes without writing a LeRobot dataset",
+    )
+    ap.add_argument(
+        "--allow-incomplete-gripper-coverage",
+        action="store_true",
+        help="export even when successful episodes do not cover fully open and closed gripper states",
     )
     run(ap.parse_args())
 
