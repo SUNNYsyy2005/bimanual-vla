@@ -9,6 +9,13 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from piper_data_contract import (
+    ACTION_NAMES,
+    IMAGE_HW,
+    REQUIRED_EPISODE_FIELDS,
+    STATE_NAMES,
+)
+
 
 TARGET_FPS = 20.0
 FPS_TOLERANCE = 0.05
@@ -22,17 +29,7 @@ GRIPPER_OPEN_THRESHOLD = 0.1
 GRIPPER_CLOSED_THRESHOLD = 0.9
 GRIPPER_TRANSITION_THRESHOLD = 0.01
 
-REQUIRED_FIELDS = {
-    "state",
-    "actions",
-    "timestamps",
-    "image",
-    "wrist_image",
-    "instruction",
-    "success",
-    "image_timestamps_cam_high",
-    "image_timestamps_cam_wrist",
-}
+REQUIRED_FIELDS = set(REQUIRED_EPISODE_FIELDS)
 
 
 class EpisodeValidationError(ValueError):
@@ -158,17 +155,17 @@ def validate_episode(path: str | Path, target_fps: float = TARGET_FPS) -> Episod
         _require_exact_dtype(image_ts_high, np.float64, "image_timestamps_cam_high", errors)
         _require_exact_dtype(image_ts_wrist, np.float64, "image_timestamps_cam_wrist", errors)
 
-        if state.ndim != 2 or state.shape[1:] != (10,):
-            errors.append(f"state shape must be (T,10), got {state.shape}")
+        if state.ndim != 2 or state.shape[1:] != (len(STATE_NAMES),):
+            errors.append(f"state shape must be (T,{len(STATE_NAMES)}), got {state.shape}")
             frame_count = state.shape[0] if state.ndim else 0
         else:
             frame_count = len(state)
 
         expected_shapes = {
-            "actions": ((frame_count, 7), actions.shape),
+            "actions": ((frame_count, len(ACTION_NAMES)), actions.shape),
             "timestamps": ((frame_count,), timestamps.shape),
-            "image": ((frame_count, 256, 256, 3), image.shape),
-            "wrist_image": ((frame_count, 256, 256, 3), wrist_image.shape),
+            "image": ((frame_count, *IMAGE_HW, 3), image.shape),
+            "wrist_image": ((frame_count, *IMAGE_HW, 3), wrist_image.shape),
             "image_timestamps_cam_high": ((frame_count,), image_ts_high.shape),
             "image_timestamps_cam_wrist": ((frame_count,), image_ts_wrist.shape),
         }
@@ -187,7 +184,7 @@ def validate_episode(path: str | Path, target_fps: float = TARGET_FPS) -> Episod
                 errors.append("joint_qpos contains NaN or Inf")
 
         shapes_valid = all(expected == actual for expected, actual in expected_shapes.values())
-        state_shape_valid = state.ndim == 2 and state.shape == (frame_count, 10)
+        state_shape_valid = state.ndim == 2 and state.shape == (frame_count, len(STATE_NAMES))
         if frame_count < 3:
             errors.append("episode must contain at least two real frames and one terminal frame")
 
@@ -268,7 +265,7 @@ def validate_episode(path: str | Path, target_fps: float = TARGET_FPS) -> Episod
             if np.array_equal(image[:real_frames], wrist_image[:real_frames]):
                 errors.append("image and wrist_image are identical; check the two camera mappings")
 
-        action_shape_valid = actions.shape == (frame_count, 7)
+        action_shape_valid = actions.shape == (frame_count, len(ACTION_NAMES))
         state_numeric_valid = frame_count > 0 and state_shape_valid and _is_finite(state)
         action_numeric_valid = frame_count > 0 and action_shape_valid and _is_finite(actions)
         rotation_state_valid = False

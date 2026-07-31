@@ -21,18 +21,23 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from camera import CameraCapture
+from piper_data_contract import (
+    ACTION_NAMES,
+    GRIPPER_MAX_M,
+    IMAGE_HW,
+    STATE_NAMES,
+    build_delivery_state,
+)
 
 
 RAD_FACTOR = 57295.7795  # Piper unit: 0.001 degree -> rad
 GRIPPER_FACTOR = 1_000_000.0  # Piper unit: 0.001 mm -> metre
-GRIPPER_MAX_M = 0.07
 DEFAULT_POLICY_HOST = "192.168.101.9"
 DEFAULT_POLICY_PORT = 8000
 DEFAULT_CAN = "can0"
 DEFAULT_HIGH_DEVICE = "/dev/video8"
 DEFAULT_WRIST_DEVICE = "/dev/video16"
 CAMERA_SOURCE_HW = (240, 424)
-IMAGE_HW = (256, 256)
 
 
 class ExecutionBlocked(RuntimeError):
@@ -73,11 +78,6 @@ def read_output_qpos(piper: Any) -> np.ndarray:
     return np.append(values, float(gripper.grippers_angle) / GRIPPER_FACTOR).astype(np.float32)
 
 
-def gripper_closed_fraction(gripper_m: float) -> float:
-    """Map Piper gripper position to 0=open, 1=closed."""
-    return float(np.clip(1.0 - gripper_m / GRIPPER_MAX_M, 0.0, 1.0))
-
-
 def rotation_from_state(state: np.ndarray) -> np.ndarray:
     """Recover an orthonormal rotation matrix from the delivery rotation6d."""
     c0 = np.asarray(state[3:6], dtype=np.float64)
@@ -103,9 +103,7 @@ def read_output_state(piper: Any) -> tuple[np.ndarray, np.ndarray]:
         np.array([pose.RX_axis, pose.RY_axis, pose.RZ_axis], dtype=np.float64) / 1000.0
     )
     rotation = Rotation.from_euler("xyz", rpy_rad).as_matrix()
-    rotation6d = rotation[:, :2].T.reshape(-1)
-    state = np.concatenate((xyz_m, rotation6d, [gripper_closed_fraction(float(qpos[6]))]))
-    return state.astype(np.float32), qpos
+    return build_delivery_state(xyz_m, rotation, float(qpos[6])), qpos
 
 
 def arm_status_dict(piper: Any) -> dict[str, Any]:
@@ -178,7 +176,7 @@ def first_action(result: dict[str, Any]) -> np.ndarray:
         action = actions[0]
     else:
         raise ExecutionBlocked(f"invalid action chunk shape {actions.shape}")
-    if action.shape != (7,) or not np.all(np.isfinite(action)):
+    if action.shape != (len(ACTION_NAMES),) or not np.all(np.isfinite(action)):
         raise ExecutionBlocked(f"first action must be finite 7D, got {action.shape}")
     return action
 
@@ -197,7 +195,7 @@ def build_checked_target(
     """Validate one delivery action and return target xyz, xyz Euler, gripper m."""
     state = np.asarray(state, dtype=np.float64)
     action = np.asarray(action, dtype=np.float64)
-    if state.shape != (10,) or not np.all(np.isfinite(state)):
+    if state.shape != (len(STATE_NAMES),) or not np.all(np.isfinite(state)):
         raise ExecutionBlocked("current delivery state is not finite 10D")
     translation_norm = float(np.linalg.norm(action[:3]))
     rotation_norm = float(np.linalg.norm(action[3:6]))

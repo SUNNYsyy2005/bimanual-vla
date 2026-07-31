@@ -60,7 +60,7 @@ def _bool(data, key: str, default: bool) -> bool:
 def load_episode(path: Path, *, arm_side: str, fps: int, action_offset: int, use_existing_actions: bool) -> dict:
     wrist_key = f"cam_{arm_side}_wrist"
     with np.load(path, allow_pickle=False) as data:
-        states, state_field = _array(data, ("qpos", "observation.state"))
+        states, state_field = _array(data, ("qpos", "joint_qpos", "observation.state"))
         states = np.asarray(states, dtype=np.float32)
 
         existing_actions, action_field = _array(data, ("actions", "action"), required=False)
@@ -83,7 +83,7 @@ def load_episode(path: Path, *, arm_side: str, fps: int, action_offset: int, use
 
         high, high_field = _array(
             data,
-            ("images_cam_high", "observation.images.cam_high"),
+            ("images_cam_high", "observation.images.cam_high", "image"),
         )
         wrist, wrist_field = _array(
             data,
@@ -96,6 +96,7 @@ def load_episode(path: Path, *, arm_side: str, fps: int, action_offset: int, use
                 "observation.images.cam_right_wrist",
                 "images_cam_left_wrist",
                 "observation.images.cam_left_wrist",
+                "wrist_image",
             ),
         )
         return {
@@ -106,7 +107,7 @@ def load_episode(path: Path, *, arm_side: str, fps: int, action_offset: int, use
                 "cam_high": np.asarray(high),
                 wrist_key: np.asarray(wrist),
             },
-            "task_name": _text(data, "task_name", "single_arm_task"),
+            "task_name": _text(data, "task_name", _text(data, "task", "single_arm_task")),
             "instruction": _text(data, "instruction", "single arm task"),
             "success": _bool(data, "success", True),
             "metadata": {
