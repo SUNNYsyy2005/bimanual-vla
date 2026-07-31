@@ -10,6 +10,7 @@ import contextlib
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 from pathlib import Path, PurePosixPath
@@ -34,6 +35,9 @@ REPO_DIR = APP_DIR.parent
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 TASK_TYPES = {"norm", "train", "policy"}
+PROCESS_STATES = {"starting", "running", "stopping"}
+WAITING_STATES = {"waiting_norm", "waiting_gpu"}
+TERMINAL_STATES = {"completed", "failed", "lost", "stopped"}
 
 
 def now_iso() -> str:
@@ -126,6 +130,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "policy_port_min": 8000,
         "policy_port_max": 8099,
         "robot_observation_max_age_s": 3.0,
+        "task_monitor_interval_s": 2.0,
     }
     defaults.update(config)
     for key in (
@@ -151,6 +156,17 @@ class TaskManager:
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.processes: dict[str, subprocess.Popen] = {}
+        self.monitor_interval_s = float(config.get("task_monitor_interval_s", 2.0))
+        self.monitor_wakeup = threading.Event()
+        self.monitor_stop = threading.Event()
+        self.monitor_thread: threading.Thread | None = None
+        if self.monitor_interval_s > 0:
+            self.monitor_thread = threading.Thread(
+                target=self._monitor_loop,
+                name="task-dependency-monitor",
+                daemon=True,
+            )
+            self.monitor_thread.start()
 
     def _path(self, task_id: str) -> Path:
         return self.root / safe_name(task_id, "task id") / "task.json"
@@ -158,8 +174,206 @@ class TaskManager:
     def _log_path(self, task_id: str) -> Path:
         return self.root / safe_name(task_id, "task id") / "task.log"
 
+    def _monitor_loop(self) -> None:
+        while not self.monitor_stop.is_set():
+            self.monitor_wakeup.wait(self.monitor_interval_s)
+            self.monitor_wakeup.clear()
+            if self.monitor_stop.is_set():
+                return
+            try:
+                self.list()
+            except Exception:
+                logging.getLogger(__name__).exception("task dependency monitor failed")
+
+    def close(self) -> None:
+        self.monitor_stop.set()
+        self.monitor_wakeup.set()
+        if self.monitor_thread is not None:
+            self.monitor_thread.join(timeout=max(1.0, self.monitor_interval_s + 0.5))
+
+    def _append_log(self, task: dict[str, Any], message: str) -> None:
+        with self._log_path(task["id"]).open("a", encoding="utf-8") as handle:
+            handle.write(f"[{now_iso()}] {message}\n")
+
+    def _new_task(
+        self,
+        task_type: str,
+        command: list[str],
+        metadata: dict[str, Any],
+        *,
+        state: str,
+    ) -> dict[str, Any]:
+        if task_type not in TASK_TYPES:
+            raise ValueError("unsupported task type")
+        task_id = f"{task_type}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        task_dir = self.root / task_id
+        task_dir.mkdir(parents=True)
+        task = {
+            "id": task_id,
+            "type": task_type,
+            "state": state,
+            "created_at": now_iso(),
+            "command": command,
+            "metadata": dict(metadata),
+            "log_path": str(task_dir / "task.log"),
+        }
+        atomic_json(task_dir / "task.json", task)
+        return task
+
+    def _launch(
+        self,
+        task: dict[str, Any],
+        *,
+        env: dict[str, str],
+        raise_on_error: bool,
+    ) -> dict[str, Any]:
+        task_id = task["id"]
+        task["state"] = "starting"
+        task["launch_attempted_at"] = now_iso()
+        task.pop("waiting_reason", None)
+        atomic_json(self._path(task_id), task)
+        log_handle = self._log_path(task_id).open("ab", buffering=0)
+        try:
+            process = subprocess.Popen(
+                task["command"],
+                cwd=self.config["openpi_repo"],
+                env=env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            task.update(
+                {
+                    "state": "failed",
+                    "start_error": str(exc),
+                    "finished_at": now_iso(),
+                }
+            )
+            atomic_json(self._path(task_id), task)
+            self._append_log(task, f"process launch failed: {exc}")
+            if raise_on_error:
+                raise
+            return task
+        finally:
+            log_handle.close()
+        task.update({"state": "running", "pid": process.pid, "started_at": now_iso()})
+        atomic_json(self._path(task_id), task)
+        self.processes[task_id] = process
+        self.monitor_wakeup.set()
+        return task
+
+    def _fail_dependency(self, task: dict[str, Any], reason: str) -> dict[str, Any]:
+        task.update(
+            {
+                "state": "failed",
+                "dependency_failed": True,
+                "dependency_error": reason,
+                "finished_at": now_iso(),
+            }
+        )
+        atomic_json(self._path(task["id"]), task)
+        self._append_log(task, reason)
+        return task
+
+    def _gpu_wait_reason(self, task: dict[str, Any]) -> str | None:
+        if self.config.get("allow_busy_gpus", False):
+            return None
+        gpu_ids = [int(item) for item in task.get("metadata", {}).get("gpu_ids", [])]
+        if not gpu_ids:
+            return "queued training task has no GPU ids"
+        requested = set(gpu_ids)
+        managed_busy: dict[int, list[str]] = {}
+        for path in self.root.glob("*/task.json"):
+            other = read_json(path)
+            if not isinstance(other, dict) or other.get("id") == task["id"]:
+                continue
+            if other.get("state") not in PROCESS_STATES or other.get("type") not in {"train", "policy"}:
+                continue
+            overlap = requested.intersection(other.get("metadata", {}).get("gpu_ids", []))
+            for gpu_id in overlap:
+                managed_busy.setdefault(gpu_id, []).append(other["id"])
+        if managed_busy:
+            return f"waiting for managed task(s) on GPU(s): {managed_busy}"
+        inventory = {gpu["index"]: gpu for gpu in gpu_inventory()}
+        external_busy = {
+            gpu_id: inventory.get(gpu_id, {}).get("processes", [])
+            for gpu_id in gpu_ids
+            if inventory.get(gpu_id, {}).get("processes")
+        }
+        if external_busy:
+            return f"waiting for busy GPU(s): {external_busy}"
+        return None
+
+    def _refresh_waiting(self, task: dict[str, Any]) -> dict[str, Any]:
+        dependency = task.get("dependency")
+        if not isinstance(dependency, dict):
+            return self._fail_dependency(task, "queued training task has no dependency record")
+        dependency_id = dependency.get("task_id")
+        artifact = dependency.get("artifact")
+        if not dependency_id or not artifact:
+            return self._fail_dependency(task, "queued training dependency is incomplete")
+
+        dependency_task = read_json(self._path(str(dependency_id)))
+        if isinstance(dependency_task, dict):
+            dependency_task = self._refresh(dependency_task)
+            task["dependency_state"] = dependency_task.get("state")
+        else:
+            task["dependency_state"] = "missing"
+
+        dependency_state = task.get("dependency_state")
+        artifact_exists = Path(str(artifact)).is_file()
+        dependency_ready = dependency_state == "completed" or (
+            dependency_state == "lost" and artifact_exists
+        )
+        if not dependency_ready:
+            if dependency_state in TERMINAL_STATES or dependency_state == "missing":
+                detail = None
+                if isinstance(dependency_task, dict):
+                    detail = dependency_task.get("start_error") or dependency_task.get("lost_reason")
+                    if detail is None and dependency_task.get("returncode") is not None:
+                        detail = f"returncode={dependency_task['returncode']}"
+                suffix = f": {detail}" if detail else ""
+                return self._fail_dependency(
+                    task,
+                    f"normalization dependency {dependency_id} ended as {dependency_state} without {artifact}{suffix}",
+                )
+            if task.get("state") != "waiting_norm":
+                task["state"] = "waiting_norm"
+                task.pop("waiting_reason", None)
+            atomic_json(self._path(task["id"]), task)
+            return task
+
+        if not artifact_exists:
+            return self._fail_dependency(task, f"normalization dependency {dependency_id} completed but missing {artifact}")
+
+        if dependency_state == "lost":
+            task["dependency_recovered_from_artifact"] = True
+
+        wait_reason = self._gpu_wait_reason(task)
+        if wait_reason:
+            changed = task.get("state") != "waiting_gpu" or task.get("waiting_reason") != wait_reason
+            task["state"] = "waiting_gpu"
+            task["waiting_reason"] = wait_reason
+            if changed:
+                atomic_json(self._path(task["id"]), task)
+            return task
+        task["dependency_resolved_at"] = now_iso()
+        task.pop("waiting_reason", None)
+        self._append_log(
+            task,
+            f"normalization dependency {dependency_id} is ready; starting training",
+        )
+        return self._launch(
+            task,
+            env=build_environment(self.config, task.get("metadata", {}).get("gpu_ids", [])),
+            raise_on_error=False,
+        )
+
     def _refresh(self, task: dict[str, Any]) -> dict[str, Any]:
-        if task.get("state") not in {"starting", "running", "stopping"}:
+        if task.get("state") in WAITING_STATES:
+            return self._refresh_waiting(task)
+        if task.get("state") not in PROCESS_STATES:
             return task
         task_id = task["id"]
         process = self.processes.get(task_id)
@@ -195,10 +409,11 @@ class TaskManager:
             return sorted(tasks, key=lambda item: item.get("created_at", ""), reverse=True)
 
     def get(self, task_id: str) -> dict[str, Any]:
-        task = read_json(self._path(task_id))
-        if not isinstance(task, dict):
-            raise FileNotFoundError(task_id)
-        return self._refresh(task)
+        with self.lock:
+            task = read_json(self._path(task_id))
+            if not isinstance(task, dict):
+                raise FileNotFoundError(task_id)
+            return self._refresh(task)
 
     def start(
         self,
@@ -207,45 +422,52 @@ class TaskManager:
         *,
         env: dict[str, str],
         metadata: dict[str, Any],
+        raise_on_error: bool = True,
     ) -> dict[str, Any]:
-        if task_type not in TASK_TYPES:
-            raise ValueError("unsupported task type")
         with self.lock:
-            task_id = f"{task_type}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
-            task_dir = self.root / task_id
-            task_dir.mkdir(parents=True)
-            log_path = task_dir / "task.log"
-            task = {
-                "id": task_id,
-                "type": task_type,
-                "state": "starting",
-                "created_at": now_iso(),
-                "command": command,
-                "metadata": metadata,
-                "log_path": str(log_path),
+            task = self._new_task(task_type, command, metadata, state="starting")
+            return self._launch(task, env=env, raise_on_error=raise_on_error)
+
+    def create_waiting_train(
+        self,
+        command: list[str],
+        *,
+        metadata: dict[str, Any],
+        norm_task: dict[str, Any],
+        norm_path: Path,
+    ) -> dict[str, Any]:
+        with self.lock:
+            metadata = {
+                **metadata,
+                "depends_on": norm_task["id"],
+                "dependency_type": "norm",
+                "norm_path": str(norm_path),
             }
-            atomic_json(task_dir / "task.json", task)
-            log_handle = log_path.open("ab", buffering=0)
-            try:
-                process = subprocess.Popen(
-                    command,
-                    cwd=self.config["openpi_repo"],
-                    env=env,
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-            finally:
-                log_handle.close()
-            task.update({"state": "running", "pid": process.pid, "started_at": now_iso()})
-            atomic_json(task_dir / "task.json", task)
-            self.processes[task_id] = process
+            task = self._new_task("train", command, metadata, state="waiting_norm")
+            task["queued_at"] = now_iso()
+            task["dependency"] = {
+                "task_id": norm_task["id"],
+                "type": "norm",
+                "artifact": str(norm_path),
+            }
+            task["dependency_state"] = norm_task.get("state")
+            atomic_json(self._path(task["id"]), task)
+            self._append_log(task, f"waiting for normalization dependency {norm_task['id']}")
+            self.monitor_wakeup.set()
             return task
 
     def stop(self, task_id: str, *, force: bool = False) -> dict[str, Any]:
         with self.lock:
             task = self.get(task_id)
-            if task["state"] not in {"starting", "running", "stopping"}:
+            if task["state"] in WAITING_STATES:
+                task["state"] = "stopped"
+                task["stop_requested_at"] = now_iso()
+                task["finished_at"] = now_iso()
+                task["stop_reason"] = "queued task cancelled before process launch"
+                atomic_json(self._path(task_id), task)
+                self._append_log(task, task["stop_reason"])
+                return task
+            if task["state"] not in PROCESS_STATES:
                 return task
             pid = int(task["pid"])
             process = self.processes.get(task_id)
@@ -979,6 +1201,7 @@ def create_app(config_path: Path) -> Flask:
         *,
         one_only: bool = False,
         ignored_pids: set[int] | None = None,
+        check_busy: bool = True,
     ) -> list[int]:
         raw = payload.get("gpu_ids", [0])
         if isinstance(raw, str):
@@ -990,6 +1213,8 @@ def create_app(config_path: Path) -> Flask:
             raise ValueError(f"GPU ids must be unique and within {sorted(allowed_gpus)}")
         if one_only and len(gpu_ids) != 1:
             raise ValueError("policy serving requires exactly one GPU")
+        if not check_busy:
+            return gpu_ids
         ignored_pids = ignored_pids or set()
         inventory = {gpu["index"]: gpu for gpu in gpu_inventory()}
         busy = {
@@ -1005,13 +1230,18 @@ def create_app(config_path: Path) -> Flask:
             raise ValueError(f"refusing busy GPU(s): {busy}")
         return gpu_ids
 
-    @app.post("/api/tasks/norm")
-    def start_norm():
-        payload = request.get_json(force=True)
-        dataset_id, arm_side, schema = parse_dataset(payload)
-        batch_size = safe_int(payload.get("batch_size", 16), "batch_size", 1, 1024)
-        num_workers = safe_int(payload.get("num_workers", 2), "num_workers", 1, 64)
-        max_frames = payload.get("max_frames")
+    def norm_stats_path(dataset_id: str) -> Path:
+        return Path(config["assets_base_dir"]) / "pi05_piper_single_arm_lora" / dataset_id / "norm_stats.json"
+
+    def build_norm_command(
+        dataset_id: str,
+        arm_side: str,
+        schema: str,
+        *,
+        batch_size: int,
+        num_workers: int,
+        max_frames: int | None = None,
+    ) -> list[str]:
         command = [
             config["openpi_python"], openpi_helper, "norm",
             "--dataset-id", dataset_id,
@@ -1023,12 +1253,41 @@ def create_app(config_path: Path) -> Flask:
             "--batch-size", str(batch_size),
             "--num-workers", str(num_workers),
         ]
-        if max_frames not in (None, ""):
-            command += ["--max-frames", str(safe_int(max_frames, "max_frames", 1, 10**9))]
+        if max_frames is not None:
+            command += ["--max-frames", str(max_frames)]
+        return command
+
+    @app.post("/api/tasks/norm")
+    def start_norm():
+        payload = request.get_json(force=True)
+        dataset_id, arm_side, schema = parse_dataset(payload)
+        batch_size = safe_int(payload.get("batch_size", 16), "batch_size", 1, 1024)
+        num_workers = safe_int(payload.get("num_workers", 2), "num_workers", 1, 64)
+        max_frames = payload.get("max_frames")
+        parsed_max_frames = (
+            None if max_frames in (None, "") else safe_int(max_frames, "max_frames", 1, 10**9)
+        )
+        command = build_norm_command(
+            dataset_id,
+            arm_side,
+            schema,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            max_frames=parsed_max_frames,
+        )
         task = tasks.start(
             "norm", command,
             env=build_environment(config, None),
-            metadata={"dataset_id": dataset_id, "arm_side": arm_side, "schema": schema},
+            metadata={
+                "dataset_id": dataset_id,
+                "arm_side": arm_side,
+                "schema": schema,
+                "batch_size": batch_size,
+                "num_workers": num_workers,
+                "max_frames": parsed_max_frames,
+                "norm_path": str(norm_stats_path(dataset_id)),
+                "automatic": False,
+            },
         )
         return jsonify(task), 201
 
@@ -1036,7 +1295,8 @@ def create_app(config_path: Path) -> Flask:
     def start_train():
         payload = request.get_json(force=True)
         dataset_id, arm_side, schema = parse_dataset(payload)
-        gpu_ids = parse_gpus(payload)
+        norm_path = norm_stats_path(dataset_id)
+        gpu_ids = parse_gpus(payload, check_busy=norm_path.is_file())
         exp_name = safe_name(payload.get("exp_name"), "experiment name")
         batch_size = safe_int(payload.get("batch_size", 8), "batch_size", 1, 1024)
         if batch_size % len(gpu_ids):
@@ -1050,9 +1310,6 @@ def create_app(config_path: Path) -> Flask:
         mode = str(payload.get("mode", "new"))
         if mode not in {"new", "resume", "overwrite"}:
             raise ValueError("mode must be new, resume, or overwrite")
-        norm_path = Path(config["assets_base_dir"]) / "pi05_piper_single_arm_lora" / dataset_id / "norm_stats.json"
-        if not norm_path.exists():
-            raise ValueError(f"normalization stats are missing; run norm first: {norm_path}")
         command = [
             config["openpi_python"], openpi_helper, "train",
             "--dataset-id", dataset_id,
@@ -1072,15 +1329,73 @@ def create_app(config_path: Path) -> Flask:
             command.append(f"--{mode}")
         if bool(payload.get("wandb_enabled", False)):
             command.append("--wandb-enabled")
-        task = tasks.start(
-            "train", command,
-            env=build_environment(config, gpu_ids),
-            metadata={
-                "dataset_id": dataset_id, "arm_side": arm_side, "schema": schema, "exp_name": exp_name,
-                "gpu_ids": gpu_ids, "steps": steps, "fsdp_devices": fsdp_devices,
-            },
-        )
-        return jsonify(task), 201
+        metadata = {
+            "dataset_id": dataset_id,
+            "arm_side": arm_side,
+            "schema": schema,
+            "exp_name": exp_name,
+            "gpu_ids": gpu_ids,
+            "steps": steps,
+            "fsdp_devices": fsdp_devices,
+        }
+        with tasks.lock:
+            # Re-check while holding the task lock so simultaneous submissions
+            # cannot create duplicate automatic norm jobs for the same dataset.
+            if norm_path.is_file():
+                gpu_ids = parse_gpus(payload)
+                metadata["gpu_ids"] = gpu_ids
+                task = tasks.start(
+                    "train",
+                    command,
+                    env=build_environment(config, gpu_ids),
+                    metadata=metadata,
+                )
+                return jsonify(task), 201
+
+            norm_task = next(
+                (
+                    item
+                    for item in tasks.list()
+                    if item.get("type") == "norm"
+                    and item.get("state") in {"starting", "running"}
+                    and item.get("metadata", {}).get("dataset_id") == dataset_id
+                    and item.get("metadata", {}).get("arm_side") == arm_side
+                    and item.get("metadata", {}).get("schema") == schema
+                ),
+                None,
+            )
+            if norm_task is None:
+                norm_batch_size = safe_int(payload.get("norm_batch_size", 16), "norm_batch_size", 1, 1024)
+                norm_num_workers = safe_int(payload.get("norm_num_workers", 2), "norm_num_workers", 1, 64)
+                norm_task = tasks.start(
+                    "norm",
+                    build_norm_command(
+                        dataset_id,
+                        arm_side,
+                        schema,
+                        batch_size=norm_batch_size,
+                        num_workers=norm_num_workers,
+                    ),
+                    env=build_environment(config, None),
+                    metadata={
+                        "dataset_id": dataset_id,
+                        "arm_side": arm_side,
+                        "schema": schema,
+                        "batch_size": norm_batch_size,
+                        "num_workers": norm_num_workers,
+                        "max_frames": None,
+                        "norm_path": str(norm_path),
+                        "automatic": True,
+                    },
+                    raise_on_error=False,
+                )
+            task = tasks.create_waiting_train(
+                command,
+                metadata=metadata,
+                norm_task=norm_task,
+                norm_path=norm_path,
+            )
+            return jsonify(task), 202
 
     @app.post("/api/tasks/policy")
     def start_policy():

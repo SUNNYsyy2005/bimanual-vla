@@ -11,6 +11,7 @@
   "allowed_gpu_ids": [0, 1, 2, 3],
   "allow_busy_gpus": false,
   "xla_memory_fraction": 0.95,
+  "task_monitor_interval_s": 2.0,
   "robot_observation_max_age_s": 3.0,
   "max_upload_gib": 500,
   "max_chunk_mib": 64,
