@@ -121,6 +121,49 @@ def process_matches_task(pid: int, task: dict[str, Any]) -> bool:
     return same_entrypoint and running[2] == str(command[2])
 
 
+def process_cmdline(pid: int) -> list[str]:
+    try:
+        return [
+            item.decode("utf-8", errors="surrogateescape")
+            for item in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if item
+        ]
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return []
+
+
+def _cmd_arg(command: list[str], flag: str) -> str | None:
+    prefix = flag + "="
+    for item in command:
+        if item.startswith(prefix):
+            return item[len(prefix):]
+    try:
+        index = command.index(flag)
+    except ValueError:
+        return None
+    if index + 1 >= len(command):
+        return None
+    return command[index + 1]
+
+
+def _is_policy_command(command: list[str]) -> bool:
+    joined = " ".join(command)
+    return (
+        "serve_policy.py" in joined
+        or ("openpi_single_arm.py" in joined and "serve" in command)
+    )
+
+
+def _policy_port_from_command(command: list[str]) -> int | None:
+    value = _cmd_arg(command, "--port")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
 def load_config(path: Path) -> dict[str, Any]:
     config = read_json(path)
     if not isinstance(config, dict):
@@ -461,6 +504,70 @@ class TaskManager:
             self.monitor_wakeup.set()
             return task
 
+    def _active_policy_pids(self) -> set[int]:
+        pids: set[int] = set()
+        for path in self.root.glob("*/task.json"):
+            task = read_json(path)
+            if not isinstance(task, dict):
+                continue
+            if task.get("type") != "policy" or task.get("state") not in PROCESS_STATES:
+                continue
+            if task.get("metadata", {}).get("external"):
+                continue
+            try:
+                pids.add(int(task.get("pid", 0)))
+            except (TypeError, ValueError):
+                continue
+        pids.discard(0)
+        return pids
+
+    def adopt_external_policy(
+        self,
+        *,
+        pid: int,
+        command: list[str],
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        task_id = f"policy-external-{pid}"
+        task_dir = self.root / task_id
+        task_dir.mkdir(parents=True, exist_ok=True)
+        task = read_json(task_dir / "task.json")
+        if not isinstance(task, dict):
+            task = {
+                "id": task_id,
+                "type": "policy",
+                "state": "running",
+                "pid": pid,
+                "created_at": now_iso(),
+                "started_at": None,
+                "discovered_at": now_iso(),
+                "command": command,
+                "metadata": metadata,
+                "log_path": str(task_dir / "task.log"),
+            }
+            atomic_json(task_dir / "task.json", task)
+            self._append_log(task, "adopted external Policy process discovered on a managed port")
+            return task
+        task["command"] = command
+        task["metadata"] = {**task.get("metadata", {}), **metadata}
+        task["pid"] = pid
+        if pid_alive(pid) and process_matches_task(pid, task) and task.get("state") not in {"stopping"}:
+            task["state"] = "running"
+            task.pop("finished_at", None)
+            task.pop("returncode", None)
+            task.pop("lost_reason", None)
+        task["last_discovered_at"] = now_iso()
+        atomic_json(task_dir / "task.json", task)
+        return self._refresh(task)
+
+    def discover_external_policies(self) -> list[dict[str, Any]]:
+        with self.lock:
+            active_pids = self._active_policy_pids()
+            adopted = []
+            for candidate in discover_external_policy_candidates(self.config, ignored_pids=active_pids):
+                adopted.append(self.adopt_external_policy(**candidate))
+            return adopted
+
     def stop(self, task_id: str, *, force: bool = False) -> dict[str, Any]:
         with self.lock:
             task = self.get(task_id)
@@ -484,7 +591,10 @@ class TaskManager:
                 return task
             sig = signal.SIGKILL if force else signal.SIGTERM
             try:
-                os.killpg(pid, sig)
+                if os.getpgid(pid) == pid:
+                    os.killpg(pid, sig)
+                else:
+                    os.kill(pid, sig)
             except ProcessLookupError:
                 pass
             task["state"] = "stopping"
@@ -930,6 +1040,75 @@ def gpu_inventory() -> list[dict[str, Any]]:
     return gpus
 
 
+def listening_processes_by_port(port_min: int, port_max: int) -> dict[int, set[int]]:
+    try:
+        output = subprocess.check_output(["ss", "-H", "-ltnp"], text=True, timeout=5, stderr=subprocess.DEVNULL)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return {}
+    result: dict[int, set[int]] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        local = parts[3]
+        try:
+            port = int(local.rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if not port_min <= port <= port_max:
+            continue
+        pids = {int(match.group(1)) for match in re.finditer(r"pid=(\d+)", line)}
+        if pids:
+            result.setdefault(port, set()).update(pids)
+    return result
+
+
+def discover_external_policy_candidates(
+    config: dict[str, Any],
+    *,
+    ignored_pids: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    ignored_pids = ignored_pids or set()
+    port_min = int(config.get("policy_port_min", 8000))
+    port_max = int(config.get("policy_port_max", 8099))
+    gpu_by_pid: dict[int, list[int]] = {}
+    for gpu in gpu_inventory():
+        gpu_id = int(gpu["index"])
+        for process in gpu.get("processes", []):
+            try:
+                gpu_by_pid.setdefault(int(process["pid"]), []).append(gpu_id)
+            except (TypeError, ValueError):
+                continue
+    candidates = []
+    for port, pids in listening_processes_by_port(port_min, port_max).items():
+        for pid in sorted(pids):
+            if pid in ignored_pids:
+                continue
+            command = process_cmdline(pid)
+            if not command or not _is_policy_command(command):
+                continue
+            command_port = _policy_port_from_command(command)
+            metadata = {
+                "external": True,
+                "adopted": True,
+                "source": "listening_policy_port",
+                "port": command_port or port,
+                "gpu_ids": sorted(gpu_by_pid.get(pid, [])),
+                "schema": _cmd_arg(command, "--schema") or "external",
+                "dataset_id": _cmd_arg(command, "--dataset-id") or "external",
+                "arm_side": _cmd_arg(command, "--arm-side"),
+                "checkpoint": _cmd_arg(command, "--checkpoint") or _cmd_arg(command, "--policy.dir"),
+                "policy_config": _cmd_arg(command, "--policy.config"),
+                "ws_url": f"ws://{socket.gethostname()}:{command_port or port}",
+            }
+            telemetry_dir = _cmd_arg(command, "--telemetry-dir")
+            if telemetry_dir:
+                metadata["telemetry_dir"] = telemetry_dir
+                metadata["telemetry_session"] = Path(telemetry_dir).name
+            candidates.append({"pid": pid, "command": command, "metadata": metadata})
+    return candidates
+
+
 def build_environment(config: dict[str, Any], gpu_ids: list[int] | None) -> dict[str, str]:
     env = os.environ.copy()
     openpi_env_lib = str(Path(config["openpi_python"]).resolve().parent.parent / "lib")
@@ -1164,6 +1343,7 @@ def create_app(config_path: Path) -> Flask:
 
     @app.get("/api/status")
     def status():
+        tasks.discover_external_policies()
         task_list = tasks.list()
         for task in task_list:
             if task["type"] != "policy":
