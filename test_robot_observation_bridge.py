@@ -106,7 +106,9 @@ def execution_args(**overrides):
         gripper_lowpass_alpha=0.5,
         gripper_hysteresis=0.05,
         gripper_confirm_steps=2,
-        ik_max_joint_step_rad=0.08,
+        ik_max_joint_step_rad=0.02,
+        ik_search_joint_radius_rad=0.30,
+        ik_joint_regularization_weight=1.0,
         ik_position_tolerance_m=0.0015,
         ik_rotation_tolerance_rad=0.02,
         ik_max_nfev=100,
@@ -276,6 +278,20 @@ class RecordingContinuousIK:
         return np.asarray(current_joints_rad, dtype=np.float64).copy()
 
 
+class RejectFirstContinuousIK(RecordingContinuousIK):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def solve(self, current_joints_rad, target_xyz_m, target_rpy_deg, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            raise ExecutionBlocked("continuous IK synthetic target rejection")
+        return super().solve(
+            current_joints_rad, target_xyz_m, target_rpy_deg, **kwargs
+        )
+
+
 class LinearForwardKinematics:
     """Small deterministic FK used to test the bounded numerical IK itself."""
 
@@ -334,6 +350,28 @@ class ContinuousIKTest(unittest.TestCase):
                 rotation_tolerance_rad=0.005,
                 max_nfev=50,
             )
+
+    def test_rate_limits_a_reachable_future_pose_and_still_makes_progress(self):
+        xyz, rotation = self.solver.pose(self.joints)
+        target_xyz = xyz + np.array([0.05, 0.0, 0.0])
+        target_rpy = Rotation.from_matrix(rotation).as_euler("xyz", degrees=True)
+        solved = self.solver.solve(
+            self.joints,
+            target_xyz,
+            target_rpy,
+            max_joint_step_rad=0.01,
+            search_joint_radius_rad=0.08,
+            joint_regularization_weight=0.0,
+            position_tolerance_m=0.0015,
+            rotation_tolerance_rad=0.02,
+            max_nfev=100,
+        )
+        solved_xyz, _ = self.solver.pose(solved)
+        self.assertAlmostEqual(float(np.max(np.abs(solved - self.joints))), 0.01)
+        self.assertLess(
+            float(np.linalg.norm(solved_xyz - target_xyz)),
+            float(np.linalg.norm(xyz - target_xyz)),
+        )
 
     def test_accepts_small_zero_offset_and_does_not_move_farther_outward(self):
         joints = self.joints.copy()
@@ -1477,6 +1515,40 @@ class ExecutionQueueTest(unittest.TestCase):
         self.assertIn("JointCtrl", names)
         self.assertNotIn("EndPoseCtrl", names)
         self.assertEqual(len(ik_solver.targets), 1)
+
+    def test_unreachable_delivery_row_is_dropped_without_destroying_chunk(self):
+        protocol = validate_policy_metadata(DELIVERY_METADATA, "right")
+        piper = FakePiper()
+        execution = ExecutionController(piper, execution_args())
+        execution.configure_protocol(protocol)
+        execution.ik_solver = RejectFirstContinuousIK()
+        execution.robot_enabled = {"right"}
+        actions = np.zeros((2, 7), dtype=np.float64)
+        actions[:, 6] = 0.5
+        now = time.time()
+        execution.queue_result(
+            execution_result(actions),
+            self.raw_state,
+            self.qpos,
+            protocol,
+            {"cam_high": now, "cam_wrist": now},
+            0.01,
+        )
+        self.assertFalse(
+            execution.execute_next(
+                self.raw_state, self.qpos, protocol, feedback_captured_at=time.time()
+            )
+        )
+        self.assertEqual(execution.state, "ready")
+        self.assertEqual(execution.pending_action_count, 1)
+        self.assertIn("dropped unsafe queued target", execution.blocked_reason)
+        self.assertTrue(
+            execution.execute_next(
+                self.raw_state, self.qpos, protocol, feedback_captured_at=time.time()
+            )
+        )
+        self.assertEqual(execution.pending_action_count, 0)
+        self.assertIn("JointCtrl", [call[0] for call in piper.calls])
 
     def test_feedback_freshness_and_status_block_before_motion(self):
         protocol = validate_policy_metadata(JOINT_METADATA, "right")

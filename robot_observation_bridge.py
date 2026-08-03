@@ -116,7 +116,13 @@ IK_JOINT_LIMIT_MARGIN_RAD = 0.002
 # feedback/calibration tolerance only: local IK may start from that measured
 # pose, but it may not move farther out past it.
 IK_FEEDBACK_LIMIT_TOLERANCE_RAD = 0.06
-DEFAULT_IK_MAX_JOINT_STEP_RAD = 0.08
+# One 20 Hz command must be a small servo step.  The numerical solve may look
+# farther along the same joint branch, then the returned command is rate
+# limited to this value so a Cartesian target cannot produce a wrist jump.
+DEFAULT_IK_MAX_JOINT_STEP_RAD = 0.02
+DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD = 0.30
+DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT = 1.0
+IK_JOINT_REGULARIZATION_SCALE_RAD = 0.08
 DEFAULT_IK_POSITION_TOLERANCE_M = 0.0015
 DEFAULT_IK_ROTATION_TOLERANCE_RAD = 0.02
 DEFAULT_IK_MAX_NFEV = 100
@@ -267,6 +273,8 @@ class PiperContinuousIK:
         position_tolerance_m: float,
         rotation_tolerance_rad: float,
         max_nfev: int,
+        search_joint_radius_rad: float | None = None,
+        joint_regularization_weight: float = DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT,
     ) -> np.ndarray:
         current = np.asarray(current_joints_rad, dtype=np.float64)
         target_xyz = np.asarray(target_xyz_m, dtype=np.float64)
@@ -277,6 +285,20 @@ class PiperContinuousIK:
             raise ExecutionBlocked("IK target xyz is not finite 3D")
         if target_rpy.shape != (3,) or not np.all(np.isfinite(target_rpy)):
             raise ExecutionBlocked("IK target rpy is not finite 3D")
+        if not math.isfinite(max_joint_step_rad) or max_joint_step_rad <= 0:
+            raise ExecutionBlocked("IK maximum command joint step must be positive")
+        search_radius = (
+            max_joint_step_rad
+            if search_joint_radius_rad is None
+            else float(search_joint_radius_rad)
+        )
+        if not math.isfinite(search_radius) or search_radius < max_joint_step_rad:
+            raise ExecutionBlocked(
+                "IK search joint radius must be finite and at least the command step"
+            )
+        regularization_weight = float(joint_regularization_weight)
+        if not math.isfinite(regularization_weight) or regularization_weight < 0:
+            raise ExecutionBlocked("IK joint regularization weight must be non-negative")
 
         hard_lower = JOINT_LIMITS_RAD[:, 0] + IK_JOINT_LIMIT_MARGIN_RAD
         hard_upper = JOINT_LIMITS_RAD[:, 1] - IK_JOINT_LIMIT_MARGIN_RAD
@@ -290,8 +312,8 @@ class PiperContinuousIK:
         # an already-outside joint farther outward.
         feedback_lower = np.minimum(hard_lower, current)
         feedback_upper = np.maximum(hard_upper, current)
-        lower = np.maximum(feedback_lower, current - max_joint_step_rad)
-        upper = np.minimum(feedback_upper, current + max_joint_step_rad)
+        lower = np.maximum(feedback_lower, current - search_radius)
+        upper = np.minimum(feedback_upper, current + search_radius)
         if np.any(lower >= upper):
             raise ExecutionBlocked("continuous IK has no valid local joint interval")
         initial = np.clip(current, lower + 1e-8, upper - 1e-8)
@@ -300,12 +322,20 @@ class PiperContinuousIK:
         def residual(candidate: np.ndarray) -> np.ndarray:
             xyz, rotation = self.pose(candidate)
             rotation_error = Rotation.from_matrix(target_rotation @ rotation.T).as_rotvec()
-            return np.concatenate(
+            task_error = np.concatenate(
                 (
                     (xyz - target_xyz) / position_tolerance_m,
                     rotation_error / rotation_tolerance_rad,
                 )
             )
+            if regularization_weight == 0:
+                return task_error
+            joint_regularization = (
+                math.sqrt(regularization_weight)
+                * (candidate - current)
+                / IK_JOINT_REGULARIZATION_SCALE_RAD
+            )
+            return np.concatenate((task_error, joint_regularization))
 
         result = least_squares(
             residual,
@@ -322,7 +352,7 @@ class PiperContinuousIK:
         rotation_error = float(
             np.linalg.norm(Rotation.from_matrix(target_rotation @ solved_rotation.T).as_rotvec())
         )
-        joint_step = float(np.max(np.abs(solved - current)))
+        solved_joint_step = float(np.max(np.abs(solved - current)))
         if np.any(solved < hard_lower - IK_FEEDBACK_LIMIT_TOLERANCE_RAD) or np.any(
             solved > hard_upper + IK_FEEDBACK_LIMIT_TOLERANCE_RAD
         ):
@@ -332,14 +362,44 @@ class PiperContinuousIK:
                 "continuous IK could not reach a nearby solution: "
                 f"position_error={position_error:.5f}m, "
                 f"rotation_error={rotation_error:.5f}rad, "
-                f"max_joint_step={joint_step:.5f}rad"
+                f"search_joint_step={solved_joint_step:.5f}rad"
             )
-        if joint_step > max_joint_step_rad + 1e-6:
+        if solved_joint_step > search_radius + 1e-6:
             raise ExecutionBlocked(
-                f"continuous IK joint step {joint_step:.5f}rad exceeds "
-                f"{max_joint_step_rad:.5f}rad"
+                f"continuous IK search step {solved_joint_step:.5f}rad exceeds "
+                f"{search_radius:.5f}rad"
             )
-        return solved
+        if solved_joint_step <= max_joint_step_rad + 1e-9:
+            return solved
+
+        # Follow the regularized solution direction with a bounded 20 Hz servo
+        # step. Requiring the whole future EEF target to be reached in one tick
+        # caused either 0.08 rad wrist jumps or a complete queue stop.
+        scale = max_joint_step_rad / solved_joint_step
+        command = current + scale * (solved - current)
+        command_xyz, command_rotation = self.pose(command)
+        current_xyz, current_rotation = self.pose(current)
+        current_task_error = float(
+            np.linalg.norm((current_xyz - target_xyz) / position_tolerance_m) ** 2
+            + np.linalg.norm(
+                Rotation.from_matrix(target_rotation @ current_rotation.T).as_rotvec()
+                / rotation_tolerance_rad
+            )
+            ** 2
+        )
+        command_task_error = float(
+            np.linalg.norm((command_xyz - target_xyz) / position_tolerance_m) ** 2
+            + np.linalg.norm(
+                Rotation.from_matrix(target_rotation @ command_rotation.T).as_rotvec()
+                / rotation_tolerance_rad
+            )
+            ** 2
+        )
+        if command_task_error >= current_task_error - 1e-9:
+            raise ExecutionBlocked(
+                "continuous IK rate-limited step does not make progress toward target"
+            )
+        return command
 
 
 
@@ -1636,6 +1696,8 @@ class ExecutionController:
             "delivery_command_mode": "continuous_ik_joint",
             "continuous_ik": {
                 "max_joint_step_rad": float(getattr(self.args, "ik_max_joint_step_rad", DEFAULT_IK_MAX_JOINT_STEP_RAD)),
+                "search_joint_radius_rad": float(getattr(self.args, "ik_search_joint_radius_rad", DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD)),
+                "joint_regularization_weight": float(getattr(self.args, "ik_joint_regularization_weight", DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT)),
                 "position_tolerance_m": float(getattr(self.args, "ik_position_tolerance_m", DEFAULT_IK_POSITION_TOLERANCE_M)),
                 "rotation_tolerance_rad": float(getattr(self.args, "ik_rotation_tolerance_rad", DEFAULT_IK_ROTATION_TOLERANCE_RAD)),
                 "max_nfev": int(getattr(self.args, "ik_max_nfev", DEFAULT_IK_MAX_NFEV)),
@@ -2277,6 +2339,7 @@ class ExecutionController:
             dict(self._gripper_extreme_count),
             dict(self._gripper_extreme_latch),
         )
+        target_prevalidation = False
         try:
             statuses = {side: arm_status_dict(self.pipers[side]) for side in sides}
             self.robot_status = statuses if protocol.arm_mode == "bimanual" else statuses[sides[0]]
@@ -2312,6 +2375,7 @@ class ExecutionController:
                     "waiting for enable hold to settle: " + "; ".join(waiting_for_hold),
                 )
 
+            target_prevalidation = True
             queued = self._filter_gripper_target(queued, qpos_m, protocol)
             prepared: dict[str, tuple[Any, ...]] = {}
             for index, side in enumerate(sides):
@@ -2366,6 +2430,8 @@ class ExecutionController:
                         target_xyz,
                         target_rpy_deg,
                         max_joint_step_rad=float(getattr(self.args, "ik_max_joint_step_rad", DEFAULT_IK_MAX_JOINT_STEP_RAD)),
+                        search_joint_radius_rad=float(getattr(self.args, "ik_search_joint_radius_rad", DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD)),
+                        joint_regularization_weight=float(getattr(self.args, "ik_joint_regularization_weight", DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT)),
                         position_tolerance_m=float(getattr(self.args, "ik_position_tolerance_m", DEFAULT_IK_POSITION_TOLERANCE_M)),
                         rotation_tolerance_rad=float(getattr(self.args, "ik_rotation_tolerance_rad", DEFAULT_IK_ROTATION_TOLERANCE_RAD)),
                         max_nfev=int(getattr(self.args, "ik_max_nfev", DEFAULT_IK_MAX_NFEV)),
@@ -2390,6 +2456,7 @@ class ExecutionController:
                     )
                 else:
                     raise ExecutionBlocked(f"unsupported execution schema: {protocol.schema}")
+            target_prevalidation = False
 
             missing_enabled = [side for side in sides if side not in self.robot_enabled]
             if missing_enabled:
@@ -2432,6 +2499,19 @@ class ExecutionController:
                 self._gripper_extreme_count,
                 self._gripper_extreme_latch,
             ) = filter_snapshot
+            if target_prevalidation and self.pending_actions:
+                # A bad/unreachable row must not destroy the whole action chunk.
+                # Drop only that timed target and let the next 20 Hz tick try the
+                # next row; a fresh inference can still blend with the remainder.
+                self.pending_actions.pop(0)
+                self.dropped_action_count += 1
+                self.last_queue_drop_reason = str(exc)[:500]
+                self.queued_action_index = (
+                    self.pending_actions[0].queue_index
+                    if self.pending_actions
+                    else None
+                )
+                return self._block("ready", f"dropped unsafe queued target: {exc}")
             self.discard_pending_actions(str(exc))
             return self._block("blocked", str(exc))
         except Exception as exc:
@@ -3030,7 +3110,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--ik-max-joint-step-rad", type=float, default=DEFAULT_IK_MAX_JOINT_STEP_RAD,
-        help="maximum per-joint change for delivery actions solved by continuous local IK",
+        help="maximum commanded per-joint change on one 20 Hz delivery control tick",
+    )
+    parser.add_argument(
+        "--ik-search-joint-radius-rad",
+        type=float,
+        default=DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD,
+        help="near-current joint radius used to find the regularized EEF IK direction",
+    )
+    parser.add_argument(
+        "--ik-joint-regularization-weight",
+        type=float,
+        default=DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT,
+        help="penalty on unnecessary joint motion in delivery IK (0 disables it)",
     )
     parser.add_argument(
         "--ik-position-tolerance-m", type=float, default=DEFAULT_IK_POSITION_TOLERANCE_M,
@@ -3100,6 +3192,7 @@ def main() -> None:
         args.max_joint_step_rad,
         args.max_joint_gripper_step,
         args.ik_max_joint_step_rad,
+        args.ik_search_joint_radius_rad,
         args.ik_position_tolerance_m,
         args.ik_rotation_tolerance_rad,
         args.gripper_lowpass_alpha,
@@ -3108,6 +3201,10 @@ def main() -> None:
     )
     if any(value <= 0 for value in positive) or args.reconnect_delay < 0:
         parser.error("frequencies, freshness/safety limits, and timeout must be positive")
+    if args.ik_search_joint_radius_rad < args.ik_max_joint_step_rad:
+        parser.error("ik-search-joint-radius-rad must be at least ik-max-joint-step-rad")
+    if args.ik_joint_regularization_weight < 0:
+        parser.error("ik-joint-regularization-weight must be non-negative")
     if args.action_chunk_steps is not None and args.action_chunk_steps <= 0:
         parser.error("action-chunk-steps must be positive")
     if args.ik_max_nfev <= 0:
