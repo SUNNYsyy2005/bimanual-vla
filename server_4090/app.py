@@ -1250,6 +1250,13 @@ class PolicyTelemetryStore:
         return path
 
 
+def _nvidia_int(value: str) -> int | None:
+    try:
+        return int(value.strip())
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def gpu_inventory() -> list[dict[str, Any]]:
     gpu_cmd = [
         "nvidia-smi",
@@ -1269,24 +1276,39 @@ def gpu_inventory() -> list[dict[str, Any]]:
     processes: dict[str, list[dict[str, Any]]] = {}
     for line in process_lines:
         parts = [part.strip() for part in line.split(",", 3)]
-        if len(parts) == 4:
-            processes.setdefault(parts[0], []).append(
-                {"pid": int(parts[1]), "name": parts[2], "memory_mib": int(parts[3])}
-            )
+        if len(parts) != 4:
+            continue
+        pid = _nvidia_int(parts[1])
+        if pid is None:
+            # NVIDIA occasionally reports stale/driver-only compute contexts as
+            # ``uuid, [N/A], [N/A], [N/A]``. They have no actionable process
+            # identity and must not make the entire status endpoint fail.
+            continue
+        processes.setdefault(parts[0], []).append(
+            {
+                "pid": pid,
+                "name": None if parts[2] == "[N/A]" else parts[2],
+                "memory_mib": _nvidia_int(parts[3]),
+            }
+        )
     gpus = []
     for line in gpu_lines:
         parts = [part.strip() for part in line.split(",", 4)]
-        if len(parts) == 5:
-            gpus.append(
-                {
-                    "index": int(parts[0]),
-                    "uuid": parts[1],
-                    "name": parts[2],
-                    "memory_total_mib": int(parts[3]),
-                    "memory_used_mib": int(parts[4]),
-                    "processes": processes.get(parts[1], []),
-                }
-            )
+        if len(parts) != 5:
+            continue
+        index = _nvidia_int(parts[0])
+        if index is None:
+            continue
+        gpus.append(
+            {
+                "index": index,
+                "uuid": parts[1],
+                "name": parts[2],
+                "memory_total_mib": _nvidia_int(parts[3]) or 0,
+                "memory_used_mib": _nvidia_int(parts[4]) or 0,
+                "processes": processes.get(parts[1], []),
+            }
+        )
     return gpus
 
 
