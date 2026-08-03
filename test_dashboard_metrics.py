@@ -5,7 +5,10 @@ import unittest
 from unittest import mock
 
 from server_4090.app import (
+    build_environment,
+    cuda_visible_devices,
     describe_dataset_schema,
+    gpu_memory_shortfalls,
     gpu_inventory,
     infer_model_variant,
     parse_training_metrics,
@@ -61,7 +64,41 @@ class GpuInventoryTest(unittest.TestCase):
                 "memory_total_mib": 24564,
                 "memory_used_mib": 30,
                 "processes": [],
+                "compute_available": False,
+                "health_issue": "nvidia-smi reports an unavailable compute context ([N/A])",
             }],
+        )
+
+    def test_cuda_visibility_uses_physical_gpu_uuids(self):
+        inventory = [
+            {"index": 0, "uuid": "GPU-zero"},
+            {"index": 3, "uuid": "GPU-three"},
+        ]
+        self.assertEqual(cuda_visible_devices([0, 3], inventory), "GPU-zero,GPU-three")
+
+    @mock.patch("server_4090.app.cuda_visible_devices", return_value="GPU-zero,GPU-two")
+    def test_training_environment_uses_stable_gpu_order_and_memory_fraction(self, _visible):
+        env = build_environment(
+            {
+                "openpi_python": "/opt/conda/envs/openpi/bin/python",
+                "dataset_root": "/datasets",
+                "xla_memory_fraction": 0.90,
+            },
+            [0, 2],
+            xla_memory_fraction=0.88,
+        )
+        self.assertEqual(env["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "GPU-zero,GPU-two")
+        self.assertEqual(env["XLA_PYTHON_CLIENT_MEM_FRACTION"], "0.88")
+
+    def test_gpu_memory_shortfall_uses_total_minus_used(self):
+        inventory = {
+            0: {"memory_total_mib": 24564, "memory_used_mib": 400},
+            2: {"memory_total_mib": 24564, "memory_used_mib": 2200},
+        }
+        self.assertEqual(
+            gpu_memory_shortfalls(inventory, [0, 2], 23_000),
+            {2: {"free_mib": 22_364, "required_mib": 23_000}},
         )
 
 
