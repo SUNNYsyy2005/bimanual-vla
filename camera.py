@@ -12,6 +12,8 @@ Verify device IDs before connecting:
   v4l2-ctl --list-devices
 """
 
+from pathlib import Path
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -29,6 +31,28 @@ DEFAULT_CAM_IDS = {
 }
 
 STALE_THRESHOLD_S = 0.5   # flag image as stale if older than this
+
+
+def resolve_video_device(device: object) -> str:
+    """Return the concrete ``/dev/videoN`` path behind a camera selector.
+
+    Collection uses stable ``/dev/v4l/by-path`` symlinks so USB enumeration
+    changes do not swap camera roles.  Operators still need to see which
+    numeric video node was selected for the current connection.
+    """
+    if isinstance(device, int) or (isinstance(device, str) and device.isdigit()):
+        candidate = Path(f"/dev/video{int(device)}")
+    else:
+        candidate = Path(str(device)).expanduser()
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        resolved = candidate.resolve(strict=False)
+    if re.fullmatch(r"video\d+", resolved.name):
+        return str(resolved)
+    if re.fullmatch(r"video\d+", candidate.name):
+        return str(candidate)
+    return str(resolved)
 
 
 class CameraCapture:
@@ -140,5 +164,7 @@ class CameraCapture:
                 "shape": frame.shape if ret else None,
                 "latency_ms": round(latency_ms, 1),
                 "fps": float(cap.get(cv2.CAP_PROP_FPS)),
+                "configured_device": str(self._ids[key]),
+                "video_device": resolve_video_device(self._ids[key]),
             }
         return results
