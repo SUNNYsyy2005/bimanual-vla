@@ -123,8 +123,6 @@
           <div id="serverInfo" class="muted">输入 Token 后刷新。</div>
         </div>
         <div class="card half"><h2>GPU 资源</h2><div id="gpuList"><span class="muted">等待状态数据。</span></div></div>
-        <div class="card two-third"><h2>Norm / Train 任务</h2><div class="table-wrap"><table><thead><tr><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div></div>
-        <div class="card third"><h2>任务日志</h2><p class="muted">从任务表或 Policy 表点击“日志”。</p><pre id="taskLog">尚未选择任务。</pre></div>
       </div>
     </section>
 
@@ -156,6 +154,16 @@
       <div class="grid">
         <div class="card third"><h2>1. 归一化统计</h2><p class="muted">训练提交时若缺失 norm stats 会自动串联执行。</p><form id="normForm"><label>数据集</label><select name="dataset_id" class="dataset-select"></select><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option></select><div class="row"><div><label>Batch size</label><input name="batch_size" type="number" value="16" min="1"></div><div><label>Workers</label><input name="num_workers" type="number" value="2" min="1"></div></div><label>最多帧数（留空=全部）</label><input name="max_frames" type="number" min="1"><p><button type="submit">提交 norm stats</button></p></form></div>
         <div class="card two-third"><h2>2. 提交 LoRA 微调</h2><form id="trainForm"><div class="row"><div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div><div><label>实验名</label><input name="exp_name" required placeholder="pick_cube_r1"></div></div><div class="row3"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option></select></div><div><label>GPU IDs</label><input name="gpu_ids" value="0,1" placeholder="0,1"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div><div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>Batch</label><input name="batch_size" type="number" value="8"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div><div class="row"><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div><div><label>启动方式</label><select name="mode"><option value="auto">auto（推荐）</option><option value="new">new</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select></div></div><p class="muted">缺少 norm stats 时自动执行 norm→train；任务持久化并支持续训。</p><p><button type="submit">提交训练</button></p></form></div>
+        <div class="card two-third">
+          <h2>训练进程管理</h2>
+          <p class="muted">查看 Norm / Train 任务状态、PID、依赖关系，并停止不需要的训练进程。</p>
+          <div class="table-wrap"><table><thead><tr><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div>
+        </div>
+        <div class="card third" id="trainingTaskLogCard">
+          <h2>训练任务日志</h2>
+          <p class="muted">从训练进程表点击“日志”查看最近输出。</p>
+          <pre id="taskLog">尚未选择任务。</pre>
+        </div>
         <div class="card two-third">
           <h2>训练指标曲线</h2>
           <div class="chart-toolbar"><div><label>训练任务</label><select id="trainMetricsTask"></select></div><button class="inline secondary" type="button" onclick="loadTrainingMetrics()">刷新曲线</button></div>
@@ -1032,7 +1040,8 @@ async function loadLog(id) {
   try {
     const data = await api(`/api/tasks/${encodeURIComponent(id)}/log?max_bytes=131072`);
     document.getElementById('taskLog').textContent = data.log || '(empty)';
-    showModule('overview');
+    showModule('training');
+    document.getElementById('trainingTaskLogCard').scrollIntoView({behavior: 'smooth', block: 'center'});
   } catch (error) {
     show(error.message);
   }
