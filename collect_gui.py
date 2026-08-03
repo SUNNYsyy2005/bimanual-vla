@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover - OpenCV fallback is for minimal install
     ImageTk = None
 
 from collection_session import CollectionConfig, CollectionSession, SessionState
+from camera import select_video_device
 from collect_output_arm import (
     DEFAULT_CAN,
     DEFAULT_CAMERA_FPS,
@@ -474,6 +475,12 @@ class CollectorGUI:
         ttk.Button(controls, text="Replay selected episode", command=self.replay_selected).grid(
             row=1, column=2, padx=3, pady=3, sticky="ew"
         )
+        self.swap_camera_button = ttk.Button(
+            controls,
+            text="Swap Camera Roles",
+            command=self.swap_camera_roles,
+        )
+        self.swap_camera_button.grid(row=2, column=0, columnspan=3, padx=3, pady=3, sticky="ew")
         for col in range(3):
             controls.columnconfigure(col, weight=1)
 
@@ -673,6 +680,10 @@ class CollectorGUI:
                 "cam_high": "high",
                 self.contract.camera_keys[1]: "primary_wrist",
             }
+        if hasattr(self, "swap_camera_button"):
+            self.swap_camera_button.configure(
+                state="disabled" if bimanual or self.session is not None else "normal"
+            )
         for camera_key, slot in self.preview_key_to_slot.items():
             self.preview_title_labels[slot].configure(text=self._camera_role_title(camera_key))
         for label in self.preview_labels.values():
@@ -697,6 +708,37 @@ class CollectorGUI:
             selector.configure(state=selector_state)
         for entry in self.connection_entries:
             entry.configure(state=entry_state)
+        if hasattr(self, "swap_camera_button"):
+            self.swap_camera_button.configure(
+                state=("normal" if enabled and self.arm_mode == SINGLE_ARM else "disabled")
+            )
+
+    def swap_camera_roles(self) -> None:
+        """Swap the configured overhead and wrist camera for single-arm mode."""
+        if self.arm_mode != SINGLE_ARM:
+            messagebox.showinfo(
+                "Swap Camera Roles",
+                "For bimanual mode, configure the left and right wrist cameras separately.",
+            )
+            return
+        if self.session is not None or self.piper is not None or self.cameras is not None:
+            messagebox.showwarning(
+                "Disconnect first",
+                "Disconnect devices before swapping camera roles. Do not change camera semantics during an episode.",
+            )
+            return
+        wrist_key = "cam_left_wrist" if self.arm_side == "left" else "cam_right_wrist"
+        try:
+            overhead = select_video_device("cam_high", self.high_var.get().strip())
+            wrist = select_video_device(wrist_key, self.wrist_var.get().strip())
+        except Exception as exc:
+            messagebox.showerror("Cannot resolve cameras", str(exc))
+            return
+        self.high_var.set(str(wrist))
+        self.wrist_var.set(str(overhead))
+        self.status_var.set(
+            f"Camera roles swapped: overhead={self.high_var.get()} | wrist={self.wrist_var.get()}"
+        )
 
     def _load_pose_check_config(self):
         joint_tol_deg = float(self.joint_tol_var.get())
@@ -797,6 +839,15 @@ class CollectorGUI:
             camera_status_parts = []
             for key, info in checks.items():
                 video_device = str(info.get("video_device") or info.get("configured_device") or "?")
+                selected_device = str(info.get("selected_device") or video_device)
+                if key == "cam_high":
+                    self.high_var.set(selected_device)
+                elif self.arm_mode == SINGLE_ARM:
+                    self.wrist_var.set(selected_device)
+                elif key == "cam_left_wrist":
+                    self.left_wrist_var.set(selected_device)
+                elif key == "cam_right_wrist":
+                    self.right_wrist_var.set(selected_device)
                 camera_status_parts.append(f"{key}={video_device} ({info['fps']:.0f}FPS)")
                 slot = self.preview_key_to_slot.get(key)
                 if slot is not None:

@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from camera import resolve_video_device
+from camera import resolve_video_device, select_video_device
 from collect_gui import build_dataset_tool_command, move_episodes_to_trash
 
 
@@ -93,6 +93,12 @@ class VideoDeviceDisplayTest(unittest.TestCase):
             stable = Path(directory) / "camera-by-path"
             stable.symlink_to("/dev/video17")
             self.assertEqual(resolve_video_device(stable), "/dev/video17")
+
+    def test_existing_camera_selector_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            camera = Path(directory) / "video-test"
+            camera.touch()
+            self.assertEqual(select_video_device("cam_high", camera), str(camera))
 
 
 if __name__ == "__main__":

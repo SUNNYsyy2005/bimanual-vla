@@ -336,6 +336,18 @@ class ContinuousIKTest(unittest.TestCase):
 
 
 class MetadataCompatibilityTest(unittest.TestCase):
+    def test_v3_delivery_accepts_side_specific_wrist_key(self):
+        metadata = dict(
+            DELIVERY_METADATA,
+            camera_keys=["cam_high", "cam_right_wrist"],
+        )
+        protocol = validate_policy_metadata(metadata, "right")
+        self.assertEqual(protocol.camera_keys, ("cam_high", "cam_right_wrist"))
+
+        wrong_side = dict(metadata, camera_keys=["cam_high", "cam_left_wrist"])
+        with self.assertRaisesRegex(RuntimeError, "camera_keys"):
+            validate_policy_metadata(wrong_side, "right")
+
     def test_explicit_delivery_metadata_selects_old_and_new_conventions(self):
         new = validate_policy_metadata(DELIVERY_METADATA, "right")
         old = validate_policy_metadata(LEGACY_DELIVERY_METADATA, "right")

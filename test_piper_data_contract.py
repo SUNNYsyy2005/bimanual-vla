@@ -15,6 +15,7 @@ from collect_output_arm import (
     RAD_FACTOR,
     PiperFeedbackStaleError,
     _require_fresh_feedback,
+    require_can_interface_up,
     read_robot_state,
     read_output_gripper_command_target,
 )
@@ -241,6 +242,21 @@ class RobotStateReaderTest(unittest.TestCase):
                 self.Hz = 100.0
         with self.assertRaises(PiperFeedbackStaleError):
             _require_fresh_feedback({"joint": Message(time.time() - 10)})
+
+    def test_can_interface_must_exist_and_be_up(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sysfs_root = Path(directory)
+            with self.assertRaisesRegex(RuntimeError, "does not exist"):
+                require_can_interface_up("can0", sysfs_root=sysfs_root)
+
+            interface_dir = sysfs_root / "can0"
+            interface_dir.mkdir()
+            (interface_dir / "flags").write_text("0x0\n")
+            with self.assertRaisesRegex(RuntimeError, "is DOWN"):
+                require_can_interface_up("can0", sysfs_root=sysfs_root)
+
+            (interface_dir / "flags").write_text("0x1\n")
+            require_can_interface_up("can0", sysfs_root=sysfs_root)
 
     def test_bimanual_reader_returns_left_then_right_and_fraction(self):
         class Msg:

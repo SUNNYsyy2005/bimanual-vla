@@ -20,6 +20,7 @@ from collect_output_arm import (
     DEFAULT_RIGHT_CAN,
     DEFAULT_RIGHT_WRIST_DEVICE,
     DEFAULT_WRIST_DEVICE,
+    PiperFeedbackStaleError,
     connect,
     next_episode_index,
     read_robot_gripper_command_samples,
@@ -152,6 +153,24 @@ class CollectionSession:
         self.camera_checks: dict[str, dict] = {}
         self.episode_index = next_episode_index(Path(config.output_dir))
 
+    def _wait_for_robot_feedback(self, robot: Any, timeout_s: float = 3.0) -> None:
+        """Wait briefly for Piper's reader thread to populate live CAN feedback."""
+        deadline = time.monotonic() + timeout_s
+        last_error: PiperFeedbackStaleError | None = None
+        while True:
+            try:
+                self._state_reader(robot)
+                return
+            except PiperFeedbackStaleError as exc:
+                last_error = exc
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "CAN socket opened, but no fresh Piper feedback arrived within "
+                    f"{timeout_s:.1f}s. Check that the interface is UP and verify live frames with "
+                    "'candump -L <can-interface>'."
+                ) from last_error
+            time.sleep(0.05)
+
     @property
     def frame_count(self) -> int:
         return len(self.buffer) if self.buffer is not None else 0
@@ -175,6 +194,7 @@ class CollectionSession:
                 right = self._robot_connect(self.config.right_can_name)
                 connected.append(right)
                 piper = {"left": left, "right": right}
+            self._wait_for_robot_feedback(piper)
             if self.config.arm_mode == BIMANUAL:
                 camera_ids = {
                     "cam_high": self.config.cam_high_device,
@@ -195,10 +215,6 @@ class CollectionSession:
             )
             cameras.open()
             checks = self._camera_verifier(cameras, self.config.camera_fps)
-            # Verify live Piper feedback before reporting the session as ready.
-            # The production reader rejects stale SDK cache values by checking
-            # the underlying SocketCAN receive timestamps.
-            self._state_reader(piper)
         except Exception:
             if "cameras" in locals():
                 cameras.close()

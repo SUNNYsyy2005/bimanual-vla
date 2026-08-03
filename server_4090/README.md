@@ -263,8 +263,8 @@ python robot_observation_bridge.py \
   --host 192.168.101.9 \
   --port 8000 \
   --can can0 \
-  --cam-high-device /dev/video8 \
-  --cam-wrist-device /dev/video16 \
+  --cam-high-device auto \
+  --cam-wrist-device auto \
   --arm-side right \
   --instruction "pick up the cube" \
   --hz 4
@@ -280,9 +280,9 @@ python robot_observation_bridge.py \
   --arm-side both \
   --left-can can1 \
   --right-can can3 \
-  --cam-high-device /dev/video8 \
-  --cam-left-wrist-device /dev/video12 \
-  --cam-right-wrist-device /dev/video16 \
+  --cam-high-device auto \
+  --cam-left-wrist-device auto \
+  --cam-right-wrist-device auto \
   --instruction "pick up the cube" \
   --hz 4
 ```
