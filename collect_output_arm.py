@@ -1,14 +1,15 @@
-"""Collect output-arm feedback and two RGB camera streams.
+"""Collect measured Piper output-arm feedback and synchronized RGB cameras.
 
-This collector deliberately talks to only one Piper interface (can0).  It
-records the execution/output arm's measured joint angles and gripper position;
-it does not read master-arm data or control-command frames.
+Supported raw contracts:
 
-Each saved episode contains the Piper delivery schema:
-  state: [EEF xyz, rotation 6D, gripper fraction], shape (T, 10)
-  actions: base-frame delta action, shape (T, 7)
-  image / wrist_image: RGB HWC frames, shape (T, 256, 256, 3)
-  joint_qpos: optional diagnostic joint feedback, shape (T, 7)
+* single + delivery: 10D state / 7D EEF-delta action / 2 cameras;
+* single + joint: 7D state / 7D next measured joint target / 2 cameras;
+* bimanual + delivery: 20D state / 14D EEF-delta action / 3 cameras;
+* bimanual + joint: 14D state / 14D next measured joint target / 3 cameras.
+
+This output-only collector cannot see the teleoperator's commanded target, so
+joint actions are deliberately labelled ``next_measured_qpos``.  For preferred
+same-step master-arm targets use ``teleop_single.py`` or ``teleop.py``.
 """
 
 from __future__ import annotations
@@ -16,29 +17,49 @@ from __future__ import annotations
 import argparse
 import pathlib
 import sys
+import threading
 import time
+from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from camera import CameraCapture
 from piper_data_contract import (
+    BIMANUAL,
     DEFAULT_FPS,
+    DELIVERY_SCHEMA,
     IMAGE_HW,
+    JOINT_SCHEMA,
+    SINGLE_ARM,
     EpisodeBuffer,
+    EpisodeContract,
     build_actions as _build_actions,
     build_delivery_state,
     gripper_closed_fraction,
 )
-from piper_sdk import C_PiperInterface_V2
-from teleop import KeyListener
+try:
+    from teleop import KeyListener
+except ModuleNotFoundError:
+    class KeyListener:  # pragma: no cover - only used without the hardware stack
+        def __init__(self):
+            raise RuntimeError("teleop/piper_sdk is not installed in this environment")
+
+try:
+    from piper_sdk import C_PiperInterface_V2
+except ModuleNotFoundError:  # Allows schema/tests to run without the hardware SDK.
+    C_PiperInterface_V2 = None  # type: ignore[assignment]
 
 
 RAD_FACTOR = 57295.7795  # Piper unit: 0.001 degree -> rad
 GRIPPER_FACTOR = 1_000_000.0  # Piper unit: 0.001 mm -> metre
 DEFAULT_CAN = "can0"
+DEFAULT_LEFT_CAN = "can1"
+DEFAULT_RIGHT_CAN = "can3"
 DEFAULT_HIGH_DEVICE = "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:4:1.3-video-index0"
 DEFAULT_WRIST_DEVICE = "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:5.2:1.0-video-index4"
+DEFAULT_LEFT_WRIST_DEVICE = "/dev/video12"
+DEFAULT_RIGHT_WRIST_DEVICE = DEFAULT_WRIST_DEVICE
 DEFAULT_CAMERA_FPS = 30
 CAMERA_SOURCE_HW = (240, 424)
 PIPER_FEEDBACK_MAX_AGE_S = 0.5
@@ -53,13 +74,7 @@ def _require_fresh_feedback(
     *,
     max_age_s: float = PIPER_FEEDBACK_MAX_AGE_S,
 ) -> None:
-    """Fail when SDK feedback timestamps have stopped advancing.
-
-    Piper SDK getters keep returning the last decoded values after CAN traffic
-    stops. Their wrapper timestamps originate from SocketCAN receive frames,
-    so an age check prevents frozen robot state from being recorded alongside
-    live camera images.
-    """
+    """Reject missing/stale SDK cache values before recording an episode."""
     now = time.time()
     failures = []
     for name, message in messages.items():
@@ -75,7 +90,7 @@ def _require_fresh_feedback(
         )
 
 
-def _qpos_from_feedback(joints_message, gripper_message) -> np.ndarray:
+def _qpos_from_feedback(joints_message: Any, gripper_message: Any) -> np.ndarray:
     joints = joints_message.joint_state
     gripper = gripper_message.gripper_state
     values = np.array(
@@ -89,52 +104,91 @@ def _qpos_from_feedback(joints_message, gripper_message) -> np.ndarray:
         ],
         dtype=np.float32,
     ) / RAD_FACTOR
-    return np.append(values, float(gripper.grippers_angle) / GRIPPER_FACTOR)
+    return np.append(values, float(gripper.grippers_angle) / GRIPPER_FACTOR).astype(np.float32)
 
 
-def read_output_qpos(piper: C_PiperInterface_V2) -> np.ndarray:
-    """Read measured output-arm joint feedback and gripper position only."""
+def read_output_qpos(piper: Any) -> np.ndarray:
+    """Read fresh measured joint feedback and gripper opening for one arm."""
     joints_message = piper.GetArmJointMsgs()
     gripper_message = piper.GetArmGripperMsgs()
     _require_fresh_feedback({"joint": joints_message, "gripper": gripper_message})
     return _qpos_from_feedback(joints_message, gripper_message)
 
 
-def read_output_state(piper: C_PiperInterface_V2) -> tuple[np.ndarray, np.ndarray]:
-    """Return delivery state (10D) and diagnostic joint qpos (7D)."""
-    joints_message = piper.GetArmJointMsgs()
-    gripper_message = piper.GetArmGripperMsgs()
-    pose_message = piper.GetArmEndPoseMsgs()
-    _require_fresh_feedback(
-        {
-            "joint": joints_message,
-            "gripper": gripper_message,
-            "end_pose": pose_message,
-        }
-    )
-    qpos = _qpos_from_feedback(joints_message, gripper_message)
+def read_output_delivery_state(piper: Any, qpos: np.ndarray | None = None) -> np.ndarray:
+    if qpos is None:
+        joints_message = piper.GetArmJointMsgs()
+        gripper_message = piper.GetArmGripperMsgs()
+        pose_message = piper.GetArmEndPoseMsgs()
+        _require_fresh_feedback(
+            {
+                "joint": joints_message,
+                "gripper": gripper_message,
+                "end_pose": pose_message,
+            }
+        )
+        qpos = _qpos_from_feedback(joints_message, gripper_message)
+    else:
+        qpos = np.asarray(qpos, dtype=np.float32)
+        pose_message = piper.GetArmEndPoseMsgs()
+        _require_fresh_feedback({"end_pose": pose_message})
     pose = pose_message.end_pose
     xyz_m = np.array([pose.X_axis, pose.Y_axis, pose.Z_axis], dtype=np.float64) / 1_000_000.0
-    rpy_rad = np.deg2rad(np.array([pose.RX_axis, pose.RY_axis, pose.RZ_axis], dtype=np.float64) / 1000.0)
+    rpy_rad = np.deg2rad(
+        np.array([pose.RX_axis, pose.RY_axis, pose.RZ_axis], dtype=np.float64) / 1000.0
+    )
     rotation = Rotation.from_euler("xyz", rpy_rad).as_matrix()
-    state = build_delivery_state(xyz_m, rotation, float(qpos[6]))
-    return state, qpos.astype(np.float32)
+    return build_delivery_state(xyz_m, rotation, float(qpos[6]))
 
 
-def send_output_qpos(piper: C_PiperInterface_V2, qpos: np.ndarray):
-    """Send one joint/gripper target to the output arm."""
+def read_output_state(piper: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Backwards-compatible return of single-arm 10D delivery state + 7D qpos."""
+    qpos = read_output_qpos(piper)
+    return read_output_delivery_state(piper, qpos), qpos
+
+
+def read_robot_state(
+    robot: Any,
+    *,
+    schema: str,
+    arm_mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read a schema-specific state and diagnostic joint vector."""
+    if arm_mode == SINGLE_ARM:
+        qpos = read_output_qpos(robot)
+        state = qpos if schema == JOINT_SCHEMA else read_output_delivery_state(robot, qpos)
+        return np.asarray(state, dtype=np.float32), qpos
+
+    if not isinstance(robot, dict) or set(robot) != {"left", "right"}:
+        raise ValueError("bimanual robot must be a {'left': arm, 'right': arm} mapping")
+    qpos_by_side = {side: read_output_qpos(robot[side]) for side in ("left", "right")}
+    qpos = np.concatenate((qpos_by_side["left"], qpos_by_side["right"]))
+    if schema == JOINT_SCHEMA:
+        state = qpos
+    else:
+        state = np.concatenate(
+            tuple(
+                read_output_delivery_state(robot[side], qpos_by_side[side])
+                for side in ("left", "right")
+            )
+        )
+    return np.asarray(state, dtype=np.float32), np.asarray(qpos, dtype=np.float32)
+
+
+def send_output_qpos(piper: Any, qpos: np.ndarray) -> None:
+    """Send one joint/gripper target to one output arm."""
     joints = [round(float(value) * RAD_FACTOR) for value in qpos[:6]]
     piper.JointCtrl(*joints)
     piper.GripperCtrl(round(abs(float(qpos[6])) * GRIPPER_FACTOR), 1000, 0x01, 0)
 
 
 def reset_output_arm(
-    piper: C_PiperInterface_V2,
+    piper: Any,
     duration_s: float = 4.0,
     hz: int = 20,
     speed_pct: int = 10,
-):
-    """Smoothly move the output arm to the all-zero joint pose."""
+) -> None:
+    """Smoothly move one output arm to the all-zero joint pose."""
     current = read_output_qpos(piper)
     target = np.zeros(7, dtype=np.float32)
     piper.ModeCtrl(0x01, 0x01, speed_pct, 0x00)
@@ -145,11 +199,47 @@ def reset_output_arm(
         time.sleep(1.0 / hz)
 
 
-def connect(can_name: str) -> C_PiperInterface_V2:
+def reset_robot_arms(
+    robot: Any,
+    *,
+    arm_mode: str,
+    duration_s: float = 4.0,
+    hz: int = 20,
+    speed_pct: int = 10,
+) -> None:
+    """Reset one arm or both arms concurrently to the all-zero joint pose."""
+    if arm_mode == SINGLE_ARM:
+        reset_output_arm(robot, duration_s=duration_s, hz=hz, speed_pct=speed_pct)
+        return
+    if arm_mode != BIMANUAL or not isinstance(robot, dict) or set(robot) != {"left", "right"}:
+        raise ValueError("bimanual reset requires a {'left': arm, 'right': arm} mapping")
+
+    failures: list[BaseException] = []
+
+    def reset_side(side: str) -> None:
+        try:
+            reset_output_arm(
+                robot[side],
+                duration_s=duration_s,
+                hz=hz,
+                speed_pct=speed_pct,
+            )
+        except BaseException as exc:  # Propagate worker failures to the caller.
+            failures.append(exc)
+
+    workers = [threading.Thread(target=reset_side, args=(side,)) for side in ("left", "right")]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    if failures:
+        raise RuntimeError(f"failed to reset bimanual output arms: {failures[0]}") from failures[0]
+
+
+def connect(can_name: str) -> Any:
+    if C_PiperInterface_V2 is None:
+        raise RuntimeError("piper_sdk is not installed; run this collector in the Piper hardware environment")
     piper = C_PiperInterface_V2(can_name, judge_flag=False, can_auto_init=False)
-    # With can_auto_init=False, Piper SDK requires explicit CAN-bus creation
-    # before ConnectPort(). The Linux SocketCAN interface is already brought
-    # up by can_activate.sh; CreateCanBus only binds the SDK to that interface.
     piper.CreateCanBus(
         can_name=can_name,
         bustype="socketcan",
@@ -188,28 +278,67 @@ def verify_camera_streams(
             or abs(actual_fps - expected_fps) / expected_fps > 0.05
         ):
             failures.append(
-                f"{key}: requested {expected_fps} FPS but negotiated "
-                f"{actual_fps:.3f} FPS"
+                f"{key}: requested {expected_fps} FPS but negotiated {actual_fps:.3f} FPS"
             )
     if failures:
         raise RuntimeError("Camera verification failed: " + "; ".join(failures))
     return checks
 
 
-def run(args):
+def _connect_robot(args) -> tuple[Any, list[Any]]:
+    connected: list[Any] = []
+    try:
+        if args.arm_mode == SINGLE_ARM:
+            robot = connect(args.can)
+            connected.append(robot)
+            return robot, connected
+        left = connect(args.left_can)
+        connected.append(left)
+        right = connect(args.right_can)
+        connected.append(right)
+        return {"left": left, "right": right}, connected
+    except Exception:
+        for piper in reversed(connected):
+            piper.DisconnectPort()
+        raise
+
+
+def _camera_devices(args, contract: EpisodeContract) -> dict[str, str]:
+    if contract.arm_mode == BIMANUAL:
+        return {
+            "cam_high": args.cam_high_device,
+            "cam_left_wrist": args.cam_left_wrist_device,
+            "cam_right_wrist": args.cam_right_wrist_device,
+        }
+    wrist_key = contract.camera_keys[1]
+    return {"cam_high": args.cam_high_device, wrist_key: args.cam_wrist_device}
+
+
+def run(args) -> None:
     if args.fps <= 0:
         raise ValueError("fps must be positive")
     if args.camera_fps <= 0:
         raise ValueError("camera-fps must be positive")
     if args.fps > args.camera_fps:
         raise ValueError("dataset fps cannot exceed camera-fps")
-    print(f"Connecting to output arm on {args.can} ...")
-    piper = connect(args.can)
+
+    contract = EpisodeContract(
+        schema=args.schema,
+        arm_mode=args.arm_mode,
+        arm_side=args.arm_side,
+        action_source=(
+            "next_measured_qpos" if args.schema == JOINT_SCHEMA else "next_measured_eef"
+        ),
+        action_alignment="next_observation",
+    )
+    can_summary = args.can if args.arm_mode == SINGLE_ARM else f"{args.left_can},{args.right_can}"
+    print(
+        f"Connecting {contract.robot_type} output arm(s) on {can_summary}; "
+        f"schema={contract.schema} state={contract.state_dim} action={contract.action_dim} ..."
+    )
+    robot, connected = _connect_robot(args)
     cameras = CameraCapture(
-        cam_ids={
-            "cam_high": args.cam_high_device,
-            "cam_wrist": args.cam_wrist_device,
-        },
+        cam_ids=_camera_devices(args, contract),
         fps=args.camera_fps,
         image_hw=IMAGE_HW,
         capture_hw=CAMERA_SOURCE_HW,
@@ -220,7 +349,8 @@ def run(args):
         checks = verify_camera_streams(cameras, args.camera_fps)
     except Exception:
         cameras.close()
-        piper.DisconnectPort()
+        for piper in reversed(connected):
+            piper.DisconnectPort()
         raise
     for key, info in checks.items():
         print(
@@ -230,7 +360,15 @@ def run(args):
 
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    buffer = EpisodeBuffer(fps=args.fps)
+    buffer = EpisodeBuffer(
+        fps=args.fps,
+        schema=contract.schema,
+        arm_mode=contract.arm_mode,
+        arm_side=contract.arm_side,
+        camera_keys=contract.camera_keys,
+        action_source=contract.action_source,
+        action_alignment=contract.action_alignment,
+    )
     keys = KeyListener()
     episode_index = next_episode_index(out_dir)
     if episode_index:
@@ -242,7 +380,11 @@ def run(args):
     try:
         while not keys.quit:
             t0 = time.time()
-            state, qpos = read_output_state(piper)
+            state, qpos = read_robot_state(
+                robot,
+                schema=contract.schema,
+                arm_mode=contract.arm_mode,
+            )
             state_timestamp = time.time()
             images, image_ts = cameras.read()
             buffer.add(
@@ -252,9 +394,11 @@ def run(args):
                 qpos=qpos,
                 state_timestamp=state_timestamp,
             )
+            grippers = qpos[6::7] * 1000.0
+            display = ",".join(f"{value:.1f}" for value in grippers)
             sys.stdout.write(
                 f"\r[ep {episode_index:04d}] step {len(buffer):04d} "
-                f"eef=({state[:3].round(3)}) g={qpos[6] * 1000:.1f}mm   "
+                f"state_dim={len(state)} gripper_mm=[{display}]   "
             )
             sys.stdout.flush()
 
@@ -277,15 +421,23 @@ def run(args):
         if len(buffer):
             print("\nUnsaved episode remains in memory and was discarded.")
         cameras.close()
-        piper.DisconnectPort()
+        for piper in reversed(connected):
+            piper.DisconnectPort()
         print(f"\nDone. {episode_index} episodes saved to {out_dir}/")
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--can", default=DEFAULT_CAN)
+    ap.add_argument("--schema", choices=(DELIVERY_SCHEMA, JOINT_SCHEMA), default=DELIVERY_SCHEMA)
+    ap.add_argument("--arm-mode", choices=(SINGLE_ARM, BIMANUAL), default=SINGLE_ARM)
+    ap.add_argument("--arm-side", choices=("left", "right"), default="right")
+    ap.add_argument("--can", default=DEFAULT_CAN, help="single-arm output CAN")
+    ap.add_argument("--left-can", default=DEFAULT_LEFT_CAN, help="bimanual left output CAN")
+    ap.add_argument("--right-can", default=DEFAULT_RIGHT_CAN, help="bimanual right output CAN")
     ap.add_argument("--cam-high-device", default=DEFAULT_HIGH_DEVICE)
     ap.add_argument("--cam-wrist-device", default=DEFAULT_WRIST_DEVICE)
+    ap.add_argument("--cam-left-wrist-device", default=DEFAULT_LEFT_WRIST_DEVICE)
+    ap.add_argument("--cam-right-wrist-device", default=DEFAULT_RIGHT_WRIST_DEVICE)
     ap.add_argument("--fps", type=int, default=DEFAULT_FPS)
     ap.add_argument("--camera-fps", type=int, default=DEFAULT_CAMERA_FPS)
     ap.add_argument("--out-dir", default="episodes_piper_v21")

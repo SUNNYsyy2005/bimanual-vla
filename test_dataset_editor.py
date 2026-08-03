@@ -298,7 +298,8 @@ class DatasetEditorTest(unittest.TestCase):
         )
         self.assertFalse(norm.exists())
         self.assertTrue(result["norm_stats_invalidated"])
-        self.assertTrue(Path(result["norm_stats_invalidated"]).is_file())
+        self.assertEqual(len(result["norm_stats_invalidated_paths"]), 1)
+        self.assertTrue(Path(result["norm_stats_invalidated_paths"][0]).is_file())
         details = self.editor().details("target")
         episode = details["episodes"][0]
         self.assertEqual(episode["instruction"], "new instruction")
@@ -338,6 +339,27 @@ class DatasetEditorTest(unittest.TestCase):
         self.assertTrue(result["norm_stats_deleted"])
         self.assertFalse((self.datasets / "renamed").exists())
         self.assertFalse((self.assets / "pi05_piper_single_arm_lora" / "renamed").exists())
+
+    def test_bimanual_norm_stats_follow_dataset_lifecycle(self):
+        make_dataset(self.datasets, "target", [2])
+        norm = self.assets / "pi05_piper_bimanual_lora" / "target" / "norm_stats.json"
+        norm.parent.mkdir(parents=True)
+        norm.write_text("{}", encoding="utf-8")
+
+        renamed = self.editor().rename_dataset("target", "renamed")
+        moved = self.assets / "pi05_piper_bimanual_lora" / "renamed" / "norm_stats.json"
+        self.assertTrue(renamed["norm_stats_moved"])
+        self.assertTrue(moved.is_file())
+
+        self.editor().update_episode("renamed", 0, {"metadata": {"note": "invalidate"}})
+        self.assertFalse(moved.exists())
+        invalidated = list(moved.parent.glob("norm_stats.invalidated-*.json"))
+        self.assertEqual(len(invalidated), 1)
+
+        moved.write_text("{}", encoding="utf-8")
+        deleted = self.editor().delete_dataset("renamed")
+        self.assertTrue(deleted["norm_stats_deleted"])
+        self.assertFalse(moved.parent.exists())
 
     def test_rename_conflict_and_loader_failure_leave_original_untouched(self):
         target = make_dataset(self.datasets, "target", [2])

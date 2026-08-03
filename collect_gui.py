@@ -1,13 +1,14 @@
-"""GUI for collecting output-arm episodes.
+"""GUI for collecting single-arm or bimanual output-arm episodes.
 
-The GUI talks only to the output arm on one CAN interface and records the
-same NPZ format as :mod:`collect_output_arm`.  It intentionally does not read
-control-command frames or master-arm data.
+The GUI records the same explicit NPZ contracts as :mod:`collect_output_arm`:
+single-arm 7D/10D with two cameras, or bimanual 14D/20D in fixed left+right
+order with three cameras.  It reads measured output-arm feedback only; for
+same-step master-arm joint commands use :mod:`teleop_single` or :mod:`teleop`.
 
-The live view is deliberately kept in the Tk window: it shows both RGB
-cameras, the measured joint pose, EEF state, and whether the arm is inside the
-configured home-pose tolerance.  An episode cannot be started until the
-latest robot feedback passes that check.
+The live view stays in the Tk window and shows every active RGB camera, all
+measured joints, schema-specific state, and the initial-pose check.  Pose
+mismatches are visible warnings rather than collection blockers; missing or
+stale hardware feedback is still rejected before and during recording.
 """
 
 from __future__ import annotations
@@ -36,13 +37,19 @@ from collect_output_arm import (
     DEFAULT_CAN,
     DEFAULT_CAMERA_FPS,
     DEFAULT_HIGH_DEVICE,
+    DEFAULT_LEFT_CAN,
+    DEFAULT_LEFT_WRIST_DEVICE,
+    DEFAULT_RIGHT_CAN,
+    DEFAULT_RIGHT_WRIST_DEVICE,
     DEFAULT_WRIST_DEVICE,
-    reset_output_arm,
+    reset_robot_arms,
 )
+from piper_data_contract import BIMANUAL, DELIVERY_SCHEMA, JOINT_SCHEMA, SINGLE_ARM, EpisodeContract
 
 
 JOINT_NAMES = tuple(f"J{i}" for i in range(1, 7)) + ("Gripper",)
-PREVIEW_SIZE = (480, 360)
+SINGLE_PREVIEW_SIZE = (480, 360)
+BIMANUAL_PREVIEW_SIZE = (360, 270)
 
 
 def check_initial_pose(
@@ -53,41 +60,53 @@ def check_initial_pose(
 ) -> tuple[bool, str, np.ndarray]:
     """Check measured qpos against the configured home pose.
 
-    The first six values are Piper joint angles in radians and the last value
-    is the gripper position in metres.  The returned error vector uses the
-    same units.  This is a pure helper so it can be tested without hardware or
-    a Tk display.
+    Each arm contributes six Piper joint angles in radians followed by one
+    gripper position in metres.  Bimanual vectors use fixed ``left + right``
+    order.  The returned error vector uses the same units.  This is a pure
+    helper so it can be tested without hardware or a Tk display.
     """
     measured = np.asarray(qpos, dtype=np.float64).reshape(-1)
     target = np.asarray(start_qpos, dtype=np.float64).reshape(-1)
-    if measured.shape != (7,) or target.shape != (7,):
-        return False, "invalid qpos shape (expected 7 values)", np.full(7, np.nan)
+    if measured.shape != target.shape or measured.size not in {7, 14}:
+        size = target.size if target.size in {7, 14} else measured.size
+        return (
+            False,
+            "invalid qpos shape (expected matching 7 or 14 values)",
+            np.full(size if size in {7, 14} else 7, np.nan),
+        )
     if not np.all(np.isfinite(measured)) or not np.all(np.isfinite(target)):
-        return False, "robot feedback contains NaN/Inf", np.full(7, np.nan)
+        return False, "robot feedback contains NaN/Inf", np.full(measured.shape, np.nan)
     if joint_tolerance_rad <= 0 or gripper_tolerance_m <= 0:
-        return False, "pose tolerances must be positive", np.full(7, np.nan)
+        return False, "pose tolerances must be positive", np.full(measured.shape, np.nan)
 
     errors = measured - target
-    bad_joints = np.flatnonzero(np.abs(errors[:6]) > joint_tolerance_rad)
-    bad_gripper = abs(float(errors[6])) > gripper_tolerance_m
-    if len(bad_joints) == 0 and not bad_gripper:
-        return True, "OK: robot is at the home pose", errors.astype(np.float32)
-
-    details = [
-        f"J{i + 1}={np.degrees(errors[i]):+.1f}°"
-        for i in bad_joints
-    ]
-    if bad_gripper:
-        details.append(f"Gripper={errors[6] * 1000:+.1f} mm")
-    return False, "Pose diff: " + ", ".join(details), errors.astype(np.float32)
+    details: list[str] = []
+    arm_sides = ("",) if measured.size == 7 else ("L-", "R-")
+    for arm_index, side_prefix in enumerate(arm_sides):
+        start = arm_index * 7
+        bad_joints = np.flatnonzero(
+            np.abs(errors[start : start + 6]) > joint_tolerance_rad
+        )
+        details.extend(
+            f"{side_prefix}J{index + 1}={np.degrees(errors[start + index]):+.1f}°"
+            for index in bad_joints
+        )
+        if abs(float(errors[start + 6])) > gripper_tolerance_m:
+            details.append(
+                f"{side_prefix}Gripper={errors[start + 6] * 1000:+.1f} mm"
+            )
+    if not details:
+        arm_text = "both robots are" if measured.size == 14 else "robot is"
+        return True, f"OK: {arm_text} at the home pose", errors.astype(np.float32)
+    return False, "outside tolerance: " + ", ".join(details), errors.astype(np.float32)
 
 
 class CollectorGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Piper · π0.5 Data Collection")
-        self.root.geometry("1660x1000")
-        self.root.minsize(1280, 800)
+        self.root.geometry("1450x980")
+        self.root.minsize(1100, 780)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         self.session: CollectionSession | None = None
@@ -102,7 +121,7 @@ class CollectorGUI:
         self.latest_state: np.ndarray | None = None
         self.latest_pose_errors = np.zeros(7, dtype=np.float32)
         self.latest_pose_ok: bool | None = None
-        self.latest_pose_reason = "Waiting for robot feedback"
+        self.latest_pose_reason = "等待机械臂反馈"
         self.messages: queue.Queue = queue.Queue()
         self.recording = False
         self.episode_index = 0
@@ -118,11 +137,21 @@ class CollectorGUI:
         # PhotoImage references must be retained for Tk to keep them alive.
         self.preview_photos: dict[str, object] = {}
         self.preview_labels: dict[str, tk.Label] = {}
+        self.preview_cards: dict[str, tk.Frame] = {}
+        self.preview_title_labels: dict[str, tk.Label] = {}
+        self.preview_key_to_slot: dict[str, str] = {}
         self.joint_rows: dict[str, str] = {}
 
+        self.arm_mode_var = tk.StringVar(value=SINGLE_ARM)
+        self.schema_var = tk.StringVar(value=DELIVERY_SCHEMA)
+        self.arm_side_var = tk.StringVar(value="right")
         self.can_var = tk.StringVar(value=DEFAULT_CAN)
+        self.left_can_var = tk.StringVar(value=DEFAULT_LEFT_CAN)
+        self.right_can_var = tk.StringVar(value=DEFAULT_RIGHT_CAN)
         self.high_var = tk.StringVar(value=DEFAULT_HIGH_DEVICE)
         self.wrist_var = tk.StringVar(value=DEFAULT_WRIST_DEVICE)
+        self.left_wrist_var = tk.StringVar(value=DEFAULT_LEFT_WRIST_DEVICE)
+        self.right_wrist_var = tk.StringVar(value=DEFAULT_RIGHT_WRIST_DEVICE)
         self.fps_var = tk.StringVar(value="20")
         self.camera_fps_var = tk.StringVar(value=str(DEFAULT_CAMERA_FPS))
         self.joint_tol_var = tk.StringVar(value="5.0")
@@ -130,14 +159,13 @@ class CollectorGUI:
         self.out_var = tk.StringVar(value="episodes_piper_v21")
         self.task_var = tk.StringVar(value="pick_cube")
         self.instruction_var = tk.StringVar(value="pick up the cube")
-        self.status_var = tk.StringVar(value="Disconnected")
-        self.progress_var = tk.StringVar(value="No episode started")
-        self.pose_check_var = tk.StringVar(value="Waiting for robot feedback")
+        self.status_var = tk.StringVar(value="未连接")
+        self.progress_var = tk.StringVar(value="尚未开始 episode")
+        self.pose_check_var = tk.StringVar(value="等待机械臂反馈")
         self.eef_var = tk.StringVar(value="EEF: --")
         self.live_var = tk.StringVar(value="Live telemetry: --")
-        self.joint_vars = {name: tk.StringVar(value="--") for name in JOINT_NAMES}
-
         self._build_ui()
+        self._configure_mode_ui()
         self.refresh_files()
         self.root.after(100, self._poll_messages)
 
@@ -152,7 +180,7 @@ class CollectorGUI:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("TButton", font=("Sans", 12), padding=(9, 5))
+        style.configure("TButton", font=("Sans", 12), padding=(11, 6))
         style.configure("TLabel", font=("Sans", 12))
         style.configure("TLabelframe.Label", font=("Sans", 13, "bold"))
         style.configure("Treeview", rowheight=29, font=("Sans", 11))
@@ -160,100 +188,137 @@ class CollectorGUI:
 
         main = ttk.Panedwindow(self.root, orient="horizontal")
         main.pack(fill="both", expand=True, padx=10, pady=10)
-        left = ttk.Frame(main, padding=(2, 0, 8, 0), width=620)
+        left = ttk.Frame(main, padding=(2, 0, 8, 0))
         right = ttk.Frame(main, padding=(8, 0, 2, 0))
-        main.add(left, weight=5)
-        main.add(right, weight=8)
+        main.add(left, weight=1)
+        main.add(right, weight=2)
         left.columnconfigure(0, weight=1)
-        left.rowconfigure(4, weight=2)
-        left.rowconfigure(5, weight=1)
+        left.rowconfigure(4, weight=1)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(0, weight=1)
 
-        config = ttk.LabelFrame(left, text="Devices and Task", padding=10)
+        config = ttk.LabelFrame(left, text="设备与任务", padding=10)
         config.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         config.columnconfigure(1, weight=1)
-        config.columnconfigure(3, weight=1)
-        rows = [
-            (("CAN Interface", self.can_var), ("Output Directory", self.out_var)),
-            (("Third-Person Camera", self.high_var), ("Wrist Camera", self.wrist_var)),
-            (("Capture Rate (Hz)", self.fps_var), ("Camera Rate (Hz)", self.camera_fps_var)),
-            (("Task Name", self.task_var), ("Instruction", self.instruction_var)),
+        selectors = [
+            ("机械臂模式", self.arm_mode_var, (("单臂", SINGLE_ARM), ("双臂", BIMANUAL))),
+            ("训练 schema", self.schema_var, (("关节 joint", JOINT_SCHEMA), ("末端 delivery", DELIVERY_SCHEMA))),
+            ("单臂侧", self.arm_side_var, (("right", "right"), ("left", "left"))),
         ]
-        for row, pair in enumerate(rows):
-            for group, (label, var) in enumerate(pair):
-                label_col = group * 2
-                ttk.Label(config, text=label).grid(
-                    row=row, column=label_col, sticky="w", pady=3, padx=(0 if group == 0 else 12, 0)
-                )
-                ttk.Entry(config, textvariable=var, width=22).grid(
-                    row=row, column=label_col + 1, sticky="ew", pady=3, padx=(7, 0)
-                )
+        self.mode_selectors: list[ttk.Combobox] = []
+        self.mode_display_vars: list[tk.StringVar] = []
+        for row, (label, variable, values) in enumerate(selectors):
+            ttk.Label(config, text=label, width=14).grid(row=row, column=0, sticky="w", pady=3)
+            display_to_value = dict(values)
+            value_to_display = {value: display for display, value in values}
+            display_var = tk.StringVar(value=value_to_display[variable.get()])
+            selector = ttk.Combobox(
+                config,
+                textvariable=display_var,
+                values=tuple(display_to_value),
+                state="readonly",
+                width=34,
+            )
+            selector.grid(row=row, column=1, sticky="ew", pady=3, padx=(8, 0))
 
-        pose_config = ttk.LabelFrame(left, text="Pose Status", padding=10)
+            def changed(_event=None, *, source=display_var, target=variable, mapping=display_to_value):
+                target.set(mapping[source.get()])
+                self._configure_mode_ui()
+
+            selector.bind("<<ComboboxSelected>>", changed)
+            self.mode_selectors.append(selector)
+            self.mode_display_vars.append(display_var)
+
+        rows = [
+            ("单臂 CAN", self.can_var, "single"),
+            ("左臂 CAN", self.left_can_var, "bimanual"),
+            ("右臂 CAN", self.right_can_var, "bimanual"),
+            ("顶部相机", self.high_var, "all"),
+            ("单臂腕部相机", self.wrist_var, "single"),
+            ("左腕相机", self.left_wrist_var, "bimanual"),
+            ("右腕相机", self.right_wrist_var, "bimanual"),
+            ("采集频率 Hz", self.fps_var),
+            ("相机源频率 Hz", self.camera_fps_var),
+            ("输出目录", self.out_var),
+            ("任务名", self.task_var),
+            ("指令", self.instruction_var),
+        ]
+        self.device_rows: dict[str, list[tk.Widget]] = {"single": [], "bimanual": []}
+        self.connection_entries: list[ttk.Entry] = []
+        for offset, item in enumerate(rows, start=len(selectors)):
+            label, var, *mode = item
+            label_widget = ttk.Label(config, text=label, width=14)
+            entry = ttk.Entry(config, textvariable=var, width=36)
+            label_widget.grid(row=offset, column=0, sticky="w", pady=3)
+            entry.grid(
+                row=offset, column=1, sticky="ew", pady=3, padx=(8, 0)
+            )
+            if mode and mode[0] in self.device_rows:
+                self.device_rows[mode[0]].extend((label_widget, entry))
+            if label not in {"任务名", "指令"}:
+                self.connection_entries.append(entry)
+        self.device_entries = [
+            widget
+            for widgets in self.device_rows.values()
+            for widget in widgets
+            if isinstance(widget, ttk.Entry)
+        ]
+
+        pose_config = ttk.LabelFrame(left, text="初始位姿安全检查", padding=10)
         pose_config.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         pose_config.columnconfigure(1, weight=1)
-        pose_config.columnconfigure(4, weight=1)
-        ttk.Label(pose_config, text="Joint Tolerance").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Label(pose_config, text="关节误差阈值").grid(row=0, column=0, sticky="w", pady=3)
         ttk.Entry(pose_config, textvariable=self.joint_tol_var, width=9).grid(
             row=0, column=1, sticky="w", padx=(8, 0), pady=3
         )
-        ttk.Label(pose_config, text="deg (J1-J6)").grid(row=0, column=2, sticky="w", padx=(5, 18))
-        ttk.Label(pose_config, text="Gripper Tolerance").grid(row=0, column=3, sticky="w", pady=3)
+        ttk.Label(pose_config, text="°（J1-J6）").grid(row=0, column=2, sticky="w", padx=(5, 0))
+        ttk.Label(pose_config, text="夹爪误差阈值").grid(row=1, column=0, sticky="w", pady=3)
         ttk.Entry(pose_config, textvariable=self.gripper_tol_var, width=9).grid(
-            row=0, column=4, sticky="w", padx=(8, 0), pady=3
+            row=1, column=1, sticky="w", padx=(8, 0), pady=3
         )
-        ttk.Label(pose_config, text="mm").grid(row=0, column=5, sticky="w", padx=(5, 0))
+        ttk.Label(pose_config, text="mm").grid(row=1, column=2, sticky="w", padx=(5, 0))
         ttk.Label(
             pose_config,
-            text="Reference: all six joints at zero with the gripper closed.",
+            text="参考位姿：Reset to Home 使用的全零关节位姿",
             foreground="#65717d",
-        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        controls = ttk.LabelFrame(left, text="Collection Controls", padding=8)
+        controls = ttk.LabelFrame(left, text="采集控制", padding=8)
         controls.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        self.connect_button = ttk.Button(controls, text="Connect", command=self.toggle_connection)
+        self.connect_button = ttk.Button(controls, text="连接设备", command=self.toggle_connection)
         self.connect_button.grid(row=0, column=0, padx=3, pady=3, sticky="ew")
-        self.start_button = ttk.Button(controls, text="Start Episode", command=self.start_episode, state="disabled")
+        self.start_button = ttk.Button(controls, text="开始 episode", command=self.start_episode, state="disabled")
         self.start_button.grid(row=0, column=1, padx=3, pady=3, sticky="ew")
-        self.stop_button = ttk.Button(controls, text="Stop Episode", command=self.stop_episode, state="disabled")
+        self.stop_button = ttk.Button(controls, text="停止 episode", command=self.stop_episode, state="disabled")
         self.stop_button.grid(row=0, column=2, padx=3, pady=3, sticky="ew")
-        self.reset_button = ttk.Button(controls, text="Reset Home", command=self.reset_arm, state="disabled")
+        self.reset_button = ttk.Button(controls, text="Reset to Home", command=self.reset_arm, state="disabled")
         self.reset_button.grid(row=1, column=0, padx=3, pady=3, sticky="ew")
-        ttk.Button(controls, text="Refresh", command=self.refresh_files).grid(
+        ttk.Button(controls, text="刷新文件", command=self.refresh_files).grid(
             row=1, column=1, padx=3, pady=3, sticky="ew"
         )
-        ttk.Button(controls, text="Replay Selected", command=self.replay_selected).grid(
+        ttk.Button(controls, text="回放选中 episode", command=self.replay_selected).grid(
             row=1, column=2, padx=3, pady=3, sticky="ew"
         )
         for col in range(3):
             controls.columnconfigure(col, weight=1)
 
-        status = ttk.LabelFrame(left, text="Status", padding=10)
+        status = ttk.LabelFrame(left, text="状态", padding=10)
         status.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-        ttk.Label(
-            status, textvariable=self.status_var, wraplength=560, justify="left"
-        ).pack(anchor="w", fill="x")
-        ttk.Label(
-            status, textvariable=self.progress_var, foreground="#52606d",
-            wraplength=560, justify="left",
-        ).pack(anchor="w", fill="x", pady=(5, 0))
+        ttk.Label(status, textvariable=self.status_var, wraplength=520).pack(anchor="w")
+        ttk.Label(status, textvariable=self.progress_var, foreground="#52606d").pack(anchor="w", pady=(5, 0))
         self.pose_status_label = tk.Label(
             status,
             textvariable=self.pose_check_var,
             anchor="w",
             justify="left",
-            wraplength=560,
+            wraplength=520,
             font=("Sans", 12, "bold"),
             fg="#65717d",
         )
         self.pose_status_label.pack(fill="x", pady=(7, 0))
-        ttk.Label(
-            status, textvariable=self.live_var, foreground="#52606d",
-            wraplength=560, justify="left",
-        ).pack(anchor="w", fill="x", pady=(5, 0))
+        ttk.Label(status, textvariable=self.live_var, foreground="#52606d").pack(anchor="w", pady=(5, 0))
 
-        joints = ttk.LabelFrame(left, text="Live Robot Pose", padding=8)
+        joints = ttk.LabelFrame(left, text="实时机械臂位姿", padding=8)
         joints.grid(row=4, column=0, sticky="nsew", pady=(0, 8))
         joints.columnconfigure(0, weight=1)
         joints.rowconfigure(0, weight=1)
@@ -261,17 +326,13 @@ class CollectorGUI:
             joints,
             columns=("joint", "position", "error", "limit"),
             show="headings",
-            height=7,
+            height=8,
         )
-        headings = {"joint": "Joint", "position": "Position", "error": "Home Error", "limit": "Status"}
-        widths = {"joint": 90, "position": 125, "error": 125, "limit": 90}
+        headings = {"joint": "关节", "position": "当前值", "error": "相对 Home", "limit": "状态"}
+        widths = {"joint": 95, "position": 130, "error": 130, "limit": 100}
         for column in headings:
             self.joint_table.heading(column, text=headings[column])
             self.joint_table.column(column, width=widths[column], anchor="center")
-        for name in JOINT_NAMES:
-            self.joint_rows[name] = self.joint_table.insert(
-                "", "end", values=(name, "--", "--", "Waiting")
-            )
         self.joint_table.tag_configure("ok", foreground="#137333")
         self.joint_table.tag_configure("bad", foreground="#b3261e")
         self.joint_table.tag_configure("waiting", foreground="#65717d")
@@ -280,55 +341,61 @@ class CollectorGUI:
             row=1, column=0, sticky="w", pady=(8, 0)
         )
 
-        files = ttk.LabelFrame(left, text="Saved Episodes", padding=8)
+        files = ttk.LabelFrame(left, text="已保存 episodes", padding=8)
         files.grid(row=5, column=0, sticky="nsew")
         files.columnconfigure(0, weight=1)
         files.rowconfigure(0, weight=1)
-        self.listbox = tk.Listbox(files, height=4, font=("Sans", 11))
+        self.listbox = tk.Listbox(files, height=7, font=("Sans", 11))
         self.listbox.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(files, orient="vertical", command=self.listbox.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.listbox.configure(yscrollcommand=scrollbar.set)
 
-        preview = ttk.LabelFrame(right, text="Live Camera Views", padding=8)
+        preview = ttk.LabelFrame(right, text="实时相机画面", padding=8)
         preview.grid(row=0, column=0, sticky="nsew")
         preview.columnconfigure(0, weight=1)
         preview.columnconfigure(1, weight=1)
+        preview.columnconfigure(2, weight=1)
         preview.rowconfigure(0, weight=1)
-        for col, (key, title) in enumerate(
-            (("cam_high", "Third-Person Camera"), ("cam_wrist", "Wrist Camera"))
+        for col, (slot, title) in enumerate(
+            (
+                ("high", "顶部全局摄像头"),
+                ("primary_wrist", "单臂夹爪上方摄像头"),
+                ("right_wrist", "右臂夹爪上方摄像头"),
+            )
         ):
             card = tk.Frame(preview, bg="#18232f", bd=0, highlightthickness=0)
             card.grid(row=0, column=col, sticky="nsew", padx=5)
             preview.columnconfigure(col, weight=1)
-            tk.Label(
+            title_label = tk.Label(
                 card,
                 text=title,
                 bg="#18232f",
                 fg="#f5f7fa",
                 font=("Sans", 13, "bold"),
-            ).pack(fill="x", padx=8, pady=(8, 5))
+            )
+            title_label.pack(fill="x", padx=8, pady=(8, 5))
             label = tk.Label(
                 card,
-                text="Waiting for camera frames...",
+                text="等待相机画面...",
                 bg="#0f1720",
                 fg="#aab7c4",
-                width=1,
-                height=1,
+                width=48,
+                height=20,
             )
             label.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-            self.preview_labels[key] = label
+            self.preview_cards[slot] = card
+            self.preview_title_labels[slot] = title_label
+            self.preview_labels[slot] = label
 
-        telemetry = ttk.LabelFrame(right, text="Live End-Effector State", padding=10)
+        telemetry = ttk.LabelFrame(right, text="Schema 实时状态", padding=10)
         telemetry.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         ttk.Label(telemetry, textvariable=self.eef_var, font=("Sans", 12, "bold")).pack(anchor="w")
         ttk.Label(
             telemetry,
-            text="The home-pose check uses measured joint feedback. Camera panels show the latest captured frames.",
+            text="单双臂位姿检查均以输出臂关节反馈为准；双臂 state/action 固定 left + right。",
             foreground="#65717d",
-            wraplength=820,
-            justify="left",
-        ).pack(anchor="w", fill="x", pady=(5, 0))
+        ).pack(anchor="w", pady=(5, 0))
 
     @property
     def out_dir(self) -> pathlib.Path:
@@ -336,13 +403,104 @@ class CollectorGUI:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    @property
+    def arm_mode(self) -> str:
+        return self.arm_mode_var.get()
+
+    @property
+    def schema(self) -> str:
+        return self.schema_var.get()
+
+    @property
+    def arm_side(self) -> str:
+        return "both" if self.arm_mode == BIMANUAL else self.arm_side_var.get()
+
+    @property
+    def contract(self) -> EpisodeContract:
+        return EpisodeContract(
+            schema=self.schema,
+            arm_mode=self.arm_mode,
+            arm_side=self.arm_side,
+        )
+
+    def _joint_display_names(self) -> tuple[str, ...]:
+        if self.arm_mode == BIMANUAL:
+            return tuple(f"L-{name}" for name in JOINT_NAMES) + tuple(
+                f"R-{name}" for name in JOINT_NAMES
+            )
+        return JOINT_NAMES
+
+    def _configure_mode_ui(self):
+        if not hasattr(self, "joint_table"):
+            return
+        bimanual = self.arm_mode == BIMANUAL
+        for widget in self.device_rows.get("single", []):
+            if bimanual:
+                widget.grid_remove()
+            else:
+                widget.grid()
+        for widget in self.device_rows.get("bimanual", []):
+            if bimanual:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+        self.start_qpos = np.zeros(14 if bimanual else 7, dtype=np.float32)
+        self.latest_pose_errors = np.zeros_like(self.start_qpos)
+        self.joint_rows.clear()
+        for item in self.joint_table.get_children():
+            self.joint_table.delete(item)
+        for name in self._joint_display_names():
+            self.joint_rows[name] = self.joint_table.insert(
+                "", "end", values=(name, "--", "--", "等待")
+            )
+
+        if bimanual:
+            self.preview_cards["right_wrist"].grid()
+            self.preview_key_to_slot = {
+                "cam_high": "high",
+                "cam_left_wrist": "primary_wrist",
+                "cam_right_wrist": "right_wrist",
+            }
+        else:
+            self.preview_cards["right_wrist"].grid_remove()
+            self.preview_key_to_slot = {
+                "cam_high": "high",
+                self.contract.camera_keys[1]: "primary_wrist",
+            }
+        self.preview_title_labels["primary_wrist"].configure(
+            text="左臂夹爪上方摄像头" if bimanual else f"{self.arm_side} 臂夹爪上方摄像头"
+        )
+        for label in self.preview_labels.values():
+            label.configure(image="", text="等待相机画面...")
+        self.preview_photos.clear()
+        if self.session is None:
+            self.latest_qpos = None
+            self.latest_state = None
+            self.latest_pose_ok = None
+            self.latest_pose_reason = "等待机械臂反馈"
+            self.pose_check_var.set("等待机械臂反馈")
+        self.eef_var.set("State: --")
+        self.live_var.set(
+            f"{self.arm_mode} / {self.schema} · "
+            f"state={self.contract.state_dim}D action={self.contract.action_dim}D"
+        )
+
+    def _set_connection_config_enabled(self, enabled: bool) -> None:
+        selector_state = "readonly" if enabled else "disabled"
+        entry_state = "normal" if enabled else "disabled"
+        for selector in self.mode_selectors:
+            selector.configure(state=selector_state)
+        for entry in self.connection_entries:
+            entry.configure(state=entry_state)
+
     def _load_pose_check_config(self):
         joint_tol_deg = float(self.joint_tol_var.get())
         gripper_tol_mm = float(self.gripper_tol_var.get())
         if not np.isfinite(joint_tol_deg) or joint_tol_deg <= 0:
-            raise ValueError("Joint tolerance must be positive.")
+            raise ValueError("关节误差阈值必须是正数")
         if not np.isfinite(gripper_tol_mm) or gripper_tol_mm <= 0:
-            raise ValueError("Gripper tolerance must be positive.")
+            raise ValueError("夹爪误差阈值必须是正数")
         self.joint_tolerance_rad = float(np.deg2rad(joint_tol_deg))
         self.gripper_tolerance_m = float(gripper_tol_mm / 1000.0)
 
@@ -358,6 +516,10 @@ class CollectorGUI:
         if self.piper is None or self.cameras is None or self.recording or self.reset_thread is not None:
             state = "disabled"
         else:
+            # Keep the home-pose check as an operator warning only. Requiring
+            # an all-zero pose here prevented valid teleoperation episodes
+            # from starting; freshness checks still fail closed on missing or
+            # stale Piper feedback.
             state = "normal"
         self.start_button.configure(state=state)
 
@@ -370,15 +532,15 @@ class CollectorGUI:
             fps = int(self.fps_var.get())
             camera_fps = int(self.camera_fps_var.get())
             if fps <= 0:
-                raise ValueError("Capture rate must be positive.")
+                raise ValueError("采集频率必须是正数")
             if camera_fps <= 0:
-                raise ValueError("Camera source rate must be positive.")
+                raise ValueError("相机源频率必须是正数")
             if fps > camera_fps:
-                raise ValueError("Capture rate cannot exceed the camera source rate.")
+                raise ValueError("采集频率不能高于相机源频率")
             self.capture_fps = fps
             self.camera_fps = camera_fps
-            self.status_var.set("Connecting to the robot and cameras...")
-            self.pose_check_var.set("Waiting for robot feedback...")
+            self.status_var.set("正在连接机械臂和相机...")
+            self.pose_check_var.set("等待机械臂反馈，开始初始位姿检测...")
             self.root.update_idletasks()
             self.session = CollectionSession(
                 CollectionConfig(
@@ -388,6 +550,13 @@ class CollectorGUI:
                     capture_fps=fps,
                     camera_fps=camera_fps,
                     output_dir=self.out_dir,
+                    schema=self.schema,
+                    arm_mode=self.arm_mode,
+                    arm_side=self.arm_side,
+                    left_can_name=self.left_can_var.get().strip(),
+                    right_can_name=self.right_can_var.get().strip(),
+                    cam_left_wrist_device=self.left_wrist_var.get().strip(),
+                    cam_right_wrist_device=self.right_wrist_var.get().strip(),
                 )
             )
             checks = self.session.connect()
@@ -399,24 +568,32 @@ class CollectorGUI:
                 self.latest_qpos = None
                 self.latest_state = None
                 self.latest_pose_ok = None
-                self.latest_pose_reason = "Waiting for robot feedback"
+                self.latest_pose_reason = "等待机械臂反馈"
             self.capture_stop = threading.Event()
             self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
             self.capture_thread.start()
             camera_status = ", ".join(
                 f"{key}={info['fps']:.0f}FPS" for key, info in checks.items()
             )
-            self.status_var.set(
-                f"Connected to {self.can_var.get()} | Capture: {fps} Hz | {camera_status} | "
-                f"Next episode: {self.episode_index:04d}"
+            can_status = (
+                self.can_var.get().strip()
+                if self.arm_mode == SINGLE_ARM
+                else f"left={self.left_can_var.get().strip()}, right={self.right_can_var.get().strip()}"
             )
-            self.connect_button.configure(text="Disconnect")
+            self.status_var.set(
+                f"已连接 {self.arm_mode}/{self.schema} ({can_status}) | "
+                f"state={self.contract.state_dim}D action={self.contract.action_dim}D | "
+                f"采集 {fps}Hz | {camera_status} | 下一个 episode: {self.episode_index:04d}"
+            )
+            self._set_connection_config_enabled(False)
+            self.connect_button.configure(text="断开设备")
             self.reset_button.configure(state="normal")
             self._update_start_button()
         except Exception as exc:
-            self.status_var.set(f"Connection failed: {exc}")
+            self.status_var.set(f"连接失败: {exc}")
             self._cleanup_devices()
-            messagebox.showerror("Connection Failed", str(exc))
+            self._set_connection_config_enabled(True)
+            messagebox.showerror("连接失败", str(exc))
 
     def start_episode(self):
         if self.session is None or self.recording:
@@ -424,22 +601,23 @@ class CollectorGUI:
         try:
             self._load_pose_check_config()
         except ValueError as exc:
-            messagebox.showwarning("Invalid Home-Pose Settings", str(exc))
+            messagebox.showwarning("初始位姿检查配置错误", str(exc))
             return
         with self.data_lock:
             qpos = None if self.latest_qpos is None else self.latest_qpos.copy()
             state = None if self.latest_state is None else self.latest_state.copy()
         if qpos is None:
-            messagebox.showwarning(
-                "Cannot Start Collection",
-                "No robot feedback has been received yet. Wait a few seconds and try again.",
-            )
+            messagebox.showwarning("无法开始采集", "尚未收到机械臂状态反馈，请等待几秒后重试。")
             return
         pose_ok, reason, errors = self._check_initial_pose(qpos)
         with self.data_lock:
             self.latest_pose_ok = pose_ok
             self.latest_pose_reason = reason
             self.latest_pose_errors = errors
+        # Pose mismatch is intentionally non-blocking. The red telemetry
+        # warning remains visible so the operator can decide whether the
+        # episode starts from the intended task pose. A missing/stale Piper
+        # stream is rejected separately by the hardware reader.
         self._update_telemetry(qpos, state, pose_ok, reason, errors)
 
         task_name = self.task_var.get().strip()
@@ -449,7 +627,7 @@ class CollectorGUI:
                 label = self.session.start_episode(task_name, instruction)
                 self.recording = True
         except Exception as exc:
-            messagebox.showerror("Cannot Start Episode", str(exc))
+            messagebox.showerror("无法开始 episode", str(exc))
             return
         self.task_var.set(label.task_name)
         self.instruction_var.set(label.instruction)
@@ -457,7 +635,7 @@ class CollectorGUI:
         self.stop_button.configure(state="normal")
         self.reset_button.configure(state="disabled")
         self.status_var.set(
-            f"Recording episode {self.episode_index:04d} | Instruction: {label.instruction}"
+            f"正在录制 episode {self.episode_index:04d} | Instruction: {label.instruction}"
         )
         self.progress_var.set("Frames: 0")
 
@@ -500,7 +678,7 @@ class CollectorGUI:
             self.session.stop_episode()
             self.recording = False
         self.stop_button.configure(state="disabled")
-        self.status_var.set("Stopping the episode and preparing it for review...")
+        self.status_var.set("正在停止并准备保存当前 episode...")
         self.root.after(100, self._finish_stop)
 
     def _finish_stop(self):
@@ -509,19 +687,18 @@ class CollectorGUI:
         if self.session is None or self.session.frame_count == 0:
             if self.session is not None and self.session.state is SessionState.REVIEW:
                 self.session.discard_episode()
-            self.status_var.set("The episode is empty and was not saved.")
+            self.status_var.set("episode 为空，未保存")
             return
         self._ask_label_and_save()
 
     def _ask_label_and_save(self):
         dialog = tk.Toplevel(self.root)
-        dialog.title("Review Episode")
+        dialog.title("标记当前 episode")
         dialog.transient(self.root)
         dialog.grab_set()
-        dialog.resizable(False, False)
         ttk.Label(
             dialog,
-            text=f"Episode {self.episode_index:04d} | {self.session.frame_count} frames",
+            text=f"Episode {self.episode_index:04d} | {self.session.frame_count} 帧",
         ).pack(padx=20, pady=15)
         buttons = ttk.Frame(dialog)
         buttons.pack(pady=(0, 15))
@@ -530,7 +707,7 @@ class CollectorGUI:
             if choice == "discard":
                 self.session.discard_episode()
                 dialog.destroy()
-                self.status_var.set("Episode discarded.")
+                self.status_var.set("已丢弃当前 episode")
                 self._update_start_button()
                 return
             instruction = self.instruction_var.get().strip() or self.task_var.get().replace("_", " ")
@@ -541,23 +718,23 @@ class CollectorGUI:
                     instruction=instruction,
                 )
             except Exception as exc:
-                messagebox.showerror("Episode Validation Failed", str(exc), parent=dialog)
+                messagebox.showerror("Episode 校验失败", str(exc), parent=dialog)
                 return
             self.episode_index = self.session.episode_index
             dialog.destroy()
             self.status_var.set(
-                f"Saved and validated: {path} | FPS={stats.actual_fps:.2f}"
+                f"已保存并校验: {path} | FPS={stats.actual_fps:.2f}"
             )
             self.refresh_files()
             self._update_start_button()
 
-        ttk.Button(buttons, text="Save as Success", command=lambda: finish("success")).pack(
+        ttk.Button(buttons, text="保存为成功", command=lambda: finish("success")).pack(
             side="left", padx=5
         )
-        ttk.Button(buttons, text="Save as Failure", command=lambda: finish("failure")).pack(
+        ttk.Button(buttons, text="保存为失败", command=lambda: finish("failure")).pack(
             side="left", padx=5
         )
-        ttk.Button(buttons, text="Discard", command=lambda: finish("discard")).pack(
+        ttk.Button(buttons, text="丢弃", command=lambda: finish("discard")).pack(
             side="left", padx=5
         )
 
@@ -566,20 +743,20 @@ class CollectorGUI:
             return
         confirmed = messagebox.askyesno(
             "Reset to Home",
-            "Move the robot smoothly to the all-zero joint pose and close the gripper?",
+            "将当前连接的机械臂平滑移动到全零关节参考位姿并关闭夹爪，是否继续？",
         )
         if not confirmed:
             return
         self.start_button.configure(state="disabled")
         self.reset_button.configure(state="disabled")
-        self.status_var.set("Resetting the robot to Home...")
-        self.pose_check_var.set("Reset in progress; starting an episode is temporarily disabled.")
+        self.status_var.set("正在将机械臂复位到 Home...")
+        self.pose_check_var.set("复位中：暂时禁止开始 episode")
         self.reset_thread = threading.Thread(target=self._reset_worker, daemon=True)
         self.reset_thread.start()
 
     def _reset_worker(self):
         try:
-            reset_output_arm(self.piper)
+            reset_robot_arms(self.piper, arm_mode=self.arm_mode)
             self.messages.put(("reset_done",))
         except Exception as exc:
             self.messages.put(("reset_error", str(exc)))
@@ -587,10 +764,10 @@ class CollectorGUI:
     def _finish_reset(self, success: bool, error: str | None = None):
         self.reset_thread = None
         if success:
-            self.status_var.set("Home reset command completed. Waiting for the pose check to pass.")
+            self.status_var.set("Home 复位指令已完成，等待位姿检测通过")
         else:
-            self.status_var.set(f"Reset failed: {error}")
-            messagebox.showerror("Reset Failed", error or "Unknown error")
+            self.status_var.set(f"复位失败: {error}")
+            messagebox.showerror("复位失败", error or "未知错误")
         if self.piper is not None and not self.recording:
             self.reset_button.configure(state="normal")
         self._update_start_button()
@@ -603,44 +780,77 @@ class CollectorGUI:
         pose_reason: str,
         pose_errors: np.ndarray | None,
     ):
-        if qpos is None or np.asarray(qpos).shape != (7,):
-            for name in JOINT_NAMES:
-                self.joint_table.item(
-                    self.joint_rows[name],
-                    values=(name, "--", "--", "Waiting"),
-                    tags=("waiting",),
-                )
-            self.eef_var.set("EEF: --")
-            self.live_var.set("Live telemetry: waiting for robot feedback")
+        expected_joint_dim = self.contract.joint_dim
+        display_names = self._joint_display_names()
+        qpos_array = None if qpos is None else np.asarray(qpos, dtype=np.float64)
+        if qpos_array is None or qpos_array.shape != (expected_joint_dim,):
+            for name in display_names:
+                row = self.joint_rows.get(name)
+                if row is not None:
+                    self.joint_table.item(
+                        row,
+                        values=(name, "--", "--", "等待"),
+                        tags=("waiting",),
+                    )
+            self.eef_var.set("State: --")
+            self.live_var.set(
+                f"Live telemetry: 等待 {expected_joint_dim}D 机械臂关节反馈"
+            )
         else:
-            qpos = np.asarray(qpos, dtype=np.float64)
-            errors = np.zeros(7, dtype=np.float64) if pose_errors is None else np.asarray(pose_errors)
-            for index, name in enumerate(JOINT_NAMES):
-                if index < 6:
-                    position = f"{np.degrees(qpos[index]):+.2f}°"
+            errors = (
+                qpos_array - self.start_qpos
+                if pose_errors is None
+                else np.asarray(pose_errors, dtype=np.float64)
+            )
+            if errors.shape != qpos_array.shape:
+                errors = qpos_array - self.start_qpos
+            for index, name in enumerate(display_names):
+                local_index = index % 7
+                if local_index < 6:
+                    position = f"{np.degrees(qpos_array[index]):+.2f}°"
                     error = f"{np.degrees(errors[index]):+.2f}°"
                     ok = abs(errors[index]) <= self.joint_tolerance_rad
                 else:
-                    position = f"{qpos[index] * 1000:+.2f} mm"
+                    position = f"{qpos_array[index] * 1000:+.2f} mm"
                     error = f"{errors[index] * 1000:+.2f} mm"
                     ok = abs(errors[index]) <= self.gripper_tolerance_m
-                tag = "ok" if ok else "bad"
                 self.joint_table.item(
                     self.joint_rows[name],
-                    values=(name, position, error, "OK" if ok else "CHECK"),
-                    tags=(tag,),
+                    values=(name, position, error, "正常" if ok else "超差"),
+                    tags=(("ok" if ok else "bad"),),
                 )
-            if state is not None and np.asarray(state).shape == (10,):
-                state = np.asarray(state)
-                xyz = ", ".join(f"{value:+.3f}" for value in state[:3])
-                rot6d = ", ".join(f"{value:+.2f}" for value in state[3:9])
-                self.eef_var.set(f"EEF xyz (m): [{xyz}]   gripper fraction: {state[9]:.3f}")
-                self.live_var.set(f"EEF rotation-6D: [{rot6d}]")
-            else:
-                self.eef_var.set("EEF: --")
-                self.live_var.set("Live telemetry: state unavailable")
 
-        self.pose_check_var.set(f"Pose: {pose_reason}")
+            state_array = None if state is None else np.asarray(state, dtype=np.float64)
+            if state_array is None or state_array.shape != (self.contract.state_dim,):
+                actual = "missing" if state_array is None else f"{state_array.size}D"
+                self.eef_var.set("State: --")
+                self.live_var.set(
+                    f"Live telemetry: state {actual}, expected {self.contract.state_dim}D"
+                )
+            elif self.schema == JOINT_SCHEMA:
+                order = "left + right" if self.arm_mode == BIMANUAL else self.arm_side
+                self.eef_var.set(
+                    f"Joint state: {self.contract.state_dim}D measured qpos ({order})"
+                )
+                self.live_var.set(
+                    f"π0.5 joint action: {self.contract.action_dim}D absolute joint target"
+                )
+            else:
+                arm_summaries: list[str] = []
+                rotation_summaries: list[str] = []
+                for arm_index, side in enumerate(self.contract.arm_sides):
+                    arm_state = state_array[arm_index * 10 : (arm_index + 1) * 10]
+                    xyz = ", ".join(f"{value:+.3f}" for value in arm_state[:3])
+                    rot6d = ", ".join(f"{value:+.2f}" for value in arm_state[3:9])
+                    label = side.upper()[0]
+                    arm_summaries.append(
+                        f"{label} xyz(m)=[{xyz}] grip={arm_state[9]:.3f}"
+                    )
+                    rotation_summaries.append(f"{label} rot6D=[{rot6d}]")
+                self.eef_var.set("   |   ".join(arm_summaries))
+                self.live_var.set("   |   ".join(rotation_summaries))
+
+        self.pose_check_var.set(f"初始位姿: {pose_reason}")
         if pose_ok is True:
             self.pose_status_label.configure(fg="#137333")
         elif pose_ok is False:
@@ -667,26 +877,12 @@ class CollectorGUI:
             while True:
                 kind, *payload = self.messages.get_nowait()
                 if kind == "progress":
-                    self.progress_var.set(f"Recorded frames: {payload[0]}")
+                    self.progress_var.set(f"已录制帧数: {payload[0]}")
                 elif kind == "error":
-                    error = payload[0]
-                    with self.data_lock:
-                        if self.session is not None and self.session.state is SessionState.RECORDING:
-                            self.session.stop_episode()
-                            self.session.discard_episode()
-                        self.recording = False
-                    self._cleanup_devices()
-                    self.connect_button.configure(text="Connect")
-                    self.start_button.configure(state="disabled")
-                    self.stop_button.configure(state="disabled")
-                    self.reset_button.configure(state="disabled")
-                    self.progress_var.set("Episode discarded because device feedback failed.")
-                    self.status_var.set(f"Collection aborted: {error}")
-                    messagebox.showerror(
-                        "Collection Aborted",
-                        f"{error}\n\nThe current episode was discarded. "
-                        "Reconnect the devices before collecting again.",
-                    )
+                    self.status_var.set(f"采集错误: {payload[0]}")
+                    if self.recording:
+                        self.stop_episode()
+                    messagebox.showerror("采集错误", payload[0])
                 elif kind == "reset_done":
                     self._finish_reset(True)
                 elif kind == "reset_error":
@@ -696,9 +892,11 @@ class CollectorGUI:
         self.root.after(100, self._poll_messages)
 
     def _show_preview(self, images: dict[str, np.ndarray]):
+        preview_size = BIMANUAL_PREVIEW_SIZE if self.arm_mode == BIMANUAL else SINGLE_PREVIEW_SIZE
         if Image is not None and ImageTk is not None:
             for key, frame in images.items():
-                label = self.preview_labels.get(key)
+                slot = self.preview_key_to_slot.get(key)
+                label = None if slot is None else self.preview_labels.get(slot)
                 if label is None:
                     continue
                 rgb = np.asarray(frame)
@@ -709,20 +907,33 @@ class CollectorGUI:
                 rgb = np.ascontiguousarray(rgb.astype(np.uint8, copy=False))
                 image = Image.fromarray(rgb, mode="RGB")
                 resampling = getattr(Image, "Resampling", Image).BILINEAR
-                image = image.resize(PREVIEW_SIZE, resampling)
+                image = image.resize(preview_size, resampling)
                 photo = ImageTk.PhotoImage(image=image)
                 label.configure(image=photo, text="")
-                self.preview_photos[key] = photo
+                self.preview_photos[slot] = photo
             return
 
         # Minimal-install fallback.  The normal project environment includes
         # Pillow, so this path is only used when Tk cannot embed PhotoImage.
         for key, frame in images.items():
-            image = np.asarray(frame).transpose(1, 2, 0)
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-            image = cv2.resize(image, PREVIEW_SIZE, interpolation=cv2.INTER_NEAREST)
-            title = "Third-person - cam_high" if key == "cam_high" else "Wrist - cam_wrist"
-            cv2.putText(image, title, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+            rgb = np.asarray(frame)
+            if rgb.ndim == 3 and rgb.shape[0] in (1, 3, 4):
+                rgb = rgb.transpose(1, 2, 0)
+            if rgb.ndim != 3 or rgb.shape[2] != 3:
+                continue
+            image = cv2.cvtColor(rgb.astype(np.uint8, copy=False), cv2.COLOR_RGB2BGR)
+            image = cv2.resize(image, preview_size, interpolation=cv2.INTER_NEAREST)
+            title = key.replace("_", " ")
+            cv2.putText(
+                image,
+                title,
+                (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
             cv2.imshow(title, image)
         cv2.waitKey(1)
 
@@ -736,7 +947,7 @@ class CollectorGUI:
     def replay_selected(self):
         selection = self.listbox.curselection()
         if not selection:
-            messagebox.showinfo("Replay Episode", "Select an episode first.")
+            messagebox.showinfo("回放", "请先选择一个 episode")
             return
         path = self.listbox.get(selection[0])
         viewer = pathlib.Path(__file__).with_name("view_episode.py")
@@ -763,34 +974,33 @@ class CollectorGUI:
             self.latest_qpos = None
             self.latest_state = None
             self.latest_pose_ok = None
-            self.latest_pose_reason = "Waiting for robot feedback"
-            self.latest_pose_errors = np.zeros(7, dtype=np.float32)
+            self.latest_pose_reason = "等待机械臂反馈"
+            self.latest_pose_errors = np.zeros(self.contract.joint_dim, dtype=np.float32)
         self.preview_photos.clear()
         for key, label in self.preview_labels.items():
-            label.configure(image="", text="Waiting for camera frames...")
+            label.configure(image="", text="等待相机画面...")
         cv2.destroyAllWindows()
 
     def disconnect(self):
         if self.recording:
-            messagebox.showwarning("Cannot Disconnect", "Stop the current episode first.")
+            messagebox.showwarning("无法断开", "请先停止当前 episode")
             return
         if self.reset_thread is not None:
-            messagebox.showwarning("Cannot Disconnect", "Wait for the reset operation to finish.")
+            messagebox.showwarning("无法断开", "请等待复位完成")
             return
         self._cleanup_devices()
-        self.connect_button.configure(text="Connect")
+        self.connect_button.configure(text="连接设备")
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="disabled")
         self.reset_button.configure(state="disabled")
-        self.status_var.set("Disconnected")
-        self.pose_check_var.set("Waiting for robot feedback")
+        self._set_connection_config_enabled(True)
+        self._configure_mode_ui()
+        self.status_var.set("未连接")
+        self.pose_check_var.set("等待机械臂反馈")
 
     def close(self):
         if self.recording:
-            if not messagebox.askyesno(
-                "Exit",
-                "The current episode has not been saved. Exit anyway?",
-            ):
+            if not messagebox.askyesno("退出", "当前 episode 尚未保存，确定退出吗？"):
                 return
             with self.data_lock:
                 if self.session is not None and self.session.state is SessionState.RECORDING:

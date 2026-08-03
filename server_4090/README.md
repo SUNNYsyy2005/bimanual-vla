@@ -9,11 +9,11 @@
   └─ openpi_client.WebsocketClientPolicy（OpenPI 官方协议）
        └─ 4×4090 OpenPI WebsocketPolicyServer
             ├─ π0.5 模型推理
-            └─ 镜像 state / 两路图像 / prompt / action telemetry
+            └─ 镜像 state / 单臂两路或双臂三路图像 / prompt / action telemetry
                  └─ Dashboard 只读可视化
 ```
 
-- 真实 `state + cam_high + cam_wrist + prompt` 由机械臂电脑直接发送到 Policy WebSocket 端口。
+- 真实观测由机械臂电脑直接发送到 Policy WebSocket 端口：单臂为 `state + cam_high + 单腕部相机 + prompt`，双臂为 `state + cam_high + cam_left_wrist + cam_right_wrist + prompt`。
 - Dashboard 不接收机械臂观测上传，也不代发 inference。
 - Dashboard 负责数据集、norm、训练、GPU、checkpoint 和 Policy 进程管理。
 - 页面顶部按“总览 / 数据集 / 训练 / Policy / 实时遥测”分模块导航；总览集中显示 GPU、数据量和活动任务。
@@ -29,7 +29,7 @@
 bash deploy_4090_server.sh
 ```
 
-脚本只同步本服务需要的文件到 `4x4090:/home/sunny/bimanual-vla`。它会重启 Dashboard 本身，但不会停止页面管理的 Policy、训练任务或服务器上已有的其他 GPU 进程。首次启动会生成随机 Token，并打印：
+脚本只同步本服务需要的文件到 `4x4090-wg:/home/sunny/bimanual-vla`。它会重启 Dashboard 本身，但不会停止页面管理的 Policy、训练任务或服务器上已有的其他 GPU 进程。首次启动会生成随机 Token，并打印：
 
 ```text
 URL: http://192.168.101.9:8090
@@ -45,13 +45,13 @@ Token 保存在服务器：
 随时读取现有 Token：
 
 ```bash
-ssh 4x4090 'source ~/.config/bimanual-vla/server.env && printf "%s\n" "$BIMANUAL_VLA_SERVER_TOKEN"'
+ssh 4x4090-wg 'source ~/.config/bimanual-vla/server.env && printf "%s\n" "$BIMANUAL_VLA_SERVER_TOKEN"'
 ```
 
 Dashboard 也支持用账号密码换取 Token。`start_server.sh` 会在首次启动时生成一组独立的 Dashboard 登录凭据，并与 Token 一起保存在权限为 `0600` 的 `server.env` 中：
 
 ```bash
-ssh 4x4090 'source ~/.config/bimanual-vla/server.env && printf "user=%s\npassword=%s\n" "$BIMANUAL_VLA_LOGIN_USER" "$BIMANUAL_VLA_LOGIN_PASSWORD"'
+ssh 4x4090-wg 'source ~/.config/bimanual-vla/server.env && printf "user=%s\npassword=%s\n" "$BIMANUAL_VLA_LOGIN_USER" "$BIMANUAL_VLA_LOGIN_PASSWORD"'
 ```
 
 网页顶部的“账号密码获取 Token”按钮会调用 `POST /api/auth/token`，验证成功后自动把返回的 Bearer Token 保存到当前浏览器。命令行也可以这样获取（不要把密码放在 URL 中）：
@@ -72,7 +72,7 @@ curl -sS -X POST http://192.168.101.9:8090/api/auth/token \
 Token 只用于 Dashboard 管理 API；OpenPI Policy WebSocket 使用官方通信协议，机械臂客户端不需要这个 Token。不要把 Token 提交到 Git、放进 URL，或保存在不可信浏览器。需要轮换时：
 
 ```bash
-ssh 4x4090 'bash /home/sunny/bimanual-vla/server_4090/stop_server.sh && rm -f ~/.config/bimanual-vla/server.env && bash /home/sunny/bimanual-vla/server_4090/start_server.sh'
+ssh 4x4090-wg 'bash /home/sunny/bimanual-vla/server_4090/stop_server.sh && rm -f ~/.config/bimanual-vla/server.env && bash /home/sunny/bimanual-vla/server_4090/start_server.sh'
 ```
 
 自定义路径、端口或 JAX 显存比例时修改服务器上的：
@@ -84,8 +84,8 @@ ssh 4x4090 'bash /home/sunny/bimanual-vla/server_4090/stop_server.sh && rm -f ~/
 重启 Dashboard：
 
 ```bash
-ssh 4x4090 'bash /home/sunny/bimanual-vla/server_4090/stop_server.sh'
-ssh 4x4090 'bash /home/sunny/bimanual-vla/server_4090/start_server.sh'
+ssh 4x4090-wg 'bash /home/sunny/bimanual-vla/server_4090/stop_server.sh'
+ssh 4x4090-wg 'bash /home/sunny/bimanual-vla/server_4090/start_server.sh'
 ```
 
 ## 上传数据集
@@ -117,31 +117,29 @@ python upload_dataset_4090.py /path/to/new_episodes \
 - 新 episodes 会重新生成连续的 `episode_index`、全局 `index` 和 `task_index`；视频只复制/硬链接，不重新编码。
 - 合并在隐藏临时目录执行，最终数据集通过结构和实际 loader 校验后才原子替换旧目录。
 
-当前 delivery schema：
+支持四种 canonical Piper 数据合同，双臂向量顺序固定为 `left + right`：
+
+| 模式 | schema | state | action | 相机 |
+|---|---|---:|---:|---|
+| 单臂 | joint | 7D 关节角 + 夹爪开度 | 7D 绝对关节/夹爪目标 | `cam_high` + 单腕部 |
+| 单臂 | delivery | 10D EEF xyz + rotation6d + 夹爪闭合比例 | 7D Δxyz + Δrotvec + 夹爪目标 | `cam_high` + 单腕部 |
+| 双臂 | joint | 14D = left 7D + right 7D | 14D = left 7D + right 7D | `cam_high` + 左右腕部 |
+| 双臂 | delivery | 20D = left 10D + right 10D | 14D = left 7D + right 7D | `cam_high` + 左右腕部 |
+
+canonical LeRobot 相机字段为：
 
 ```text
-state:        10D = EEF xyz + rotation6d + gripper_closed_fraction
-actions:       7D = base-frame Δxyz + left-multiplied Δrotvec + gripper target
-image:         cam_high, RGB 256×256
-wrist_image:   cam_wrist, RGB 256×256
+single:   observation.images.cam_high + observation.images.cam_<side>_wrist
+bimanual: observation.images.cam_high + observation.images.cam_left_wrist + observation.images.cam_right_wrist
 ```
 
-旧版 joint 数据集/Policy schema：
-
-```text
-observation.state:                  7D = joint1..joint6 (rad) + gripper opening (m)
-action:                             7D = absolute joint1..joint6 + gripper opening target
-observation.images.cam_high:        RGB
-observation.images.cam_<side>_wrist RGB
-```
-
-同一 Policy 进程仍只运行与其 checkpoint 一致的一种 schema；机械臂 bridge 会读取握手 metadata，并自动选择匹配的 10D/7D state、相机 key 和动作执行方式，不能把 EEF 与 joint 数值直接互相解释。
+同一 Policy 进程只运行与其 checkpoint 一致的一种合同；机械臂 bridge 会读取握手 metadata，并自动选择匹配的 7D/10D/14D/20D state、相机 key 和动作执行方式，不能把 EEF 与 joint 数值直接互相解释。
 
 ## 网页 Episode 编辑器
 
 Dashboard 的“Episode 级数据集编辑”区域支持：
 
-1. 识别并显示单臂 Joint 7D、单臂 Delivery 10D、双臂 Joint 14D、双臂 Delivery 20D，以及其他自定义 state/action 维度；双臂或自定义格式当前仅开放管理和预览，不会静默提交到单臂训练入口。
+1. 识别并显示单臂 Joint 7D/7D、单臂 Delivery 10D/7D、双臂 Joint 14D/14D、双臂 Delivery 20D/14D，以及其他自定义 state/action 维度；四种 canonical Piper 格式均可进入对应训练配置，自定义格式只开放管理和预览。
 2. 分页查看 episode 的帧数、instruction、可选 task name、可选 success 和附加 metadata；未设置的可选字段保持为空，不会被自动写成 `success=true`。
 3. 数据集级重命名和整库删除；重命名同步移动当前 dataset-level norm stats，删除整库不删除历史 checkpoint、模型或任务记录。
 4. 独立预览该 episode 的各路摄像头媒体：
@@ -156,7 +154,7 @@ Dashboard 的“Episode 级数据集编辑”区域支持：
 - 数据集被正在运行或等待中的 norm/train/Policy 任务使用时拒绝修改。
 - 所有修改都在临时目录完成，并通过结构校验和 LeRobot/OpenPI loader 校验后原子替换。
 - 原目录保留为隐藏的 `.DATASET.backup-*`；失败自动回滚。
-- `assets/pi05_piper_single_arm_lora/DATASET/norm_stats.json` 会被重命名为 `norm_stats.invalidated-*`，防止继续使用旧统计；下一次提交训练会自动重新计算 norm stats。
+- 对应训练配置下的 `assets/pi05_piper_single_arm_lora/DATASET/norm_stats.json` 或 `assets/pi05_piper_bimanual_lora/DATASET/norm_stats.json` 会被重命名为 `norm_stats.invalidated-*`，防止继续使用旧统计；下一次提交训练会自动重新计算 norm stats。
 - 所有 API 都要求 Dashboard Bearer Token。
 
 相关管理 API：
@@ -176,7 +174,7 @@ LeRobot 数据集的 `meta/info.json` 中 `total_videos: 0` 只表示没有编�
 
 ## 下载训练基座权重
 
-单臂 Piper LoRA 微调使用 `pi05_base`，不是 DROID 8D 的 `pi05_droid`：
+单臂和双臂 Piper LoRA 微调都使用 `pi05_base`，不是 DROID 8D 的 `pi05_droid`：
 
 ```bash
 cd /home/sunny/bimanual-vla
@@ -206,7 +204,7 @@ cd /home/sunny/bimanual-vla
    - 启动方式默认使用 `auto`：实验目录存在时等价于 `--resume`，不存在时创建新训练；只有明确选择 `overwrite` 才会删除原 checkpoint。
 4. “计算归一化统计”表单保留为手动重算或限制帧数调试入口，正常训练无需预先手动点击。
 5. 训练模块集中展示 Norm / Train 进程管理、任务日志和指标曲线；从日志提取 `Step N: key=value`，绘制 `loss`、`loss_physical_14d`、`loss_padding_18d` 等曲线，并显示 step 进度、latest/min/max；图例按钮可切换 `grad_norm`、`param_norm` 等其他指标。
-6. 页面扫描 `pi05_piper_single_arm_lora/<experiment>/<step>`，按数据集过滤完整 checkpoint，并在训练模块列出 checkpoint 表。
+6. 页面按数据集臂模式扫描 `pi05_piper_single_arm_lora/<experiment>/<step>` 或 `pi05_piper_bimanual_lora/<experiment>/<step>`，过滤完整 checkpoint，并在训练模块列出 checkpoint 表。
 7. 在“新建 / 切换 Policy 进程”中选择 GPU、端口和 checkpoint：
    - 留空“操作对象”：新建独立 Policy；
    - 选择运行中的 Policy：先停止旧进程，再从新 checkpoint 启动替代进程。
@@ -218,7 +216,7 @@ cd /home/sunny/bimanual-vla
    - 最近 telemetry / 客户端推理时间；
    - 独立 Policy 日志、正常停止、强制结束，以及终态历史记录删除。
 9. 在机械臂控制电脑启动官方 WebSocket 客户端。
-10. Dashboard 按 schema 显示 Policy 实际收到的 10D delivery state 或 7D joint state、两路图像、prompt、预测 action，以及服务端授权、客户端本地执行许可、双重门结果和实际执行/阻断原因。
+10. Dashboard 按 schema 显示 Policy 实际收到的单臂 7D/10D 或双臂 14D/20D state、Policy 要求的两路/三路图像、prompt、7D/14D 预测 action，以及服务端授权、客户端本地执行许可、双重门结果和实际执行/阻断原因。
 
 训练指标 API（Bearer Token 必需）：
 
@@ -233,7 +231,7 @@ DELETE /api/tasks/<task_id>
 
 ## 机械臂电脑：官方 Policy 客户端
 
-脚本必须运行在物理连接 Piper CAN 和两路 USB 相机的电脑，而不是 4×4090：
+脚本必须运行在物理连接 Piper CAN 和相机的电脑，而不是 4×4090；单臂使用一个 CAN 和两路相机：
 
 ```bash
 python robot_observation_bridge.py \
@@ -247,28 +245,34 @@ python robot_observation_bridge.py \
   --hz 5
 ```
 
-单次验证：
+双臂 shadow-only 示例使用两个 CAN 和三路相机：
 
 ```bash
 python robot_observation_bridge.py \
   --host 192.168.101.9 \
   --port 8000 \
-  --can can0 \
+  --arm-mode bimanual \
+  --arm-side both \
+  --left-can can1 \
+  --right-can can3 \
   --cam-high-device /dev/video8 \
-  --cam-wrist-device /dev/video16 \
+  --cam-left-wrist-device /dev/video12 \
+  --cam-right-wrist-device /dev/video16 \
   --instruction "pick up the cube" \
-  --once
+  --hz 5
 ```
+
+单次验证可在任一示例末尾追加 `--once`。
 
 客户端行为：
 
-1. 读取 `GetArmJointMsgs`、`GetArmGripperMsgs` 和 `GetArmEndPoseMsgs`。
-2. 同时构造与 `collect_output_arm.py` 一致的 10D delivery state，并保留实测 7D joint qpos。
-3. 以 30 FPS 打开 `/dev/video8` 和 `/dev/video16`，并行读取后转换为 256×256 RGB。
+1. 从每个活动 Piper 读取 `GetArmJointMsgs`、`GetArmGripperMsgs` 和 `GetArmEndPoseMsgs`；双臂固定按 `left + right` 拼接。
+2. 单臂同时构造 10D delivery state 和 7D joint qpos；双臂同时构造 20D delivery state 和 14D joint qpos。
+3. 单臂并行读取顶部与单腕部两路相机，双臂并行读取顶部与左右腕部三路相机，并转换为 256×256 RGB。
 4. 使用 `openpi_client.websocket_client_policy.WebsocketClientPolicy` 直连所选 Policy 端口。
-5. 校验服务端 metadata：`transport`、`schema`、`state_dim`、`action_dim`、`arm_side`、`action_semantics` 和 `camera_keys`。
-6. delivery Policy 自动发送 10D state + `cam_wrist`；joint Policy 自动发送 7D qpos + `cam_<arm_side>_wrist`。
-7. 打印 action chunk；切换模型造成断线时自动重连并重新协商 schema。
+5. 校验服务端 metadata：`transport`、`schema`、`arm_mode`、`state_dim`、`action_dim`、`arm_side`、`action_semantics` 和 `camera_keys`；不一致时 fail closed。
+6. 根据 metadata 自动发送匹配的 7D/10D/14D/20D state 和相机字段，并只接受匹配的 7D/14D action。
+7. 打印 action chunk；切换模型造成断线时自动重连并重新协商合同。
 
 该脚本不需要 Dashboard URL 或 Token。上述默认命令不会调用动作控制 API。
 

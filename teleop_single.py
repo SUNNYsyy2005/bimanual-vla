@@ -11,6 +11,7 @@ import time
 import numpy as np
 
 from camera import CameraCapture
+from piper_data_contract import EpisodeContract
 from piper_sdk import C_PiperInterface_V2
 from teleop import KeyListener, _countdown, _read_7d, _reset_one_arm, _send_7d, connect_arm
 from trajectory import TrajectoryRecorder
@@ -87,6 +88,11 @@ def _maybe_make_pi0_writer(args):
         action_names=single_arm_joint_names(args.arm_side),
         camera_keys=["cam_high", wrist_key],
         image_hw=(224, 224),
+        schema="joint",
+        arm_mode="single",
+        arm_side=args.arm_side,
+        action_source="master_joint_feedback",
+        action_alignment="same_step_command",
     )
 
 
@@ -95,16 +101,26 @@ def _save_episode(recorder: TrajectoryRecorder, args, ep_dir: pathlib.Path, ep_i
         print("  (empty episode, skipping)")
         return ep_idx
     instruction = args.instruction or _default_instruction(args.task_name)
+    episode = recorder.to_numpy_dict()
+    contract = EpisodeContract(
+        schema="joint",
+        arm_mode="single",
+        arm_side=args.arm_side,
+        camera_keys=("cam_high", f"cam_{args.arm_side}_wrist"),
+        action_source="master_joint_feedback",
+        action_alignment="same_step_command",
+    )
     extras = {
+        "state": episode["qpos"],
         "task_name": args.task_name,
         "instruction": instruction,
         "success": np.array(bool(success), dtype=np.bool_),
-        "arm_side": np.array(args.arm_side),
+        **contract.metadata_payload(),
+        "terminal_padding": np.asarray(False, dtype=np.bool_),
     }
     raw_path = ep_dir / f"ep_{ep_idx:04d}.npz"
     recorder.save(raw_path, extras=extras)
     if pi0_writer is not None:
-        episode = recorder.to_numpy_dict()
         images = {key.removeprefix("images_"): value for key, value in episode.items() if key.startswith("images_")}
         pi0_writer.append_episode(
             states=episode["qpos"],

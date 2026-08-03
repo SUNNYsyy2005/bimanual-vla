@@ -18,6 +18,12 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from piper_data_contract import (
+    CONTRACT_VERSION,
+    JOINT_SCHEMA,
+    EpisodeContract,
+)
+
 LEROBOT_CODEBASE_VERSION = "v2.1"
 DEFAULT_CHUNK_SIZE = 1000
 DEFAULT_VIDEO_CODEC = "mp4v"
@@ -72,8 +78,13 @@ class Pi0LeRobotDatasetWriter:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         save_raw_npz: bool = True,
         val_ratio: float = 0.1,
-        action_semantics: str = "absolute_joint_position",
-        action_offset: int = 0,
+        schema: str = JOINT_SCHEMA,
+        arm_mode: str | None = None,
+        arm_side: str = "right",
+        action_semantics: str | None = None,
+        action_source: str = "master_joint_feedback",
+        action_alignment: str = "same_step_command",
+        action_offset: int | None = None,
     ):
         self.root = Path(root).expanduser()
         self.fps = int(fps)
@@ -85,8 +96,33 @@ class Pi0LeRobotDatasetWriter:
         self.chunk_size = int(chunk_size)
         self.save_raw_npz = bool(save_raw_npz)
         self.val_ratio = float(val_ratio)
-        self.action_semantics = str(action_semantics)
-        self.action_offset = int(action_offset)
+        inferred_arm_mode = arm_mode
+        if inferred_arm_mode is None:
+            per_arm_state_dim = 10 if str(schema).lower() == "delivery" else 7
+            if len(self.state_names) == per_arm_state_dim:
+                inferred_arm_mode = "single"
+            elif len(self.state_names) == 2 * per_arm_state_dim:
+                inferred_arm_mode = "bimanual"
+            else:
+                raise ValueError(
+                    f"cannot infer arm_mode from schema={schema!r} and "
+                    f"state_dim={len(self.state_names)}"
+                )
+        self.contract = EpisodeContract(
+            schema=schema,
+            arm_mode=inferred_arm_mode,
+            arm_side=arm_side,
+            camera_keys=tuple(self.camera_keys),
+            action_source=action_source,
+            action_alignment=action_alignment,
+        )
+        self.schema = self.contract.schema
+        self.arm_mode = self.contract.arm_mode
+        self.arm_side = self.contract.arm_side
+        self.action_source = self.contract.action_source
+        self.action_alignment = self.contract.action_alignment
+        self.action_semantics = str(action_semantics or self.contract.action_semantics)
+        self.action_offset = self.contract.action_offset if action_offset is None else int(action_offset)
 
         if self.fps <= 0:
             raise ValueError("fps must be positive")
@@ -102,6 +138,24 @@ class Pi0LeRobotDatasetWriter:
             raise ValueError("val_ratio must be in [0, 1)")
         if self.action_offset < 0:
             raise ValueError("action_offset must be >= 0")
+        if len(self.state_names) != self.contract.state_dim:
+            raise ValueError(
+                f"state_names dim {len(self.state_names)} != contract state_dim {self.contract.state_dim}"
+            )
+        if len(self.action_names) != self.contract.action_dim:
+            raise ValueError(
+                f"action_names dim {len(self.action_names)} != contract action_dim {self.contract.action_dim}"
+            )
+        if self.action_semantics != self.contract.action_semantics:
+            raise ValueError(
+                f"action_semantics={self.action_semantics!r} is incompatible with "
+                f"schema={self.schema!r}; expected {self.contract.action_semantics!r}"
+            )
+        if self.action_offset != self.contract.action_offset:
+            raise ValueError(
+                f"action_offset={self.action_offset} disagrees with "
+                f"action_alignment={self.action_alignment!r} (expected {self.contract.action_offset})"
+            )
 
         self.meta_dir = self.root / "meta"
         self.data_dir = self.root / "data"
@@ -117,11 +171,13 @@ class Pi0LeRobotDatasetWriter:
         self.episodes_path = self.meta_dir / "episodes.jsonl"
         self.episodes_stats_path = self.meta_dir / "episodes_stats.jsonl"
         self.norm_stats_path = self.meta_dir / "openpi_norm_stats.json"
+        self.policy_contract_path = self.meta_dir / "policy_contract.json"
 
         self.tasks: dict[str, int] = {}
         self.info = self._load_or_init_info()
         self._load_existing_tasks()
         self._validate_existing_dataset()
+        self._write_policy_contract()
 
     def append_episode(
         self,
@@ -173,7 +229,17 @@ class Pi0LeRobotDatasetWriter:
                 "task_name": np.asarray(task_name),
                 "instruction": np.asarray(instruction),
                 "success": np.asarray(bool(success), dtype=np.bool_),
+                "contract_version": np.asarray(CONTRACT_VERSION, dtype=np.int64),
+                "schema": np.asarray(self.schema),
+                "arm_mode": np.asarray(self.arm_mode),
+                "arm_side": np.asarray(self.arm_side),
+                "robot_type": np.asarray(self.robot_type),
+                "state_dim": np.asarray(self.contract.state_dim, dtype=np.int64),
+                "action_dim": np.asarray(self.contract.action_dim, dtype=np.int64),
+                "camera_keys": np.asarray(self.camera_keys),
                 "action_semantics": np.asarray(self.action_semantics),
+                "action_source": np.asarray(self.action_source),
+                "action_alignment": np.asarray(self.action_alignment),
                 "action_offset": np.asarray(self.action_offset, dtype=np.int64),
             }
             for key, value in normalized_images.items():
@@ -202,8 +268,7 @@ class Pi0LeRobotDatasetWriter:
                 "length": frame_count,
                 "task_name": task_name,
                 "success": bool(success),
-                "action_semantics": self.action_semantics,
-                "action_offset": self.action_offset,
+                **self._contract_dict(),
                 **(metadata or {}),
             },
         )
@@ -297,8 +362,7 @@ class Pi0LeRobotDatasetWriter:
             "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
             "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
             "features": features,
-            "action_semantics": self.action_semantics,
-            "action_offset": self.action_offset,
+            **self._contract_dict(),
         }
         self.info_path.write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
         return info
@@ -309,10 +373,17 @@ class Pi0LeRobotDatasetWriter:
             "robot_type": self.robot_type,
             "fps": self.fps,
             "chunks_size": self.chunk_size,
-            "action_semantics": self.action_semantics,
-            "action_offset": self.action_offset,
+            **self._contract_dict(),
         }
+        backfilled = False
         for key, value in expected.items():
+            if key not in self.info:
+                # Older writer versions did not persist the full contract. The
+                # feature/dimension checks below must still pass before this
+                # metadata is committed.
+                self.info[key] = value
+                backfilled = True
+                continue
             actual = self.info.get(key)
             if actual != value:
                 raise ValueError(f"existing dataset {key}={actual!r}, requested {value!r}")
@@ -332,6 +403,34 @@ class Pi0LeRobotDatasetWriter:
             actual_shape = features[f"observation.images.{key}"].get("shape")
             if actual_shape != expected_shape:
                 raise ValueError(f"existing camera {key} shape {actual_shape} != requested {expected_shape}")
+        if backfilled:
+            self._write_info()
+
+    def _contract_dict(self) -> dict[str, Any]:
+        return {
+            "contract_version": CONTRACT_VERSION,
+            "schema": self.schema,
+            "arm_mode": self.arm_mode,
+            "arm_side": self.arm_side,
+            "state_dim": self.contract.state_dim,
+            "action_dim": self.contract.action_dim,
+            "camera_keys": list(self.camera_keys),
+            "action_semantics": self.action_semantics,
+            "action_source": self.action_source,
+            "action_alignment": self.action_alignment,
+            "action_offset": self.action_offset,
+        }
+
+    def _write_policy_contract(self) -> None:
+        payload = {
+            "version": CONTRACT_VERSION,
+            "robot_type": self.robot_type,
+            **{key: value for key, value in self._contract_dict().items() if key != "contract_version"},
+        }
+        self.policy_contract_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     @staticmethod
     def _validate_vector_feature(features: dict[str, Any], key: str, names: list[str]) -> None:

@@ -15,13 +15,26 @@ from collect_output_arm import (
     DEFAULT_CAMERA_FPS,
     DEFAULT_CAN,
     DEFAULT_HIGH_DEVICE,
+    DEFAULT_LEFT_CAN,
+    DEFAULT_LEFT_WRIST_DEVICE,
+    DEFAULT_RIGHT_CAN,
+    DEFAULT_RIGHT_WRIST_DEVICE,
     DEFAULT_WRIST_DEVICE,
     connect,
     next_episode_index,
-    read_output_state,
+    read_robot_state,
     verify_camera_streams,
 )
-from piper_data_contract import DEFAULT_FPS, IMAGE_HW, EpisodeBuffer
+from piper_data_contract import (
+    BIMANUAL,
+    DEFAULT_FPS,
+    DELIVERY_SCHEMA,
+    IMAGE_HW,
+    JOINT_SCHEMA,
+    SINGLE_ARM,
+    EpisodeBuffer,
+    EpisodeContract,
+)
 from validate_piper_data import EpisodeStats, validate_episode
 
 
@@ -40,6 +53,13 @@ class CollectionConfig:
     capture_fps: int = DEFAULT_FPS
     camera_fps: int = DEFAULT_CAMERA_FPS
     output_dir: Path = Path("episodes_piper_v21")
+    schema: str = DELIVERY_SCHEMA
+    arm_mode: str = SINGLE_ARM
+    arm_side: str = "right"
+    left_can_name: str = DEFAULT_LEFT_CAN
+    right_can_name: str = DEFAULT_RIGHT_CAN
+    cam_left_wrist_device: str = DEFAULT_LEFT_WRIST_DEVICE
+    cam_right_wrist_device: str = DEFAULT_RIGHT_WRIST_DEVICE
 
     def __post_init__(self):
         if self.capture_fps <= 0:
@@ -48,8 +68,20 @@ class CollectionConfig:
             raise ValueError("camera_fps must be positive")
         if self.capture_fps > self.camera_fps:
             raise ValueError("capture_fps cannot exceed camera_fps")
-        if not self.can_name.strip():
-            raise ValueError("can_name must not be empty")
+        EpisodeContract(
+            schema=self.schema,
+            arm_mode=self.arm_mode,
+            arm_side=self.arm_side,
+        )
+        can_names = (
+            (self.can_name,)
+            if self.arm_mode == SINGLE_ARM
+            else (self.left_can_name, self.right_can_name)
+        )
+        if any(not name.strip() for name in can_names):
+            raise ValueError("CAN interface names must not be empty")
+        if len(set(can_names)) != len(can_names):
+            raise ValueError("bimanual CAN interface names must be distinct")
 
 
 @dataclass(frozen=True)
@@ -81,14 +113,20 @@ class CollectionSession:
         config: CollectionConfig,
         robot_connect: Callable[[str], Any] = connect,
         camera_factory: Callable[..., CameraCapture] = CameraCapture,
-        state_reader: Callable[[Any], tuple[Any, Any]] = read_output_state,
+        state_reader: Callable[[Any], tuple[Any, Any]] | None = None,
         camera_verifier: Callable[[Any, int], dict[str, dict]] = verify_camera_streams,
         episode_validator: Callable[..., EpisodeStats] = validate_episode,
     ):
         self.config = config
         self._robot_connect = robot_connect
         self._camera_factory = camera_factory
-        self._state_reader = state_reader
+        self._state_reader = state_reader or (
+            lambda robot: read_robot_state(
+                robot,
+                schema=self.config.schema,
+                arm_mode=self.config.arm_mode,
+            )
+        )
         self._camera_verifier = camera_verifier
         self._episode_validator = episode_validator
         self.state = SessionState.DISCONNECTED
@@ -106,18 +144,40 @@ class CollectionSession:
     def connect(self) -> dict[str, dict]:
         if self.state is not SessionState.DISCONNECTED:
             raise RuntimeError(f"cannot connect while session is {self.state.value}")
-        piper = self._robot_connect(self.config.can_name)
-        cameras = self._camera_factory(
-            cam_ids={
-                "cam_high": self.config.cam_high_device,
-                "cam_wrist": self.config.cam_wrist_device,
-            },
-            fps=self.config.camera_fps,
-            image_hw=IMAGE_HW,
-            capture_hw=CAMERA_SOURCE_HW,
-            parallel_reads=True,
+        contract = EpisodeContract(
+            schema=self.config.schema,
+            arm_mode=self.config.arm_mode,
+            arm_side=self.config.arm_side,
         )
+        connected: list[Any] = []
         try:
+            if self.config.arm_mode == SINGLE_ARM:
+                piper = self._robot_connect(self.config.can_name)
+                connected.append(piper)
+            else:
+                left = self._robot_connect(self.config.left_can_name)
+                connected.append(left)
+                right = self._robot_connect(self.config.right_can_name)
+                connected.append(right)
+                piper = {"left": left, "right": right}
+            if self.config.arm_mode == BIMANUAL:
+                camera_ids = {
+                    "cam_high": self.config.cam_high_device,
+                    "cam_left_wrist": self.config.cam_left_wrist_device,
+                    "cam_right_wrist": self.config.cam_right_wrist_device,
+                }
+            else:
+                camera_ids = {
+                    "cam_high": self.config.cam_high_device,
+                    contract.camera_keys[1]: self.config.cam_wrist_device,
+                }
+            cameras = self._camera_factory(
+                cam_ids=camera_ids,
+                fps=self.config.camera_fps,
+                image_hw=IMAGE_HW,
+                capture_hw=CAMERA_SOURCE_HW,
+                parallel_reads=True,
+            )
             cameras.open()
             checks = self._camera_verifier(cameras, self.config.camera_fps)
             # Verify live Piper feedback before reporting the session as ready.
@@ -125,8 +185,10 @@ class CollectionSession:
             # the underlying SocketCAN receive timestamps.
             self._state_reader(piper)
         except Exception:
-            cameras.close()
-            piper.DisconnectPort()
+            if "cameras" in locals():
+                cameras.close()
+            for item in reversed(connected):
+                item.DisconnectPort()
             raise
         self.piper = piper
         self.cameras = cameras
@@ -138,7 +200,18 @@ class CollectionSession:
         if self.state is not SessionState.READY:
             raise RuntimeError(f"cannot start an episode while session is {self.state.value}")
         self.label = EpisodeLabel(task_name.strip(), instruction.strip())
-        self.buffer = EpisodeBuffer(self.config.capture_fps)
+        self.buffer = EpisodeBuffer(
+            self.config.capture_fps,
+            schema=self.config.schema,
+            arm_mode=self.config.arm_mode,
+            arm_side=self.config.arm_side,
+            action_source=(
+                "next_measured_qpos"
+                if self.config.schema == JOINT_SCHEMA
+                else "next_measured_eef"
+            ),
+            action_alignment="next_observation",
+        )
         self.state = SessionState.RECORDING
         return self.label
 
@@ -239,7 +312,10 @@ class CollectionSession:
             self.discard_episode()
         if self.cameras is not None:
             self.cameras.close()
-        if self.piper is not None:
+        if isinstance(self.piper, dict):
+            for item in reversed(tuple(self.piper.values())):
+                item.DisconnectPort()
+        elif self.piper is not None:
             self.piper.DisconnectPort()
         self.cameras = None
         self.piper = None

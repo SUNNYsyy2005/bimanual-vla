@@ -9,8 +9,8 @@
 - 双臂主从遥操作采集：`teleop.py`
 - 单臂主从遥操作采集：`teleop_single.py`
 - 3 路相机采集：`camera.py`
-- 单 CAN 执行输出臂 + 双 RGB 相机反馈采集：`collect_output_arm.py`
-- episode 双视角 + 关节角回放：`view_episode.py`
+- 单臂/双臂执行输出臂反馈采集（2/3 路 RGB）：`collect_output_arm.py`
+- episode 多视角 + 关节角回放：`view_episode.py`
 - 图形化采集界面：`collect_gui.py` / `start_gui.sh`
 - LeRobot v2.1 导出：`export_lerobot.py`
 - 数据验收：`validate_piper_data.py`、`check_pi05_dataset.py`
@@ -24,53 +24,54 @@
 启动：
 
 ```bash
-cd /home/user/dual_ARM_project/arm_collect/bimanual-vla
+cd /home/sunny/bimanual-vla
 bash start_gui.sh
 ```
 
-界面支持：
+界面可选择：
 
-- 配置 `can0`、`/dev/video8`、`/dev/video16` 和任务信息
-- 放大字体、窗口和按钮，方便现场操作
-- 连接/断开机械臂与相机
-- 连接成功后在主界面内实时显示顶部全局相机和夹爪上方腕部相机画面
-- 实时显示 J1-J6、夹爪位姿、EEF xyz / rotation-6D 状态
-- 采集前自动检查机械臂是否处于 `Reset to Home` 的全零参考位姿；超出阈值时显示红色警告并禁止开始 episode
-- 关节和夹爪误差阈值可在界面中调整，默认分别为 ±5° 和 ±5 mm
-- 开始/停止 episode
-- 停止后标记成功、失败或丢弃
-- 自动从已有编号继续保存，避免覆盖旧数据
-- 选择已保存的 episode 并启动双视角回放
+- 单臂 / 双臂；
+- `joint` / `delivery` schema；
+- 单臂 left / right；
+- 单臂 CAN + 两路相机，或左右 CAN + 顶部/左腕/右腕三路相机；
+- 采集 FPS、相机源 FPS、任务、instruction 和输出目录。
 
-采集频率默认是交付规范要求的 `20 Hz`，可在 GUI 的 `Capture FPS` 中切换。两台 RealSense 的 `Camera source FPS` 默认是设备稳定支持的 `30 FPS`；采集器每 50 ms 从 30 FPS 相机流中读取一帧。最终导出到 Piper 训练集时必须使用 `20 Hz`。如果环境没有 Pillow，GUI 会回退到 OpenCV 预览窗口，但推荐在项目环境中安装 Pillow 以使用内嵌双路预览。
+连接成功后会实时显示所有活动相机、单臂 7 个或双臂 14 个关节值、
+schema 对应的 7D/10D/14D/20D state，以及相对 Home 的位姿误差。任一
+机械臂超出默认 ±5° / ±5 mm 阈值时，界面以红色警告但仍允许开始 episode；无反馈或反馈过期时才会拒绝采集；
+双臂 Reset 会并行复位左右输出臂。连接期间会锁定 arm mode、schema、CAN、
+相机、FPS 和输出目录，避免 UI 配置与当前设备会话不一致。
 
-### Piper delivery schema
+### 单双臂 π0.5 数据合同
 
-新采集的 NPZ episode 包含：
+| 模式 | schema | state/action | 相机 |
+|---|---|---:|---|
+| 单臂 | joint | 7D / 7D | `cam_high` + 单腕部 |
+| 双臂 | joint | 14D / 14D | `cam_high` + 左右腕部 |
+| 单臂 | delivery | 10D / 7D | `cam_high` + 单腕部 |
+| 双臂 | delivery | 20D / 14D | `cam_high` + 左右腕部 |
 
-```text
-state                         float32 (T,10)
-actions                       float32 (T,7)
-timestamps                    float64 (T,)
-image                         uint8   (T,256,256,3), RGB HWC
-wrist_image                   uint8   (T,256,256,3), RGB HWC
-task                          Unicode scalar, internal task ID (optional)
-instruction                   Unicode scalar, natural-language prompt
-success                       bool scalar
-joint_qpos                    float32 (T,7), diagnostics (optional)
-image_timestamps_cam_high     float64 (T,)
-image_timestamps_cam_wrist    float64 (T,)
-```
+双臂 state/action 永远按 `left + right` 拼接。`joint` 每臂为 6 个关节角
+加夹爪开度；`delivery` 每臂 state 为 base-frame xyz、rotation-6D 和夹爪
+闭合比例，action 为 base-frame EEF 增量和绝对夹爪目标。
 
-`state` 是 base-frame EEF position（m）、旋转矩阵前两列组成的 rotation 6D，以及 `0=open, 1=closed` 的夹爪闭合比例。`actions[t]` 是 `state[t] -> state[t+1]` 的 base-frame position delta、左乘旋转增量 rotvec，以及下一帧绝对夹爪目标。每个 episode 最后自动增加 terminal observation，最后动作固定为 `[0,0,0,0,0,0,state[-1,9]]`。
+动作来源必须区分：
 
-导出前单独验收：
+- `collect_output_arm.py` / `collect_gui.py` 只读输出臂反馈，无法看到遥操命令；
+  joint action 标记为下一帧实测 qpos，delivery action 由相邻 EEF state 推导，
+  都是 `action_alignment=next_observation`、`action_offset=1`。
+- `teleop_single.py` / `teleop.py` 记录 `state=slave measured qpos`、
+  `action=master qpos command`，是更推荐的遥操 joint 数据，使用
+  `action_source=master_joint_feedback`、`same_step_command`、`action_offset=0`。
+
+导出前验收：
 
 ```bash
 python validate_piper_data.py --input-dir episodes_piper_v21 --target-fps 20
 ```
 
-验收会检查真实 FPS、两路图像与状态的同步误差、shape/dtype、rotation 6D、动作重算、terminal action、空帧/冻结帧、夹爪覆盖和 no-op/action norm 统计。
+验收会按 episode metadata 检查单双臂维度、活动相机、同步误差、shape/dtype、
+动作语义、terminal padding、空帧/冻结帧和动作统计。
 
 导出 LeRobot v2.1：
 
@@ -82,7 +83,8 @@ python export_lerobot.py \
   --fps 20
 ```
 
-导出使用 `instruction` 写入 LeRobot `meta/tasks.jsonl`，内部 `task` ID 不会作为训练 prompt。只检查、不写 LeRobot 数据时可在上述命令后加 `--validate-only`。
+导出使用 `instruction` 写入 LeRobot `meta/tasks.jsonl`。完整字段和动作语义见
+`PIPER_DATA_CONTRACT.md`。
 
 ### Collection UI backend
 
@@ -99,9 +101,9 @@ python export_lerobot.py \
 python -m unittest -v test_piper_data_contract.py
 ```
 
-注意：`convert_output_arm_npz.py`、`check_pi05_dataset.py`、`teleop.py` 和
-`teleop_single.py` 属于旧的 7D 关节空间链路，不能作为新 10D EEF 采集 UI
-的保存后端。
+`collect_output_arm.py`、GUI、单双臂遥操、NPZ 转换器、LeRobot writer 和
+Dashboard 均使用同一份 `EpisodeContract` 元数据。输出臂反馈采集与遥操采集
+的 action source 不同，不能在转换时静默互换。
 
 - 轨迹保存 / 回放：`trajectory.py`
 - 导出可直接用于 pi0.5 / openpi 训练的 LeRobot 风格数据集：`pi0_dataset.py`
@@ -113,28 +115,43 @@ python -m unittest -v test_piper_data_contract.py
 
 ### 1.0 当前硬件的推荐采集方式
 
-如果电脑只通过 `can0` 连接执行输出臂，不读取示教臂和控制指令，使用：
+单臂输出反馈采集：
 
 ```bash
 python collect_output_arm.py \
+  --arm-mode single \
+  --arm-side right \
+  --schema joint \
   --can can0 \
   --cam-high-device /dev/video8 \
   --cam-wrist-device /dev/video16 \
-  --fps 20 \
-  --camera-fps 30 \
+  --fps 20 --camera-fps 30 \
   --task-name pick_cube \
   --instruction "pick up the cube"
 ```
 
-该脚本保存执行输出臂的 10D EEF `state`、7D 增量 `actions`、两路 RGB 图像，并额外保存 7D `joint_qpos` 作为诊断字段。它不读取示教臂，也不读取关节控制指令。
+双臂输出反馈采集：
 
-按键：`SPACE` 结束 episode，`S` 保存成功，`F` 保存失败，`D` 丢弃，`Q` 退出。
+```bash
+python collect_output_arm.py \
+  --arm-mode bimanual \
+  --schema joint \
+  --left-can can1 \
+  --right-can can3 \
+  --cam-high-device /dev/video8 \
+  --cam-left-wrist-device /dev/video12 \
+  --cam-right-wrist-device /dev/video16 \
+  --fps 20 --camera-fps 30 \
+  --task-name handover \
+  --instruction "handover the object"
+```
 
-如果 `/dev/video8` 或 `/dev/video16` 不是 RGB 节点，先用 `v4l2-ctl --list-formats-ext -d /dev/videoN` 确认后替换参数。
+该脚本只读取执行输出臂，因此 joint action 是下一帧实测 qpos，不是 master
+命令。若采集遥操训练数据，优先使用 `teleop_single.py` / `teleop.py`，它们会
+直接保存同一步 master joint command。按键：`SPACE` 结束 episode，`S` 保存
+成功，`F` 保存失败，`D` 丢弃，`Q` 退出。
 
-仓库同时保留早期关节空间采集链路；下列 `qpos` / `observation.state` 7D 约定适用于 `teleop.py`、`teleop_single.py` 和旧数据转换器，不等同于上面的 Piper delivery schema。
-
-### 1.1 旧关节空间原始 episode
+### 1.1 遥操 joint 原始 episode
 
 默认目录：
 
@@ -154,7 +171,7 @@ episodes_single/
 - `task_name`
 - `success`
 
-### 1.2 旧关节空间 pi0.5 / openpi 数据集
+### 1.2 遥操 joint pi0.5 / openpi 数据集
 
 双臂默认输出：
 
@@ -479,7 +496,7 @@ python upload_dataset_4090.py piper/piper_v1_increment \
 4. 新建 Policy 进程，显示 PID、WebSocket `/healthz`、GPU、端口、schema、checkpoint 和最近 telemetry。
 5. 正常停止或强制结束指定 Policy。
 6. 选择运行中的 Policy，以新 checkpoint 执行“停止旧进程 → 启动替代进程”的模型切换。
-7. 按 Policy schema 只读显示实际收到的 10D delivery state 或 7D joint state、两路图像、prompt 和预测 action。
+7. 按 Policy schema 只读显示单臂 7D/10D 或双臂 14D/20D state、单臂两路或双臂三路图像、prompt 和预测 action。
 8. 显示并管理短时服务端 EXECUTE 授权，同时显示机械臂客户端本地 `--allow-execution`、双重门结果和实际执行/阻断原因。
 9. 在网页执行 episode 级数据集编辑：修改 instruction、task name、success 和附加 metadata，批量删除 episode，或把另一个兼容数据集的全部 episodes 增量合并进目标数据集。不会修改 episode 内的 state/action/图像帧。
 
@@ -489,16 +506,39 @@ python upload_dataset_4090.py piper/piper_v1_increment \
 python robot_observation_bridge.py \
   --host 192.168.101.9 \
   --port 8000 \
+  --arm-mode single \
+  --arm-side right \
   --can can0 \
   --cam-high-device /dev/video8 \
   --cam-wrist-device /dev/video16 \
-  --arm-side right \
   --instruction "pick up the cube"
 ```
 
-bridge 同时读取 10D EEF delivery state 与 7D 实测 joint qpos，并根据服务端 metadata 自动选择正确的 state 和腕部相机 wire key：delivery 使用 `cam_wrist`，joint 使用 `cam_<arm_side>_wrist`。默认只打印预测 action；显式追加 `--allow-execution` 后仍需网页对同一 Policy 短时授权 EXECUTE，并通过 schema 对应的本地新鲜度、动作幅度/关节限位和 Piper 状态检查才会下发。模型切换导致连接断开后客户端会自动重连、重新协商 schema，并回到 SHADOW。
+双臂客户端示例：
 
-Dashboard Token 只保护管理 API，机械臂客户端不需要 Dashboard URL 或 Token。首次启动自动生成，保存在 4×4090 的 `~/.config/bimanual-vla/server.env`；可用 `ssh 4x4090 'source ~/.config/bimanual-vla/server.env && printf "%s\n" "$BIMANUAL_VLA_SERVER_TOKEN"'` 读取。上传采用并行分块、SHA256 和断点续传。任何合并、删除或 episode 参数修改都会保留隐藏备份、重新校验并让旧 norm stats 失效；下一次训练会自动重新执行 norm→train。详细架构和 Policy 生命周期说明见 `server_4090/README.md`。
+```bash
+python robot_observation_bridge.py \
+  --host 192.168.101.9 \
+  --port 8000 \
+  --arm-mode bimanual \
+  --arm-side both \
+  --left-can can1 \
+  --right-can can3 \
+  --cam-high-device /dev/video8 \
+  --cam-left-wrist-device /dev/video12 \
+  --cam-right-wrist-device /dev/video16 \
+  --instruction "handover the object"
+```
+
+bridge 会同时读取每条机械臂的 10D EEF delivery state 与 7D 实测 joint qpos，
+根据服务端 metadata 自动选择单臂 7D/10D 或双臂 14D/20D state、相机 wire key
+和 7D/14D action 执行方式，并严格校验 `arm_mode`、维度、左右顺序和相机集合。
+默认只打印预测 action；显式追加 `--allow-execution` 后仍需网页对同一 Policy
+短时授权 EXECUTE，并通过 schema 对应的新鲜度、动作幅度/关节限位和 Piper
+状态检查才会下发。模型切换导致连接断开后客户端会自动重连、重新协商
+schema，并回到 SHADOW。
+
+Dashboard Token 只保护管理 API，机械臂客户端不需要 Dashboard URL 或 Token。首次启动自动生成，保存在 4×4090 的 `~/.config/bimanual-vla/server.env`；可用 `ssh 4x4090-wg 'source ~/.config/bimanual-vla/server.env && printf "%s\n" "$BIMANUAL_VLA_SERVER_TOKEN"'` 读取。上传采用并行分块、SHA256 和断点续传。任何合并、删除或 episode 参数修改都会保留隐藏备份、重新校验并让旧 norm stats 失效；下一次训练会自动重新执行 norm→train。详细架构和 Policy 生命周期说明见 `server_4090/README.md`。
 
 ## 9. 相关脚本
 

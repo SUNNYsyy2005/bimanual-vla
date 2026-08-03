@@ -19,6 +19,7 @@ except ImportError:
     _UNIX = False
 
 from camera import CameraCapture
+from piper_data_contract import EpisodeContract
 from piper_sdk import C_PiperInterface_V2
 from trajectory import TrajectoryRecorder
 
@@ -219,6 +220,11 @@ def _maybe_make_pi0_writer(args):
         action_names=BIMANUAL_JOINT_NAMES,
         camera_keys=["cam_high", "cam_left_wrist", "cam_right_wrist"],
         image_hw=(224, 224),
+        schema="joint",
+        arm_mode="bimanual",
+        arm_side="both",
+        action_source="master_joint_feedback",
+        action_alignment="same_step_command",
     )
 
 
@@ -227,15 +233,26 @@ def _save_episode(recorder: TrajectoryRecorder, args, ep_dir: pathlib.Path, ep_i
         print("  (empty episode, skipping)")
         return ep_idx
     instruction = args.instruction or _default_instruction(args.task_name)
+    episode = recorder.to_numpy_dict()
+    contract = EpisodeContract(
+        schema="joint",
+        arm_mode="bimanual",
+        arm_side="both",
+        camera_keys=("cam_high", "cam_left_wrist", "cam_right_wrist"),
+        action_source="master_joint_feedback",
+        action_alignment="same_step_command",
+    )
     extras = {
+        "state": episode["qpos"],
         "task_name": args.task_name,
         "instruction": instruction,
         "success": np.array(bool(success), dtype=np.bool_),
+        **contract.metadata_payload(),
+        "terminal_padding": np.asarray(False, dtype=np.bool_),
     }
     raw_path = ep_dir / f"ep_{ep_idx:04d}.npz"
     recorder.save(raw_path, extras=extras)
     if pi0_writer is not None:
-        episode = recorder.to_numpy_dict()
         images = {
             key.removeprefix("images_"): value
             for key, value in episode.items()
