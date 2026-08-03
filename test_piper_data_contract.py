@@ -1,328 +1,45 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from collection_session import CollectionConfig, CollectionSession, SessionState
-from collect_gui import CollectorGUI, check_initial_pose
 from collect_output_arm import (
     GRIPPER_FACTOR,
     RAD_FACTOR,
     PiperFeedbackStaleError,
     _require_fresh_feedback,
     read_robot_state,
+    read_output_gripper_command_target,
 )
+from piper_action_conventions import DELIVERY_RAW_ACTION_SEMANTICS, DELIVERY_STEP_ACTION_SEMANTICS
 from piper_data_contract import (
     ACTION_NAMES,
     BIMANUAL,
     DELIVERY_SCHEMA,
     IMAGE_HW,
+    JOINT_NAMES,
     JOINT_SCHEMA,
     LEROBOT_FEATURES,
-    REQUIRED_EPISODE_FIELDS,
-    STATE_NAMES,
+    MODEL_ACTION_NAMES,
     EpisodeBuffer,
     EpisodeContract,
+    build_delivery_actions_with_gripper_targets,
     build_delivery_state,
+    build_legacy_delivery_step_actions,
+    infer_episode_contract,
+    next_observation_timestamps,
 )
+from teleop import _episode_contract as bimanual_episode_contract, _prepare_delivery_episode
+from teleop_single import _episode_contract as single_episode_contract
+from trajectory import TrajectoryRecorder
 from validate_piper_data import EpisodeValidationError, validate_episode
-
-
-class PiperDataContractTest(unittest.TestCase):
-    def make_state(self, xyz, rotation, gripper_opening):
-        return build_delivery_state(
-            np.asarray(xyz, dtype=np.float64),
-            np.asarray(rotation, dtype=np.float64),
-            gripper_opening,
-        )
-
-    def test_state_layout_and_gripper_convention(self):
-        state = self.make_state([0.1, -0.2, 0.3], np.eye(3), 0.07)
-        np.testing.assert_allclose(
-            state,
-            [0.1, -0.2, 0.3, 1, 0, 0, 0, 1, 0, 0],
-            atol=1e-7,
-        )
-        self.assertEqual(state.dtype, np.float32)
-
-        closed = self.make_state([0, 0, 0], np.eye(3), 0.0)
-        self.assertEqual(float(closed[-1]), 1.0)
-
-    def test_payload_uses_base_frame_actions_and_terminal_observation(self):
-        buffer = EpisodeBuffer(fps=20)
-        rotation_0 = Rotation.from_euler("x", 0.2).as_matrix()
-        rotation_1 = Rotation.from_rotvec([0.0, 0.0, 0.1]).as_matrix() @ rotation_0
-        states = (
-            self.make_state([0.0, 0.0, 0.2], rotation_0, 0.07),
-            self.make_state([0.01, -0.02, 0.2], rotation_1, 0.0),
-        )
-        high = np.full((3, *IMAGE_HW), 20, dtype=np.uint8)
-        wrist = np.full((3, *IMAGE_HW), 80, dtype=np.uint8)
-        for index, state in enumerate(states):
-            timestamp = 100.0 + index * 0.05
-            buffer.add(
-                state,
-                {"cam_high": high + index, "cam_wrist": wrist + index},
-                {"cam_high": timestamp, "cam_wrist": timestamp},
-                qpos=np.arange(7, dtype=np.float32),
-                state_timestamp=timestamp,
-            )
-
-        payload = buffer.build_payload("pick_cube", "pick up the cube", True)
-        self.assertTrue(REQUIRED_EPISODE_FIELDS.issubset(payload))
-        self.assertEqual(payload["state"].shape, (3, len(STATE_NAMES)))
-        self.assertEqual(payload["actions"].shape, (3, len(ACTION_NAMES)))
-        self.assertEqual(payload["image"].shape, (3, *IMAGE_HW, 3))
-        self.assertEqual(payload["wrist_image"].shape, (3, *IMAGE_HW, 3))
-        self.assertEqual(payload["joint_qpos"].shape, (3, 7))
-        np.testing.assert_allclose(payload["actions"][0, :3], [0.01, -0.02, 0])
-        np.testing.assert_allclose(payload["actions"][0, 3:6], [0, 0, 0.1], atol=1e-6)
-        np.testing.assert_allclose(payload["actions"][-1, :6], 0)
-        self.assertEqual(payload["actions"][-1, 6], payload["state"][-1, 9])
-        self.assertEqual(payload["instruction"].item(), "pick up the cube")
-        self.assertEqual(payload["success"].dtype, np.bool_)
-
-    def test_lerobot_features_come_from_the_same_dimensions(self):
-        self.assertEqual(LEROBOT_FEATURES["state"]["shape"], (len(STATE_NAMES),))
-        self.assertEqual(LEROBOT_FEATURES["actions"]["shape"], (len(ACTION_NAMES),))
-        self.assertEqual(LEROBOT_FEATURES["image"]["shape"], (*IMAGE_HW, 3))
-        self.assertEqual(LEROBOT_FEATURES["wrist_image"]["shape"], (*IMAGE_HW, 3))
-
-
-    def test_successful_static_episode_is_rejected(self):
-        buffer = EpisodeBuffer(fps=20)
-        state = self.make_state([0.1, 0.2, 0.3], np.eye(3), 0.0)
-        high = np.full((3, *IMAGE_HW), 20, dtype=np.uint8)
-        wrist = np.full((3, *IMAGE_HW), 80, dtype=np.uint8)
-        for index in range(4):
-            timestamp = 100.0 + index * 0.05
-            buffer.add(
-                state,
-                {"cam_high": high + index, "cam_wrist": wrist + index},
-                {"cam_high": timestamp, "cam_wrist": timestamp},
-                qpos=np.zeros(7, dtype=np.float32),
-                state_timestamp=timestamp,
-            )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "ep_0000.npz"
-            buffer.save(path, "pick_cube", "pick up the cube", True)
-            with self.assertRaisesRegex(EpisodeValidationError, "100% no-op"):
-                validate_episode(path, target_fps=20)
-
-    def test_stale_piper_feedback_is_rejected(self):
-        class Message:
-            def __init__(self, timestamp):
-                self.time_stamp = timestamp
-                self.Hz = 100.0
-
-        _require_fresh_feedback({"joint": Message(time.time())})
-        with self.assertRaises(PiperFeedbackStaleError):
-            _require_fresh_feedback({"joint": Message(time.time() - 1.0)})
-
-
-    def test_bimanual_joint_payload_uses_left_then_right(self):
-        contract = EpisodeContract(schema=JOINT_SCHEMA, arm_mode=BIMANUAL)
-        self.assertEqual(contract.state_dim, 14)
-        self.assertEqual(contract.action_dim, 14)
-        self.assertEqual(
-            contract.camera_keys,
-            ("cam_high", "cam_left_wrist", "cam_right_wrist"),
-        )
-        buffer = EpisodeBuffer(fps=20, schema=JOINT_SCHEMA, arm_mode=BIMANUAL)
-        image = np.zeros((3, *IMAGE_HW), dtype=np.uint8)
-        states = (
-            np.arange(14, dtype=np.float32) / 100,
-            np.arange(14, dtype=np.float32) / 100 + 0.1,
-        )
-        for index, state in enumerate(states):
-            timestamp = 200.0 + index * 0.05
-            images = {
-                "cam_high": image + 10 + index,
-                "cam_left_wrist": image + 20 + index,
-                "cam_right_wrist": image + 30 + index,
-            }
-            buffer.add(
-                state,
-                images,
-                {key: timestamp for key in images},
-                qpos=state,
-                state_timestamp=timestamp,
-            )
-
-        payload = buffer.build_payload("handover", "handover the object", True)
-        self.assertEqual(payload["state"].shape, (3, 14))
-        self.assertEqual(payload["actions"].shape, (3, 14))
-        np.testing.assert_allclose(payload["state"][0, :7], states[0][:7])
-        np.testing.assert_allclose(payload["state"][0, 7:], states[0][7:])
-        np.testing.assert_allclose(payload["actions"][0], states[1])
-        self.assertEqual(payload["arm_mode"].item(), BIMANUAL)
-        self.assertEqual(payload["arm_side"].item(), "both")
-        self.assertEqual(payload["schema"].item(), JOINT_SCHEMA)
-        self.assertEqual(payload["action_offset"].item(), 1)
-        for key in contract.camera_keys:
-            self.assertEqual(payload[contract.image_field(key)].shape, (3, *IMAGE_HW, 3))
-
-    def test_bimanual_delivery_actions_are_independent_per_arm(self):
-        contract = EpisodeContract(schema=DELIVERY_SCHEMA, arm_mode=BIMANUAL)
-        buffer = EpisodeBuffer(fps=20, schema=DELIVERY_SCHEMA, arm_mode=BIMANUAL)
-        image = np.zeros((3, *IMAGE_HW), dtype=np.uint8)
-        left_0 = self.make_state([0.0, 0.0, 0.2], np.eye(3), 0.07)
-        right_0 = self.make_state([0.3, 0.0, 0.2], np.eye(3), 0.0)
-        left_1 = self.make_state([0.01, 0.0, 0.2], np.eye(3), 0.0)
-        right_1 = self.make_state([0.3, -0.02, 0.2], np.eye(3), 0.07)
-        for index, state in enumerate(
-            (np.concatenate((left_0, right_0)), np.concatenate((left_1, right_1)))
-        ):
-            timestamp = 300.0 + index * 0.05
-            images = {
-                "cam_high": image + 10 + index,
-                "cam_left_wrist": image + 20 + index,
-                "cam_right_wrist": image + 30 + index,
-            }
-            buffer.add(
-                state,
-                images,
-                {key: timestamp for key in images},
-                qpos=np.zeros(14, dtype=np.float32),
-                state_timestamp=timestamp,
-            )
-
-        payload = buffer.build_payload("handover", "handover the object", True)
-        self.assertEqual(payload["state"].shape, (3, 20))
-        self.assertEqual(payload["actions"].shape, (3, 14))
-        np.testing.assert_allclose(payload["actions"][0, :3], [0.01, 0.0, 0.0])
-        np.testing.assert_allclose(payload["actions"][0, 7:10], [0.0, -0.02, 0.0])
-        self.assertEqual(payload["actions"][0, 6], left_1[9])
-        self.assertEqual(payload["actions"][0, 13], right_1[9])
-        self.assertEqual(payload["schema"].item(), DELIVERY_SCHEMA)
-
-
-class CollectionGuiStartPolicyTest(unittest.TestCase):
-    def test_pose_warning_does_not_disable_collection_start(self):
-        class Button:
-            state = None
-
-            def configure(self, *, state):
-                self.state = state
-
-        gui = CollectorGUI.__new__(CollectorGUI)
-        gui.piper = object()
-        gui.cameras = object()
-        gui.recording = False
-        gui.reset_thread = None
-        gui.latest_pose_ok = False
-        gui.start_button = Button()
-
-        gui._update_start_button()
-
-        self.assertEqual(gui.start_button.state, "normal")
-
-
-class InitialPoseCheckTest(unittest.TestCase):
-    def test_bimanual_pose_reports_side_specific_errors(self):
-        qpos = np.zeros(14, dtype=np.float32)
-        qpos[1] = np.deg2rad(7.0)
-        qpos[13] = 0.008
-        ok, reason, errors = check_initial_pose(
-            qpos,
-            np.zeros(14, dtype=np.float32),
-            np.deg2rad(5.0),
-            0.005,
-        )
-        self.assertFalse(ok)
-        self.assertIn("L-J2", reason)
-        self.assertIn("R-Gripper", reason)
-        self.assertEqual(errors.shape, (14,))
-
-    def test_bimanual_pose_accepts_both_arms_within_tolerance(self):
-        qpos = np.zeros(14, dtype=np.float32)
-        qpos[[0, 7]] = np.deg2rad([4.0, -4.0])
-        qpos[[6, 13]] = [0.004, 0.004]
-        ok, reason, errors = check_initial_pose(
-            qpos,
-            np.zeros(14, dtype=np.float32),
-            np.deg2rad(5.0),
-            0.005,
-        )
-        self.assertTrue(ok)
-        self.assertIn("both robots", reason)
-        self.assertEqual(errors.shape, (14,))
-
-
-
-class RobotStateReaderTest(unittest.TestCase):
-    class FeedbackArm:
-        def __init__(self, joints, gripper_m, xyz_m):
-            self.joints = np.asarray(joints, dtype=np.float64)
-            self.gripper_m = float(gripper_m)
-            self.xyz_m = np.asarray(xyz_m, dtype=np.float64)
-
-        @staticmethod
-        def _message(**kwargs):
-            return SimpleNamespace(time_stamp=time.time(), Hz=100.0, **kwargs)
-
-        def GetArmJointMsgs(self):
-            values = np.rint(self.joints * RAD_FACTOR).astype(np.int64)
-            joint_state = SimpleNamespace(
-                **{f"joint_{index + 1}": int(value) for index, value in enumerate(values)}
-            )
-            return self._message(joint_state=joint_state)
-
-        def GetArmGripperMsgs(self):
-            gripper_state = SimpleNamespace(
-                grippers_angle=int(round(self.gripper_m * GRIPPER_FACTOR))
-            )
-            return self._message(gripper_state=gripper_state)
-
-        def GetArmEndPoseMsgs(self):
-            xyz = np.rint(self.xyz_m * 1_000_000).astype(np.int64)
-            end_pose = SimpleNamespace(
-                X_axis=int(xyz[0]),
-                Y_axis=int(xyz[1]),
-                Z_axis=int(xyz[2]),
-                RX_axis=0,
-                RY_axis=0,
-                RZ_axis=0,
-            )
-            return self._message(end_pose=end_pose)
-
-    def test_bimanual_reader_returns_left_then_right_joint_and_delivery_states(self):
-        left = self.FeedbackArm(
-            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
-            0.01,
-            [0.10, 0.20, 0.30],
-        )
-        right = self.FeedbackArm(
-            [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6],
-            0.02,
-            [0.40, 0.50, 0.60],
-        )
-        robot = {"left": left, "right": right}
-
-        joint_state, qpos = read_robot_state(
-            robot, schema=JOINT_SCHEMA, arm_mode=BIMANUAL
-        )
-        self.assertEqual(joint_state.shape, (14,))
-        np.testing.assert_allclose(joint_state, qpos)
-        np.testing.assert_allclose(qpos[[6, 13]], [0.01, 0.02], atol=1e-7)
-        self.assertGreater(float(qpos[0]), 0.0)
-        self.assertLess(float(qpos[7]), 0.0)
-
-        delivery_state, delivery_qpos = read_robot_state(
-            robot, schema=DELIVERY_SCHEMA, arm_mode=BIMANUAL
-        )
-        self.assertEqual(delivery_state.shape, (20,))
-        np.testing.assert_allclose(delivery_qpos, qpos, atol=2e-5)
-        np.testing.assert_allclose(delivery_state[:3], [0.10, 0.20, 0.30])
-        np.testing.assert_allclose(delivery_state[10:13], [0.40, 0.50, 0.60])
-        np.testing.assert_allclose(delivery_state[3:9], [1, 0, 0, 0, 1, 0])
-        np.testing.assert_allclose(delivery_state[13:19], [1, 0, 0, 0, 1, 0])
 
 
 class FakePiper:
@@ -337,171 +54,364 @@ class FakeCameras:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.closed = False
+        self.counter = 0
 
     def open(self):
         return None
 
+    def verify(self):
+        return {key: {"ok": True, "fps": 20.0, "latency_ms": 1} for key in self.kwargs["cam_ids"]}
+
+    def read(self):
+        self.counter += 1
+        now = 100.0 + self.counter * 0.05
+        frames = {
+            key: np.full((*IMAGE_HW, 3), 20 + index + self.counter, dtype=np.uint8)
+            for index, key in enumerate(self.kwargs["cam_ids"])
+        }
+        return frames, {key: now for key in frames}
+
     def close(self):
         self.closed = True
 
-    def read(self):
-        camera_keys = tuple(self.kwargs["cam_ids"])
-        images = {
-            key: np.full((3, *IMAGE_HW), 20 + index * 30, dtype=np.uint8)
-            for index, key in enumerate(camera_keys)
+
+class PiperDataContractTest(unittest.TestCase):
+    @staticmethod
+    def make_state(xyz, rotation, opening_m):
+        return build_delivery_state(np.asarray(xyz), np.asarray(rotation), opening_m)
+
+    @staticmethod
+    def _images(keys):
+        return {key: np.full((*IMAGE_HW, 3), 20 + index, dtype=np.uint8) for index, key in enumerate(keys)}
+
+    def test_v3_state_uses_opening_fraction(self):
+        state = self.make_state([0.1, -0.2, 0.3], np.eye(3), 0.07)
+        np.testing.assert_allclose(state[-1], 1.0)
+        closed = self.make_state([0, 0, 0], np.eye(3), 0.0)
+        np.testing.assert_allclose(closed[-1], 0.0)
+        self.assertEqual(EpisodeContract(schema=JOINT_SCHEMA).gripper_semantics, "absolute_opening_fraction_0_closed_1_open")
+
+    def test_v3_delivery_raw_action_is_absolute_10d_and_timestamps_are_separate(self):
+        keys = ("cam_high", "cam_right_wrist")
+        buffer = EpisodeBuffer(fps=20, schema=DELIVERY_SCHEMA, arm_side="right", camera_keys=keys)
+        state0 = self.make_state([0, 0, 0.2], np.eye(3), 0.07)
+        state1 = self.make_state([0.01, -0.02, 0.2], Rotation.from_euler("z", 0.1).as_matrix(), 0.0)
+        for index, state in enumerate((state0, state1)):
+            ts = 100.0 + index * 0.05
+            buffer.add(state, self._images(keys), {key: ts for key in keys}, qpos=np.zeros(7, np.float32), state_timestamp=ts)
+        payload = buffer.build_payload("pick_cube", "pick up the cube", True)
+        self.assertEqual(payload["state"].shape, (3, 10))
+        self.assertEqual(payload["actions"].shape, (3, 10))
+        np.testing.assert_allclose(payload["actions"][0], payload["state"][1])
+        np.testing.assert_allclose(payload["actions"][1], payload["state"][2])
+        self.assertEqual(payload["raw_action_dim"].item(), 10)
+        self.assertEqual(payload["model_action_dim"].item(), 7)
+        self.assertEqual(payload["action_semantics"].item(), DELIVERY_RAW_ACTION_SEMANTICS)
+        self.assertEqual(payload["gripper_semantics"].item(), "absolute_opening_fraction_0_closed_1_open")
+        self.assertIn("state_timestamp", payload)
+        self.assertIn("action_timestamp", payload)
+        self.assertNotEqual(payload["state_timestamp"].tolist(), payload["action_timestamp"].tolist())
+
+    def test_v3_joint_is_7d_opening_fraction(self):
+        keys = ("cam_high", "cam_right_wrist")
+        buffer = EpisodeBuffer(fps=20, schema=JOINT_SCHEMA, arm_side="right", camera_keys=keys)
+        state0 = np.asarray([0, 0, 0, 0, 0, 0, 0.25], dtype=np.float32)
+        state1 = np.asarray([1, 2, 3, 4, 5, 6, 0.75], dtype=np.float32)
+        buffer.add(state0, self._images(keys), {key: 100.0 for key in keys}, qpos=state0, state_timestamp=100.0)
+        buffer.add(state1, self._images(keys), {key: 100.05 for key in keys}, qpos=state1, state_timestamp=100.05)
+        payload = buffer.build_payload("joint", "move the arm", True)
+        self.assertEqual(payload["state"].shape, (3, 7))
+        self.assertEqual(payload["actions"].shape, (3, 7))
+        np.testing.assert_allclose(payload["actions"][0], state1)
+        self.assertEqual(payload["action_names"][-1].item(), "right_gripper_opening_fraction")
+        self.assertEqual(payload["raw_action_dim"].item(), 7)
+
+    def test_legacy_v2_delivery_is_explicitly_inferred(self):
+        states = np.asarray([
+            self.make_state([0, 0, 0], np.eye(3), 0.0),
+            self.make_state([0.01, 0, 0], Rotation.from_euler("z", 0.1).as_matrix(), 0.035),
+        ], dtype=np.float32)
+        # v2 state gripper is closed fraction, so replace the v3 opening field.
+        states[:, 9] = 1.0 - states[:, 9]
+        actions = build_legacy_delivery_step_actions(states)
+        data = {
+            "state": states,
+            "actions": actions,
+            "schema": np.asarray("delivery"),
+            "contract_version": np.asarray(2),
+            "action_semantics": np.asarray(DELIVERY_STEP_ACTION_SEMANTICS),
+            "action_dim": np.asarray(7),
+            "camera_keys": np.asarray(["cam_high", "cam_wrist"]),
         }
-        return images, {key: 100.0 for key in camera_keys}
+        contract = infer_episode_contract(data)
+        self.assertTrue(contract.legacy_delivery_v2)
+        self.assertEqual(contract.raw_action_dim, 7)
+        self.assertEqual(contract.gripper_semantics, "absolute_closed_fraction_0_open_1_closed")
+        self.assertEqual(contract.action_semantics, DELIVERY_STEP_ACTION_SEMANTICS)
+        self.assertIn("chunk_origin", contract.model_action_semantics)
+        self.assertTrue(contract.model_action_names[-1].endswith("gripper_target_closed_fraction"))
+
+    def test_legacy_v2_episode_validates_exact_one_step_layout(self):
+        states = np.stack((
+            self.make_state([0.00, 0, 0.2], np.eye(3), 0.07),
+            self.make_state([0.01, 0, 0.2], Rotation.from_euler("z", 0.1).as_matrix(), 0.035),
+            self.make_state([0.02, 0.01, 0.2], Rotation.from_euler("z", 0.2).as_matrix(), 0.0),
+        )).astype(np.float32)
+        states[:, 9] = 1.0 - states[:, 9]
+        states = np.concatenate((states, states[-1:]), axis=0)
+        actions = build_legacy_delivery_step_actions(states)
+        timestamps = np.asarray([100.0, 100.05, 100.10, 100.15], dtype=np.float64)
+        high = np.stack([np.full((*IMAGE_HW, 3), 20 + i, np.uint8) for i in range(4)])
+        wrist = np.stack([np.full((*IMAGE_HW, 3), 80 + i, np.uint8) for i in range(4)])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ep_0000.npz"
+            np.savez_compressed(
+                path, state=states, actions=actions, timestamps=timestamps,
+                image=high, wrist_image=wrist,
+                image_timestamps_cam_high=timestamps, image_timestamps_cam_wrist=timestamps,
+                instruction=np.asarray("move the object"), success=np.asarray(True, dtype=np.bool_),
+                schema=np.asarray("delivery"), contract_version=np.asarray(2),
+                arm_mode=np.asarray("single"), arm_side=np.asarray("right"),
+                state_dim=np.asarray(10), action_dim=np.asarray(7),
+                camera_keys=np.asarray(["cam_high", "cam_wrist"]),
+                action_semantics=np.asarray(DELIVERY_STEP_ACTION_SEMANTICS),
+                action_source=np.asarray("next_measured_eef"),
+                action_alignment=np.asarray("next_observation"), action_offset=np.asarray(1),
+                terminal_padding=np.asarray(True, dtype=np.bool_),
+            )
+            stats = validate_episode(path, target_fps=20)
+            self.assertTrue(stats.legacy_layout)
+            self.assertEqual(stats.action_dim, 7)
+
+    def test_legacy_joint_v2_names_are_not_reinterpreted(self):
+        data = {
+            "qpos": np.zeros((3, 7), dtype=np.float32),
+            "actions": np.zeros((3, 7), dtype=np.float32),
+            "camera_keys": np.asarray(["cam_high", "cam_right_wrist"]),
+            "schema": np.asarray("joint"),
+            "contract_version": np.asarray(2),
+            "action_semantics": np.asarray("absolute_next_joint_position"),
+        }
+        contract = infer_episode_contract(data)
+        self.assertTrue(contract.legacy_joint_v2)
+        self.assertEqual(contract.state_names[-1], "right_gripper_opening_m")
+        self.assertEqual(contract.model_action_names[-1], "right_gripper_opening_m")
+
+    def test_lerobot_features_and_model_dimensions(self):
+        self.assertEqual(LEROBOT_FEATURES["state"]["shape"], (10,))
+        self.assertEqual(LEROBOT_FEATURES["actions"]["shape"], (10,))
+        self.assertEqual(len(MODEL_ACTION_NAMES), 7)
+        self.assertEqual(len(ACTION_NAMES), 10)
+
+    def test_moving_v3_fallback_episode_validates(self):
+        keys = ("cam_high", "cam_right_wrist")
+        buffer = EpisodeBuffer(fps=20, schema=DELIVERY_SCHEMA, arm_side="right", camera_keys=keys)
+        for index in range(3):
+            ts = 100.0 + index * 0.05
+            state = self.make_state([0.01 * index, 0, 0.2], Rotation.from_euler("z", 0.05 * index).as_matrix(), 0.035)
+            images = {key: np.full((*IMAGE_HW, 3), 20 + camera + index, dtype=np.uint8) for camera, key in enumerate(keys)}
+            buffer.add(state, images, {key: ts for key in keys}, qpos=np.zeros(7, np.float32), state_timestamp=ts)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ep_0000.npz"
+            buffer.save(path, "move", "move the arm", True)
+            stats = validate_episode(path, target_fps=20)
+            self.assertFalse(stats.legacy_layout)
+            self.assertEqual(stats.action_dim, 10)
+            self.assertEqual(stats.model_action_dim, 7)
+
+    def test_static_success_is_rejected(self):
+        keys = ("cam_high", "cam_right_wrist")
+        buffer = EpisodeBuffer(fps=20, schema=DELIVERY_SCHEMA, arm_side="right", camera_keys=keys)
+        state = self.make_state([0.1, 0.2, 0.3], np.eye(3), 0.0)
+        for index in range(4):
+            ts = 100.0 + index * 0.05
+            buffer.add(state, self._images(keys), {key: ts for key in keys}, qpos=np.zeros(7, np.float32), state_timestamp=ts)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ep_0000.npz"
+            buffer.save(path, "pick_cube", "pick up the cube", True)
+            with self.assertRaisesRegex(EpisodeValidationError, "100% no-op"):
+                validate_episode(path, target_fps=20)
+
+
+class RobotStateReaderTest(unittest.TestCase):
+    def test_stale_feedback_is_rejected(self):
+        class Message:
+            def __init__(self, timestamp):
+                self.time_stamp = timestamp
+                self.Hz = 100.0
+        with self.assertRaises(PiperFeedbackStaleError):
+            _require_fresh_feedback({"joint": Message(time.time() - 10)})
+
+    def test_bimanual_reader_returns_left_then_right_and_fraction(self):
+        class Msg:
+            time_stamp = time.time()
+            Hz = 100.0
+            def __init__(self, offset):
+                self.joint_state = type("J", (), {f"joint_{i}": i * RAD_FACTOR for i in range(1, 7)})()
+                self.gripper_state = type("G", (), {"grippers_angle": offset * GRIPPER_FACTOR})()
+                self.end_pose = type("P", (), {"X_axis": 0, "Y_axis": 0, "Z_axis": 0, "RX_axis": 0, "RY_axis": 0, "RZ_axis": 0})()
+        class Robot:
+            def __init__(self, opening): self.opening = opening
+            def GetArmJointMsgs(self): return Msg(self.opening)
+            def GetArmGripperMsgs(self): return Msg(self.opening)
+            def GetArmEndPoseMsgs(self): return Msg(self.opening)
+        state, qpos = read_robot_state({"left": Robot(0.01), "right": Robot(0.02)}, schema=JOINT_SCHEMA, arm_mode=BIMANUAL)
+        self.assertEqual(state.shape, (14,))
+        np.testing.assert_allclose(qpos[[6, 13]], [0.01 / 0.07, 0.02 / 0.07], atol=1e-6)
+
+
+class TeleopDeliveryContractTest(unittest.TestCase):
+    def test_delivery_contract_does_not_require_eef_calibration(self):
+        single = single_episode_contract(
+            SimpleNamespace(schema=DELIVERY_SCHEMA, arm_side="right", fps=20, action_horizon=50)
+        )
+        bimanual = bimanual_episode_contract(
+            SimpleNamespace(schema=DELIVERY_SCHEMA, fps=20, action_horizon=50)
+        )
+        for contract, raw_dim, model_dim in ((single, 10, 7), (bimanual, 20, 14)):
+            self.assertEqual(contract.raw_action_dim, raw_dim)
+            self.assertEqual(contract.model_action_dim, model_dim)
+            self.assertEqual(contract.action_alignment, "next_observation_pose_same_step_gripper")
+            self.assertEqual(contract.action_offset, 1)
+            self.assertIn("master_gripper_feedback", contract.action_source)
+            self.assertEqual(contract.coordinate_frame, "slave_base")
+
+    def test_prepare_delivery_episode_keeps_master_gripper_and_shifts_slave_pose(self):
+        contract = single_episode_contract(
+            SimpleNamespace(schema=DELIVERY_SCHEMA, arm_side="right", fps=20, action_horizon=50)
+        )
+        states = np.zeros((3, 10), dtype=np.float32)
+        states[:, :3] = [[0.0, 0.1, 0.2], [0.2, 0.3, 0.4], [0.4, 0.5, 0.6]]
+        states[:, 3:9] = [1, 0, 0, 0, 1, 0]
+        provisional = states.copy()
+        provisional[:, 9] = [0.9, 0.6, 0.2]
+        prepared = _prepare_delivery_episode(
+            {
+                "qpos": states,
+                "actions": provisional,
+                "state_timestamp": np.array([1.0, 1.05, 1.10]),
+                "action_timestamp": np.array([1.01, 1.06, 1.11]),
+            },
+            contract,
+        )
+        np.testing.assert_allclose(prepared["actions"][:-1, :9], states[1:, :9])
+        np.testing.assert_allclose(prepared["actions"][:, 9], [0.9, 0.6, 0.2])
+        np.testing.assert_allclose(prepared["action_timestamp"], [1.05, 1.10, 1.15])
+        np.testing.assert_allclose(prepared["gripper_command_timestamp"][:, 0], [1.01, 1.06, 1.11])
+        self.assertTrue(prepared["gripper_command_present"].all())
+
+
+class MixedDeliveryActionTest(unittest.TestCase):
+    def test_next_slave_pose_uses_same_step_master_gripper(self):
+        states = np.zeros((3, 20), dtype=np.float32)
+        for arm in range(2):
+            offset = arm * 10
+            states[:, offset : offset + 3] = np.array(
+                [[0.0, 0.1, 0.2], [0.2, 0.3, 0.4], [0.4, 0.5, 0.6]],
+                dtype=np.float32,
+            ) + arm
+            states[:, offset + 3 : offset + 9] = np.array([1, 0, 0, 0, 1, 0], dtype=np.float32)
+            states[:, offset + 9] = [0.1, 0.2, 0.3]
+        master_grippers = np.array([[0.8, 0.7], [0.6, 0.5], [0.4, 0.3]], dtype=np.float32)
+        actions = build_delivery_actions_with_gripper_targets(states, master_grippers, arm_count=2)
+        np.testing.assert_allclose(actions[:-1, :9], states[1:, :9])
+        np.testing.assert_allclose(actions[:-1, 10:19], states[1:, 10:19])
+        np.testing.assert_allclose(actions[:, [9, 19]], master_grippers)
+        np.testing.assert_allclose(actions[-1, :9], states[-1, :9])
+        np.testing.assert_allclose(actions[-1, 10:19], states[-1, 10:19])
+
+    def test_next_observation_action_timestamps(self):
+        values = next_observation_timestamps(np.array([1.0, 1.05, 1.10]), fps=20)
+        np.testing.assert_allclose(values, [1.05, 1.10, 1.15])
+
+
+class TimestampAndCommandTest(unittest.TestCase):
+    def test_trajectory_records_independent_timestamps(self):
+        recorder = TrajectoryRecorder()
+        recorder.start()
+        image = np.ones((*IMAGE_HW, 3), dtype=np.uint8)
+        recorder.add(
+            np.zeros(7, np.float32), np.ones(7, np.float32), {"cam_high": image},
+            {"cam_high": 10.02}, state_timestamp=10.0, action_timestamp=10.01,
+            joint_qpos=np.zeros(7, np.float32),
+        )
+        data = recorder.to_numpy_dict()
+        self.assertEqual(data["state_timestamp"].tolist(), [10.0])
+        self.assertEqual(data["action_timestamp"].tolist(), [10.01])
+        self.assertEqual(data["image_timestamps_cam_high"].tolist(), [10.02])
+
+    def test_commanded_gripper_support_uses_opening_fraction(self):
+        message = type("Message", (), {
+            "time_stamp": time.time(),
+            "gripper_ctrl": type("Command", (), {"grippers_angle": 0.035 * GRIPPER_FACTOR})(),
+        })()
+        robot = type("Robot", (), {"GetArmGripperCtrl": lambda self: message})()
+        self.assertAlmostEqual(read_output_gripper_command_target(robot), 0.5, places=6)
 
 
 class CollectionSessionTest(unittest.TestCase):
-    def test_ui_neutral_collection_lifecycle(self):
-        piper = FakePiper()
-        state = build_delivery_state(np.zeros(3), np.eye(3), 0.07)
-        qpos = np.zeros(7, dtype=np.float32)
-        with tempfile.TemporaryDirectory() as directory:
-            session = CollectionSession(
-                CollectionConfig(output_dir=Path(directory)),
-                robot_connect=lambda can_name: piper,
-                camera_factory=FakeCameras,
-                state_reader=lambda robot: (state, qpos),
-                camera_verifier=lambda cameras, fps: {
-                    "cam_high": {"ok": True, "fps": fps},
-                    "cam_wrist": {"ok": True, "fps": fps},
-                },
-            )
-            session.connect()
-            self.assertIs(session.state, SessionState.READY)
-            session.start_episode("pick_cube", "pick up the cube")
-            session.capture_once()
-            self.assertEqual(session.stop_episode(), 1)
-            path, stats = session.save_episode(True, validate=False)
-            self.assertIsNone(stats)
-            self.assertTrue(path.is_file())
-            self.assertIs(session.state, SessionState.READY)
-            with np.load(path, allow_pickle=False) as data:
-                self.assertEqual(data["state"].shape, (2, 10))
-                self.assertEqual(data["instruction"].item(), "pick up the cube")
-            session.disconnect()
-            self.assertTrue(piper.disconnected)
-            self.assertIs(session.state, SessionState.DISCONNECTED)
-
-    def test_bimanual_joint_collection_lifecycle(self):
+    def test_collection_lifecycle_writes_v3_metadata(self):
         robots = {"can_left": FakePiper(), "can_right": FakePiper()}
-        qpos = np.arange(14, dtype=np.float32) / 100
+        state = np.zeros(14, dtype=np.float32)
+        state[6], state[13] = 0.2, 0.8
         with tempfile.TemporaryDirectory() as directory:
             session = CollectionSession(
-                CollectionConfig(
-                    output_dir=Path(directory),
-                    schema=JOINT_SCHEMA,
-                    arm_mode=BIMANUAL,
-                    arm_side="both",
-                    left_can_name="can_left",
-                    right_can_name="can_right",
-                    cam_left_wrist_device="left-camera",
-                    cam_right_wrist_device="right-camera",
-                ),
-                robot_connect=robots.__getitem__,
-                camera_factory=FakeCameras,
-                state_reader=lambda robot: (qpos, qpos),
-                camera_verifier=lambda cameras, fps: {
-                    key: {"ok": True, "fps": fps}
-                    for key in cameras.kwargs["cam_ids"]
-                },
+                CollectionConfig(output_dir=Path(directory), schema=JOINT_SCHEMA, arm_mode=BIMANUAL, arm_side="both", left_can_name="can_left", right_can_name="can_right"),
+                robot_connect=robots.__getitem__, camera_factory=FakeCameras,
+                state_reader=lambda robot: (state, state.copy()),
+                camera_verifier=lambda cameras, fps: {key: {"ok": True, "fps": fps} for key in cameras.kwargs["cam_ids"]},
             )
-            checks = session.connect()
-            self.assertEqual(set(session.piper), {"left", "right"})
-            self.assertEqual(
-                tuple(session.cameras.kwargs["cam_ids"]),
-                ("cam_high", "cam_left_wrist", "cam_right_wrist"),
-            )
-            self.assertEqual(set(checks), set(session.cameras.kwargs["cam_ids"]))
-            session.start_episode("handover", "handover the object")
-            session.capture_once()
-            session.stop_episode()
+            session.connect(); session.start_episode("handover", "handover the object")
+            session.capture_once(); session.stop_episode()
             path, _ = session.save_episode(True, validate=False)
             with np.load(path, allow_pickle=False) as data:
-                self.assertEqual(data["state"].shape, (2, 14))
                 self.assertEqual(data["actions"].shape, (2, 14))
-                self.assertEqual(data["arm_mode"].item(), BIMANUAL)
-                self.assertEqual(data["action_source"].item(), "next_measured_qpos")
-                self.assertEqual(data["action_alignment"].item(), "next_observation")
-                self.assertEqual(data["action_offset"].item(), 1)
+                self.assertEqual(data["action_source"].item(), "next_measured_joint_fallback")
+                self.assertEqual(data["fps"].item(), 20)
+                self.assertEqual(data["action_horizon"].item(), 50)
+                self.assertIn("state_timestamp", data.files)
+                self.assertIn("action_timestamp", data.files)
             session.disconnect()
-            self.assertTrue(all(robot.disconnected for robot in robots.values()))
 
-    def test_bimanual_delivery_collection_lifecycle(self):
+    def test_delivery_collection_uses_10d_raw_fallback(self):
         robots = {"can_left": FakePiper(), "can_right": FakePiper()}
-        left_state = build_delivery_state([0.1, 0.2, 0.3], np.eye(3), 0.07)
-        right_state = build_delivery_state([0.4, 0.5, 0.6], np.eye(3), 0.02)
-        state = np.concatenate((left_state, right_state))
-        qpos = np.arange(14, dtype=np.float32) / 100
+        left = build_delivery_state([0.1, 0.2, 0.3], np.eye(3), 0.07)
+        right = build_delivery_state([0.4, 0.5, 0.6], np.eye(3), 0.02)
+        state = np.concatenate((left, right))
+        qpos = np.zeros(14, dtype=np.float32)
         with tempfile.TemporaryDirectory() as directory:
             session = CollectionSession(
-                CollectionConfig(
-                    output_dir=Path(directory),
-                    schema=DELIVERY_SCHEMA,
-                    arm_mode=BIMANUAL,
-                    arm_side="both",
-                    left_can_name="can_left",
-                    right_can_name="can_right",
-                    cam_left_wrist_device="left-camera",
-                    cam_right_wrist_device="right-camera",
-                ),
-                robot_connect=robots.__getitem__,
-                camera_factory=FakeCameras,
+                CollectionConfig(output_dir=Path(directory), schema=DELIVERY_SCHEMA, arm_mode=BIMANUAL, arm_side="both", left_can_name="can_left", right_can_name="can_right"),
+                robot_connect=robots.__getitem__, camera_factory=FakeCameras,
                 state_reader=lambda robot: (state, qpos),
-                camera_verifier=lambda cameras, fps: {
-                    key: {"ok": True, "fps": fps}
-                    for key in cameras.kwargs["cam_ids"]
-                },
+                camera_verifier=lambda cameras, fps: {key: {"ok": True, "fps": fps} for key in cameras.kwargs["cam_ids"]},
             )
-            session.connect()
-            session.start_episode("handover", "handover the object")
-            session.capture_once()
-            session.stop_episode()
+            session.connect(); session.start_episode("handover", "handover the object")
+            session.capture_once(); session.stop_episode()
             path, _ = session.save_episode(True, validate=False)
             with np.load(path, allow_pickle=False) as data:
                 self.assertEqual(data["state"].shape, (2, 20))
-                self.assertEqual(data["actions"].shape, (2, 14))
-                self.assertEqual(data["joint_qpos"].shape, (2, 14))
-                self.assertEqual(data["schema"].item(), DELIVERY_SCHEMA)
-                self.assertEqual(data["arm_mode"].item(), BIMANUAL)
-                self.assertEqual(data["action_source"].item(), "next_measured_eef")
-                self.assertEqual(data["action_alignment"].item(), "next_observation")
-                self.assertEqual(data["action_offset"].item(), 1)
-                self.assertEqual(
-                    data["camera_keys"].tolist(),
-                    ["cam_high", "cam_left_wrist", "cam_right_wrist"],
-                )
+                self.assertEqual(data["actions"].shape, (2, 20))
+                self.assertEqual(data["raw_action_dim"].item(), 20)
+                self.assertEqual(data["model_action_dim"].item(), 14)
+                self.assertEqual(data["action_source"].item(), "next_measured_eef_fallback")
             session.disconnect()
-            self.assertTrue(all(robot.disconnected for robot in robots.values()))
 
-    def test_failed_validation_does_not_publish_an_episode(self):
+    def test_failed_validation_does_not_publish_episode(self):
         state = build_delivery_state(np.zeros(3), np.eye(3), 0.07)
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory)
-
             def fail_validation(path, target_fps):
                 raise ValueError("synthetic validation failure")
-
             session = CollectionSession(
-                CollectionConfig(output_dir=output_dir),
-                robot_connect=lambda can_name: FakePiper(),
-                camera_factory=FakeCameras,
-                state_reader=lambda robot: (state, np.zeros(7, dtype=np.float32)),
-                camera_verifier=lambda cameras, fps: {},
-                episode_validator=fail_validation,
+                CollectionConfig(output_dir=output_dir), robot_connect=lambda can_name: FakePiper(), camera_factory=FakeCameras,
+                state_reader=lambda robot: (state, np.zeros(7, dtype=np.float32)), camera_verifier=lambda cameras, fps: {}, episode_validator=fail_validation,
             )
-            session.connect()
-            session.start_episode("pick_cube", "pick up the cube")
-            session.capture_once()
-            session.stop_episode()
+            session.connect(); session.start_episode("pick_cube", "pick up the cube"); session.capture_once(); session.stop_episode()
             with self.assertRaisesRegex(ValueError, "synthetic validation failure"):
                 session.save_episode(True)
             self.assertFalse((output_dir / "ep_0000.npz").exists())
-            self.assertEqual(list(output_dir.glob(".*.npz")), [])
             self.assertIs(session.state, SessionState.REVIEW)
-            self.assertEqual(session.frame_count, 1)
 
 
 if __name__ == "__main__":

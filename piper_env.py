@@ -1,7 +1,11 @@
 """Bimanual Piper environment using piper-sdk.
 
-State/action layout (14D):
+Legacy physical state/action layout (14D):
   [left_j1..j6 (rad), left_gripper (m), right_j1..j6 (rad), right_gripper (m)]
+
+``step_policy`` additionally accepts the policy wire layout. New v3 policies
+use absolute joints plus opening fraction; legacy joint checkpoints may use
+absolute joints plus opening metres and must pass their metadata semantics.
 
 CAN port assignment is UNKNOWN until hardware is connected.
 Default: left_can="can0", right_can="can1". Verify with `ip link show` or `ls /sys/class/net/`.
@@ -11,6 +15,9 @@ import math
 import time
 import numpy as np
 from piper_sdk import C_PiperInterface_V2
+
+from piper_action_conventions import NEW_GRIPPER_SEMANTICS
+from piper_data_contract import LEGACY_GRIPPER_OPENING_METRES_SEMANTICS
 
 # --- unit conversion constants ---
 _RAD_TO_MDEG = 1000.0 * 180.0 / math.pi   # rad  →  0.001 °
@@ -27,6 +34,53 @@ JOINT_LIMITS_RAD = np.array([
 ], dtype=np.float64)
 
 GRIPPER_RANGE_M = (0.0, 0.07)   # fully closed → fully open
+DEFAULT_MAX_JOINT_STEP_RAD = 0.3
+DEFAULT_MAX_GRIPPER_STEP_FRACTION = 0.25
+
+
+def decode_joint_policy_target(
+    current_qpos: np.ndarray,
+    wire_action: np.ndarray,
+    *,
+    gripper_semantics: str,
+    max_joint_step_rad: float = DEFAULT_MAX_JOINT_STEP_RAD,
+    max_gripper_step_fraction: float = DEFAULT_MAX_GRIPPER_STEP_FRACTION,
+) -> tuple[np.ndarray, float]:
+    """Decode/check one 7D policy target before converting to Piper metres."""
+    current = np.asarray(current_qpos, dtype=np.float64)
+    target = np.asarray(wire_action, dtype=np.float64)
+    if current.shape != (7,) or target.shape != (7,):
+        raise ValueError(f"current_qpos and wire_action must be 7D, got {current.shape}/{target.shape}")
+    if not np.isfinite(current).all() or not np.isfinite(target).all():
+        raise ValueError("joint policy target contains NaN or Inf")
+    for index, (value, bounds) in enumerate(zip(target[:6], JOINT_LIMITS_RAD), start=1):
+        if not bounds[0] <= value <= bounds[1]:
+            raise ValueError(f"joint{index} target {value:.5f}rad outside {tuple(bounds)}")
+    deltas = np.abs(target[:6] - current[:6])
+    worst = int(np.argmax(deltas))
+    if deltas[worst] > max_joint_step_rad:
+        raise ValueError(
+            f"joint{worst + 1} step {deltas[worst]:.5f}rad exceeds {max_joint_step_rad:.5f}rad"
+        )
+    if gripper_semantics == NEW_GRIPPER_SEMANTICS:
+        opening_fraction = float(target[6])
+        if not 0.0 <= opening_fraction <= 1.0:
+            raise ValueError(f"opening fraction {opening_fraction:.5f} outside [0,1]")
+        gripper_m = opening_fraction * GRIPPER_RANGE_M[1]
+    elif gripper_semantics == LEGACY_GRIPPER_OPENING_METRES_SEMANTICS:
+        gripper_m = float(target[6])
+        if not GRIPPER_RANGE_M[0] <= gripper_m <= GRIPPER_RANGE_M[1]:
+            raise ValueError(f"gripper opening {gripper_m:.5f}m outside {GRIPPER_RANGE_M}")
+        opening_fraction = gripper_m / GRIPPER_RANGE_M[1]
+    else:
+        raise ValueError(f"unsupported joint gripper_semantics={gripper_semantics!r}")
+    current_fraction = float(current[6]) / GRIPPER_RANGE_M[1]
+    if abs(opening_fraction - current_fraction) > max_gripper_step_fraction:
+        raise ValueError(
+            f"gripper step {abs(opening_fraction - current_fraction):.5f} exceeds "
+            f"{max_gripper_step_fraction:.5f}"
+        )
+    return target[:6].copy(), gripper_m
 
 
 def _joints_mdeg_to_rad(joint_state) -> np.ndarray:
@@ -152,6 +206,36 @@ class PiperBimanualEnv:
         """Send 14D action: [left_j1..6, left_gripper, right_j1..6, right_gripper]."""
         self.left.send(action[0:6], float(action[6]))
         self.right.send(action[7:13], float(action[13]))
+
+    def step_policy(
+        self,
+        action: np.ndarray,
+        *,
+        gripper_semantics: str,
+        max_joint_step_rad: float = DEFAULT_MAX_JOINT_STEP_RAD,
+        max_gripper_step_fraction: float = DEFAULT_MAX_GRIPPER_STEP_FRACTION,
+    ):
+        """Atomically validate/decode a 14D policy wire target, then send both arms."""
+        action = np.asarray(action, dtype=np.float64)
+        if action.shape != (14,):
+            raise ValueError(f"bimanual policy action must be 14D, got {action.shape}")
+        current = self.get_qpos()
+        left_target = decode_joint_policy_target(
+            current[:7],
+            action[:7],
+            gripper_semantics=gripper_semantics,
+            max_joint_step_rad=max_joint_step_rad,
+            max_gripper_step_fraction=max_gripper_step_fraction,
+        )
+        right_target = decode_joint_policy_target(
+            current[7:],
+            action[7:],
+            gripper_semantics=gripper_semantics,
+            max_joint_step_rad=max_joint_step_rad,
+            max_gripper_step_fraction=max_gripper_step_fraction,
+        )
+        self.left.send(*left_target)
+        self.right.send(*right_target)
 
     def go_home(self):
         self.left.go_home()

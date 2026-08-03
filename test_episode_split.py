@@ -14,6 +14,25 @@ from server_4090.episode_split import (
 
 
 class EpisodeSplitTest(unittest.TestCase):
+    @staticmethod
+    def contract(**overrides):
+        value = {
+            "contract_version": 3,
+            "raw_action_dim": 10,
+            "model_action_dim": 7,
+            "raw_action_semantics": "absolute_eef_target",
+            "model_action_semantics": "eef_delta_chunk_origin_base_xyz_left_rotvec_gripper_opening_target",
+            "raw_action_convention": "absolute_eef_target",
+            "model_action_convention": "chunk_origin",
+            "gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+            "raw_gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+            "wire_gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+            "action_offset": 0,
+            "model_action_start_offset": 1,
+        }
+        value.update(overrides)
+        return value
+
     def make_dataset(self, root: Path, count: int, dataset_id: str = "demo") -> Path:
         dataset = root / dataset_id
         meta = dataset / "meta"
@@ -78,6 +97,90 @@ class EpisodeSplitTest(unittest.TestCase):
             self.assertFalse(norm_split_matches(norm_dir, split))
             write_norm_split(norm_dir, split)
             self.assertTrue(norm_split_matches(norm_dir, split))
+            self.assertFalse(
+                norm_split_matches(
+                    norm_dir, split, delivery_action_convention="chunk_origin"
+                )
+            )
+            write_norm_config(
+                norm_dir,
+                split,
+                model_variant="pi05",
+                base_checkpoint="/models/pi05_base",
+                arm_mode="single",
+                arm_side="right",
+                schema="delivery",
+                delivery_action_convention="chunk_origin",
+                requested_batch_size=16,
+                effective_batch_size=10,
+                num_workers=2,
+                max_frames=None,
+                available_train_frames=100,
+                processed_batches=10,
+            )
+            self.assertTrue(
+                norm_split_matches(
+                    norm_dir, split, delivery_action_convention="chunk_origin"
+                )
+            )
+            self.assertFalse(
+                norm_split_matches(norm_dir, split, delivery_action_convention="step")
+            )
+
+    def test_split_and_norm_reject_action_contract_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_dataset(root, 8)
+            contract = self.contract()
+            split = resolve_episode_split(
+                root, "demo", test_ratio=0.25, seed=11, contract=contract
+            )
+            payload = json.loads(
+                (root / "demo" / "meta" / "train_test_split.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            for key, value in contract.items():
+                self.assertEqual(payload[key], value)
+            self.assertEqual(
+                load_episode_split(root, "demo", contract=contract), split
+            )
+            mismatch = self.contract(model_action_dim=14)
+            self.assertIsNone(load_episode_split(root, "demo", contract=mismatch))
+            self.assertIsNone(
+                load_episode_split(root, "demo", contract=self.contract(action_offset=1))
+            )
+            with self.assertRaisesRegex(ValueError, "model_action_start_offset"):
+                load_episode_split(
+                    root, "demo", contract=self.contract(model_action_start_offset=0)
+                )
+
+            norm_dir = root / "assets" / "demo"
+            norm_dir.mkdir(parents=True)
+            (norm_dir / "norm_stats.json").write_text("{}", encoding="utf-8")
+            write_norm_split(norm_dir, split)
+            write_norm_config(
+                norm_dir,
+                split,
+                model_variant="pi05",
+                base_checkpoint="/models/pi05_base",
+                arm_mode="single",
+                arm_side="right",
+                schema="delivery",
+                contract=contract,
+                requested_batch_size=16,
+                effective_batch_size=8,
+                num_workers=2,
+                max_frames=None,
+                available_train_frames=80,
+                processed_batches=10,
+            )
+            self.assertTrue(
+                norm_split_matches(norm_dir, split, contract=contract)
+            )
+            self.assertFalse(
+                norm_split_matches(norm_dir, split, contract=mismatch)
+            )
 
     def test_invalid_ratio_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -100,6 +203,7 @@ class EpisodeSplitTest(unittest.TestCase):
                 arm_mode="single",
                 arm_side="right",
                 schema="delivery",
+                delivery_action_convention="chunk_origin",
                 requested_batch_size=16,
                 effective_batch_size=10,
                 num_workers=2,
@@ -113,6 +217,7 @@ class EpisodeSplitTest(unittest.TestCase):
             self.assertEqual(payload["split_seed"], 7)
             self.assertEqual(payload["requested_batch_size"], 16)
             self.assertEqual(payload["effective_batch_size"], 10)
+            self.assertEqual(payload["delivery_action_convention"], "chunk_origin")
             self.assertEqual(payload["train_episodes"], list(split.train_episodes))
 
 
