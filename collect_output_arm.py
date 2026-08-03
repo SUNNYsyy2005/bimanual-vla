@@ -60,17 +60,49 @@ GRIPPER_FACTOR = 1_000_000.0  # Piper unit: 0.001 mm -> metre
 DEFAULT_CAN = "can0"
 DEFAULT_LEFT_CAN = "can1"
 DEFAULT_RIGHT_CAN = "can3"
-DEFAULT_HIGH_DEVICE = "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:4:1.3-video-index0"
-DEFAULT_WRIST_DEVICE = "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:5.2:1.0-video-index4"
-DEFAULT_LEFT_WRIST_DEVICE = "/dev/video12"
-DEFAULT_RIGHT_WRIST_DEVICE = DEFAULT_WRIST_DEVICE
+DEFAULT_HIGH_DEVICE = "auto"
+DEFAULT_WRIST_DEVICE = "auto"
+DEFAULT_LEFT_WRIST_DEVICE = "auto"
+DEFAULT_RIGHT_WRIST_DEVICE = "auto"
 DEFAULT_CAMERA_FPS = 30
 CAMERA_SOURCE_HW = (240, 424)
 PIPER_FEEDBACK_MAX_AGE_S = 0.5
+CAN_INTERFACE_UP_FLAG = 0x1
 
 
 class PiperFeedbackStaleError(RuntimeError):
     """Raised when Piper SDK getters only contain old cached CAN feedback."""
+
+
+def require_can_interface_up(
+    can_name: str,
+    *,
+    sysfs_root: pathlib.Path = pathlib.Path("/sys/class/net"),
+) -> None:
+    """Fail early when a SocketCAN interface exists but is not operationally up.
+
+    ``python-can`` can successfully create a socket for a DOWN interface.  The
+    first read then fails with ``Network is down``, while Piper's SDK may only
+    expose that as stale cached feedback.  Checking the Linux interface flags
+    before constructing the SDK object gives the GUI an actionable error.
+    """
+    name = can_name.strip()
+    if not name:
+        raise RuntimeError("CAN interface name must not be empty")
+    interface_dir = sysfs_root / name
+    if not interface_dir.is_dir():
+        raise RuntimeError(
+            f"CAN interface {name!r} does not exist. Connect the USB-CAN adapter first."
+        )
+    try:
+        flags = int((interface_dir / "flags").read_text().strip(), 0)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"cannot read Linux link flags for CAN interface {name!r}: {exc}") from exc
+    if not flags & CAN_INTERFACE_UP_FLAG:
+        raise RuntimeError(
+            f"CAN interface {name!r} exists but is DOWN. Activate it at 1000000 bit/s "
+            "and confirm that 'candump' receives live Piper frames before connecting the GUI."
+        )
 
 
 def _require_fresh_feedback(
@@ -322,6 +354,7 @@ def reset_robot_arms(
 def connect(can_name: str) -> Any:
     if C_PiperInterface_V2 is None:
         raise RuntimeError("piper_sdk is not installed; run this collector in the Piper hardware environment")
+    require_can_interface_up(can_name)
     piper = C_PiperInterface_V2(can_name, judge_flag=False, can_auto_init=False)
     piper.CreateCanBus(
         can_name=can_name,

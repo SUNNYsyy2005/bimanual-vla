@@ -473,19 +473,6 @@ def export_dataset(
 
     first = episodes[0]
     output_root = Path(root).expanduser()
-    if contract.schema == DELIVERY_SCHEMA and contract.arm_mode == SINGLE_ARM:
-        count, frames = _export_legacy_single_delivery(
-            successful,
-            output_root,
-            fps=fps,
-        )
-        print(
-            f"Export complete: root={output_root} schema={contract.schema} "
-            f"arm={contract.arm_mode}/{contract.arm_side} layout=legacy "
-            f"episodes={count} frames={frames} fps={fps}"
-        )
-        return output_root
-
     writer = Pi0LeRobotDatasetWriter(
         output_root,
         fps=fps,

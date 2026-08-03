@@ -34,6 +34,7 @@ from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
 from camera import CameraCapture
+from collect_output_arm import require_can_interface_up
 from piper_action_conventions import (
     DELIVERY_CHUNK_ORIGIN_ACTION_SEMANTICS,
     DELIVERY_MODEL_ACTION_SEMANTICS,
@@ -89,12 +90,12 @@ GRIPPER_OPENING_FRACTION = NEW_GRIPPER_SEMANTICS
 GRIPPER_CLOSED_FRACTION = LEGACY_GRIPPER_SEMANTICS
 GRIPPER_OPENING_METRES = LEGACY_GRIPPER_OPENING_METRES_SEMANTICS
 DEFAULT_CAN = "can0"
-DEFAULT_LEFT_CAN = "can0"
-DEFAULT_RIGHT_CAN = "can1"
-DEFAULT_HIGH_DEVICE = "/dev/video8"
-DEFAULT_WRIST_DEVICE = "/dev/video16"
-DEFAULT_LEFT_WRIST_DEVICE = "/dev/video14"
-DEFAULT_RIGHT_WRIST_DEVICE = "/dev/video16"
+DEFAULT_LEFT_CAN = "can1"
+DEFAULT_RIGHT_CAN = "can3"
+DEFAULT_HIGH_DEVICE = "auto"
+DEFAULT_WRIST_DEVICE = "auto"
+DEFAULT_LEFT_WRIST_DEVICE = "auto"
+DEFAULT_RIGHT_WRIST_DEVICE = "auto"
 CAMERA_SOURCE_HW = (240, 424)
 # 8_3_64eps full-set envelope: 18,034 frames sampled at 20 Hz. These defaults
 # include a small margin over observed maxima. They remain CLI-tightenable, and
@@ -149,6 +150,7 @@ def connect_piper(can_name: str) -> Any:
     """Connect for feedback; this alone does not enable or command the arm."""
     from piper_sdk import C_PiperInterface_V2
 
+    require_can_interface_up(can_name)
     piper = C_PiperInterface_V2(can_name, judge_flag=False, can_auto_init=False)
     piper.CreateCanBus(
         can_name=can_name,
@@ -562,11 +564,21 @@ def validate_policy_metadata(
         errors.append(f"schema={schema!r}, expected 'delivery' or 'joint'")
 
     if arm_mode == "bimanual":
-        expected_camera_keys = {"cam_high", "cam_left_wrist", "cam_right_wrist"}
+        expected_camera_key_sets = (
+            {"cam_high", "cam_left_wrist", "cam_right_wrist"},
+        )
     elif schema == "delivery":
-        expected_camera_keys = {"cam_high", "cam_wrist"}
+        # Legacy delivery datasets expose the generic ``cam_wrist`` alias,
+        # while canonical v3 datasets preserve the physical arm side in the
+        # wire key. Both identify the same locally captured wrist stream.
+        expected_camera_key_sets = (
+            {"cam_high", "cam_wrist"},
+            {"cam_high", f"cam_{arm_side}_wrist"},
+        )
     else:
-        expected_camera_keys = {"cam_high", f"cam_{arm_side}_wrist"}
+        expected_camera_key_sets = (
+            {"cam_high", f"cam_{arm_side}_wrist"},
+        )
 
     if expected_state_dim is not None and metadata.get("state_dim") != expected_state_dim:
         errors.append(f"state_dim={metadata.get('state_dim')!r}, expected {expected_state_dim!r}")
@@ -695,12 +707,14 @@ def validate_policy_metadata(
         else:
             if not math.isfinite(action_hz) or action_hz <= 0:
                 errors.append(f"action_hz={raw_action_hz!r} must be a positive number")
+    camera_key_set = set(camera_keys) if isinstance(camera_keys, (list, tuple)) else set()
     if (
         not isinstance(camera_keys, (list, tuple))
-        or len(camera_keys) != len(expected_camera_keys)
-        or set(camera_keys) != expected_camera_keys
+        or len(camera_keys) != len(camera_key_set)
+        or camera_key_set not in expected_camera_key_sets
     ):
-        errors.append(f"camera_keys={camera_keys!r}, expected {sorted(expected_camera_keys)!r}")
+        expected_camera_keys = [sorted(keys) for keys in expected_camera_key_sets]
+        errors.append(f"camera_keys={camera_keys!r}, expected one of {expected_camera_keys!r}")
     if errors:
         raise RuntimeError("incompatible policy metadata: " + "; ".join(errors))
 
@@ -2602,11 +2616,28 @@ def run(args: argparse.Namespace) -> None:
     control_period = 1.0 / float(getattr(args, "control_hz", DEFAULT_ACTION_HZ))
     try:
         cameras.open()
-        for key, info in cameras.verify().items():
+        camera_checks = cameras.verify()
+        for key, info in camera_checks.items():
+            selected_device = str(
+                info.get("selected_device")
+                or info.get("configured_device")
+                or camera_ids[key]
+            )
+            video_device = str(info.get("video_device") or selected_device)
+            if key == "cam_high":
+                args.cam_high_device = selected_device
+            elif key == "cam_wrist":
+                args.cam_wrist_device = selected_device
+            elif key == "cam_left_wrist":
+                args.cam_left_wrist_device = selected_device
+            elif key == "cam_right_wrist":
+                args.cam_right_wrist_device = selected_device
             logging.info(
-                "Camera %s: %s shape=%s latency=%sms",
+                "Camera %s: %s selected=%s video=%s shape=%s latency=%sms",
                 key,
                 "OK" if info["ok"] else "FAIL",
+                selected_device,
+                video_device,
                 info["shape"],
                 info["latency_ms"],
             )

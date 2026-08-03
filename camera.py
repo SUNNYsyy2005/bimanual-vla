@@ -14,6 +14,7 @@ Verify device IDs before connecting:
 
 from pathlib import Path
 import re
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -31,6 +32,113 @@ DEFAULT_CAM_IDS = {
 }
 
 STALE_THRESHOLD_S = 0.5   # flag image as stale if older than this
+
+# Camera roles used by the current collection rig.  Device numbers and USB
+# paths can change after reconnecting a hub, but these model names and serial
+# backed udev properties remain stable.
+CAMERA_MODEL_HINTS = {
+    # Current physical installation: D435i is the overhead view and D405 is
+    # mounted at the single/right wrist. The GUI can swap these roles when the
+    # cameras are moved temporarily.
+    "cam_high": ("realsense_tm__depth_camera_435i", "depth_camera_435i"),
+    "cam_wrist": ("realsense_tm__depth_camera_405", "depth_camera_405"),
+    "cam_right_wrist": ("realsense_tm__depth_camera_405", "depth_camera_405"),
+    "cam_left_wrist": ("asus_fhd_webcam",),
+}
+COLOR_FORMAT_SCORES = {
+    "MJPG": 40,
+    "YUYV": 35,
+    "RGB3": 35,
+    "BGR3": 35,
+    "UYVY": 10,
+}
+
+
+def _command_output(args: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def _stable_video_selector(device: Path) -> str:
+    """Prefer a stable udev symlink for a concrete video node."""
+    resolved = device.resolve(strict=False)
+    for directory in (Path("/dev/v4l/by-id"), Path("/dev/v4l/by-path")):
+        if not directory.is_dir():
+            continue
+        for candidate in sorted(directory.iterdir()):
+            try:
+                if candidate.resolve(strict=True) == resolved:
+                    return str(candidate)
+            except OSError:
+                continue
+    return str(device)
+
+
+def discover_video_device(camera_key: str, *, device_root: Path = Path("/dev")) -> str:
+    """Discover the RGB V4L2 node for a known camera role.
+
+    RealSense devices expose depth, infrared, metadata and RGB nodes under one
+    USB device.  Model matching alone is therefore insufficient: candidates
+    are also ranked by their advertised colour pixel formats.
+    """
+    hints = CAMERA_MODEL_HINTS.get(camera_key)
+    if not hints:
+        raise RuntimeError(
+            f"Cannot auto-discover unknown camera role {camera_key!r}; enter an explicit /dev/videoN path."
+        )
+
+    candidates: list[tuple[int, int, Path, str]] = []
+    for device in device_root.glob("video[0-9]*"):
+        match = re.fullmatch(r"video(\d+)", device.name)
+        if match is None:
+            continue
+        properties = _command_output(
+            ["udevadm", "info", "--query=property", f"--name={device}"]
+        ).lower()
+        if not any(hint in properties for hint in hints):
+            continue
+        formats = _command_output(["v4l2-ctl", "-d", str(device), "--list-formats"])
+        format_score = max(
+            (score for pixel_format, score in COLOR_FORMAT_SCORES.items() if pixel_format in formats),
+            default=0,
+        )
+        if format_score <= 0:
+            continue
+        candidates.append((format_score, -int(match.group(1)), device, formats))
+
+    if not candidates:
+        raise RuntimeError(
+            f"Cannot auto-discover an RGB device for {camera_key}. "
+            "Check that the expected camera is connected and visible in 'v4l2-ctl --list-devices'."
+        )
+    _, _, selected, _ = max(candidates)
+    return _stable_video_selector(selected)
+
+
+def select_video_device(camera_key: str, configured_device: object) -> object:
+    """Keep a valid configured selector, otherwise auto-discover by role."""
+    if isinstance(configured_device, int):
+        numeric_device = Path(f"/dev/video{int(configured_device)}")
+        return configured_device if numeric_device.exists() else discover_video_device(camera_key)
+    if isinstance(configured_device, str) and configured_device.isdigit():
+        numeric_device = Path(f"/dev/video{int(configured_device)}")
+        return int(configured_device) if numeric_device.exists() else discover_video_device(camera_key)
+
+    configured_text = str(configured_device).strip()
+    if configured_text.lower() != "auto":
+        candidate = Path(configured_text).expanduser()
+        if candidate.exists():
+            return str(candidate)
+    return discover_video_device(camera_key)
 
 
 def resolve_video_device(device: object) -> str:
@@ -70,6 +178,7 @@ class CameraCapture:
         parallel_reads: bool = False,
     ):
         self._ids = cam_ids or dict(DEFAULT_CAM_IDS)
+        self._configured_ids = dict(self._ids)
         self._fps = fps
         self._image_hw = tuple(image_hw)
         self._capture_hw = tuple(capture_hw or image_hw)
@@ -78,16 +187,25 @@ class CameraCapture:
         self._executor: ThreadPoolExecutor | None = None
 
     def open(self):
-        for key, dev_id in self._ids.items():
-            cap = cv2.VideoCapture(dev_id)
-            if not cap.isOpened():
-                raise RuntimeError(f"Cannot open camera {key} at {dev_id}")
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._capture_hw[1])
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._capture_hw[0])
-            cap.set(cv2.CAP_PROP_FPS, self._fps)
-            # disable internal buffering to reduce latency
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self._caps[key] = cap
+        try:
+            for key, configured_id in self._configured_ids.items():
+                dev_id = select_video_device(key, configured_id)
+                self._ids[key] = dev_id
+                cap = cv2.VideoCapture(dev_id)
+                if not cap.isOpened():
+                    raise RuntimeError(
+                        f"Cannot open camera {key} at {dev_id} "
+                        f"(configured selector: {configured_id})"
+                    )
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._capture_hw[1])
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._capture_hw[0])
+                cap.set(cv2.CAP_PROP_FPS, self._fps)
+                # disable internal buffering to reduce latency
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self._caps[key] = cap
+        except Exception:
+            self.close()
+            raise
         if self._parallel_reads and len(self._caps) > 1:
             self._executor = ThreadPoolExecutor(
                 max_workers=len(self._caps),
@@ -164,7 +282,8 @@ class CameraCapture:
                 "shape": frame.shape if ret else None,
                 "latency_ms": round(latency_ms, 1),
                 "fps": float(cap.get(cv2.CAP_PROP_FPS)),
-                "configured_device": str(self._ids[key]),
+                "configured_device": str(self._configured_ids[key]),
+                "selected_device": str(self._ids[key]),
                 "video_device": resolve_video_device(self._ids[key]),
             }
         return results
