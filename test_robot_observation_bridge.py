@@ -5,12 +5,16 @@ import time
 import unittest
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from robot_observation_bridge import (
     ExecutionBlocked,
     ExecutionController,
+    PiperContinuousIK,
+    PiperFeedbackStaleError,
     PolicyProtocol,
     RAD_FACTOR,
+    _require_fresh_feedback,
     aggregate_action_chunk,
     build_checked_joint_target,
     build_checked_target,
@@ -18,6 +22,7 @@ from robot_observation_bridge import (
     resolve_action_chunk_steps,
     validate_policy_metadata,
 )
+from piper_data_contract import build_delivery_state
 
 
 DELIVERY_METADATA = {
@@ -81,7 +86,11 @@ class FakePiper:
             motion_status=0,
             err_code=0,
         )
-        return SimpleNamespace(arm_status=status)
+        return SimpleNamespace(
+            arm_status=status,
+            time_stamp=time.time(),
+            Hz=200.0,
+        )
 
     def EnablePiper(self):
         self.calls.append(("EnablePiper",))
@@ -104,6 +113,13 @@ class FakePiper:
 
 
 class ActionChunkTimingTest(unittest.TestCase):
+    def test_stale_piper_feedback_is_rejected(self):
+        message = SimpleNamespace(time_stamp=time.time(), Hz=200.0)
+        _require_fresh_feedback({"joint": message})
+        message.time_stamp -= 1.0
+        with self.assertRaises(PiperFeedbackStaleError):
+            _require_fresh_feedback({"joint": message})
+
     def test_resolves_model_steps_per_command_interval(self):
         self.assertEqual(resolve_action_chunk_steps(action_hz=20, command_hz=5), 4)
         self.assertEqual(resolve_action_chunk_steps(action_hz=20, command_hz=10), 2)
@@ -144,6 +160,17 @@ class ActionChunkTimingTest(unittest.TestCase):
             atol=1e-12,
         )
         self.assertAlmostEqual(command[6], 0.4)
+
+    def test_read_only_websocket_action_can_reach_rotation_conversion(self):
+        protocol = validate_policy_metadata(DELIVERY_METADATA, "right")
+        actions = np.zeros((2, 7), dtype=np.float64)
+        actions[0, 3] = 0.01
+        actions[0, 6] = 0.5
+        actions.setflags(write=False)
+        command, used_steps = aggregate_action_chunk(actions, protocol, 2)
+        self.assertEqual(used_steps, 2)
+        self.assertTrue(command.flags.writeable)
+        self.assertTrue(np.all(np.isfinite(command)))
 
     def test_aggregates_each_bimanual_delivery_arm_independently(self):
         protocol = validate_policy_metadata(BIMANUAL_DELIVERY_METADATA, "both", "bimanual")
@@ -378,6 +405,112 @@ class DeliveryExecutionSafetyTest(unittest.TestCase):
         action[-1] = state[-1]
         with self.assertRaisesRegex(ExecutionBlocked, "outside workspace"):
             build_checked_target(state, action, **self.kwargs)
+
+
+class ContinuousIKTest(unittest.TestCase):
+    def setUp(self):
+        self.solver = PiperContinuousIK()
+        self.joints = np.array(
+            [1.7377021, 0.00226893, -0.0148353, -0.21961477, 0.29255208, 0.22399555],
+            dtype=np.float64,
+        )
+
+    def test_solves_nearby_pose_without_switching_joint_branch(self):
+        xyz, rotation = self.solver.pose(self.joints)
+        target_xyz = xyz + np.array([0.0002, 0.0025, -0.0003])
+        target_rotation = (
+            Rotation.from_rotvec([-0.015, 0.001, -0.001]).as_matrix() @ rotation
+        )
+        target_rpy = Rotation.from_matrix(target_rotation).as_euler("xyz", degrees=True)
+
+        solved = self.solver.solve(
+            self.joints,
+            target_xyz,
+            target_rpy,
+            max_joint_step_rad=0.08,
+            position_tolerance_m=0.0015,
+            rotation_tolerance_rad=0.02,
+            max_nfev=100,
+        )
+
+        solved_xyz, solved_rotation = self.solver.pose(solved)
+        self.assertLessEqual(float(np.max(np.abs(solved - self.joints))), 0.080001)
+        self.assertLessEqual(float(np.linalg.norm(solved_xyz - target_xyz)), 0.0015)
+        self.assertLessEqual(
+            float(
+                np.linalg.norm(
+                    Rotation.from_matrix(target_rotation @ solved_rotation.T).as_rotvec()
+                )
+            ),
+            0.02,
+        )
+
+    def test_rejects_pose_without_a_nearby_joint_solution(self):
+        xyz, rotation = self.solver.pose(self.joints)
+        target_rpy = Rotation.from_matrix(rotation).as_euler("xyz", degrees=True)
+        with self.assertRaisesRegex(ExecutionBlocked, "could not reach a nearby solution"):
+            self.solver.solve(
+                self.joints,
+                xyz + np.array([0.0, 0.05, 0.0]),
+                target_rpy,
+                max_joint_step_rad=0.01,
+                position_tolerance_m=0.0005,
+                rotation_tolerance_rad=0.005,
+                max_nfev=50,
+            )
+
+    def test_delivery_execution_uses_joint_control_not_firmware_cartesian_ik(self):
+        xyz, rotation = self.solver.pose(self.joints)
+        qpos = np.append(self.joints, 0.035).astype(np.float32)
+        state = build_delivery_state(xyz, rotation, float(qpos[6]))
+        action = np.zeros(7, dtype=np.float64)
+        action[6] = state[9]
+        now = time.time()
+        result = {
+            "actions": action[None, :],
+            "execution_control": {
+                "mode": "execute",
+                "task_id": "ik-policy-test",
+                "session_id": "ik-session-test",
+                "server_time": now,
+                "expires_at": now + 30.0,
+                "revision": 1,
+            },
+        }
+        args = SimpleNamespace(
+            arm_mode="single",
+            arm_side="right",
+            allow_execution=True,
+            enable_timeout_s=0.1,
+            max_action_age_s=2.0,
+            max_translation_step_m=0.005,
+            max_rotation_step_rad=0.05,
+            max_gripper_step=0.1,
+            gripper_range_tolerance=0.02,
+            max_joint_step_rad=0.3,
+            max_joint_gripper_step_m=0.02,
+            workspace_x=(-0.04, 0.30),
+            workspace_y=(0.02, 0.52),
+            workspace_z=(0.12, 0.50),
+            speed_pct=5,
+            gripper_effort=1000,
+        )
+        piper = FakePiper()
+        execution = ExecutionController(piper, args)
+        protocol = validate_policy_metadata(DELIVERY_METADATA, "right")
+        image_timestamps = {"cam_high": now, "cam_wrist": now}
+
+        self.assertFalse(
+            execution.process(result, state, qpos, protocol, image_timestamps, 0.01)
+        )
+        self.assertTrue(
+            execution.process(result, state, qpos, protocol, image_timestamps, 0.01)
+        )
+        names = [call[0] for call in piper.calls]
+        self.assertIn("JointCtrl", names)
+        self.assertIn("ModeCtrl", names)
+        self.assertNotIn("EndPoseCtrl", names)
+        self.assertNotIn("MotionCtrl_2", names)
 
 
 class JointExecutionSafetyTest(unittest.TestCase):

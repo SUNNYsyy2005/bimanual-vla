@@ -22,6 +22,7 @@ import time
 from typing import Any
 
 import numpy as np
+from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
 from camera import CameraCapture
@@ -56,8 +57,10 @@ DEFAULT_ACTION_HZ = 20.0
 DEFAULT_CAN = "can0"
 DEFAULT_LEFT_CAN = "can0"
 DEFAULT_RIGHT_CAN = "can1"
-DEFAULT_HIGH_DEVICE = "/dev/video8"
-DEFAULT_WRIST_DEVICE = "/dev/video16"
+# Keep inference on the same RGB streams used by the single-arm collector.
+# The by-path links are stable across kernel /dev/videoN re-enumeration.
+DEFAULT_HIGH_DEVICE = "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:4:1.3-video-index0"
+DEFAULT_WRIST_DEVICE = "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:5.2:1.0-video-index4"
 DEFAULT_LEFT_WRIST_DEVICE = "/dev/video14"
 DEFAULT_RIGHT_WRIST_DEVICE = "/dev/video16"
 CAMERA_SOURCE_HW = (240, 424)
@@ -67,10 +70,20 @@ DEFAULT_WORKSPACE_X_M = (-0.04, 0.30)
 DEFAULT_WORKSPACE_Y_M = (0.02, 0.52)
 DEFAULT_WORKSPACE_Z_M = (0.12, 0.50)
 DEFAULT_GRIPPER_RANGE_TOLERANCE = 0.02
+PIPER_FEEDBACK_MAX_AGE_S = 0.5
+IK_JOINT_LIMIT_MARGIN_RAD = 0.002
+DEFAULT_IK_MAX_JOINT_STEP_RAD = 0.08
+DEFAULT_IK_POSITION_TOLERANCE_M = 0.0015
+DEFAULT_IK_ROTATION_TOLERANCE_RAD = 0.02
+DEFAULT_IK_MAX_NFEV = 100
 
 
 class ExecutionBlocked(RuntimeError):
     """The action was rejected before a robot command was sent."""
+
+
+class PiperFeedbackStaleError(RuntimeError):
+    """Piper SDK getters contain missing or cached CAN feedback."""
 
 
 @dataclass(frozen=True)
@@ -101,13 +114,37 @@ def connect_piper(can_name: str) -> Any:
     )
     piper.ConnectPort(can_init=True, piper_init=True)
     time.sleep(0.5)
+    try:
+        read_output_state(piper)
+        arm_status_dict(piper)
+    except Exception:
+        piper.DisconnectPort()
+        raise
     return piper
 
 
-def read_output_qpos(piper: Any) -> np.ndarray:
-    """Read measured joints and gripper for diagnostics only."""
-    joints = piper.GetArmJointMsgs().joint_state
-    gripper = piper.GetArmGripperMsgs().gripper_state
+def _require_fresh_feedback(
+    messages: dict[str, object],
+    *,
+    max_age_s: float = PIPER_FEEDBACK_MAX_AGE_S,
+) -> None:
+    now = time.time()
+    failures = []
+    for name, message in messages.items():
+        timestamp = float(getattr(message, "time_stamp", 0.0) or 0.0)
+        hz = float(getattr(message, "Hz", 0.0) or 0.0)
+        age_s = now - timestamp if timestamp > 0 else float("inf")
+        if timestamp <= 0 or age_s > max_age_s or age_s < -1.0:
+            failures.append(f"{name}: age={age_s:.3f}s Hz={hz:.1f}")
+    if failures:
+        raise PiperFeedbackStaleError(
+            "Piper CAN feedback is missing or stale: " + "; ".join(failures)
+        )
+
+
+def _qpos_from_feedback(joints_message: Any, gripper_message: Any) -> np.ndarray:
+    joints = joints_message.joint_state
+    gripper = gripper_message.gripper_state
     values = np.array(
         [
             joints.joint_1,
@@ -120,6 +157,14 @@ def read_output_qpos(piper: Any) -> np.ndarray:
         dtype=np.float32,
     ) / RAD_FACTOR
     return np.append(values, float(gripper.grippers_angle) / GRIPPER_FACTOR).astype(np.float32)
+
+
+def read_output_qpos(piper: Any) -> np.ndarray:
+    """Read measured joints and gripper for diagnostics only."""
+    joints_message = piper.GetArmJointMsgs()
+    gripper_message = piper.GetArmGripperMsgs()
+    _require_fresh_feedback({"joint": joints_message, "gripper": gripper_message})
+    return _qpos_from_feedback(joints_message, gripper_message)
 
 
 def rotation_from_state(state: np.ndarray) -> np.ndarray:
@@ -138,10 +183,110 @@ def rotation_from_state(state: np.ndarray) -> np.ndarray:
     return np.column_stack((c0, c1, np.cross(c0, c1)))
 
 
+class PiperContinuousIK:
+    """Numerical Piper IK constrained to the branch near current feedback."""
+
+    def __init__(self) -> None:
+        from piper_sdk import C_PiperForwardKinematics
+
+        self._fk = C_PiperForwardKinematics()
+
+    def pose(self, joints_rad: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        joints = np.asarray(joints_rad, dtype=np.float64)
+        if joints.shape != (6,) or not np.all(np.isfinite(joints)):
+            raise ExecutionBlocked(f"IK joints must be finite 6D, got {joints.shape}")
+        pose = np.asarray(self._fk.CalFK(joints.tolist())[-1], dtype=np.float64)
+        xyz_m = pose[:3] / 1000.0
+        rotation = Rotation.from_euler("xyz", pose[3:6], degrees=True).as_matrix()
+        return xyz_m, rotation
+
+    def solve(
+        self,
+        current_joints_rad: np.ndarray,
+        target_xyz_m: np.ndarray,
+        target_rpy_deg: np.ndarray,
+        *,
+        max_joint_step_rad: float,
+        position_tolerance_m: float,
+        rotation_tolerance_rad: float,
+        max_nfev: int,
+    ) -> np.ndarray:
+        current = np.asarray(current_joints_rad, dtype=np.float64)
+        target_xyz = np.asarray(target_xyz_m, dtype=np.float64)
+        target_rpy = np.asarray(target_rpy_deg, dtype=np.float64)
+        if current.shape != (6,) or not np.all(np.isfinite(current)):
+            raise ExecutionBlocked("current IK joints are not finite 6D")
+        if target_xyz.shape != (3,) or not np.all(np.isfinite(target_xyz)):
+            raise ExecutionBlocked("IK target xyz is not finite 3D")
+        if target_rpy.shape != (3,) or not np.all(np.isfinite(target_rpy)):
+            raise ExecutionBlocked("IK target rpy is not finite 3D")
+
+        hard_lower = JOINT_LIMITS_RAD[:, 0] + IK_JOINT_LIMIT_MARGIN_RAD
+        hard_upper = JOINT_LIMITS_RAD[:, 1] - IK_JOINT_LIMIT_MARGIN_RAD
+        if np.any(current < hard_lower - 0.05) or np.any(current > hard_upper + 0.05):
+            raise ExecutionBlocked("current joints are too far outside IK limits")
+        lower = np.maximum(hard_lower, current - max_joint_step_rad)
+        upper = np.minimum(hard_upper, current + max_joint_step_rad)
+        if np.any(lower >= upper):
+            raise ExecutionBlocked("continuous IK has no valid local joint interval")
+        initial = np.clip(current, lower + 1e-8, upper - 1e-8)
+        target_rotation = Rotation.from_euler("xyz", target_rpy, degrees=True).as_matrix()
+
+        def residual(candidate: np.ndarray) -> np.ndarray:
+            xyz, rotation = self.pose(candidate)
+            rotation_error = Rotation.from_matrix(target_rotation @ rotation.T).as_rotvec()
+            return np.concatenate(
+                (
+                    (xyz - target_xyz) / position_tolerance_m,
+                    rotation_error / rotation_tolerance_rad,
+                )
+            )
+
+        result = least_squares(
+            residual,
+            initial,
+            bounds=(lower, upper),
+            max_nfev=max_nfev,
+            xtol=1e-8,
+            ftol=1e-8,
+            gtol=1e-8,
+        )
+        solved = np.asarray(result.x, dtype=np.float64)
+        solved_xyz, solved_rotation = self.pose(solved)
+        position_error = float(np.linalg.norm(solved_xyz - target_xyz))
+        rotation_error = float(
+            np.linalg.norm(Rotation.from_matrix(target_rotation @ solved_rotation.T).as_rotvec())
+        )
+        joint_step = float(np.max(np.abs(solved - current)))
+        if position_error > position_tolerance_m or rotation_error > rotation_tolerance_rad:
+            raise ExecutionBlocked(
+                "continuous IK could not reach a nearby solution: "
+                f"position_error={position_error:.5f}m, "
+                f"rotation_error={rotation_error:.5f}rad, "
+                f"max_joint_step={joint_step:.5f}rad"
+            )
+        if joint_step > max_joint_step_rad + 1e-6:
+            raise ExecutionBlocked(
+                f"continuous IK joint step {joint_step:.5f}rad exceeds "
+                f"{max_joint_step_rad:.5f}rad"
+            )
+        return solved
+
+
 def read_output_state(piper: Any) -> tuple[np.ndarray, np.ndarray]:
     """Return the same 10D delivery state used by collect_output_arm.py."""
-    qpos = read_output_qpos(piper)
-    pose = piper.GetArmEndPoseMsgs().end_pose
+    joints_message = piper.GetArmJointMsgs()
+    gripper_message = piper.GetArmGripperMsgs()
+    pose_message = piper.GetArmEndPoseMsgs()
+    _require_fresh_feedback(
+        {
+            "joint": joints_message,
+            "gripper": gripper_message,
+            "end_pose": pose_message,
+        }
+    )
+    qpos = _qpos_from_feedback(joints_message, gripper_message)
+    pose = pose_message.end_pose
     xyz_m = np.array([pose.X_axis, pose.Y_axis, pose.Z_axis], dtype=np.float64) / 1_000_000.0
     rpy_rad = np.deg2rad(
         np.array([pose.RX_axis, pose.RY_axis, pose.RZ_axis], dtype=np.float64) / 1000.0
@@ -151,7 +296,9 @@ def read_output_state(piper: Any) -> tuple[np.ndarray, np.ndarray]:
 
 
 def arm_status_dict(piper: Any) -> dict[str, Any]:
-    feedback = piper.GetArmStatus().arm_status
+    status_message = piper.GetArmStatus()
+    _require_fresh_feedback({"status": status_message})
+    feedback = status_message.arm_status
     return {
         "ctrl_mode": int(feedback.ctrl_mode),
         "arm_status": int(feedback.arm_status),
@@ -276,7 +423,9 @@ def aggregate_action_chunk(
     consumed prefix. For joint actions, each row is an absolute target, so the
     final target is selected without arithmetic on joint coordinates.
     """
-    values = np.asarray(actions, dtype=np.float64)
+    # msgpack/websocket deserialization can expose a read-only NumPy buffer.
+    # SciPy's Rotation.from_rotvec requires writable contiguous storage.
+    values = np.array(actions, dtype=np.float64, copy=True)
     if values.ndim == 1:
         values = values[None, :]
     if values.ndim != 2 or values.shape[1] != protocol.action_dim or values.shape[0] <= 0:
@@ -468,6 +617,9 @@ class ExecutionController:
         self.last_action_chunk_steps: int = 0
         self.last_composed_action: list[float] | None = None
         self.last_composed_action_at: float | None = None
+        self.arm_hold_targets: dict[str, np.ndarray] = {}
+        self.arm_hold_started_at: dict[str, float] = {}
+        self.ik_solver: PiperContinuousIK | None = None
 
     def configure_protocol(self, protocol: PolicyProtocol) -> None:
         """Resolve model-rate to command-rate conversion after handshake."""
@@ -507,6 +659,7 @@ class ExecutionController:
             "last_action_chunk_steps": self.last_action_chunk_steps,
             "last_composed_action": self.last_composed_action,
             "last_composed_action_at": self.last_composed_action_at,
+            "delivery_command_mode": "continuous_ik_joint",
         }
 
     def _block(self, state: str, reason: str) -> bool:
@@ -514,10 +667,34 @@ class ExecutionController:
         self.blocked_reason = reason[:500]
         return False
 
-    def _enable_robot(self, side: str, piper: Any) -> None:
+    def _enable_robot(self, side: str, piper: Any, hold_qpos: np.ndarray) -> None:
+        """Enable Piper and immediately hold its measured joint pose."""
+        hold_qpos = np.asarray(hold_qpos, dtype=np.float64)
+        if hold_qpos.shape != (7,) or not np.all(np.isfinite(hold_qpos)):
+            raise ExecutionBlocked(f"{side} Piper hold qpos is not finite 7D")
+        lower = JOINT_LIMITS_RAD[:, 0]
+        upper = JOINT_LIMITS_RAD[:, 1]
+        excess = np.maximum(lower - hold_qpos[:6], hold_qpos[:6] - upper)
+        if float(np.max(excess)) > 0.05:
+            raise ExecutionBlocked(
+                f"{side} Piper measured joints are too far outside limits to hold safely"
+            )
+        hold_joints = np.clip(hold_qpos[:6], lower + 0.002, upper - 0.002)
+        hold_gripper_m = float(np.clip(hold_qpos[6], 0.0, GRIPPER_MAX_M))
         deadline = time.monotonic() + self.args.enable_timeout_s
         while time.monotonic() < deadline:
             if piper.EnablePiper():
+                raw_joints = np.rint(hold_joints * RAD_FACTOR).astype(np.int64)
+                piper.ModeCtrl(0x01, 0x01, self.args.speed_pct, 0x00)
+                piper.JointCtrl(*map(int, raw_joints))
+                piper.GripperCtrl(
+                    round(hold_gripper_m * GRIPPER_FACTOR),
+                    self.args.gripper_effort,
+                    0x01,
+                    0,
+                )
+                self.arm_hold_targets[side] = hold_joints.copy()
+                self.arm_hold_started_at[side] = time.monotonic()
                 self.robot_enabled.add(side)
                 return
             time.sleep(0.02)
@@ -596,12 +773,36 @@ class ExecutionController:
             if bad_status:
                 raise ExecutionBlocked(f"Piper status is not normal: {bad_status}")
 
+            waiting_for_hold = []
+            for index, side in enumerate(sides):
+                hold_target = self.arm_hold_targets.get(side)
+                if hold_target is None:
+                    continue
+                current_joints = np.asarray(qpos)[index * 7 : index * 7 + 6]
+                hold_error = float(np.max(np.abs(current_joints - hold_target)))
+                hold_age = time.monotonic() - self.arm_hold_started_at[side]
+                if (
+                    hold_age < getattr(self.args, "arm_settle_s", 0.0)
+                    or hold_error > getattr(self.args, "arm_hold_tolerance_rad", 0.02)
+                ):
+                    waiting_for_hold.append(
+                        f"{side}: age={hold_age:.2f}s joint_error={hold_error:.4f}rad"
+                    )
+                else:
+                    self.arm_hold_targets.pop(side, None)
+                    self.arm_hold_started_at.pop(side, None)
+            if waiting_for_hold:
+                return self._block(
+                    "armed",
+                    "waiting for enable hold to settle: " + "; ".join(waiting_for_hold),
+                )
+
             prepared: dict[str, tuple[Any, ...]] = {}
             for index, side in enumerate(sides):
                 action_slice = action[index * 7 : (index + 1) * 7]
                 if protocol.schema == "delivery":
                     state_slice = np.asarray(delivery_state)[index * 10 : (index + 1) * 10]
-                    prepared[side] = build_checked_target(
+                    target_xyz, target_rpy_deg, target_gripper_m = build_checked_target(
                         state_slice,
                         action_slice,
                         max_translation_step_m=self.args.max_translation_step_m,
@@ -612,6 +813,31 @@ class ExecutionController:
                         workspace_y=tuple(self.args.workspace_y),
                         workspace_z=tuple(self.args.workspace_z),
                     )
+                    qpos_slice = np.asarray(qpos)[index * 7 : (index + 1) * 7]
+                    if self.ik_solver is None:
+                        self.ik_solver = PiperContinuousIK()
+                    target_joints = self.ik_solver.solve(
+                        qpos_slice[:6],
+                        target_xyz,
+                        target_rpy_deg,
+                        max_joint_step_rad=getattr(
+                            self.args,
+                            "ik_max_joint_step_rad",
+                            DEFAULT_IK_MAX_JOINT_STEP_RAD,
+                        ),
+                        position_tolerance_m=getattr(
+                            self.args,
+                            "ik_position_tolerance_m",
+                            DEFAULT_IK_POSITION_TOLERANCE_M,
+                        ),
+                        rotation_tolerance_rad=getattr(
+                            self.args,
+                            "ik_rotation_tolerance_rad",
+                            DEFAULT_IK_ROTATION_TOLERANCE_RAD,
+                        ),
+                        max_nfev=getattr(self.args, "ik_max_nfev", DEFAULT_IK_MAX_NFEV),
+                    )
+                    prepared[side] = (target_joints, target_gripper_m)
                 elif protocol.schema == "joint":
                     qpos_slice = np.asarray(qpos)[index * 7 : (index + 1) * 7]
                     prepared[side] = build_checked_joint_target(
@@ -626,24 +852,22 @@ class ExecutionController:
             missing_enabled = [side for side in sides if side not in self.robot_enabled]
             if missing_enabled:
                 for side in missing_enabled:
-                    self._enable_robot(side, self.pipers[side])
+                    side_index = sides.index(side)
+                    hold_qpos = np.asarray(qpos)[side_index * 7 : (side_index + 1) * 7]
+                    self._enable_robot(side, self.pipers[side], hold_qpos)
                 self.state = "armed"
-                self.blocked_reason = "Piper enabled; waiting for the next fresh policy response"
+                self.blocked_reason = (
+                    "Piper enabled and holding measured joints; waiting for the next fresh "
+                    "policy response"
+                )
                 return False
 
             for side in sides:
                 piper = self.pipers[side]
-                if protocol.schema == "delivery":
-                    target_xyz, target_rpy_deg, target_gripper_m = prepared[side]
-                    raw_xyz = np.rint(target_xyz * 1_000_000.0).astype(np.int64)
-                    raw_rpy = np.rint(target_rpy_deg * 1000.0).astype(np.int64)
-                    piper.MotionCtrl_2(0x01, 0x00, self.args.speed_pct, 0x00)
-                    piper.EndPoseCtrl(*map(int, np.concatenate((raw_xyz, raw_rpy))))
-                else:
-                    target_joints, target_gripper_m = prepared[side]
-                    raw_joints = np.rint(target_joints * RAD_FACTOR).astype(np.int64)
-                    piper.ModeCtrl(0x01, 0x01, self.args.speed_pct, 0x00)
-                    piper.JointCtrl(*map(int, raw_joints))
+                target_joints, target_gripper_m = prepared[side]
+                raw_joints = np.rint(target_joints * RAD_FACTOR).astype(np.int64)
+                piper.ModeCtrl(0x01, 0x01, self.args.speed_pct, 0x00)
+                piper.JointCtrl(*map(int, raw_joints))
                 raw_gripper = round(target_gripper_m * GRIPPER_FACTOR)
                 piper.GripperCtrl(int(raw_gripper), self.args.gripper_effort, 0x01, 0)
         except ExecutionBlocked as exc:
@@ -795,6 +1019,7 @@ def run(args: argparse.Namespace) -> None:
     policy = None
     protocol = None
     count = 0
+    command_count = 0
     interval = 1.0 / args.hz
     try:
         cameras.open()
@@ -842,6 +1067,14 @@ def run(args: argparse.Namespace) -> None:
                 )
                 count += 1
                 print_result(count, delivery_state, qpos, protocol, result, infer_elapsed, execution, command_sent)
+                if command_sent:
+                    command_count += 1
+                    if args.max_commands is not None and command_count >= args.max_commands:
+                        logging.warning(
+                            "Reached --max-commands=%d; stopping after the checked command.",
+                            args.max_commands,
+                        )
+                        return
                 if args.once:
                     return
             except KeyboardInterrupt:
@@ -903,6 +1136,12 @@ def main() -> None:
         action="store_true",
         help="enable the client-side safety gate; Dashboard EXECUTE is still required",
     )
+    parser.add_argument(
+        "--max-commands",
+        type=int,
+        default=None,
+        help="stop after this many actual robot commands; useful for a one-step deployment check",
+    )
     parser.add_argument("--max-action-age-s", type=float, default=2.0)
     parser.add_argument("--max-translation-step-m", type=float, default=0.015)
     parser.add_argument("--max-rotation-step-rad", type=float, default=0.15)
@@ -931,6 +1170,30 @@ def main() -> None:
         help="maximum joint-schema gripper opening change per command",
     )
     parser.add_argument(
+        "--ik-max-joint-step-rad",
+        type=float,
+        default=DEFAULT_IK_MAX_JOINT_STEP_RAD,
+        help="maximum per-joint change for delivery actions solved by continuous local IK",
+    )
+    parser.add_argument(
+        "--ik-position-tolerance-m",
+        type=float,
+        default=DEFAULT_IK_POSITION_TOLERANCE_M,
+        help="maximum accepted local IK position error",
+    )
+    parser.add_argument(
+        "--ik-rotation-tolerance-rad",
+        type=float,
+        default=DEFAULT_IK_ROTATION_TOLERANCE_RAD,
+        help="maximum accepted local IK rotation error",
+    )
+    parser.add_argument(
+        "--ik-max-nfev",
+        type=int,
+        default=DEFAULT_IK_MAX_NFEV,
+        help="maximum numerical IK function evaluations per command",
+    )
+    parser.add_argument(
         "--workspace-x", type=float, nargs=2, default=DEFAULT_WORKSPACE_X_M, metavar=("MIN", "MAX"),
         help="delivery EEF x bounds in base frame metres; default matches the real pick-cube capture",
     )
@@ -945,6 +1208,18 @@ def main() -> None:
     parser.add_argument("--speed-pct", type=int, default=10)
     parser.add_argument("--gripper-effort", type=int, default=1000)
     parser.add_argument("--enable-timeout-s", type=float, default=3.0)
+    parser.add_argument(
+        "--arm-settle-s",
+        type=float,
+        default=0.75,
+        help="minimum joint-hold settling time after enabling Piper",
+    )
+    parser.add_argument(
+        "--arm-hold-tolerance-rad",
+        type=float,
+        default=0.02,
+        help="maximum joint error before leaving the post-enable hold",
+    )
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("port must be in [1, 65535]")
@@ -959,12 +1234,21 @@ def main() -> None:
         args.gripper_range_tolerance,
         args.max_joint_step_rad,
         args.max_joint_gripper_step_m,
+        args.ik_max_joint_step_rad,
+        args.ik_position_tolerance_m,
+        args.ik_rotation_tolerance_rad,
         args.enable_timeout_s,
+        args.arm_settle_s,
+        args.arm_hold_tolerance_rad,
     )
     if any(value <= 0 for value in positive) or args.reconnect_delay < 0:
         parser.error("frequencies, freshness/safety limits, and timeout must be positive")
     if args.action_chunk_steps is not None and args.action_chunk_steps <= 0:
         parser.error("action-chunk-steps must be positive")
+    if args.ik_max_nfev <= 0:
+        parser.error("ik-max-nfev must be positive")
+    if args.max_commands is not None and args.max_commands <= 0:
+        parser.error("max-commands must be positive")
     if not 1 <= args.speed_pct <= 100:
         parser.error("speed-pct must be in [1,100]")
     if not 0 <= args.gripper_effort <= 5000:
