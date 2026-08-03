@@ -142,6 +142,52 @@ def build_dataset_tool_command(
     return command
 
 
+def ask_english_yes_no(parent: tk.Misc, title: str, message: str) -> bool:
+    """Show a Tk confirmation dialog with explicit English button labels.
+
+    ``messagebox.askyesno`` delegates button labels to the desktop locale. On
+    this workstation that produces Chinese labels with a font that cannot
+    render them, so the native buttons appear garbled even though the message
+    itself is English.
+    """
+    result = {"confirmed": False}
+    dialog = tk.Toplevel(parent)
+    dialog.title(title)
+    dialog.transient(parent)
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    body = ttk.Frame(dialog, padding=16)
+    body.pack(fill="both", expand=True)
+    ttk.Label(body, text=message, justify="left", wraplength=520).pack(
+        anchor="w",
+        fill="x",
+    )
+    buttons = ttk.Frame(body)
+    buttons.pack(fill="x", pady=(16, 0))
+    buttons.columnconfigure(0, weight=1)
+    buttons.columnconfigure(1, weight=1)
+
+    def finish(confirmed: bool) -> None:
+        result["confirmed"] = confirmed
+        dialog.destroy()
+
+    ttk.Button(buttons, text="Yes", command=lambda: finish(True)).grid(
+        row=0,
+        column=0,
+        sticky="ew",
+        padx=(0, 4),
+    )
+    ttk.Button(buttons, text="No", command=lambda: finish(False)).grid(
+        row=0,
+        column=1,
+        sticky="ew",
+        padx=(4, 0),
+    )
+    dialog.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+    dialog.wait_window()
+    return bool(result["confirmed"])
+
+
 def check_initial_pose(
     qpos: np.ndarray,
     start_qpos: np.ndarray,
@@ -256,6 +302,9 @@ class CollectorGUI:
         self.out_var = tk.StringVar(value="episodes_piper_v21")
         self.task_var = tk.StringVar(value="pick_cube")
         self.instruction_var = tk.StringVar(value="pick up the cube")
+        self.dataset_source_var = tk.StringVar(
+            value=str(pathlib.Path(self.out_var.get()).expanduser().resolve())
+        )
         self.dataset_name_var = tk.StringVar(value="episodes_piper_v21")
         self.dataset_server_var = tk.StringVar(
             value=os.environ.get("BIMANUAL_VLA_SERVER", DEFAULT_SERVER)
@@ -1155,7 +1204,8 @@ class CollectorGUI:
         preview = "\n".join(path.name for path in paths[:12])
         if len(paths) > 12:
             preview += f"\n... and {len(paths) - 12} more"
-        confirmed = messagebox.askyesno(
+        confirmed = ask_english_yes_no(
+            self.root,
             "Delete selected data",
             f"Move {len(paths)} selected episode(s) to the recoverable .trash folder?\n\n{preview}",
         )
@@ -1198,9 +1248,9 @@ class CollectorGUI:
         form = ttk.LabelFrame(dialog, text="NPZ to LeRobot / server upload", padding=12)
         form.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
         form.columnconfigure(1, weight=1)
-        source_text = str(self.out_dir.resolve())
+        self.dataset_source_var.set(str(self.out_dir.resolve()))
         rows = (
-            ("NPZ source", tk.StringVar(value=source_text), "readonly"),
+            ("NPZ source", self.dataset_source_var, "readonly"),
             ("Dataset name", self.dataset_name_var, "normal"),
             ("Server URL", self.dataset_server_var, "normal"),
             ("Server token", self.dataset_token_var, "token"),
