@@ -35,9 +35,25 @@ from openpi.training import data_loader
 from openpi.training import weight_loaders
 
 try:
-    from .episode_split import EpisodeSplit, resolve_episode_split, write_norm_split
+    from .episode_split import (
+        DEFAULT_SPLIT_SEED,
+        DEFAULT_TEST_RATIO,
+        EpisodeSplit,
+        load_episode_split,
+        resolve_episode_split,
+        write_norm_config,
+        write_norm_split,
+    )
 except ImportError:  # openpi_single_arm.py is normally executed directly
-    from episode_split import EpisodeSplit, resolve_episode_split, write_norm_split
+    from episode_split import (
+        DEFAULT_SPLIT_SEED,
+        DEFAULT_TEST_RATIO,
+        EpisodeSplit,
+        load_episode_split,
+        resolve_episode_split,
+        write_norm_config,
+        write_norm_split,
+    )
 
 
 class _ExpectedWebsocketProbeFilter(logging.Filter):
@@ -417,17 +433,33 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
 
 
 def _resolve_training_split(args: argparse.Namespace) -> EpisodeSplit:
-    split = resolve_episode_split(
-        _dataset_root(),
-        args.dataset_id,
-        test_ratio=float(getattr(args, "test_ratio", 0.1)),
-        seed=int(getattr(args, "split_seed", 42)),
-    )
+    requested_ratio = getattr(args, "test_ratio", None)
+    requested_seed = getattr(args, "split_seed", None)
+    persisted = load_episode_split(_dataset_root(), args.dataset_id)
+    if requested_ratio is None and requested_seed is None and persisted is not None:
+        split = persisted
+        source = "persisted dataset split"
+    else:
+        split = resolve_episode_split(
+            _dataset_root(),
+            args.dataset_id,
+            test_ratio=float(
+                requested_ratio
+                if requested_ratio is not None
+                else persisted.test_ratio if persisted is not None else DEFAULT_TEST_RATIO
+            ),
+            seed=int(
+                requested_seed
+                if requested_seed is not None
+                else persisted.seed if persisted is not None else DEFAULT_SPLIT_SEED
+            ),
+        )
+        source = "requested split" if requested_ratio is not None or requested_seed is not None else "default split"
     print(
         "Episode split: "
         f"train={len(split.train_episodes)} test={len(split.test_episodes)} "
         f"ratio={split.test_ratio:g} seed={split.seed} "
-        f"test_episodes={list(split.test_episodes)}",
+        f"source={source} test_episodes={list(split.test_episodes)}",
         flush=True,
     )
     if not split.test_episodes:
@@ -525,6 +557,7 @@ def run_norm(args: argparse.Namespace) -> None:
     )
     if len(dataset) <= 0:
         raise ValueError(f"dataset {args.dataset_id!r} is empty")
+    available_train_frames = len(dataset)
     batch_size = min(args.batch_size, len(dataset))
     if args.max_frames is not None:
         effective_frames = min(args.max_frames, len(dataset))
@@ -553,6 +586,22 @@ def run_norm(args: argparse.Namespace) -> None:
     normalize.save(output_path, output)
     split_path = write_norm_split(output_path, split)
     print(f"Writing episode split manifest to: {split_path}", flush=True)
+    config_path = write_norm_config(
+        output_path,
+        split,
+        model_variant=args.model_variant,
+        base_checkpoint=str(Path(args.base_checkpoint).expanduser().resolve()),
+        arm_mode=str(config.policy_metadata["arm_mode"]),
+        arm_side=str(config.policy_metadata["arm_side"]),
+        schema=str(config.policy_metadata["schema"]),
+        requested_batch_size=args.batch_size,
+        effective_batch_size=batch_size,
+        num_workers=args.num_workers,
+        max_frames=args.max_frames,
+        available_train_frames=available_train_frames,
+        processed_batches=num_batches,
+    )
+    print(f"Writing norm configuration to: {config_path}", flush=True)
 
 
 class PolicyTelemetry:
@@ -801,8 +850,8 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--save-interval", type=int, default=1_000)
     train.add_argument("--log-interval", type=int, default=100)
     train.add_argument("--fsdp-devices", type=int, default=1)
-    train.add_argument("--test-ratio", type=float, default=0.1)
-    train.add_argument("--split-seed", type=int, default=42)
+    train.add_argument("--test-ratio", type=float, default=None)
+    train.add_argument("--split-seed", type=int, default=None)
     mode = train.add_mutually_exclusive_group()
     mode.add_argument("--resume", action="store_true")
     mode.add_argument("--overwrite", action="store_true")
@@ -821,7 +870,7 @@ def parse_args() -> argparse.Namespace:
     for name in ("batch_size", "num_workers", "num_train_steps", "save_interval", "log_interval", "fsdp_devices"):
         if hasattr(args, name) and getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
-    if hasattr(args, "test_ratio") and not 0.0 <= args.test_ratio < 1.0:
+    if hasattr(args, "test_ratio") and args.test_ratio is not None and not 0.0 <= args.test_ratio < 1.0:
         parser.error("--test-ratio must be in [0, 1)")
     return args
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import math
 import os
@@ -11,8 +12,12 @@ import random
 from typing import Any
 
 SPLIT_VERSION = 1
+NORM_CONFIG_VERSION = 1
+DEFAULT_TEST_RATIO = 0.1
+DEFAULT_SPLIT_SEED = 42
 DATASET_SPLIT_FILENAME = "train_test_split.json"
 NORM_SPLIT_FILENAME = "episode_split.json"
+NORM_CONFIG_FILENAME = "norm_config.json"
 
 
 @dataclass(frozen=True)
@@ -89,23 +94,46 @@ def _from_payload(payload: Any) -> EpisodeSplit | None:
         return None
 
 
-def _same_definition(split: EpisodeSplit, *, dataset_id: str, episodes: tuple[int, ...], test_ratio: float, seed: int) -> bool:
+def _valid_for_dataset(split: EpisodeSplit, *, dataset_id: str, episodes: tuple[int, ...]) -> bool:
     return (
         split.dataset_id == dataset_id
         and split.all_episodes == episodes
-        and math.isclose(split.test_ratio, test_ratio, rel_tol=0.0, abs_tol=1e-12)
-        and split.seed == seed
+        and 0.0 <= split.test_ratio < 1.0
+        and split.seed >= 0
+        and bool(split.train_episodes)
         and set(split.train_episodes).isdisjoint(split.test_episodes)
         and tuple(sorted((*split.train_episodes, *split.test_episodes))) == episodes
     )
+
+
+def _same_definition(split: EpisodeSplit, *, dataset_id: str, episodes: tuple[int, ...], test_ratio: float, seed: int) -> bool:
+    return (
+        _valid_for_dataset(split, dataset_id=dataset_id, episodes=episodes)
+        and math.isclose(split.test_ratio, test_ratio, rel_tol=0.0, abs_tol=1e-12)
+        and split.seed == seed
+    )
+
+
+def load_episode_split(dataset_root: Path, dataset_id: str) -> EpisodeSplit | None:
+    """Load the persisted split when it still matches the current dataset."""
+    dataset_path = Path(dataset_root).expanduser().resolve() / dataset_id
+    episodes = _episode_indices(dataset_path)
+    split_path = dataset_path / "meta" / DATASET_SPLIT_FILENAME
+    try:
+        split = _from_payload(json.loads(split_path.read_text(encoding="utf-8")))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    if split is None or not _valid_for_dataset(split, dataset_id=dataset_id, episodes=episodes):
+        return None
+    return split
 
 
 def resolve_episode_split(
     dataset_root: Path,
     dataset_id: str,
     *,
-    test_ratio: float = 0.1,
-    seed: int = 42,
+    test_ratio: float = DEFAULT_TEST_RATIO,
+    seed: int = DEFAULT_SPLIT_SEED,
 ) -> EpisodeSplit:
     """Load or create a deterministic episode-level split for a local dataset."""
     test_ratio = float(test_ratio)
@@ -151,6 +179,48 @@ def resolve_episode_split(
 def write_norm_split(norm_stats_dir: Path, split: EpisodeSplit) -> Path:
     path = Path(norm_stats_dir) / NORM_SPLIT_FILENAME
     _atomic_json(path, split.as_dict())
+    return path
+
+
+def write_norm_config(
+    norm_stats_dir: Path,
+    split: EpisodeSplit,
+    *,
+    model_variant: str,
+    base_checkpoint: str,
+    arm_mode: str,
+    arm_side: str,
+    schema: str,
+    requested_batch_size: int,
+    effective_batch_size: int,
+    num_workers: int,
+    max_frames: int | None,
+    available_train_frames: int,
+    processed_batches: int,
+) -> Path:
+    """Persist norm provenance separately from the split compatibility manifest."""
+    path = Path(norm_stats_dir) / NORM_CONFIG_FILENAME
+    payload = {
+        "version": NORM_CONFIG_VERSION,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "dataset_id": split.dataset_id,
+        "model_variant": model_variant,
+        "base_checkpoint": base_checkpoint,
+        "arm_mode": arm_mode,
+        "arm_side": arm_side,
+        "schema": schema,
+        "requested_batch_size": requested_batch_size,
+        "effective_batch_size": effective_batch_size,
+        "num_workers": num_workers,
+        "max_frames": max_frames,
+        "available_train_frames": available_train_frames,
+        "processed_batches": processed_batches,
+        "test_ratio": split.test_ratio,
+        "split_seed": split.seed,
+        "train_episodes": list(split.train_episodes),
+        "test_episodes": list(split.test_episodes),
+    }
+    _atomic_json(path, payload)
     return path
 
 
