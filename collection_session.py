@@ -22,13 +22,17 @@ from collect_output_arm import (
     DEFAULT_WRIST_DEVICE,
     connect,
     next_episode_index,
+    read_robot_gripper_command_samples,
     read_robot_state,
     verify_camera_streams,
 )
 from piper_data_contract import (
     BIMANUAL,
     DEFAULT_FPS,
+    DEFAULT_ACTION_HORIZON,
     DELIVERY_SCHEMA,
+    DELIVERY_MEASURED_ACTION_SOURCE,
+    JOINT_MEASURED_ACTION_SOURCE,
     IMAGE_HW,
     JOINT_SCHEMA,
     SINGLE_ARM,
@@ -51,6 +55,7 @@ class CollectionConfig:
     cam_high_device: str = DEFAULT_HIGH_DEVICE
     cam_wrist_device: str = DEFAULT_WRIST_DEVICE
     capture_fps: int = DEFAULT_FPS
+    action_horizon: int = DEFAULT_ACTION_HORIZON
     camera_fps: int = DEFAULT_CAMERA_FPS
     output_dir: Path = Path("episodes_piper_v21")
     schema: str = DELIVERY_SCHEMA
@@ -66,6 +71,8 @@ class CollectionConfig:
             raise ValueError("capture_fps must be positive")
         if self.camera_fps <= 0:
             raise ValueError("camera_fps must be positive")
+        if self.action_horizon <= 0:
+            raise ValueError("action_horizon must be positive")
         if self.capture_fps > self.camera_fps:
             raise ValueError("capture_fps cannot exceed camera_fps")
         EpisodeContract(
@@ -100,6 +107,8 @@ class EpisodeLabel:
 class CaptureSample:
     state: Any
     joint_qpos: Any
+    gripper_command_targets: Any | None
+    gripper_command_timestamps: Any | None
     images: dict[str, Any]
     image_timestamps: dict[str, float]
     state_timestamp: float
@@ -114,6 +123,7 @@ class CollectionSession:
         robot_connect: Callable[[str], Any] = connect,
         camera_factory: Callable[..., CameraCapture] = CameraCapture,
         state_reader: Callable[[Any], tuple[Any, Any]] | None = None,
+        gripper_command_reader: Callable[[Any], Any | None] | None = None,
         camera_verifier: Callable[[Any, int], dict[str, dict]] = verify_camera_streams,
         episode_validator: Callable[..., EpisodeStats] = validate_episode,
     ):
@@ -125,6 +135,11 @@ class CollectionSession:
                 robot,
                 schema=self.config.schema,
                 arm_mode=self.config.arm_mode,
+            )
+        )
+        self._gripper_command_reader = gripper_command_reader or (
+            lambda robot: read_robot_gripper_command_samples(
+                robot, arm_mode=self.config.arm_mode
             )
         )
         self._camera_verifier = camera_verifier
@@ -206,11 +221,12 @@ class CollectionSession:
             arm_mode=self.config.arm_mode,
             arm_side=self.config.arm_side,
             action_source=(
-                "next_measured_qpos"
+                JOINT_MEASURED_ACTION_SOURCE
                 if self.config.schema == JOINT_SCHEMA
-                else "next_measured_eef"
+                else DELIVERY_MEASURED_ACTION_SOURCE
             ),
             action_alignment="next_observation",
+            action_horizon=self.config.action_horizon,
         )
         self.state = SessionState.RECORDING
         return self.label
@@ -224,6 +240,15 @@ class CollectionSession:
             raise RuntimeError("devices are not connected")
         state, joint_qpos = self._state_reader(self.piper)
         state_timestamp = time.time()
+        gripper_command_targets = None
+        gripper_command_timestamps = None
+        if self.config.schema == DELIVERY_SCHEMA:
+            command_sample = self._gripper_command_reader(self.piper)
+            if isinstance(command_sample, tuple) and len(command_sample) == 2:
+                gripper_command_targets, gripper_command_timestamps = command_sample
+            else:
+                # Preserve custom value-only readers used by older UIs/tests.
+                gripper_command_targets = command_sample
         images, image_timestamps = self.cameras.read()
         if self.state is SessionState.RECORDING:
             assert self.buffer is not None
@@ -232,11 +257,15 @@ class CollectionSession:
                 images,
                 image_timestamps,
                 qpos=joint_qpos,
+                gripper_targets=gripper_command_targets,
+                gripper_command_timestamps=gripper_command_timestamps,
                 state_timestamp=state_timestamp,
             )
         return CaptureSample(
             state=state,
             joint_qpos=joint_qpos,
+            gripper_command_targets=gripper_command_targets,
+            gripper_command_timestamps=gripper_command_timestamps,
             images=images,
             image_timestamps=image_timestamps,
             state_timestamp=state_timestamp,

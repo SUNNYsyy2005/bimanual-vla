@@ -2,7 +2,16 @@
 
 本文用于现场操作人员完成 Piper 执行臂、第三视角相机和腕部相机的数据采集、检查、回放、导出与上传。
 
-当前采集链路只读取执行输出臂反馈，不读取示教臂控制指令。训练数据使用 10D 末端状态和 7D 末端增量动作协议。
+当前项目支持两条明确区分的数据来源：
+
+- `teleop_single.py` / `teleop.py`：读取从臂实测状态；Delivery pose 使用下一帧从臂 EEF，夹爪使用同周期主臂 opening fraction，是无需 EEF 标定的推荐来源；
+- `collect_gui.py` / `collect_output_arm.py`：只读取执行输出臂反馈，action 会明确标记为 `next_measured_*_fallback`，不能伪装成操作者命令。
+
+v3 `joint` 使用每臂 7D state/absolute action；v3 `delivery` 在数据集保存每臂
+10D absolute EEF state/target，训练边界再转换成每臂 7D current-anchored
+EEF action。夹爪统一为 opening fraction：`0=闭合，1=张开`。采集、模型动作和
+机器人控制频率为 `20 Hz`，实机模型异步推理启动频率约为 `4 Hz`；约 200 ms
+推理期间继续执行旧 chunk，新结果到达后跳过过时前缀并平滑接入。
 
 ## 1. 系统组成
 
@@ -195,39 +204,54 @@ episodes_batches/20260801_pick_cube_02
 
 ## 6. 原始 NPZ 数据格式
 
-每个 episode 保存为一个 `ep_XXXX.npz`：
+单臂 Delivery v3 每个 episode 保存为一个 `ep_XXXX.npz`：
 
 ```text
-state                         float32 (T,10)
-actions                       float32 (T,7)
-timestamps                    float64 (T,)
-image                         uint8   (T,256,256,3), RGB HWC
-wrist_image                   uint8   (T,256,256,3), RGB HWC
-task                          Unicode scalar
-instruction                   Unicode scalar
-success                       bool scalar
-joint_qpos                    float32 (T,7)
-image_timestamps_cam_high     float64 (T,)
-image_timestamps_cam_wrist    float64 (T,)
+state                               float32 (T,10)
+actions                             float32 (T,10)
+state_timestamp                     float64 (T,)
+action_timestamp                    float64 (T,)
+images_cam_high                     uint8   (T,256,256,3), RGB HWC
+images_cam_right_wrist              uint8   (T,256,256,3), RGB HWC
+image_timestamps_cam_high           float64 (T,)
+image_timestamps_cam_right_wrist    float64 (T,)
+joint_qpos                          float32 (T,7)
+gripper_command_target              float32 (T,1)
+gripper_command_timestamp           float64 (T,1)
+gripper_command_present             bool    (T,1)
+task_name / instruction / success   scalar
 ```
 
 10D `state`：
 
 ```text
-EEF xyz in base frame (3)
+从臂 EEF xyz in slave_base (3)
 + rotation 6D (6)
-+ gripper closed fraction (1)
++ 从臂 gripper opening fraction (1)
 ```
 
-7D `actions`：
+10D `actions`：
 
 ```text
-base-frame delta xyz (3)
-+ left-multiplied delta rotvec (3)
-+ next gripper target (1)
+下一帧从臂实测 EEF xyz + rotation 6D (9)
++ 当前周期主臂 gripper opening fraction (1)
 ```
 
-每个 episode 包含 terminal observation，最后一个动作保持夹爪状态且机械臂运动增量为零。
+对应合同：
+
+```text
+action_alignment = next_observation_pose_same_step_gripper
+action_offset = 1
+pose_action_source = next_measured_eef_fallback
+gripper_action_source = master_gripper_feedback
+```
+
+因此 Delivery 采集不使用主臂 EEF pose，也不需要主从 EEF 空间标定。最后一行
+pose 为从臂末状态 hold，夹爪保持最后一个主臂 opening target。双臂格式按
+`left + right` 拼接为 state/action 20D、joint_qpos 14D，并使用三路相机。
+
+旧的 `10D state + 7D step delta action + closed fraction` 只属于 legacy v2，
+新采集不得继续写入该格式。
 
 ## 7. 批次验证
 

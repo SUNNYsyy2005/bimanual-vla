@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import tempfile
+import time
 import unittest
 from unittest import mock
 
 from server_4090.app import (
+    action_contract_command_args,
+    action_contract_for_model,
     build_environment,
     cuda_visible_devices,
     describe_dataset_schema,
@@ -13,6 +18,14 @@ from server_4090.app import (
     infer_model_variant,
     parse_training_metrics,
     policy_config_name,
+    MIN_POLICY_ACTION_HORIZON,
+    PolicyTelemetryStore,
+    policy_horizon_status,
+    require_policy_execution_horizon,
+    complete_action_contract_fingerprint,
+    norm_extended_contract_matches,
+    policy_time_contract_status,
+    require_policy_execution_time_contract,
 )
 
 
@@ -126,63 +139,180 @@ class ModelVariantTest(unittest.TestCase):
 
 class DatasetSchemaDescriptionTest(unittest.TestCase):
     @staticmethod
-    def info(state_key, state_dim, action_key, action_dim, cameras):
+    def info(
+        state_key,
+        state_dim,
+        action_key,
+        action_dim,
+        cameras,
+        *,
+        contract_version=None,
+        gripper_semantics=None,
+        raw_action_semantics=None,
+        legacy_format=None,
+        action_names=None,
+        state_names=None,
+    ):
         features = {
-            state_key: {"dtype": "float32", "shape": [state_dim]},
-            action_key: {"dtype": "float32", "shape": [action_dim]},
+            state_key: {
+                "dtype": "float32",
+                "shape": [state_dim],
+                **({"names": state_names} if state_names else {}),
+            },
+            action_key: {
+                "dtype": "float32",
+                "shape": [action_dim],
+                **({"names": action_names} if action_names else {}),
+            },
         }
         features.update({key: {"dtype": media_type} for key, media_type in cameras})
-        return {"features": features}
+        info = {"features": features}
+        if contract_version is not None:
+            info["contract_version"] = contract_version
+        if gripper_semantics is not None:
+            info["gripper_semantics"] = gripper_semantics
+        if raw_action_semantics is not None:
+            info["raw_action_semantics"] = raw_action_semantics
+        if legacy_format is not None:
+            info["legacy_format"] = legacy_format
+        return info
 
-    def test_common_single_arm_and_bimanual_dimensions(self):
+    def test_joint_v3_and_legacy_v2_units_are_visible(self):
         cases = [
             (
                 self.info(
                     "observation.state", 7, "action", 7,
                     [("observation.images.cam_high", "video"), ("observation.images.cam_right_wrist", "video")],
+                    contract_version=3,
+                    gripper_semantics="absolute_opening_fraction_0_closed_1_open",
+                    state_names=["joint_1_rad", "joint_2_rad", "joint_3_rad", "joint_4_rad", "joint_5_rad", "joint_6_rad", "gripper_opening_fraction"],
+                    action_names=["joint_1_rad", "joint_2_rad", "joint_3_rad", "joint_4_rad", "joint_5_rad", "joint_6_rad", "gripper_opening_fraction"],
                 ),
-                "单臂 Joint 7D/7D", "joint", "single", "right", True,
-            ),
-            (
-                self.info("state", 10, "actions", 7, [("image", "image"), ("wrist_image", "image")]),
-                "单臂 Delivery 10D/7D", "delivery", "single", "right", True,
+                "v3", "absolute_opening_fraction_0_closed_1_open",
             ),
             (
                 self.info(
-                    "observation.state", 14, "action", 14,
-                    [("observation.images.cam_high", "video"), ("observation.images.cam_left_wrist", "video"), ("observation.images.cam_right_wrist", "video")],
+                    "observation.state", 7, "action", 7,
+                    [("observation.images.cam_high", "video"), ("observation.images.cam_right_wrist", "video")],
+                    contract_version=2,
+                    gripper_semantics="absolute_opening_metres",
                 ),
-                "双臂 Joint 14D/14D", "joint", "bimanual", "both", True,
-            ),
-            (
-                self.info("state", 20, "actions", 14, [("overhead", "image"), ("left", "image"), ("right", "image")]),
-                "双臂 Delivery 20D/14D", "delivery", "bimanual", "both", False,
+                "legacy v2", "absolute_opening_fraction_0_closed_1_open",
             ),
         ]
-        cases.append(
-            (
-                self.info(
-                    "observation.state", 20, "action", 14,
-                    [("observation.images.cam_high", "video"), ("observation.images.cam_left_wrist", "video"), ("observation.images.cam_right_wrist", "video")],
-                ),
-                "双臂 Delivery 20D/14D", "delivery", "bimanual", "both", True,
+        for info, version_label, model_gripper in cases:
+            with self.subTest(version_label=version_label):
+                result = describe_dataset_schema(info)
+                self.assertTrue(result["training_supported"])
+                self.assertIn(version_label, result["schema_label"])
+                self.assertEqual(result["raw_action_dim"], 7)
+                self.assertEqual(result["model_action_dim"], 7)
+                self.assertEqual(result["model_gripper_semantics"], model_gripper)
+                self.assertEqual(result["wire_gripper_semantics"], model_gripper)
+
+    def test_legacy_delivery_10d7d_is_step_delta_and_new_10d10d_is_absolute_raw(self):
+        legacy = describe_dataset_schema(
+            self.info(
+                "state", 10, "actions", 7,
+                [("image", "image"), ("wrist_image", "image")],
             )
         )
-        for info, label, schema, arm_mode, arm_side, trainable in cases:
-            with self.subTest(label=label):
-                result = describe_dataset_schema(info)
-                self.assertEqual(result["schema_label"], label)
-                self.assertEqual(result["schema"], schema)
-                self.assertEqual(result["arm_mode"], arm_mode)
-                self.assertEqual(result["arm_side"], arm_side)
-                self.assertIs(result["training_supported"], trainable)
-                self.assertEqual(
-                    result["training_schema"], schema if trainable else None
-                )
-                self.assertEqual(len(result["media"]), len([
-                    value for value in info["features"].values()
-                    if value.get("dtype") in {"image", "video"}
-                ]))
+        self.assertFalse(legacy["training_supported"])
+        self.assertTrue(legacy["model_contract_supported"])
+        self.assertIn("canonical v3", legacy["training_error"])
+        self.assertEqual(legacy["contract_version"], 2)
+        self.assertTrue(legacy["legacy_delivery_v2"])
+        self.assertEqual(legacy["raw_action_convention"], "step")
+        self.assertEqual(legacy["raw_action_dim"], 7)
+        self.assertEqual(legacy["model_action_dim"], 7)
+        self.assertEqual(legacy["raw_gripper_semantics"], "absolute_closed_fraction_0_open_1_closed")
+        self.assertEqual(legacy["action_offset"], 1)
+        self.assertEqual(legacy["model_action_start_offset"], 1)
+
+        absolute = describe_dataset_schema(
+            self.info(
+                "observation.state", 10, "action", 10,
+                [
+                    ("observation.images.cam_high", "video"),
+                    ("observation.images.cam_right_wrist", "video"),
+                ],
+                contract_version=3,
+                gripper_semantics="absolute_opening_fraction_0_closed_1_open",
+            )
+        )
+        self.assertTrue(absolute["training_supported"])
+        self.assertEqual(absolute["contract_version"], 3)
+        self.assertFalse(absolute["legacy_delivery_v2"])
+        self.assertEqual(absolute["raw_action_convention"], "absolute_eef_target")
+        self.assertEqual(absolute["raw_action_dim"], 10)
+        self.assertEqual(absolute["model_action_dim"], 7)
+        self.assertEqual(absolute["model_action_semantics"], "eef_delta_chunk_origin_base_xyz_left_rotvec_gripper_opening_target")
+        self.assertEqual(absolute["action_offset"], 0)
+        self.assertEqual(absolute["model_action_start_offset"], 1)
+
+    def test_canonical_10d7d_requires_explicit_legacy_metadata(self):
+        result = describe_dataset_schema(
+            self.info(
+                "observation.state", 10, "action", 7,
+                [("observation.images.cam_high", "video"), ("observation.images.cam_right_wrist", "video")],
+            )
+        )
+        self.assertFalse(result["training_supported"])
+        self.assertIn("explicit legacy_v2/step", result["contract_error"])
+
+    def test_bimanual_raw_and_model_dimensions(self):
+        result = describe_dataset_schema(
+            self.info(
+                "observation.state", 20, "action", 20,
+                [
+                    ("observation.images.cam_high", "video"),
+                    ("observation.images.cam_left_wrist", "video"),
+                    ("observation.images.cam_right_wrist", "video"),
+                ],
+                contract_version=3,
+                gripper_semantics="absolute_opening_fraction_0_closed_1_open",
+            )
+        )
+        self.assertTrue(result["training_supported"])
+        self.assertEqual(result["arm_mode"], "bimanual")
+        self.assertEqual(result["raw_action_dim"], 20)
+        self.assertEqual(result["model_action_dim"], 14)
+
+    def test_model_contract_switches_legacy_delivery_and_joint_explicitly(self):
+        legacy_delivery = describe_dataset_schema(
+            self.info("state", 10, "actions", 7, [("image", "image"), ("wrist_image", "image")])
+        )
+        step = action_contract_for_model(
+            legacy_delivery, delivery_action_convention="step"
+        )
+        chunk = action_contract_for_model(
+            legacy_delivery, delivery_action_convention="chunk_origin"
+        )
+        self.assertEqual(step["model_action_semantics"], step["raw_action_semantics"])
+        self.assertNotEqual(chunk["model_action_semantics"], chunk["raw_action_semantics"])
+        self.assertIn("--raw-action-dim", action_contract_command_args(chunk))
+        command_args = action_contract_command_args(chunk)
+        self.assertIn("--model-action-dim", command_args)
+        self.assertEqual(command_args[command_args.index("--action-offset") + 1], "1")
+        self.assertEqual(command_args[command_args.index("--model-action-start-offset") + 1], "1")
+
+        legacy_joint = describe_dataset_schema(
+            self.info(
+                "observation.state", 7, "action", 7,
+                [("observation.images.cam_high", "video"), ("observation.images.cam_right_wrist", "video")],
+                contract_version=2,
+                gripper_semantics="absolute_opening_metres",
+            )
+        )
+        old_policy = action_contract_for_model(
+            legacy_joint, model_gripper_semantics="absolute_opening_metres"
+        )
+        new_policy = action_contract_for_model(legacy_joint)
+        self.assertEqual(old_policy["wire_gripper_semantics"], "absolute_opening_metres")
+        self.assertEqual(
+            new_policy["wire_gripper_semantics"],
+            "absolute_opening_fraction_0_closed_1_open",
+        )
 
     def test_unknown_dimensions_remain_visible_as_custom(self):
         result = describe_dataset_schema(
@@ -192,6 +322,162 @@ class DatasetSchemaDescriptionTest(unittest.TestCase):
         self.assertEqual(result["schema_label"], "通用格式 12D/8D")
         self.assertEqual(result["cameras"], ["custom_camera"])
         self.assertFalse(result["training_supported"])
+
+
+class AsyncPolicyDashboardContractTest(unittest.TestCase):
+    def test_horizon_gate_is_fail_closed(self):
+        ready = policy_horizon_status({"action_horizon": 50, "client_action_horizon": 50})
+        self.assertEqual(ready["minimum_horizon"], MIN_POLICY_ACTION_HORIZON)
+        self.assertTrue(ready["horizon_execution_ready"])
+        require_policy_execution_horizon(ready)
+
+        short = policy_horizon_status({"action_horizon": 15})
+        self.assertFalse(short["horizon_execution_ready"])
+        self.assertIn("below", short["horizon_error"])
+        with self.assertRaisesRegex(ValueError, "action_horizon >= 16"):
+            require_policy_execution_horizon(short)
+
+        missing = policy_horizon_status({})
+        self.assertFalse(missing["horizon_execution_ready"])
+        with self.assertRaisesRegex(ValueError, "missing"):
+            require_policy_execution_horizon(missing)
+
+        mismatch = policy_horizon_status({"action_horizon": 50, "client_action_horizon": 49})
+        self.assertFalse(mismatch["horizon_execution_ready"])
+        self.assertFalse(mismatch["horizon_contract_match"])
+
+    def test_temporal_contract_and_norm_fingerprint_are_fail_closed(self):
+        ready = {
+            "action_hz": 20,
+            "action_time_step_s": 0.05,
+            "action_offset": 0,
+            "model_action_start_offset": 1,
+            "action_start_offset_steps": 1,
+        }
+        status = policy_time_contract_status(ready)
+        self.assertTrue(status["time_contract_ready"])
+        require_policy_execution_time_contract(ready)
+
+        for patch in (
+            {"action_time_step_s": 0.04},
+            {"action_offset": 2},
+            {"model_action_start_offset": 0},
+            {"action_start_offset_steps": 0},
+        ):
+            invalid = {**ready, **patch}
+            self.assertFalse(policy_time_contract_status(invalid)["time_contract_ready"])
+            with self.assertRaises(ValueError):
+                require_policy_execution_time_contract(invalid)
+
+        representation = {
+            "contract_version": 3,
+            "raw_action_dim": 10,
+            "model_action_dim": 7,
+            "raw_action_semantics": "absolute_eef_target",
+            "model_action_semantics": "eef_delta",
+            "raw_action_convention": "absolute_eef_target",
+            "model_action_convention": "chunk_origin",
+            "gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+            "raw_gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+            "wire_gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+            "action_offset": 0,
+            "model_action_start_offset": 1,
+        }
+        fingerprint = complete_action_contract_fingerprint(representation)
+        self.assertTrue(norm_extended_contract_matches({"version": 4, **fingerprint}, fingerprint))
+        self.assertFalse(norm_extended_contract_matches({"version": 4, **fingerprint, "action_offset": 1}, fingerprint))
+
+    def test_summary_dual_gate_requires_valid_action_horizon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PolicyTelemetryStore({"workspace_root": tmp, "robot_observation_max_age_s": 3})
+            session, directory = store.create_session()
+            task = {
+                "id": "policy-test",
+                "type": "policy",
+                "state": "running",
+                "metadata": {"telemetry_session": session, "port": 8000},
+            }
+            store.set_control(task, mode="execute", expires_in_s=300)
+            (directory / "connections.json").write_text(
+                json.dumps({"client_connected": True, "active_clients": 1}), encoding="utf-8"
+            )
+
+            def summary(horizon):
+                payload = {
+                    "received_at": time.time(),
+                    "client_allow_execution": True,
+                    "client_execution_state": "execute",
+                    "action_hz": 20.0,
+                    "action_time_step_s": 0.05,
+                    "action_offset": 0,
+                    "model_action_start_offset": 1,
+                    "action_start_offset_steps": 1,
+                }
+                if horizon is not None:
+                    payload["action_horizon"] = horizon
+                (directory / "latest.json").write_text(json.dumps(payload), encoding="utf-8")
+                return store.summary_for_task(task)
+
+            (directory / "runtime.json").write_text(
+                json.dumps({"in_flight": True, "active_inferences": 1}), encoding="utf-8"
+            )
+            active = summary(50)
+            self.assertTrue(active["dual_gate_open"])
+            self.assertTrue(active["client_in_flight"])
+            self.assertTrue(active["policy_in_flight"])
+            (directory / "runtime.json").write_text(
+                json.dumps({"in_flight": False, "active_inferences": 0}), encoding="utf-8"
+            )
+            self.assertFalse(summary(15)["dual_gate_open"])
+            self.assertFalse(summary(None)["dual_gate_open"])
+
+    def test_dashboard_template_and_readme_publish_full_async_contract(self):
+        template = (Path(__file__).parent / "server_4090/templates/index.html").read_text(encoding="utf-8")
+        readme = (Path(__file__).parent / "server_4090/README.md").read_text(encoding="utf-8")
+        for marker in (
+            "client_inference_launch_hz",
+            "client_control_hz",
+            "client_chunk_rows",
+            "minimum_horizon",
+            "client_in_flight",
+            "client_launch_at",
+            "client_capture_at",
+            "client_arrival_at",
+            "client_latency_ms",
+            "client_latency_steps",
+            "client_skipped_prefix",
+            "client_blend_steps",
+            "client_queue_generation",
+            "client_old_remaining",
+            "client_new_remaining",
+            "client_underrun",
+            "client_rejected_result",
+            "client_drop_reason",
+            "client_last_wire_action",
+            "client_last_decoded_target",
+            "client_minimum_horizon",
+            "client_result_generation",
+            "client_safety_profile",
+            "client_delivery_safety_limits",
+            "client_actuator_delay_ms",
+            "client_expired_prefix",
+            "client_active_plan_generation",
+            "client_plan_target_times",
+            "client_hold_active",
+            "client_blend_active",
+            "client_gripper_filter",
+            "client_timed_target",
+            "client_last_safe_target",
+            "client_target_monotonic",
+        ):
+            self.assertIn(marker, template)
+        for marker in ("action_horizon", "action_hz", "action_time_step_s", "action_start_offset_steps", "--hz 4", "4 Hz", "200 ms", "旧 chunk", "动态", "2~4 步", "0.05", "0.18", "0.30", "x[-0.05,0.30]", "y[0.01,0.50]", "z[0.14,0.52]"):
+            self.assertIn(marker, template)
+        for marker in ("action_horizon", "action_hz", "action_time_step_s", "action_start_offset_steps", "action_offset", "model_action_start_offset", "--hz 4", "4 Hz", "200 ms", "旧 chunk", "动态", "2~4 步", "0.05", "0.18", "0.30"):
+            self.assertIn(marker, readme)
+        combined = template + "\n" + readme
+        for stale in ("0.015", "0.15", "0.25", "--hz 5", "5 Hz", "选择第4行", "选择第 4 行", "只排队4步", "只排队 4 步", "每次排队", "典型约 4 步", "skip≈4"):
+            self.assertNotIn(stale, combined)
 
 
 if __name__ == "__main__":

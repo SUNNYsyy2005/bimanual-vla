@@ -26,6 +26,19 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from pi0_dataset import (
+    DEFAULT_ACTION_HORIZON,
+    DELIVERY_ABSOLUTE_ACTION_FORMAT,
+    DELIVERY_LEGACY_ACTION_FORMAT,
+    GRIPPER_CLOSED_FRACTION_LEGACY,
+    GRIPPER_OPENING_FRACTION,
+    LEGACY_V2,
+    LEGACY_ROTATION_SEMANTICS,
+    ROTATION6D_SEMANTICS,
+    classify_contract_dimensions,
+    default_eef_names,
+)
+
 
 EPISODE_FILE = re.compile(r"episode_(\d+)\.parquet$")
 DATASET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -39,6 +52,27 @@ RESERVED_EPISODE_FIELDS = {
     "action_offset",
     "instruction",
     "task_index",
+    "contract_version",
+    "contract_format",
+    "legacy",
+    "legacy_format",
+    "schema",
+    "arm_mode",
+    "arm_side",
+    "state_dim",
+    "action_dim",
+    "raw_action_dim",
+    "model_action_dim",
+    "state_names",
+    "action_names",
+    "camera_keys",
+    "delivery_action_format",
+    "action_source",
+    "action_alignment",
+    "action_horizon",
+    "gripper_semantics",
+    "rotation_semantics",
+    "coordinate_frame",
 }
 COMPATIBILITY_FIELDS = (
     "codebase_version",
@@ -46,8 +80,27 @@ COMPATIBILITY_FIELDS = (
     "fps",
     "chunks_size",
     "features",
+    "schema",
+    "arm_mode",
+    "arm_side",
+    "state_dim",
+    "action_dim",
+    "raw_action_dim",
+    "model_action_dim",
+    "state_names",
+    "action_names",
+    "camera_keys",
+    "contract_format",
+    "legacy_format",
+    "delivery_action_format",
     "action_semantics",
+    "action_source",
+    "action_alignment",
     "action_offset",
+    "action_horizon",
+    "gripper_semantics",
+    "rotation_semantics",
+    "coordinate_frame",
 )
 POLICY_CONFIG_NAMES = (
     "pi05_piper_single_arm_lora",
@@ -278,6 +331,46 @@ def _replace_column(table: pa.Table, name: str, values: Any) -> pa.Table:
     return table.set_column(index, field, pa.array(values, type=field.type))
 
 
+def _numeric_column(table: pa.Table, name: str) -> np.ndarray | None:
+    field_type = table.schema.field(name).type
+    try:
+        if pa.types.is_list(field_type) or pa.types.is_fixed_size_list(field_type):
+            values = np.asarray(table[name].to_pylist(), dtype=np.float64)
+        elif pa.types.is_integer(field_type) or pa.types.is_floating(field_type) or pa.types.is_boolean(field_type):
+            values = np.asarray(table[name].to_numpy(zero_copy_only=False), dtype=np.float64)
+        else:
+            return None
+    except (TypeError, ValueError, pa.ArrowInvalid):
+        return None
+    if values.ndim == 1:
+        values = values[:, None]
+    if values.ndim != 2 or len(values) == 0 or not np.isfinite(values).all():
+        return None
+    return values
+
+
+def _column_stats(values: np.ndarray) -> dict[str, Any]:
+    return {
+        "mean": np.mean(values, axis=0).astype(np.float32).tolist(),
+        "std": np.std(values, axis=0).astype(np.float32).tolist(),
+        "min": np.min(values, axis=0).astype(np.float32).tolist(),
+        "max": np.max(values, axis=0).astype(np.float32).tolist(),
+        "q01": np.quantile(values, 0.01, axis=0).astype(np.float32).tolist(),
+        "q99": np.quantile(values, 0.99, axis=0).astype(np.float32).tolist(),
+        "count": [len(values)],
+    }
+
+
+def _recompute_episode_stats(table: pa.Table, existing: dict[str, Any]) -> dict[str, Any]:
+    """Refresh every numeric parquet statistic after reindex/task edits."""
+    result = dict(existing.get("stats", {})) if isinstance(existing, dict) else {}
+    for name in table.column_names:
+        values = _numeric_column(table, name)
+        if values is not None:
+            result[name] = _column_stats(values)
+    return {"stats": result}
+
+
 def _unique_strings(values: list[str]) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -306,11 +399,110 @@ def _build_splits(original: Any, old_total: int, new_total: int) -> dict[str, st
     return {"train": f"0:{train_end}", "val": f"{train_end}:{new_total}"}
 
 
+def _contract_metadata(info: dict[str, Any]) -> dict[str, Any]:
+    """Return normalized contract metadata while accepting old info.json files."""
+    features = info.get("features", {})
+    if not isinstance(features, dict):
+        return {}
+    if "observation.state" in features and "action" in features:
+        state_key, action_key = "observation.state", "action"
+    elif "state" in features and "actions" in features:
+        state_key, action_key = "state", "actions"
+    else:
+        return {}
+    try:
+        state_dim = int(features[state_key]["shape"][0])
+        action_dim = int(features[action_key]["shape"][0])
+        dimensions = classify_contract_dimensions(
+            state_dim,
+            action_dim,
+            schema=info.get("schema"),
+            legacy_format=info.get("legacy_format") or info.get("contract_format"),
+        )
+    except (KeyError, TypeError, ValueError, IndexError):
+        return {}
+    arm_mode = dimensions["arm_mode"]
+    arm_side = str(info.get("arm_side") or ("both" if arm_mode == "bimanual" else "right"))
+    if arm_mode == "bimanual":
+        arm_side = "both"
+    fallback_state, fallback_action = default_eef_names(
+        arm_mode=arm_mode, arm_side=arm_side, legacy=dimensions["legacy"]
+    )
+    state_names = features[state_key].get("names")
+    action_names = features[action_key].get("names")
+    if not isinstance(state_names, list) or len(state_names) != state_dim:
+        state_names = fallback_state if dimensions["schema"] == "delivery" else None
+    if not isinstance(action_names, list) or len(action_names) != action_dim:
+        action_names = fallback_action if dimensions["schema"] == "delivery" else None
+    legacy = bool(dimensions["legacy"])
+    return {
+        **dimensions,
+        "arm_side": arm_side,
+        "state_names": state_names,
+        "action_names": action_names,
+        "action_semantics": info.get(
+            "action_semantics",
+            "eef_delta_base_xyz_left_rotvec_gripper_target" if legacy else "absolute_joint_position",
+        ),
+        "action_source": info.get("action_source", "next_measured_eef" if legacy else ""),
+        "action_alignment": info.get("action_alignment", "next_observation" if legacy else ""),
+        "action_offset": int(info.get("action_offset", 1 if legacy else 0)),
+        "action_horizon": int(info.get("action_horizon", DEFAULT_ACTION_HORIZON)),
+        "gripper_semantics": info.get(
+            "gripper_semantics", GRIPPER_CLOSED_FRACTION_LEGACY if legacy else GRIPPER_OPENING_FRACTION
+        ),
+        "rotation_semantics": info.get(
+            "rotation_semantics", LEGACY_ROTATION_SEMANTICS if legacy else ROTATION6D_SEMANTICS
+        ),
+        "coordinate_frame": info.get("coordinate_frame", "slave_base"),
+    }
+
+
+def _compatibility_signature(info: dict[str, Any]) -> dict[str, Any]:
+    metadata = _contract_metadata(info)
+    features = info.get("features", {})
+    feature_signature = {}
+    for key, value in features.items():
+        if not isinstance(value, dict):
+            continue
+        names = value.get("names")
+        if key in {"observation.state", "state"} and metadata.get("state_names") is not None:
+            names = metadata["state_names"]
+        elif key in {"action", "actions"} and metadata.get("action_names") is not None:
+            names = metadata["action_names"]
+        feature_signature[key] = {
+            "dtype": value.get("dtype"),
+            "shape": value.get("shape"),
+            "names": names,
+        }
+    result = {
+        "codebase_version": info.get("codebase_version"),
+        "robot_type": info.get("robot_type"),
+        "fps": info.get("fps"),
+        "chunks_size": info.get("chunks_size"),
+        "features": feature_signature,
+    }
+    for key in (
+        "schema", "arm_mode", "arm_side", "state_dim", "raw_action_dim", "model_action_dim",
+        "contract_format", "legacy_format", "delivery_action_format", "action_semantics",
+        "action_source", "action_alignment", "action_offset", "action_horizon",
+        "gripper_semantics", "rotation_semantics", "coordinate_frame",
+    ):
+        if key in metadata:
+            result[key] = metadata[key]
+    # Missing names in metadata-free legacy files are tolerated; if both sides
+    # provide names they must agree exactly.
+    for key in ("state_names", "action_names"):
+        value = metadata.get(key)
+        if value is not None:
+            result[key] = value
+    return result
+
+
 def _validate_compatible(target_info: dict[str, Any], source_info: dict[str, Any]) -> None:
-    mismatches = []
-    for key in COMPATIBILITY_FIELDS:
-        if target_info.get(key) != source_info.get(key):
-            mismatches.append(key)
+    target = _compatibility_signature(target_info)
+    source = _compatibility_signature(source_info)
+    mismatches = [key for key in sorted(set(target) | set(source)) if target.get(key) != source.get(key)]
     if mismatches:
         raise ValueError("datasets are incompatible; differing fields: " + ", ".join(mismatches))
 
@@ -366,6 +558,10 @@ class DatasetEditor:
         info = _read_json(root / "meta" / "info.json")
         if not isinstance(info, dict):
             raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
+        display_info = dict(info)
+        normalized_contract = _contract_metadata(info)
+        for key, value in normalized_contract.items():
+            display_info.setdefault(key, value)
         parquet = _parquet_paths(root)
         episodes = _metadata_by_index(root / "meta" / "episodes.jsonl")
         tasks = _tasks_by_index(root)
@@ -415,7 +611,7 @@ class DatasetEditor:
             )
         return {
             "id": dataset_id,
-            "info": info,
+            "info": display_info,
             "tasks": [{"task_index": key, "task": value} for key, value in sorted(tasks.items())],
             "episodes": rows,
             "offset": offset,
@@ -727,6 +923,7 @@ class DatasetEditor:
         base_info = _read_json(base / "meta" / "info.json")
         if not isinstance(base_info, dict):
             raise ValueError(f"invalid target dataset: {base}")
+        base_contract = _contract_metadata(base_info)
         for source, _updates in sources[1:]:
             source_info = _read_json(source / "meta" / "info.json")
             if not isinstance(source_info, dict):
@@ -835,6 +1032,31 @@ class DatasetEditor:
                     source_row["episode_index"] = new_episode_index
                     source_row["length"] = frame_count
                     source_row["tasks"] = _unique_strings(task_texts)
+                    if base_contract.get("legacy"):
+                        source_row.update(
+                            {
+                                "schema": base_contract["schema"],
+                                "arm_mode": base_contract["arm_mode"],
+                                "arm_side": base_contract["arm_side"],
+                                "state_dim": base_contract["state_dim"],
+                                "action_dim": base_contract["raw_action_dim"],
+                                "raw_action_dim": base_contract["raw_action_dim"],
+                                "model_action_dim": base_contract["model_action_dim"],
+                                "contract_format": LEGACY_V2,
+                                "legacy": True,
+                                "legacy_format": LEGACY_V2,
+                                "legacy_delivery_v2": True,
+                                "delivery_action_format": DELIVERY_LEGACY_ACTION_FORMAT,
+                                "action_semantics": base_contract["action_semantics"],
+                                "action_source": base_contract["action_source"],
+                                "action_alignment": base_contract["action_alignment"],
+                                "action_offset": base_contract["action_offset"],
+                                "action_horizon": base_contract["action_horizon"],
+                                "gripper_semantics": base_contract["gripper_semantics"],
+                                "rotation_semantics": base_contract["rotation_semantics"],
+                                "coordinate_frame": base_contract["coordinate_frame"],
+                            }
+                        )
                     if "task_name" in update:
                         if update["task_name"] is None:
                             source_row.pop("task_name", None)
@@ -850,7 +1072,9 @@ class DatasetEditor:
                     source_row.update(update.get("metadata", {}))
                     episode_rows.append(source_row)
 
-                    source_stats = dict(stats.get(old_episode_index, {"stats": {}}))
+                    source_stats = _recompute_episode_stats(
+                        table, stats.get(old_episode_index, {"stats": {}})
+                    )
                     source_stats["episode_index"] = new_episode_index
                     stats_rows.append(source_stats)
 
@@ -889,7 +1113,53 @@ class DatasetEditor:
                     "splits": _build_splits(base_info.get("splits"), old_total, new_episode_index),
                 }
             )
+            if base_contract.get("legacy"):
+                legacy_metadata = {
+                    key: value
+                    for key, value in base_contract.items()
+                    if key
+                    in {
+                        "schema", "arm_mode", "arm_side", "state_dim", "raw_action_dim",
+                        "model_action_dim", "state_names", "action_names", "contract_format",
+                        "legacy", "legacy_format", "delivery_action_format", "action_semantics",
+                        "action_source", "action_alignment", "action_offset", "action_horizon",
+                        "gripper_semantics", "rotation_semantics", "coordinate_frame",
+                    }
+                }
+                legacy_metadata["action_dim"] = base_contract["raw_action_dim"]
+                legacy_metadata["contract_version"] = 2
+                legacy_metadata["legacy_delivery_v2"] = True
+                updated_info.update(legacy_metadata)
+                state_key = "state" if "state" in updated_info.get("features", {}) else "observation.state"
+                action_key = "actions" if "actions" in updated_info.get("features", {}) else "action"
+                if base_contract.get("state_names") is not None:
+                    updated_info["features"][state_key]["names"] = base_contract["state_names"]
+                if base_contract.get("action_names") is not None:
+                    updated_info["features"][action_key]["names"] = base_contract["action_names"]
             _atomic_json(candidate / "meta" / "info.json", updated_info)
+            policy_contract = _read_json(candidate / "meta" / "policy_contract.json", {})
+            if not isinstance(policy_contract, dict):
+                policy_contract = {}
+            if base_contract:
+                policy_contract.update(
+                    {
+                        "version": updated_info.get("contract_version", policy_contract.get("version", 2)),
+                        "robot_type": updated_info.get("robot_type"),
+                        **{
+                            key: updated_info[key]
+                            for key in (
+                                "schema", "arm_mode", "arm_side", "state_dim", "action_dim",
+                                "raw_action_dim", "model_action_dim", "state_names", "action_names",
+                                "camera_keys", "contract_format", "legacy", "legacy_format",
+                                "legacy_delivery_v2", "delivery_action_format", "action_semantics", "action_source",
+                                "action_alignment", "action_offset", "action_horizon",
+                                "gripper_semantics", "rotation_semantics", "coordinate_frame",
+                            )
+                            if key in updated_info
+                        },
+                    }
+                )
+                _atomic_json(candidate / "meta" / "policy_contract.json", policy_contract)
             return candidate
         except Exception:
             if candidate.exists():
@@ -928,7 +1198,8 @@ class DatasetEditor:
                         f"episode={old_episode_index} key={image_key} frame={frame_index}"
                     )
                 suffix = external.suffix.lower() or Path(str(cell.get("path") or "")).suffix.lower() or ".png"
-                destination = (
+                stored_relative = _safe_relative_path(cell.get("path"))
+                destination = candidate / stored_relative if stored_relative is not None else (
                     candidate
                     / "images"
                     / image_key

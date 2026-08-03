@@ -2,13 +2,13 @@
 
 Supported raw contracts:
 
-* single + delivery: 10D state / 7D EEF-delta action / 2 cameras;
+* single + delivery: 10D state / 10D absolute EEF fallback target / 2 cameras;
 * single + joint: 7D state / 7D next measured joint target / 2 cameras;
-* bimanual + delivery: 20D state / 14D EEF-delta action / 3 cameras;
+* bimanual + delivery: 20D state / 20D absolute EEF fallback target / 3 cameras;
 * bimanual + joint: 14D state / 14D next measured joint target / 3 cameras.
 
 This output-only collector cannot see the teleoperator's commanded target, so
-joint actions are deliberately labelled ``next_measured_qpos``.  For preferred
+joint actions are deliberately labelled ``next_measured_joint_fallback``.  For preferred
 same-step master-arm targets use ``teleop_single.py`` or ``teleop.py``.
 """
 
@@ -31,12 +31,16 @@ from piper_data_contract import (
     DELIVERY_SCHEMA,
     IMAGE_HW,
     JOINT_SCHEMA,
+    JOINT_MEASURED_ACTION_SOURCE,
     SINGLE_ARM,
     EpisodeBuffer,
     EpisodeContract,
+    DEFAULT_ACTION_HORIZON,
+    DELIVERY_MEASURED_ACTION_SOURCE,
     build_actions as _build_actions,
     build_delivery_state,
-    gripper_closed_fraction,
+    gripper_opening_fraction,
+    gripper_opening_m,
 )
 try:
     from teleop import KeyListener
@@ -104,7 +108,8 @@ def _qpos_from_feedback(joints_message: Any, gripper_message: Any) -> np.ndarray
         ],
         dtype=np.float32,
     ) / RAD_FACTOR
-    return np.append(values, float(gripper.grippers_angle) / GRIPPER_FACTOR).astype(np.float32)
+    opening_m = abs(float(gripper.grippers_angle)) / GRIPPER_FACTOR
+    return np.append(values, gripper_opening_fraction(opening_m)).astype(np.float32)
 
 
 def read_output_qpos(piper: Any) -> np.ndarray:
@@ -113,6 +118,84 @@ def read_output_qpos(piper: Any) -> np.ndarray:
     gripper_message = piper.GetArmGripperMsgs()
     _require_fresh_feedback({"joint": joints_message, "gripper": gripper_message})
     return _qpos_from_feedback(joints_message, gripper_message)
+
+
+def read_output_gripper_command_sample(
+    piper: Any,
+    *,
+    max_age_s: float = PIPER_FEEDBACK_MAX_AGE_S,
+) -> tuple[float, float] | None:
+    """Read the latest opening-fraction target and its SDK/CAN timestamp."""
+    getter = getattr(piper, "GetArmGripperCtrl", None)
+    if not callable(getter):
+        return None
+    try:
+        message = getter()
+        timestamp = float(getattr(message, "time_stamp", 0.0) or 0.0)
+        age_s = time.time() - timestamp if timestamp > 0 else float("inf")
+        if timestamp <= 0 or age_s > max_age_s or age_s < -1.0:
+            return None
+        command = getattr(message, "gripper_ctrl", None)
+        opening_m = abs(float(getattr(command, "grippers_angle"))) / GRIPPER_FACTOR
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    if not np.isfinite(opening_m):
+        return None
+    return gripper_opening_fraction(opening_m), timestamp
+
+
+def read_output_gripper_command_target(
+    piper: Any,
+    *,
+    max_age_s: float = PIPER_FEEDBACK_MAX_AGE_S,
+) -> float | None:
+    """Backward-compatible value-only view of the latest gripper command."""
+    sample = read_output_gripper_command_sample(piper, max_age_s=max_age_s)
+    return None if sample is None else sample[0]
+
+def read_robot_gripper_command_targets(
+    robot: Any,
+    *,
+    arm_mode: str,
+) -> np.ndarray | None:
+    """Read normalized absolute gripper targets for one or two output arms.
+
+    A bimanual result may contain one missing arm as ``NaN``; ``None`` is
+    returned only when no arm has a usable command target.
+    """
+    if arm_mode == SINGLE_ARM:
+        value = read_output_gripper_command_target(robot)
+        return None if value is None else np.asarray([value], dtype=np.float32)
+    if arm_mode != BIMANUAL or not isinstance(robot, dict):
+        raise ValueError("arm_mode must be single or bimanual with the matching robot object")
+    values = np.asarray(
+        [
+            read_output_gripper_command_target(robot["left"]),
+            read_output_gripper_command_target(robot["right"]),
+        ],
+        dtype=np.float32,
+    )
+    return values if np.isfinite(values).any() else None
+
+
+def read_robot_gripper_command_samples(
+    robot: Any,
+    *,
+    arm_mode: str,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Return per-arm command targets and original command timestamps."""
+    if arm_mode == SINGLE_ARM:
+        arms = [robot]
+    elif arm_mode == BIMANUAL and isinstance(robot, dict) and set(robot) == {"left", "right"}:
+        arms = [robot["left"], robot["right"]]
+    else:
+        raise ValueError("arm_mode must match the robot object")
+    samples = [read_output_gripper_command_sample(arm) for arm in arms]
+    if not any(sample is not None for sample in samples):
+        return None, None
+    targets = np.asarray([np.nan if sample is None else sample[0] for sample in samples], dtype=np.float32)
+    timestamps = np.asarray([np.nan if sample is None else sample[1] for sample in samples], dtype=np.float64)
+    return targets, timestamps
 
 
 def read_output_delivery_state(piper: Any, qpos: np.ndarray | None = None) -> np.ndarray:
@@ -138,7 +221,7 @@ def read_output_delivery_state(piper: Any, qpos: np.ndarray | None = None) -> np
         np.array([pose.RX_axis, pose.RY_axis, pose.RZ_axis], dtype=np.float64) / 1000.0
     )
     rotation = Rotation.from_euler("xyz", rpy_rad).as_matrix()
-    return build_delivery_state(xyz_m, rotation, float(qpos[6]))
+    return build_delivery_state(xyz_m, rotation, gripper_opening_m(float(qpos[6])))
 
 
 def read_output_state(piper: Any) -> tuple[np.ndarray, np.ndarray]:
@@ -179,7 +262,7 @@ def send_output_qpos(piper: Any, qpos: np.ndarray) -> None:
     """Send one joint/gripper target to one output arm."""
     joints = [round(float(value) * RAD_FACTOR) for value in qpos[:6]]
     piper.JointCtrl(*joints)
-    piper.GripperCtrl(round(abs(float(qpos[6])) * GRIPPER_FACTOR), 1000, 0x01, 0)
+    piper.GripperCtrl(round(gripper_opening_m(float(qpos[6])) * GRIPPER_FACTOR), 1000, 0x01, 0)
 
 
 def reset_output_arm(
@@ -327,7 +410,9 @@ def run(args) -> None:
         arm_mode=args.arm_mode,
         arm_side=args.arm_side,
         action_source=(
-            "next_measured_qpos" if args.schema == JOINT_SCHEMA else "next_measured_eef"
+            JOINT_MEASURED_ACTION_SOURCE
+            if args.schema == JOINT_SCHEMA
+            else DELIVERY_MEASURED_ACTION_SOURCE
         ),
         action_alignment="next_observation",
     )
@@ -368,6 +453,7 @@ def run(args) -> None:
         camera_keys=contract.camera_keys,
         action_source=contract.action_source,
         action_alignment=contract.action_alignment,
+        action_horizon=args.action_horizon,
     )
     keys = KeyListener()
     episode_index = next_episode_index(out_dir)
@@ -387,14 +473,22 @@ def run(args) -> None:
             )
             state_timestamp = time.time()
             images, image_ts = cameras.read()
+            if contract.schema == DELIVERY_SCHEMA:
+                gripper_targets, gripper_command_timestamps = read_robot_gripper_command_samples(
+                    robot, arm_mode=contract.arm_mode
+                )
+            else:
+                gripper_targets, gripper_command_timestamps = None, None
             buffer.add(
                 state,
                 images,
                 image_ts,
                 qpos=qpos,
+                gripper_targets=gripper_targets,
+                gripper_command_timestamps=gripper_command_timestamps,
                 state_timestamp=state_timestamp,
             )
-            grippers = qpos[6::7] * 1000.0
+            grippers = np.asarray([gripper_opening_m(value) for value in qpos[6::7]]) * 1000.0
             display = ",".join(f"{value:.1f}" for value in grippers)
             sys.stdout.write(
                 f"\r[ep {episode_index:04d}] step {len(buffer):04d} "
@@ -439,6 +533,7 @@ def main() -> None:
     ap.add_argument("--cam-left-wrist-device", default=DEFAULT_LEFT_WRIST_DEVICE)
     ap.add_argument("--cam-right-wrist-device", default=DEFAULT_RIGHT_WRIST_DEVICE)
     ap.add_argument("--fps", type=int, default=DEFAULT_FPS)
+    ap.add_argument("--action-horizon", type=int, default=DEFAULT_ACTION_HORIZON)
     ap.add_argument("--camera-fps", type=int, default=DEFAULT_CAMERA_FPS)
     ap.add_argument("--out-dir", default="episodes_piper_v21")
     ap.add_argument("--task-name", default="output_arm_task")
