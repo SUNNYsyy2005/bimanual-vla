@@ -337,6 +337,11 @@ def main() -> int:
         action="store_true",
         help="rebuild cached raw export and upload archive",
     )
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="validate/export a GUI NPZ directory to LeRobot and stop before uploading",
+    )
     install_mode = parser.add_mutually_exclusive_group()
     install_mode.add_argument(
         "--merge",
@@ -350,7 +355,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if not args.token or len(args.token) < 20:
+    if args.prepare_only and args.archive:
+        parser.error("--prepare-only requires a dataset directory, not --archive")
+    if not args.prepare_only and (not args.token or len(args.token) < 20):
         parser.error("provide --token or BIMANUAL_VLA_SERVER_TOKEN (at least 20 characters)")
     if args.workers <= 0 or args.chunk_mib <= 0 or args.attempts <= 0 or args.fps <= 0:
         parser.error("workers, chunk-mib, attempts, and fps must be positive")
@@ -376,6 +383,10 @@ def main() -> int:
             )
         except (OSError, RuntimeError, ValueError, SystemExit) as exc:
             parser.error(str(exc))
+        if args.prepare_only:
+            print(f"PREPARED_LEROBOT_PATH={dataset_root}")
+            print(f"LeRobot preparation complete: {dataset_root}")
+            return 0
         archive, archive_sha, size = build_archive(
             dataset_root,
             dataset_name,

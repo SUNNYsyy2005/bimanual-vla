@@ -42,6 +42,13 @@ schema 对应的 7D/10D/14D/20D state，以及相对 Home 的位姿误差。任�
 双臂 Reset 会并行复位左右输出臂。连接期间会锁定 arm mode、schema、CAN、
 相机、FPS 和输出目录，避免 UI 配置与当前设备会话不一致。
 
+保存 episode 列表下方的“Convert / upload dataset”可在后台执行 NPZ→LeRobot
+转换或上传。上传 token 只放在 GUI 内存和子进程环境变量中，不会出现在命令行；
+原始 NPZ 的转换结果复用 `~/.cache/bimanual-vla/uploads/exports` 缓存。
+“Delete selected data”不会直接抹除文件，而是将选中的 `ep_*.npz` 移到当前
+目录下的 `.trash/`，需要时可以手动恢复。连接成功后，相机标题和状态栏会同时
+显示稳定 by-path 链接解析出的实际 `/dev/videoN` 编号，便于确认顶部/腕部配对。
+
 ### 单双臂 π0.5 数据合同
 
 | 模式 | schema | state/action | 相机 |
@@ -493,6 +500,15 @@ python upload_dataset_4090.py piper/piper_v1_increment \
 ```
 
 原始 NPZ 的自动导出结果保存在 `~/.cache/bimanual-vla/uploads/exports`，源目录未变化时会复用；`--rebuild` 可强制重新导出并重建 tar。若一个原始目录混合了不同 arm mode/schema，导出会拒绝。`--merge` 与 `--overwrite` 互斥；目标不存在时 `--merge` 按首次安装处理。服务端会检查两个数据集的版本、robot type、FPS、chunk size、features、action semantics 和 action offset，随后重新编号新增 episode/global/task index，并在临时目录完成结构与 loader 校验后原子替换。
+
+只转换、不上传时可使用：
+
+```bash
+python upload_dataset_4090.py episodes_piper_v21 \
+  --name piper_v1 \
+  --fps 20 \
+  --prepare-only
+```
 
 网页地址：`http://192.168.101.9:8090`。页面作为管理面，可执行：
 

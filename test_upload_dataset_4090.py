@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
+import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from upload_dataset_4090 import classify_dataset_source, prepare_dataset_directory
+from upload_dataset_4090 import classify_dataset_source, main, prepare_dataset_directory
 
 
 class DatasetUploadInputTest(unittest.TestCase):
@@ -106,6 +110,40 @@ class DatasetUploadInputTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "LeRobot directory.*GUI collection"):
             classify_dataset_source(dataset)
+
+    def test_prepare_only_does_not_require_server_token(self):
+        dataset = self.root / "episodes"
+        dataset.mkdir()
+        (dataset / "ep_0000.npz").write_bytes(b"synthetic-npz")
+        prepared = self.root / "prepared"
+        (prepared / "meta").mkdir(parents=True)
+        (prepared / "meta" / "info.json").write_text("{}", encoding="utf-8")
+        output = io.StringIO()
+
+        with (
+            patch.dict(os.environ, {"BIMANUAL_VLA_SERVER_TOKEN": ""}),
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "upload_dataset_4090.py",
+                    str(dataset),
+                    "--name",
+                    "pick_cube",
+                    "--prepare-only",
+                    "--cache-dir",
+                    str(self.cache),
+                ],
+            ),
+            patch(
+                "upload_dataset_4090.prepare_dataset_directory",
+                return_value=(prepared, "raw_npz"),
+            ),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(main(), 0)
+
+        self.assertIn(f"PREPARED_LEROBOT_PATH={prepared}", output.getvalue())
 
 
 if __name__ == "__main__":

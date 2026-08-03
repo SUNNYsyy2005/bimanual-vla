@@ -13,8 +13,11 @@ stale hardware feedback is still rejected before and during recording.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import queue
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -42,14 +45,101 @@ from collect_output_arm import (
     DEFAULT_RIGHT_CAN,
     DEFAULT_RIGHT_WRIST_DEVICE,
     DEFAULT_WRIST_DEVICE,
+    next_episode_index,
     reset_robot_arms,
 )
 from piper_data_contract import BIMANUAL, DELIVERY_SCHEMA, JOINT_SCHEMA, SINGLE_ARM, EpisodeContract
+from upload_dataset_4090 import DEFAULT_SERVER, safe_dataset_name
 
 
 JOINT_NAMES = tuple(f"J{i}" for i in range(1, 7)) + ("Gripper",)
 SINGLE_PREVIEW_SIZE = (480, 360)
 BIMANUAL_PREVIEW_SIZE = (360, 270)
+EPISODE_FILE_RE = re.compile(r"ep_\d+\.npz")
+
+
+def move_episodes_to_trash(
+    output_dir: str | pathlib.Path,
+    selected_paths: list[str | pathlib.Path],
+    *,
+    timestamp: str | None = None,
+) -> list[pathlib.Path]:
+    """Move selected raw episodes into a recoverable dataset-local trash folder."""
+    output_root = pathlib.Path(output_dir).expanduser().resolve()
+    if not selected_paths:
+        raise ValueError("no episodes were selected")
+    sources: list[pathlib.Path] = []
+    for value in selected_paths:
+        source = pathlib.Path(value).expanduser().resolve()
+        if source.parent != output_root or not EPISODE_FILE_RE.fullmatch(source.name):
+            raise ValueError(f"unsafe episode path outside {output_root}: {source}")
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        sources.append(source)
+
+    suffix = timestamp or f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1_000_000_000:09d}"
+    trash_dir = output_root / ".trash" / suffix
+    counter = 1
+    while trash_dir.exists():
+        trash_dir = output_root / ".trash" / f"{suffix}-{counter}"
+        counter += 1
+    trash_dir.mkdir(parents=True)
+
+    moved: list[pathlib.Path] = []
+    for source in sources:
+        destination = trash_dir / source.name
+        shutil.move(str(source), str(destination))
+        moved.append(destination)
+    return moved
+
+
+def build_dataset_tool_command(
+    *,
+    python_executable: str,
+    script_path: str | pathlib.Path,
+    source_dir: str | pathlib.Path,
+    dataset_name: str,
+    fps: int,
+    action: str,
+    server: str = DEFAULT_SERVER,
+    workers: int = 4,
+    install_mode: str = "merge",
+    allow_incomplete_gripper_coverage: bool = False,
+    rebuild: bool = False,
+) -> list[str]:
+    """Build a token-free uploader command for the GUI background worker."""
+    name = safe_dataset_name(dataset_name.strip())
+    if fps <= 0 or workers <= 0:
+        raise ValueError("FPS and upload workers must be positive")
+    if action not in {"prepare", "upload"}:
+        raise ValueError(f"unsupported dataset action: {action}")
+    if install_mode not in {"install", "merge", "overwrite"}:
+        raise ValueError(f"unsupported upload mode: {install_mode}")
+    source = pathlib.Path(source_dir).expanduser().resolve()
+    command = [
+        python_executable,
+        str(pathlib.Path(script_path).resolve()),
+        str(source),
+        "--name",
+        name,
+        "--fps",
+        str(fps),
+    ]
+    if allow_incomplete_gripper_coverage:
+        command.append("--allow-incomplete-gripper-coverage")
+    if rebuild:
+        command.append("--rebuild")
+    if action == "prepare":
+        command.append("--prepare-only")
+        return command
+    if not server.strip():
+        raise ValueError("server URL must not be empty")
+    command.extend(("--server", server.strip(), "--workers", str(workers)))
+    if install_mode == "merge":
+        command.append("--merge")
+    elif install_mode == "overwrite":
+        command.append("--overwrite")
+    return command
 
 
 def check_initial_pose(
@@ -115,6 +205,13 @@ class CollectorGUI:
         self.capture_thread: threading.Thread | None = None
         self.capture_stop: threading.Event | None = None
         self.reset_thread: threading.Thread | None = None
+        self.dataset_task_thread: threading.Thread | None = None
+        self.dataset_task_process: subprocess.Popen | None = None
+        self.dataset_task_name: str | None = None
+        self.prepared_lerobot_path: str | None = None
+        self.dataset_tools_window: tk.Toplevel | None = None
+        self.dataset_log_widget: tk.Text | None = None
+        self.dataset_action_buttons: list[ttk.Button] = []
         self.data_lock = threading.Lock()
         self.latest_images: dict[str, np.ndarray] = {}
         self.latest_qpos: np.ndarray | None = None
@@ -159,6 +256,17 @@ class CollectorGUI:
         self.out_var = tk.StringVar(value="episodes_piper_v21")
         self.task_var = tk.StringVar(value="pick_cube")
         self.instruction_var = tk.StringVar(value="pick up the cube")
+        self.dataset_name_var = tk.StringVar(value="episodes_piper_v21")
+        self.dataset_server_var = tk.StringVar(
+            value=os.environ.get("BIMANUAL_VLA_SERVER", DEFAULT_SERVER)
+        )
+        self.dataset_token_var = tk.StringVar(
+            value=os.environ.get("BIMANUAL_VLA_SERVER_TOKEN", "")
+        )
+        self.dataset_workers_var = tk.StringVar(value="4")
+        self.dataset_install_mode_var = tk.StringVar(value="merge")
+        self.dataset_allow_gripper_var = tk.BooleanVar(value=False)
+        self.dataset_rebuild_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Disconnected")
         self.progress_var = tk.StringVar(value="No episode started")
         self.pose_check_var = tk.StringVar(value="Waiting for robot feedback")
@@ -363,11 +471,32 @@ class CollectorGUI:
         files.grid(row=5, column=0, sticky="nsew")
         files.columnconfigure(0, weight=1)
         files.rowconfigure(0, weight=1)
-        self.listbox = tk.Listbox(files, height=7, font=("Sans", 11))
+        self.listbox = tk.Listbox(
+            files,
+            height=7,
+            font=("Sans", 11),
+            selectmode=tk.EXTENDED,
+        )
         self.listbox.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(files, orient="vertical", command=self.listbox.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.listbox.configure(yscrollcommand=scrollbar.set)
+        file_actions = ttk.Frame(files)
+        file_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        file_actions.columnconfigure(0, weight=1)
+        file_actions.columnconfigure(1, weight=1)
+        self.delete_episode_button = ttk.Button(
+            file_actions,
+            text="Delete selected data",
+            command=self.delete_selected_episodes,
+        )
+        self.delete_episode_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.dataset_tools_button = ttk.Button(
+            file_actions,
+            text="Convert / upload dataset",
+            command=self.open_dataset_tools,
+        )
+        self.dataset_tools_button.grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
         preview = ttk.LabelFrame(right, text="Live camera views", padding=8)
         preview.grid(row=0, column=0, sticky="nsew")
@@ -448,6 +577,15 @@ class CollectorGUI:
             )
         return JOINT_NAMES
 
+    def _camera_role_title(self, key: str) -> str:
+        if key == "cam_high":
+            return "Overhead camera"
+        if key == "cam_left_wrist":
+            return "Left wrist camera"
+        if key == "cam_right_wrist":
+            return "Right wrist camera"
+        return f"{self.arm_side.capitalize()} wrist camera"
+
     def _configure_mode_ui(self):
         if not hasattr(self, "joint_table"):
             return
@@ -486,9 +624,8 @@ class CollectorGUI:
                 "cam_high": "high",
                 self.contract.camera_keys[1]: "primary_wrist",
             }
-        self.preview_title_labels["primary_wrist"].configure(
-            text="Left wrist camera" if bimanual else f"{self.arm_side.capitalize()} wrist camera"
-        )
+        for camera_key, slot in self.preview_key_to_slot.items():
+            self.preview_title_labels[slot].configure(text=self._camera_role_title(camera_key))
         for label in self.preview_labels.values():
             label.configure(image="", text="Waiting for camera...")
         self.preview_photos.clear()
@@ -531,7 +668,13 @@ class CollectorGUI:
         )
 
     def _update_start_button(self):
-        if self.piper is None or self.cameras is None or self.recording or self.reset_thread is not None:
+        if (
+            self.piper is None
+            or self.cameras is None
+            or self.recording
+            or self.reset_thread is not None
+            or self._dataset_task_running()
+        ):
             state = "disabled"
         else:
             # Keep the home-pose check as an operator warning only. Requiring
@@ -540,6 +683,18 @@ class CollectorGUI:
             # stale Piper feedback.
             state = "normal"
         self.start_button.configure(state=state)
+
+    def _dataset_task_running(self) -> bool:
+        thread = getattr(self, "dataset_task_thread", None)
+        return thread is not None and thread.is_alive()
+
+    def _update_dataset_action_buttons(self) -> None:
+        busy = self.recording or self._dataset_task_running()
+        state = "disabled" if busy else "normal"
+        if hasattr(self, "delete_episode_button"):
+            self.delete_episode_button.configure(state=state)
+        for button in getattr(self, "dataset_action_buttons", []):
+            button.configure(state=state)
 
     def toggle_connection(self):
         if self.piper is not None:
@@ -590,9 +745,16 @@ class CollectorGUI:
             self.capture_stop = threading.Event()
             self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
             self.capture_thread.start()
-            camera_status = ", ".join(
-                f"{key}={info['fps']:.0f}FPS" for key, info in checks.items()
-            )
+            camera_status_parts = []
+            for key, info in checks.items():
+                video_device = str(info.get("video_device") or info.get("configured_device") or "?")
+                camera_status_parts.append(f"{key}={video_device} ({info['fps']:.0f}FPS)")
+                slot = self.preview_key_to_slot.get(key)
+                if slot is not None:
+                    self.preview_title_labels[slot].configure(
+                        text=f"{self._camera_role_title(key)}\n{video_device}"
+                    )
+            camera_status = ", ".join(camera_status_parts)
             can_status = (
                 self.can_var.get().strip()
                 if self.arm_mode == SINGLE_ARM
@@ -659,6 +821,7 @@ class CollectorGUI:
             f"Recording episode {self.episode_index:04d} | Instruction: {label.instruction}"
         )
         self.progress_var.set("Frames: 0")
+        self._update_dataset_action_buttons()
 
     def _capture_loop(self):
         assert self.capture_stop is not None
@@ -704,6 +867,7 @@ class CollectorGUI:
 
     def _finish_stop(self):
         self._update_start_button()
+        self._update_dataset_action_buttons()
         self.reset_button.configure(state="normal" if self.piper is not None else "disabled")
         if self.session is None or self.session.frame_count == 0:
             if self.session is not None and self.session.state is SessionState.REVIEW:
@@ -909,8 +1073,22 @@ class CollectorGUI:
                     self._finish_reset(True)
                 elif kind == "reset_error":
                     self._finish_reset(False, payload[0])
+                elif kind == "dataset_log":
+                    line = payload[0]
+                    self._append_dataset_log(line)
+                    if line.startswith("PREPARED_LEROBOT_PATH="):
+                        prepared = line.split("=", 1)[1]
+                        self.prepared_lerobot_path = prepared
+                        self.status_var.set(f"Prepared LeRobot dataset: {prepared}")
+                elif kind == "dataset_done":
+                    self._finish_dataset_task(
+                        payload[0],
+                        int(payload[1]),
+                        payload[2],
+                    )
         except queue.Empty:
             pass
+        self._update_dataset_action_buttons()
         self.root.after(100, self._poll_messages)
 
     def _show_preview(self, images: dict[str, np.ndarray]):
@@ -958,6 +1136,251 @@ class CollectorGUI:
             )
             cv2.imshow(title, image)
         cv2.waitKey(1)
+
+    def delete_selected_episodes(self):
+        if self.recording:
+            messagebox.showwarning("Cannot delete data", "Stop the current episode first")
+            return
+        if self._dataset_task_running():
+            messagebox.showwarning(
+                "Cannot delete data",
+                "Wait for the current conversion or upload task to finish",
+            )
+            return
+        selections = self.listbox.curselection()
+        if not selections:
+            messagebox.showinfo("Delete data", "Select one or more episodes first")
+            return
+        paths = [pathlib.Path(self.listbox.get(index)) for index in selections]
+        preview = "\n".join(path.name for path in paths[:12])
+        if len(paths) > 12:
+            preview += f"\n... and {len(paths) - 12} more"
+        confirmed = messagebox.askyesno(
+            "Delete selected data",
+            f"Move {len(paths)} selected episode(s) to the recoverable .trash folder?\n\n{preview}",
+        )
+        if not confirmed:
+            return
+        try:
+            moved = move_episodes_to_trash(self.out_dir, paths)
+        except Exception as exc:
+            messagebox.showerror("Delete failed", str(exc))
+            return
+        self.refresh_files()
+        self.episode_index = next_episode_index(self.out_dir)
+        if self.session is not None:
+            self.session.episode_index = self.episode_index
+        trash_dir = moved[0].parent
+        self.status_var.set(
+            f"Moved {len(moved)} episode(s) to {trash_dir}; next episode: {self.episode_index:04d}"
+        )
+
+    def open_dataset_tools(self):
+        if self.dataset_tools_window is not None:
+            try:
+                if self.dataset_tools_window.winfo_exists():
+                    self.dataset_tools_window.deiconify()
+                    self.dataset_tools_window.lift()
+                    return
+            except tk.TclError:
+                pass
+        if not self.dataset_name_var.get().strip():
+            self.dataset_name_var.set(self.out_dir.name)
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Dataset conversion and upload")
+        dialog.geometry("820x680")
+        dialog.minsize(680, 560)
+        self.dataset_tools_window = dialog
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(2, weight=1)
+
+        form = ttk.LabelFrame(dialog, text="NPZ to LeRobot / server upload", padding=12)
+        form.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+        form.columnconfigure(1, weight=1)
+        source_text = str(self.out_dir.resolve())
+        rows = (
+            ("NPZ source", tk.StringVar(value=source_text), "readonly"),
+            ("Dataset name", self.dataset_name_var, "normal"),
+            ("Server URL", self.dataset_server_var, "normal"),
+            ("Server token", self.dataset_token_var, "token"),
+            ("Upload workers", self.dataset_workers_var, "normal"),
+        )
+        for row, (label, variable, mode) in enumerate(rows):
+            ttk.Label(form, text=label, width=18).grid(row=row, column=0, sticky="w", pady=4)
+            entry = ttk.Entry(
+                form,
+                textvariable=variable,
+                show="*" if mode == "token" else "",
+                state="readonly" if mode == "readonly" else "normal",
+            )
+            entry.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=4)
+
+        ttk.Label(form, text="Install mode", width=18).grid(row=5, column=0, sticky="w", pady=4)
+        ttk.Combobox(
+            form,
+            textvariable=self.dataset_install_mode_var,
+            values=("merge", "install", "overwrite"),
+            state="readonly",
+        ).grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=4)
+        options = ttk.Frame(form)
+        options.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(
+            options,
+            text="Allow incomplete gripper coverage",
+            variable=self.dataset_allow_gripper_var,
+        ).pack(side="left", padx=(0, 14))
+        ttk.Checkbutton(
+            options,
+            text="Rebuild conversion/archive cache",
+            variable=self.dataset_rebuild_var,
+        ).pack(side="left")
+
+        actions = ttk.Frame(dialog)
+        actions.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+        prepare_button = ttk.Button(
+            actions,
+            text="Convert NPZ to LeRobot",
+            command=lambda: self._start_dataset_task("prepare"),
+        )
+        prepare_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        upload_button = ttk.Button(
+            actions,
+            text="Convert if needed and upload",
+            command=lambda: self._start_dataset_task("upload"),
+        )
+        upload_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.dataset_action_buttons = [prepare_button, upload_button]
+
+        log_frame = ttk.LabelFrame(dialog, text="Progress", padding=8)
+        log_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        log = tk.Text(log_frame, wrap="word", font=("Monospace", 10), state="disabled")
+        log.grid(row=0, column=0, sticky="nsew")
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=log.yview)
+        log_scroll.grid(row=0, column=1, sticky="ns")
+        log.configure(yscrollcommand=log_scroll.set)
+        self.dataset_log_widget = log
+        self._append_dataset_log(
+            "Conversion uses successful ep_*.npz files and stores a reusable LeRobot cache.\n"
+        )
+        self._update_dataset_action_buttons()
+
+        def close_dialog():
+            self.dataset_log_widget = None
+            self.dataset_action_buttons = []
+            self.dataset_tools_window = None
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+
+    def _append_dataset_log(self, text: str) -> None:
+        widget = self.dataset_log_widget
+        if widget is None:
+            return
+        try:
+            if not widget.winfo_exists():
+                return
+            widget.configure(state="normal")
+            widget.insert(tk.END, text if text.endswith("\n") else text + "\n")
+            widget.see(tk.END)
+            widget.configure(state="disabled")
+        except tk.TclError:
+            self.dataset_log_widget = None
+
+    def _start_dataset_task(self, action: str) -> None:
+        if self.recording:
+            messagebox.showwarning("Dataset task", "Stop the current episode first")
+            return
+        if self._dataset_task_running():
+            messagebox.showinfo("Dataset task", "A conversion or upload task is already running")
+            return
+        try:
+            source = self.out_dir.resolve()
+            if not any(source.glob("ep_*.npz")):
+                raise ValueError(f"no ep_*.npz files found in {source}")
+            fps = int(self.fps_var.get())
+            workers = int(self.dataset_workers_var.get())
+            command = build_dataset_tool_command(
+                python_executable=sys.executable,
+                script_path=pathlib.Path(__file__).with_name("upload_dataset_4090.py"),
+                source_dir=source,
+                dataset_name=self.dataset_name_var.get(),
+                fps=fps,
+                action=action,
+                server=self.dataset_server_var.get(),
+                workers=workers,
+                install_mode=self.dataset_install_mode_var.get(),
+                allow_incomplete_gripper_coverage=self.dataset_allow_gripper_var.get(),
+                rebuild=self.dataset_rebuild_var.get(),
+            )
+            environment = os.environ.copy()
+            if action == "upload":
+                token = self.dataset_token_var.get().strip()
+                if len(token) < 20:
+                    raise ValueError("enter the server token (at least 20 characters)")
+                environment["BIMANUAL_VLA_SERVER_TOKEN"] = token
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Dataset task configuration", str(exc))
+            return
+
+        label = "LeRobot conversion" if action == "prepare" else "dataset upload"
+        if action == "prepare":
+            self.prepared_lerobot_path = None
+        self.dataset_task_name = label
+        self.status_var.set(f"Running {label}...")
+        self._append_dataset_log(f"\n[{time.strftime('%H:%M:%S')}] Starting {label}")
+
+        def worker():
+            error: str | None = None
+            return_code = -1
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env=environment,
+                )
+                self.dataset_task_process = process
+                assert process.stdout is not None
+                for line in process.stdout:
+                    self.messages.put(("dataset_log", line.rstrip("\n")))
+                return_code = process.wait()
+            except Exception as exc:
+                error = str(exc)
+            finally:
+                self.messages.put(("dataset_done", label, return_code, error))
+
+        self.dataset_task_thread = threading.Thread(target=worker, daemon=True)
+        self.dataset_task_thread.start()
+        self._update_start_button()
+        self._update_dataset_action_buttons()
+
+    def _finish_dataset_task(self, label: str, return_code: int, error: str | None) -> None:
+        self.dataset_task_process = None
+        self.dataset_task_thread = None
+        self.dataset_task_name = None
+        if error is not None:
+            message = f"{label} failed: {error}"
+        elif return_code != 0:
+            message = f"{label} failed with exit code {return_code}; see progress log"
+        elif label == "LeRobot conversion" and self.prepared_lerobot_path:
+            message = f"{label} completed: {self.prepared_lerobot_path}"
+        else:
+            message = f"{label} completed successfully"
+        self.status_var.set(message)
+        self._append_dataset_log(f"[{time.strftime('%H:%M:%S')}] {message}")
+        if error is not None or return_code != 0:
+            messagebox.showerror("Dataset task failed", message)
+        else:
+            messagebox.showinfo("Dataset task complete", message)
+        self._update_start_button()
+        self._update_dataset_action_buttons()
 
     def refresh_files(self):
         self.listbox.delete(0, tk.END)
@@ -1021,6 +1444,21 @@ class CollectorGUI:
         self.pose_check_var.set("Waiting for robot feedback")
 
     def close(self):
+        if self._dataset_task_running():
+            if not messagebox.askyesno(
+                "Exit",
+                "A dataset conversion/upload task is still running. Stop it and exit?",
+            ):
+                return
+            process = self.dataset_task_process
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            if self.dataset_task_thread is not None:
+                self.dataset_task_thread.join(timeout=3.0)
         if self.recording:
             if not messagebox.askyesno("Exit", "The current episode has not been saved. Exit anyway?"):
                 return
