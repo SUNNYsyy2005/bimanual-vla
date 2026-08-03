@@ -1,8 +1,9 @@
 """Export collected NPZ episodes to LeRobot v2.1.
 
-The exporter keeps only successful episodes by default and writes canonical
-LeRobot ``observation.state`` / ``action`` fields for single-arm or bimanual
-Piper episodes in either joint or delivery schema.
+The exporter keeps only successful episodes by default.  Single-arm delivery
+episodes use the established server-compatible ``state`` / ``actions`` plus
+``image`` / ``wrist_image`` layout.  Other contracts use canonical LeRobot
+``observation.state`` / ``action`` fields and video camera features.
 
 Example:
     python export_lerobot.py \
@@ -14,11 +15,12 @@ Example:
 from __future__ import annotations
 
 import argparse
+import inspect
 from pathlib import Path
 
 import numpy as np
 
-from piper_data_contract import LEROBOT_FEATURES
+from piper_data_contract import DELIVERY_SCHEMA, LEROBOT_FEATURES, SINGLE_ARM
 from validate_piper_data import (
     EpisodeStats,
     EpisodeValidationError,
@@ -102,6 +104,72 @@ def _load_episode(path: Path, contract):
     }
 
 
+def _export_legacy_single_delivery(
+    successful: list[EpisodeStats],
+    output_root: Path,
+    *,
+    fps: int,
+) -> tuple[int, int]:
+    """Write the delivery layout accepted by the deployed dataset server."""
+    try:
+        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+        codebase_version = "v2.1"
+    except ImportError:
+        try:
+            from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
+            codebase_version = CODEBASE_VERSION
+        except ImportError as exc:
+            raise SystemExit(
+                "LeRobot is not installed in this environment. Install the project "
+                "environment containing lerobot, then rerun this exporter."
+            ) from exc
+
+    if codebase_version != "v2.1":
+        raise SystemExit(
+            f"Installed LeRobot creates datasets with codebase_version={codebase_version}, "
+            "but this delivery requires LeRobot v2.1."
+        )
+
+    create_kwargs = {
+        "repo_id": f"piper/{output_root.name}",
+        "robot_type": "piper",
+        "fps": fps,
+        "features": FEATURES,
+        "use_videos": False,
+    }
+    if "root" in inspect.signature(LeRobotDataset.create).parameters:
+        create_kwargs["root"] = output_root
+    dataset = LeRobotDataset.create(**create_kwargs)
+
+    count = 0
+    frames = 0
+    for stats in successful:
+        with np.load(stats.path, allow_pickle=False) as data:
+            states = np.asarray(data["state"], dtype=np.float32)
+            actions = np.asarray(data["actions"], dtype=np.float32)
+            images = np.asarray(data["image"], dtype=np.uint8)
+            wrist_images = np.asarray(data["wrist_image"], dtype=np.uint8)
+        for index in range(len(states)):
+            dataset.add_frame(
+                {
+                    "image": images[index],
+                    "wrist_image": wrist_images[index],
+                    "state": states[index],
+                    "actions": actions[index],
+                },
+                task=stats.instruction,
+                timestamp=index / fps,
+            )
+        dataset.save_episode()
+        count += 1
+        frames += len(states)
+        print(
+            f"Exported {stats.path} -> episode {count - 1:06d} "
+            f"({len(states)} frames, instruction={stats.instruction!r})"
+        )
+    return count, frames
+
+
 def export_dataset(
     input_dir: str | Path,
     root: str | Path,
@@ -134,6 +202,19 @@ def export_dataset(
     with np.load(first_path, allow_pickle=False) as data:
         contract = infer_episode_contract(data)
     output_root = Path(root).expanduser()
+    if contract.schema == DELIVERY_SCHEMA and contract.arm_mode == SINGLE_ARM:
+        count, frames = _export_legacy_single_delivery(
+            successful,
+            output_root,
+            fps=fps,
+        )
+        print(
+            f"Export complete: root={output_root} schema={contract.schema} "
+            f"arm={contract.arm_mode}/{contract.arm_side} layout=legacy "
+            f"episodes={count} frames={frames} fps={fps}"
+        )
+        return output_root
+
     writer = Pi0LeRobotDatasetWriter(
         output_root,
         fps=fps,
