@@ -49,6 +49,10 @@ COMPATIBILITY_FIELDS = (
     "action_semantics",
     "action_offset",
 )
+POLICY_CONFIG_NAMES = (
+    "pi05_piper_single_arm_lora",
+    "pi05_piper_bimanual_lora",
+)
 
 
 class DatasetValidationError(ValueError):
@@ -493,23 +497,33 @@ class DatasetEditor:
             if target.exists():
                 raise FileExistsError(f"dataset already exists: {new_id}")
 
-            assets_root = self.assets_base_dir / "pi05_piper_single_arm_lora"
-            source_assets = assets_root / old_id
-            target_assets = assets_root / new_id
-            if source_assets.exists() and target_assets.exists():
-                raise FileExistsError(f"norm stats directory already exists for: {new_id}")
+            asset_moves = [
+                (
+                    self.assets_base_dir / config_name / old_id,
+                    self.assets_base_dir / config_name / new_id,
+                )
+                for config_name in POLICY_CONFIG_NAMES
+            ]
+            conflicts = [str(target_assets) for _, target_assets in asset_moves if target_assets.exists()]
+            if conflicts:
+                raise FileExistsError(
+                    f"norm stats directory already exists for: {new_id}: {conflicts}"
+                )
 
-            moved_assets = False
+            moved_assets: list[tuple[Path, Path]] = []
             os.replace(source, target)
             try:
                 loader_output = self.validate_installed(new_id)
-                if source_assets.exists():
+                for source_assets, target_assets in asset_moves:
+                    if not source_assets.exists():
+                        continue
                     target_assets.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(source_assets, target_assets)
-                    moved_assets = True
+                    moved_assets.append((source_assets, target_assets))
             except Exception:
-                if moved_assets and target_assets.exists() and not source_assets.exists():
-                    os.replace(target_assets, source_assets)
+                for source_assets, target_assets in reversed(moved_assets):
+                    if target_assets.exists() and not source_assets.exists():
+                        os.replace(target_assets, source_assets)
                 if target.exists() and not source.exists():
                     os.replace(target, source)
                 raise
@@ -519,7 +533,8 @@ class DatasetEditor:
                 "dataset_id": new_id,
                 "path": str(target),
                 "loader_validation": loader_output,
-                "norm_stats_moved": moved_assets,
+                "norm_stats_moved": bool(moved_assets),
+                "norm_stats_paths_moved": [str(target) for _, target in moved_assets],
                 "warning": "historical checkpoints and task records still reference the old dataset id",
             }
 
@@ -533,28 +548,35 @@ class DatasetEditor:
 
             suffix = f"deleted-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
             dataset_trash = self.dataset_root / f".{dataset_id}.{suffix}"
-            assets = self.assets_base_dir / "pi05_piper_single_arm_lora" / dataset_id
-            assets_trash = assets.parent / f".{dataset_id}.{suffix}"
-            moved_assets = False
+            asset_moves = []
+            for config_name in POLICY_CONFIG_NAMES:
+                assets = self.assets_base_dir / config_name / dataset_id
+                assets_trash = assets.parent / f".{dataset_id}.{suffix}"
+                asset_moves.append((assets, assets_trash))
+            moved_assets: list[tuple[Path, Path]] = []
             os.replace(target, dataset_trash)
             try:
-                if assets.exists():
+                for assets, assets_trash in asset_moves:
+                    if not assets.exists():
+                        continue
                     os.replace(assets, assets_trash)
-                    moved_assets = True
+                    moved_assets.append((assets, assets_trash))
                 shutil.rmtree(dataset_trash)
-                if moved_assets:
+                for _, assets_trash in moved_assets:
                     shutil.rmtree(assets_trash)
             except Exception:
                 if dataset_trash.exists() and not target.exists():
                     os.replace(dataset_trash, target)
-                if moved_assets and assets_trash.exists() and not assets.exists():
-                    os.replace(assets_trash, assets)
+                for assets, assets_trash in reversed(moved_assets):
+                    if assets_trash.exists() and not assets.exists():
+                        os.replace(assets_trash, assets)
                 raise
             return {
                 "operation": "delete_dataset",
                 "dataset_id": dataset_id,
                 "dataset_deleted": True,
-                "norm_stats_deleted": moved_assets,
+                "norm_stats_deleted": bool(moved_assets),
+                "norm_stats_paths_deleted": [str(path) for path, _ in moved_assets],
                 "warning": "historical checkpoints, models, and task records were not deleted",
             }
 
@@ -989,21 +1011,26 @@ class DatasetEditor:
             "path": str(target),
             "backup": str(backup) if had_target else None,
             "loader_validation": loader_output,
-            "norm_stats_invalidated": invalidated,
+            "norm_stats_invalidated": bool(invalidated),
+            "norm_stats_invalidated_paths": invalidated,
             "episodes": info.get("total_episodes"),
             "frames": info.get("total_frames"),
         }
 
-    def _invalidate_norm_stats(self, dataset_id: str) -> str | None:
-        norm_path = self.assets_base_dir / "pi05_piper_single_arm_lora" / dataset_id / "norm_stats.json"
-        if not norm_path.is_file():
-            return None
-        destination = norm_path.with_name(
-            f"norm_stats.invalidated-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.json"
-        )
-        try:
-            os.replace(norm_path, destination)
-        except OSError:
-            norm_path.unlink(missing_ok=True)
-            return str(norm_path)
-        return str(destination)
+    def _invalidate_norm_stats(self, dataset_id: str) -> list[str]:
+        invalidated: list[str] = []
+        for config_name in POLICY_CONFIG_NAMES:
+            norm_path = self.assets_base_dir / config_name / dataset_id / "norm_stats.json"
+            if not norm_path.is_file():
+                continue
+            destination = norm_path.with_name(
+                f"norm_stats.invalidated-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.json"
+            )
+            try:
+                os.replace(norm_path, destination)
+            except OSError:
+                norm_path.unlink(missing_ok=True)
+                invalidated.append(str(norm_path))
+            else:
+                invalidated.append(str(destination))
+        return invalidated

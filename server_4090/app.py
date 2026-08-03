@@ -127,8 +127,16 @@ def safe_int(value: Any, label: str, minimum: int, maximum: int) -> int:
     return parsed
 
 
+def policy_config_name(arm_mode: str) -> str:
+    if arm_mode == "single":
+        return "pi05_piper_single_arm_lora"
+    if arm_mode == "bimanual":
+        return "pi05_piper_bimanual_lora"
+    raise ValueError(f"unsupported arm_mode: {arm_mode!r}")
+
+
 def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
-    """Describe common single-arm and bimanual LeRobot feature layouts for the UI."""
+    """Describe supported single-arm/bimanual LeRobot contracts for the UI."""
     features = info.get("features", {})
     if not isinstance(features, dict):
         features = {}
@@ -140,28 +148,26 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
                 return key, value
         return None, {}
 
-    state_key, state_feature = feature_for("state", "observation.state")
-    action_key, action_feature = feature_for("actions", "action")
+    state_key, state_feature = feature_for("observation.state", "state")
+    action_key, action_feature = feature_for("action", "actions")
     state_shape = state_feature.get("shape")
     action_shape = action_feature.get("shape")
     state_dim = state_shape[-1] if isinstance(state_shape, list) and state_shape else None
     action_dim = action_shape[-1] if isinstance(action_shape, list) and action_shape else None
-
     layouts = {
-        (7, 7): ("joint", "single_arm", "单臂 Joint 7D"),
-        (10, 7): ("delivery", "single_arm", "单臂 Delivery 10D"),
-        (14, 14): ("bimanual_joint", "bimanual", "双臂 Joint 14D"),
-        (20, 14): ("bimanual_delivery", "bimanual", "双臂 Delivery 20D"),
+        (7, 7): ("joint", "single", "单臂 Joint 7D/7D"),
+        (10, 7): ("delivery", "single", "单臂 Delivery 10D/7D"),
+        (14, 14): ("joint", "bimanual", "双臂 Joint 14D/14D"),
+        (20, 14): ("delivery", "bimanual", "双臂 Delivery 20D/14D"),
     }
-    schema, arm_layout, schema_label = layouts.get(
-        (state_dim, action_dim),
-        (
-            "custom",
-            "unknown",
-            f"通用格式 {state_dim if state_dim is not None else '?'}D / "
-            f"{action_dim if action_dim is not None else '?'}D",
-        ),
-    )
+    inferred = layouts.get((state_dim, action_dim))
+    inferred_schema = inferred[0] if inferred else "custom"
+    inferred_arm_mode = inferred[1] if inferred else "unknown"
+    schema = str(info.get("schema") or inferred_schema).lower()
+    arm_mode = str(info.get("arm_mode") or inferred_arm_mode).lower()
+    schema_label = inferred[2] if inferred else f"通用格式 {state_dim or '?'}D/{action_dim or '?'}D"
+    arm_side = "both" if arm_mode == "bimanual" else str(info.get("arm_side") or "right").lower()
+
     media = sorted(
         (
             {"key": key, "type": value.get("dtype")}
@@ -171,48 +177,74 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
         key=lambda item: (str(item["type"]), str(item["key"])),
     )
     media_keys = {str(item["key"]) for item in media}
-    single_joint_media = "observation.images.cam_high" in media_keys and any(
-        key in media_keys
-        for key in ("observation.images.cam_left_wrist", "observation.images.cam_right_wrist")
+    dataset_layout = (
+        "canonical"
+        if state_key == "observation.state" and action_key == "action"
+        else "legacy" if state_key == "state" and action_key == "actions" else "unknown"
     )
-    delivery_media = {"image", "wrist_image"}.issubset(media_keys)
-    training_schema = None
-    if (
-        (state_dim, action_dim) == (7, 7)
-        and state_key == "observation.state"
-        and action_key == "action"
-        and single_joint_media
-    ):
-        training_schema = "joint"
-    elif (
-        (state_dim, action_dim) == (10, 7)
-        and state_key == "state"
-        and action_key == "actions"
-        and delivery_media
-    ):
-        training_schema = "delivery"
+    if dataset_layout == "legacy":
+        required_media = {"image", "wrist_image"}
+    elif arm_mode == "bimanual":
+        required_media = {
+            "observation.images.cam_high",
+            "observation.images.cam_left_wrist",
+            "observation.images.cam_right_wrist",
+        }
+    else:
+        wrist_candidates = {
+            "observation.images.cam_wrist",
+            f"observation.images.cam_{arm_side}_wrist",
+        }
+        required_media = {"observation.images.cam_high"}
+        if not (media_keys & wrist_candidates):
+            required_media.add(f"observation.images.cam_{arm_side}_wrist")
 
+    expected_dims = {
+        ("joint", "single"): (7, 7),
+        ("delivery", "single"): (10, 7),
+        ("joint", "bimanual"): (14, 14),
+        ("delivery", "bimanual"): (20, 14),
+    }.get((schema, arm_mode))
+    layout_supported = dataset_layout == "canonical" or (
+        dataset_layout == "legacy" and schema == "delivery" and arm_mode == "single"
+    )
+    training_supported = bool(
+        expected_dims == (state_dim, action_dim)
+        and layout_supported
+        and required_media.issubset(media_keys)
+        and (arm_side in {"left", "right"} if arm_mode == "single" else arm_side == "both")
+    )
     default_semantics = (
         "eef_delta_base_xyz_left_rotvec_gripper_target"
         if schema == "delivery"
         else "absolute_joint_position" if schema == "joint" else None
     )
+    camera_keys = [
+        key.removeprefix("observation.images.")
+        for key in sorted(media_keys)
+    ]
     return {
         "schema": schema,
         "schema_label": schema_label,
-        "arm_layout": arm_layout,
+        "arm_mode": arm_mode,
+        "arm_layout": "bimanual" if arm_mode == "bimanual" else "single_arm" if arm_mode == "single" else "unknown",
+        "arm_side": arm_side,
+        "dataset_layout": dataset_layout,
         "state_key": state_key,
         "action_key": action_key,
         "state_shape": state_shape,
         "action_shape": action_shape,
         "state_dim": state_dim,
         "action_dim": action_dim,
+        "camera_keys": camera_keys,
         "cameras": [str(item["key"]) for item in media],
         "media": media,
-        "training_schema": training_schema,
-        "training_supported": training_schema is not None,
+        "training_schema": schema if training_supported else None,
+        "training_supported": training_supported,
         "action_semantics": info.get("action_semantics") or default_semantics,
-        "action_offset": info.get("action_offset", 0 if schema == "delivery" else None),
+        "action_source": info.get("action_source"),
+        "action_alignment": info.get("action_alignment"),
+        "action_offset": info.get("action_offset"),
     }
 
 
@@ -1162,8 +1194,9 @@ class PolicyTelemetryStore:
         return max(candidates, key=lambda item: float(item.get("received_at", 0.0)))
 
     def image_path(self, session: str, view: str) -> Path:
-        if view not in {"cam_high", "cam_wrist"}:
-            raise ValueError("view must be cam_high or cam_wrist")
+        allowed = {"cam_high", "cam_wrist", "cam_left_wrist", "cam_right_wrist"}
+        if view not in allowed:
+            raise ValueError(f"view must be one of {sorted(allowed)}")
         path = self._session_dir(session) / f"{view}.jpg"
         if not path.is_file():
             raise FileNotFoundError(f"no policy telemetry image: {view}")
@@ -1441,53 +1474,58 @@ def create_app(config_path: Path) -> Flask:
                     **schema,
                     "norm_stats_ready": (
                         Path(config["assets_base_dir"])
-                        / "pi05_piper_single_arm_lora"
+                        / policy_config_name(schema["arm_mode"])
                         / directory.name
                         / "norm_stats.json"
-                    ).is_file(),
+                    ).is_file() if schema["arm_mode"] in {"single", "bimanual"} else False,
                     "mtime": directory.stat().st_mtime,
                 }
             )
         return datasets
 
     def list_checkpoints() -> list[dict[str, Any]]:
-        config_root = Path(config["checkpoint_base_dir"]) / "pi05_piper_single_arm_lora"
         checkpoints = []
-        if not config_root.exists():
-            return checkpoints
-        for exp_dir in config_root.iterdir():
-            if not exp_dir.is_dir() or exp_dir.name.startswith("."):
+        for arm_mode in ("single", "bimanual"):
+            config_name = policy_config_name(arm_mode)
+            config_root = Path(config["checkpoint_base_dir"]) / config_name
+            if not config_root.exists():
                 continue
-            for step_dir in exp_dir.iterdir():
-                if not step_dir.is_dir() or not step_dir.name.isdigit():
+            for exp_dir in config_root.iterdir():
+                if not exp_dir.is_dir() or exp_dir.name.startswith("."):
                     continue
-                if not (step_dir / "params").is_dir() or not (step_dir / "_CHECKPOINT_METADATA").is_file():
-                    continue
-                dataset_ids = sorted(
-                    path.parent.name
-                    for path in (step_dir / "assets").glob("*/norm_stats.json")
-                    if path.is_file()
-                )
-                mtime = step_dir.stat().st_mtime
-                cache_key = str(step_dir.resolve())
-                cached = checkpoint_size_cache.get(cache_key)
-                if cached is None or cached[0] != mtime:
-                    size_bytes = sum(path.stat().st_size for path in step_dir.rglob("*") if path.is_file())
-                    checkpoint_size_cache[cache_key] = (mtime, size_bytes)
-                else:
-                    size_bytes = cached[1]
-                checkpoints.append(
-                    {
-                        "path": cache_key,
-                        "experiment": exp_dir.name,
-                        "step": int(step_dir.name),
-                        "dataset_ids": dataset_ids,
-                        "mtime": mtime,
-                        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)),
-                        "size_gib": round(size_bytes / 1024**3, 2),
-                    }
-                )
+                for step_dir in exp_dir.iterdir():
+                    if not step_dir.is_dir() or not step_dir.name.isdigit():
+                        continue
+                    if not (step_dir / "params").is_dir() or not (step_dir / "_CHECKPOINT_METADATA").is_file():
+                        continue
+                    dataset_ids = sorted(
+                        path.parent.name
+                        for path in (step_dir / "assets").glob("*/norm_stats.json")
+                        if path.is_file()
+                    )
+                    mtime = step_dir.stat().st_mtime
+                    cache_key = str(step_dir.resolve())
+                    cached = checkpoint_size_cache.get(cache_key)
+                    if cached is None or cached[0] != mtime:
+                        size_bytes = sum(path.stat().st_size for path in step_dir.rglob("*") if path.is_file())
+                        checkpoint_size_cache[cache_key] = (mtime, size_bytes)
+                    else:
+                        size_bytes = cached[1]
+                    checkpoints.append(
+                        {
+                            "path": cache_key,
+                            "config_name": config_name,
+                            "arm_mode": arm_mode,
+                            "experiment": exp_dir.name,
+                            "step": int(step_dir.name),
+                            "dataset_ids": dataset_ids,
+                            "mtime": mtime,
+                            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)),
+                            "size_gib": round(size_bytes / (1024**3), 3),
+                        }
+                    )
         return sorted(checkpoints, key=lambda item: (item["mtime"], item["step"]), reverse=True)
+
 
     @app.get("/api/status")
     def status():
@@ -1613,38 +1651,35 @@ def create_app(config_path: Path) -> Flask:
         source_id = safe_name(payload.get("source_dataset_id") if isinstance(payload, dict) else None, "source dataset id")
         return jsonify(dataset_editor.merge_existing(dataset_id, source_id))
 
-    def parse_dataset(payload: dict[str, Any]) -> tuple[str, str, str]:
+    def parse_dataset(payload: dict[str, Any]) -> tuple[str, str, str, str]:
         dataset_id = safe_name(payload.get("dataset_id"), "dataset id")
-        arm_side = str(payload.get("arm_side", "right"))
-        if arm_side not in {"left", "right"}:
-            raise ValueError("arm_side must be left or right")
         dataset_path = dataset_root / dataset_id
         info = read_json(dataset_path / "meta" / "info.json")
         if not isinstance(info, dict):
             raise ValueError(f"dataset is not installed: {dataset_id}")
-        features = info.get("features", {})
-        if (
-            features.get("state", {}).get("shape") == [10]
-            and features.get("actions", {}).get("shape") == [7]
-            and {"image", "wrist_image"}.issubset(features)
-        ):
-            return dataset_id, arm_side, "delivery"
-
-        state_shape = features.get("observation.state", {}).get("shape")
-        action_shape = features.get("action", {}).get("shape")
-        cameras = [
-            key for key, value in features.items()
-            if value.get("dtype") in {"image", "video"}
-        ]
-        expected_wrist = f"observation.images.cam_{arm_side}_wrist"
-        if state_shape != [7] or action_shape != [7]:
+        contract = describe_dataset_schema(info)
+        if not contract["training_supported"]:
             raise ValueError(
-                "unsupported dataset schema: expected delivery state/actions [10]/[7] "
-                f"or legacy joint [7]/[7], got {state_shape}/{action_shape}"
+                "unsupported dataset contract: "
+                f"layout={contract['dataset_layout']} schema={contract['schema']} "
+                f"arm_mode={contract['arm_mode']} dims={contract['state_shape']}/{contract['action_shape']} "
+                f"cameras={contract['cameras']}"
             )
-        if "observation.images.cam_high" not in cameras or expected_wrist not in cameras:
-            raise ValueError(f"legacy joint schema requires cam_high + {expected_wrist}, got {cameras}")
-        return dataset_id, arm_side, "joint"
+        arm_mode = str(contract["arm_mode"])
+        schema = str(contract["schema"])
+        if arm_mode == "bimanual":
+            arm_side = "both"
+        else:
+            arm_side = str(contract.get("arm_side") or payload.get("arm_side", "right"))
+            requested_side = str(payload.get("arm_side", arm_side))
+            if requested_side in {"left", "right"} and requested_side != arm_side:
+                raise ValueError(
+                    f"requested arm_side={requested_side} conflicts with dataset arm_side={arm_side}"
+                )
+            if arm_side not in {"left", "right"}:
+                raise ValueError("single-arm dataset arm_side must be left or right")
+        return dataset_id, arm_mode, arm_side, schema
+
 
     def parse_gpus(
         payload: dict[str, Any],
@@ -1680,11 +1715,12 @@ def create_app(config_path: Path) -> Flask:
             raise ValueError(f"refusing busy GPU(s): {busy}")
         return gpu_ids
 
-    def norm_stats_path(dataset_id: str) -> Path:
-        return Path(config["assets_base_dir"]) / "pi05_piper_single_arm_lora" / dataset_id / "norm_stats.json"
+    def norm_stats_path(dataset_id: str, arm_mode: str) -> Path:
+        return Path(config["assets_base_dir"]) / policy_config_name(arm_mode) / dataset_id / "norm_stats.json"
 
     def build_norm_command(
         dataset_id: str,
+        arm_mode: str,
         arm_side: str,
         schema: str,
         *,
@@ -1695,6 +1731,7 @@ def create_app(config_path: Path) -> Flask:
         command = [
             config["openpi_python"], openpi_helper, "norm",
             "--dataset-id", dataset_id,
+            "--arm-mode", arm_mode,
             "--arm-side", arm_side,
             "--schema", schema,
             "--assets-base-dir", config["assets_base_dir"],
@@ -1710,7 +1747,7 @@ def create_app(config_path: Path) -> Flask:
     @app.post("/api/tasks/norm")
     def start_norm():
         payload = request.get_json(force=True)
-        dataset_id, arm_side, schema = parse_dataset(payload)
+        dataset_id, arm_mode, arm_side, schema = parse_dataset(payload)
         batch_size = safe_int(payload.get("batch_size", 16), "batch_size", 1, 1024)
         num_workers = safe_int(payload.get("num_workers", 2), "num_workers", 1, 64)
         max_frames = payload.get("max_frames")
@@ -1719,6 +1756,7 @@ def create_app(config_path: Path) -> Flask:
         )
         command = build_norm_command(
             dataset_id,
+            arm_mode,
             arm_side,
             schema,
             batch_size=batch_size,
@@ -1730,12 +1768,13 @@ def create_app(config_path: Path) -> Flask:
             env=build_environment(config, None),
             metadata={
                 "dataset_id": dataset_id,
+                "arm_mode": arm_mode,
                 "arm_side": arm_side,
                 "schema": schema,
                 "batch_size": batch_size,
                 "num_workers": num_workers,
                 "max_frames": parsed_max_frames,
-                "norm_path": str(norm_stats_path(dataset_id)),
+                "norm_path": str(norm_stats_path(dataset_id, arm_mode)),
                 "automatic": False,
             },
         )
@@ -1744,8 +1783,8 @@ def create_app(config_path: Path) -> Flask:
     @app.post("/api/tasks/train")
     def start_train():
         payload = request.get_json(force=True)
-        dataset_id, arm_side, schema = parse_dataset(payload)
-        norm_path = norm_stats_path(dataset_id)
+        dataset_id, arm_mode, arm_side, schema = parse_dataset(payload)
+        norm_path = norm_stats_path(dataset_id, arm_mode)
         gpu_ids = parse_gpus(payload, check_busy=norm_path.is_file())
         exp_name = safe_name(payload.get("exp_name"), "experiment name")
         batch_size = safe_int(payload.get("batch_size", 8), "batch_size", 1, 1024)
@@ -1762,7 +1801,7 @@ def create_app(config_path: Path) -> Flask:
             raise ValueError("mode must be auto, new, resume, or overwrite")
         checkpoint_dir = (
             Path(config["checkpoint_base_dir"])
-            / "pi05_piper_single_arm_lora"
+            / policy_config_name(arm_mode)
             / exp_name
         )
         if mode == "new" and checkpoint_dir.exists():
@@ -1777,6 +1816,7 @@ def create_app(config_path: Path) -> Flask:
         command = [
             config["openpi_python"], openpi_helper, "train",
             "--dataset-id", dataset_id,
+            "--arm-mode", arm_mode,
             "--arm-side", arm_side,
             "--schema", schema,
             "--exp-name", exp_name,
@@ -1795,6 +1835,7 @@ def create_app(config_path: Path) -> Flask:
             command.append("--wandb-enabled")
         metadata = {
             "dataset_id": dataset_id,
+            "arm_mode": arm_mode,
             "arm_side": arm_side,
             "schema": schema,
             "exp_name": exp_name,
@@ -1826,6 +1867,7 @@ def create_app(config_path: Path) -> Flask:
                     if item.get("type") == "norm"
                     and item.get("state") in {"starting", "running"}
                     and item.get("metadata", {}).get("dataset_id") == dataset_id
+                    and item.get("metadata", {}).get("arm_mode") == arm_mode
                     and item.get("metadata", {}).get("arm_side") == arm_side
                     and item.get("metadata", {}).get("schema") == schema
                 ),
@@ -1838,6 +1880,7 @@ def create_app(config_path: Path) -> Flask:
                     "norm",
                     build_norm_command(
                         dataset_id,
+                        arm_mode,
                         arm_side,
                         schema,
                         batch_size=norm_batch_size,
@@ -1846,6 +1889,7 @@ def create_app(config_path: Path) -> Flask:
                     env=build_environment(config, None),
                     metadata={
                         "dataset_id": dataset_id,
+                        "arm_mode": arm_mode,
                         "arm_side": arm_side,
                         "schema": schema,
                         "batch_size": norm_batch_size,
@@ -1867,7 +1911,7 @@ def create_app(config_path: Path) -> Flask:
     @app.post("/api/tasks/policy")
     def start_policy():
         payload = request.get_json(force=True)
-        dataset_id, arm_side, schema = parse_dataset(payload)
+        dataset_id, arm_mode, arm_side, schema = parse_dataset(payload)
         port = safe_int(payload.get("port", 8000), "port", config["policy_port_min"], config["policy_port_max"])
         checkpoint = resolve_under(payload.get("checkpoint", ""), checkpoint_roots)
         if not (checkpoint / "params").exists():
@@ -1924,6 +1968,7 @@ def create_app(config_path: Path) -> Flask:
         command = [
             config["openpi_python"], openpi_helper, "serve",
             "--dataset-id", dataset_id,
+            "--arm-mode", arm_mode,
             "--arm-side", arm_side,
             "--schema", schema,
             "--assets-base-dir", config["assets_base_dir"],
@@ -1942,7 +1987,8 @@ def create_app(config_path: Path) -> Flask:
             "policy", command,
             env=build_environment(config, gpu_ids),
             metadata={
-                "dataset_id": dataset_id, "arm_side": arm_side, "schema": schema,
+                "dataset_id": dataset_id, "arm_mode": arm_mode,
+                "arm_side": arm_side, "schema": schema,
                 "checkpoint": str(checkpoint), "gpu_ids": gpu_ids, "port": port,
                 "ws_url": f"ws://{request.host.split(':')[0]}:{port}",
                 "telemetry_session": telemetry_session, "telemetry_dir": str(telemetry_dir),

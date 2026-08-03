@@ -118,7 +118,7 @@
       <div class="grid">
         <div class="card half">
           <h2>链路与服务器</h2>
-          <div class="architecture"><span>机械臂控制电脑<br><small class="muted">Piper + 两路相机</small></span><b class="arrow">→</b><span>OpenPI WebSocket<br><small class="muted">真实数据面</small></span><b class="arrow">→</b><span>4×4090 Policy<br><small class="muted">推理 + telemetry</small></span></div>
+          <div class="architecture"><span>机械臂控制电脑<br><small class="muted">Piper + 单臂两路 / 双臂三路相机</small></span><b class="arrow">→</b><span>OpenPI WebSocket<br><small class="muted">真实数据面</small></span><b class="arrow">→</b><span>4×4090 Policy<br><small class="muted">推理 + telemetry</small></span></div>
           <p class="muted">Dashboard 仅管理进程、GPU、checkpoint、训练和短时执行授权。真实 state / 图像不经 Dashboard HTTP 转发。</p>
           <div id="serverInfo" class="muted">输入 Token 后刷新。</div>
         </div>
@@ -152,8 +152,8 @@
     <section id="module-training" class="dashboard-module" data-module="training" hidden>
       <div class="module-heading"><div><h2>训练中心</h2><p>归一化、LoRA 微调、训练进度和 loss 曲线。</p></div></div>
       <div class="grid">
-        <div class="card third"><h2>1. 归一化统计</h2><p class="muted">训练提交时若缺失 norm stats 会自动串联执行。</p><form id="normForm"><label>数据集</label><select name="dataset_id" class="dataset-select"></select><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option></select><div class="row"><div><label>Batch size</label><input name="batch_size" type="number" value="16" min="1"></div><div><label>Workers</label><input name="num_workers" type="number" value="2" min="1"></div></div><label>最多帧数（留空=全部）</label><input name="max_frames" type="number" min="1"><p><button type="submit">提交 norm stats</button></p></form></div>
-        <div class="card two-third"><h2>2. 提交 LoRA 微调</h2><form id="trainForm"><div class="row"><div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div><div><label>实验名</label><input name="exp_name" required placeholder="pick_cube_r1"></div></div><div class="row3"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option></select></div><div><label>GPU IDs</label><input name="gpu_ids" value="0,1" placeholder="0,1"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div><div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>Batch</label><input name="batch_size" type="number" value="8"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div><div class="row"><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div><div><label>启动方式</label><select name="mode"><option value="auto">auto（推荐）</option><option value="new">new</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select></div></div><p class="muted">缺少 norm stats 时自动执行 norm→train；任务持久化并支持续训。</p><p><button type="submit">提交训练</button></p></form></div>
+        <div class="card third"><h2>1. 归一化统计</h2><p class="muted">训练提交时若缺失 norm stats 会自动串联执行。</p><form id="normForm"><label>数据集</label><select name="dataset_id" class="dataset-select"></select><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select><div class="row"><div><label>Batch size</label><input name="batch_size" type="number" value="16" min="1"></div><div><label>Workers</label><input name="num_workers" type="number" value="2" min="1"></div></div><label>最多帧数（留空=全部）</label><input name="max_frames" type="number" min="1"><p><button type="submit">提交 norm stats</button></p></form></div>
+        <div class="card two-third"><h2>2. 提交 LoRA 微调</h2><form id="trainForm"><div class="row"><div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div><div><label>实验名</label><input name="exp_name" required placeholder="pick_cube_r1"></div></div><div class="row3"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU IDs</label><input name="gpu_ids" value="0,1" placeholder="0,1"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div><div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>Batch</label><input name="batch_size" type="number" value="8"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div><div class="row"><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div><div><label>启动方式</label><select name="mode"><option value="auto">auto（推荐）</option><option value="new">new</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select></div></div><p class="muted">缺少 norm stats 时自动执行 norm→train；任务持久化并支持续训。</p><p><button type="submit">提交训练</button></p></form></div>
         <div class="card two-third">
           <h2>训练进程管理</h2>
           <p class="muted">查看 Norm / Train 任务状态、PID、依赖关系；已结束任务可删除记录和日志，不会删除 checkpoint 或训练输出。</p>
@@ -177,17 +177,17 @@
     <section id="module-policy" class="dashboard-module" data-module="policy" hidden>
       <div class="module-heading"><div><h2>Policy 管理</h2><p>从 checkpoint 启动、切换、健康检测和实机执行授权。</p></div></div>
       <div class="grid">
-        <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div><div><label>默认 prompt</label><input name="default_prompt"></div></div><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
+        <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div><div><label>默认 prompt</label><input name="default_prompt"></div></div><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
         <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code> 和本地安全检查。已结束的历史进程可删除记录和日志。</p><div class="table-wrap"><table><thead><tr><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端 / telemetry</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div></div>
         <div class="card" id="policyTaskLogCard"><h2>Policy 进程日志</h2><p class="muted">从 Policy 进程表点击“日志”查看最近输出。</p><pre id="policyTaskLog">尚未选择 Policy 进程。</pre></div>
-        <div class="card"><h2>机械臂客户端命令</h2><pre id="policyClientCommand">python robot_observation_bridge.py --host 192.168.101.9 --port 8000 --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16 --instruction "pick up the cube"</pre></div>
+        <div class="card"><h2>机械臂客户端命令</h2><pre id="policyClientCommand">python robot_observation_bridge.py --host 192.168.101.9 --port 8000 --arm-mode single --arm-side right --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16 --instruction "pick up the cube"</pre></div>
       </div>
     </section>
 
     <section id="module-telemetry" class="dashboard-module" data-module="telemetry" hidden>
-      <div class="module-heading"><div><h2>实时遥测</h2><p>只读展示 Policy 实际收到的 state、两路图像、prompt 和预测 action。</p></div></div>
+      <div class="module-heading"><div><h2>实时遥测</h2><p>只读展示 Policy 实际收到的 state、Policy 要求的全部相机图像、prompt 和预测 action。</p></div></div>
       <div class="grid">
-        <div class="card"><h2>Policy 实时观测</h2><div id="robotObservation" class="warn">尚未收到 telemetry。</div><div class="preview-grid"><div><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div><div><h3>Prompt / predicted action</h3><pre id="policyAction">action: -</pre></div></div><div id="robotImages" class="preview-grid"><img id="previewHigh" alt="high camera"><img id="previewWrist" alt="wrist camera"></div></div>
+        <div class="card"><h2>Policy 实时观测</h2><div id="robotObservation" class="warn">尚未收到 telemetry。</div><div class="preview-grid"><div><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div><div><h3>Prompt / predicted action</h3><pre id="policyAction">action: -</pre></div></div><div id="robotImages" class="preview-grid"><figure><figcaption>顶部全局</figcaption><img id="previewHigh" alt="high camera"></figure><figure id="singleWristPreview"><figcaption>单臂腕部</figcaption><img id="previewWrist" alt="wrist camera"></figure><figure id="leftWristPreview" hidden><figcaption>左臂腕部</figcaption><img id="previewLeftWrist" alt="left wrist camera"></figure><figure id="rightWristPreview" hidden><figcaption>右臂腕部</figcaption><img id="previewRightWrist" alt="right wrist camera"></figure></div></div>
       </div>
     </section>
   </main>
@@ -320,7 +320,7 @@ function fillDatasets(items) {
     <tr>
       <td><code>${esc(d.id)}</code><br><span class="muted">${esc(d.robot_type)}</span></td>
       <td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps<br>${d.norm_stats_ready ? '<span class="ok">norm ready</span>' : '<span class="warn">norm 需计算</span>'}</td>
-      <td><span class="pill">${esc(d.schema_label || d.schema)}</span> ${d.training_supported ? '<span class="ok">训练兼容</span>' : '<span class="muted">仅管理 / 预览</span>'}<br><code>${esc(d.state_key || 'state?')}</code> ${esc(JSON.stringify(d.state_shape))} → <code>${esc(d.action_key || 'action?')}</code> ${esc(JSON.stringify(d.action_shape))}<br>${(d.media || []).map(m => `<span class="pill">${esc(m.type)} · ${esc(String(m.key).replace('observation.images.', ''))}</span>`).join('') || '<span class="muted">无相机媒体</span>'}</td>
+      <td><span class="pill">${esc(d.schema_label || d.schema)}</span> <span class="pill">${esc(d.arm_mode || '-')}</span> <span class="pill">${esc(d.dataset_layout || '-')}</span> ${d.training_supported ? '<span class="ok">训练兼容</span>' : '<span class="muted">仅管理 / 预览</span>'}<br><code>${esc(d.state_key || 'state?')}</code> ${esc(JSON.stringify(d.state_shape))} → <code>${esc(d.action_key || 'action?')}</code> ${esc(JSON.stringify(d.action_shape))}<br>state/action=${esc(d.state_dim || '?')}D/${esc(d.action_dim || '?')}D · arm=${esc(d.arm_side || '-')}<br>${(d.media || []).map(m => `<span class="pill">${esc(m.type)} · ${esc(String(m.key).replace('observation.images.', ''))}</span>`).join('') || '<span class="muted">无相机媒体</span>'}</td>
       <td>${esc(d.action_semantics || '-')}<br>offset=${d.action_offset == null ? '-' : esc(d.action_offset)}</td>
       <td><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button><button class="inline secondary" onclick="renameDataset('${esc(d.id)}')">重命名</button><button class="inline danger" onclick="deleteDataset('${esc(d.id)}')">删除数据集</button></td>
     </tr>`).join('') || '<tr><td colspan="5" class="muted">暂无数据集</td></tr>';
@@ -328,14 +328,27 @@ function fillDatasets(items) {
   const trainable = items.filter(d => d.training_supported);
   document.querySelectorAll('.dataset-select').forEach(select => {
     const old = select.value;
-    select.innerHTML = trainable.map(d => `<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.schema_label || d.schema)}</option>`).join('') || '<option value="" disabled>没有兼容单臂训练的数据集</option>';
+    select.innerHTML = trainable.map(d => `<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.arm_mode || '-')} · ${esc(d.schema_label || d.schema)}</option>`).join('') || '<option value="" disabled>没有兼容训练的数据集</option>';
     if (trainable.some(d => d.id === old)) select.value = old;
+    syncArmSideForDatasetSelect(select);
   });
   const editor = document.getElementById('editorDataset');
   const previous = editor.value;
   editor.innerHTML = items.map(d => `<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.episodes)} episodes</option>`).join('');
   if (items.some(d => d.id === previous)) editor.value = previous;
   updateMergeSourceOptions(items);
+}
+
+function datasetById(datasetId) {
+  return ((latestStatus && latestStatus.datasets) || []).find(d => d.id === datasetId);
+}
+
+function syncArmSideForDatasetSelect(datasetSelect) {
+  const dataset = datasetById(datasetSelect.value);
+  const form = datasetSelect.closest('form');
+  const armSelect = form && form.querySelector('select[name="arm_side"]');
+  if (!dataset || !armSelect) return;
+  armSelect.value = dataset.arm_mode === 'bimanual' ? 'both' : (dataset.arm_side || 'right');
 }
 
 function updateMergeSourceOptions(items = (latestStatus && latestStatus.datasets) || []) {
@@ -636,19 +649,22 @@ async function mergeDatasetEpisodes() {
 
 function checkpointLabel(c) {
   const size = c.size_gib == null ? '' : ` · ${Number(c.size_gib).toFixed(1)} GiB`;
-  return `${c.experiment} / step ${c.step} · ${c.updated_at}${size}`;
+  return `${c.experiment} / step ${c.step} · ${c.arm_mode || '-'} · ${c.updated_at}${size}`;
 }
 
 function fillCheckpoints(items) {
   document.getElementById('checkpoints').innerHTML = items.map(c => `
-    <tr><td><strong>${esc(c.experiment)}</strong><br>step ${esc(c.step)}</td>
-    <td>${(c.dataset_ids || []).map(id => `<span class="pill">${esc(id)}</span>`).join('') || '<span class="muted">-</span>'}</td>
+    <tr><td><strong>${esc(c.experiment)}</strong><br>step ${esc(c.step)} · <span class="pill">${esc(c.arm_mode || '-')}</span></td>
+    <td>${(c.dataset_ids || []).map(id => `<span class="pill">${esc(id)}</span>`).join('') || '<span class="muted">-</span>'}<br><span class="muted">${esc(c.config_name || '-')}</span></td>
     <td>${c.size_gib == null ? '-' : `${Number(c.size_gib).toFixed(1)} GiB`}<br><span class="muted">${esc(c.updated_at || '-')}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">暂无完整 checkpoint</td></tr>';
 
   const select = document.getElementById('checkpointSelect');
   const dataset = document.getElementById('policyDataset').value;
+  const datasetInfo = datasetById(dataset);
   const old = select.value;
-  const matches = items.filter(c => Array.isArray(c.dataset_ids) && c.dataset_ids.includes(dataset));
+  const matches = items.filter(c => Array.isArray(c.dataset_ids)
+    && c.dataset_ids.includes(dataset)
+    && (!datasetInfo || c.arm_mode === datasetInfo.arm_mode));
   select.innerHTML = matches.map(c => `<option value="${esc(c.path)}">${esc(checkpointLabel(c))}</option>`).join('');
   if (matches.some(c => c.path === old)) select.value = old;
   const selected = matches.find(c => c.path === select.value);
@@ -895,14 +911,14 @@ function fillTasks(items) {
     const health = t.policy_healthy === true ? '<span class="ok">/healthz OK</span>' : t.state === 'running' ? '<span class="bad">/healthz FAIL</span>' : '<span class="muted">未运行</span>';
     const badge = m.external ? '<br><span class="pill warn">外部进程已接管</span>' : '';
     const deletable = TERMINAL_STATES.has(t.state);
-    return `<tr><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid || '-')}${badge}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal ? `<br>${esc(t.stop_signal)}` : ''}</td><td>GPU ${esc((m.gpu_ids || []).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.schema || '-')}</span></td><td>dataset=${esc(m.dataset_id)}<br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}','policy')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','policy')">删除记录</button>` : ''}</td></tr>`;
+    return `<tr><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid || '-')}${badge}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal ? `<br>${esc(t.stop_signal)}` : ''}</td><td>GPU ${esc((m.gpu_ids || []).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.arm_mode || '-')}</span> <span class="pill">${esc(m.schema || '-')}</span></td><td>dataset=${esc(m.dataset_id)}<br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}','policy')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','policy')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="6" class="muted">暂无 Policy 进程；可在上方创建。</td></tr>';
 
   const jobs = items.filter(t => t.type !== 'policy');
   document.getElementById('jobs').innerHTML = jobs.map(t => {
     const m = t.metadata || {};
     const active = ACTIVE_STATES.has(t.state);
-    const params = `dataset=${esc(m.dataset_id || '-')} · schema=${esc(m.schema || '-')}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}` : `<br>batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}`;
+    const params = `dataset=${esc(m.dataset_id || '-')} · arm=${esc(m.arm_mode || '-')} · schema=${esc(m.schema || '-')}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}` : `<br>batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}`;
     const deletable = TERMINAL_STATES.has(t.state);
     return `<tr><td><code>${esc(t.id)}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${jobDependencySummary(t)}${t.start_error ? `<br><span class="bad">${esc(t.start_error)}</span>` : ''}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}','training')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','training')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="4" class="muted">暂无 Norm / Train 任务</td></tr>';
@@ -971,21 +987,49 @@ function updateClientCommand() {
     const task = latestStatus.tasks.find(t => t.id === selected);
     if (task && task.metadata && task.metadata.port) port = task.metadata.port;
   }
-  document.getElementById('policyClientCommand').textContent = `python robot_observation_bridge.py \\\n  --host 192.168.101.9 \\\n  --port ${port} \\\n  --can can0 \\\n  --cam-high-device /dev/video8 \\\n  --cam-wrist-device /dev/video16 \\\n  --instruction "pick up the cube"`;
+  const dataset = datasetById(document.getElementById('policyDataset').value);
+  const armMode = dataset && dataset.arm_mode === 'bimanual' ? 'bimanual' : 'single';
+  const armSide = armMode === 'bimanual' ? 'both' : ((dataset && dataset.arm_side) || document.getElementById('policyArm').value || 'right');
+  const robotArgs = armMode === 'bimanual'
+    ? `  --arm-mode bimanual \\
+  --arm-side both \\
+  --left-can can0 \\
+  --right-can can1 \\
+  --cam-high-device /dev/video8 \\
+  --cam-left-wrist-device /dev/video14 \\
+  --cam-right-wrist-device /dev/video16`
+    : `  --arm-mode single \\
+  --arm-side ${armSide} \\
+  --can can0 \\
+  --cam-high-device /dev/video8 \\
+  --cam-wrist-device /dev/video16`;
+  document.getElementById('policyClientCommand').textContent = `python robot_observation_bridge.py \\
+  --host 192.168.101.9 \\
+  --port ${port} \\
+${robotArgs} \\
+  --instruction "pick up the cube"`;
 }
 
 async function loadObservationPreviews(obs) {
   if (!obs || !obs.telemetry_session) return;
   try {
     const suffix = `?v=${encodeURIComponent(obs.sequence)}`;
-    const [high, wrist] = await Promise.all([
-      apiBlob(`/api/policy-telemetry/${encodeURIComponent(obs.telemetry_session)}/image/cam_high${suffix}`),
-      apiBlob(`/api/policy-telemetry/${encodeURIComponent(obs.telemetry_session)}/image/cam_wrist${suffix}`),
-    ]);
+    const session = encodeURIComponent(obs.telemetry_session);
+    const bimanual = obs.arm_mode === 'bimanual';
+    const keys = bimanual ? ['cam_high', 'cam_left_wrist', 'cam_right_wrist'] : ['cam_high', 'cam_wrist'];
+    const blobs = await Promise.all(keys.map(key => apiBlob(`/api/policy-telemetry/${session}/image/${key}${suffix}`)));
     previewUrls.forEach(URL.revokeObjectURL);
-    previewUrls = [URL.createObjectURL(high), URL.createObjectURL(wrist)];
+    previewUrls = blobs.map(blob => URL.createObjectURL(blob));
     document.getElementById('previewHigh').src = previewUrls[0];
-    document.getElementById('previewWrist').src = previewUrls[1];
+    document.getElementById('singleWristPreview').hidden = bimanual;
+    document.getElementById('leftWristPreview').hidden = !bimanual;
+    document.getElementById('rightWristPreview').hidden = !bimanual;
+    if (bimanual) {
+      document.getElementById('previewLeftWrist').src = previewUrls[1];
+      document.getElementById('previewRightWrist').src = previewUrls[2];
+    } else {
+      document.getElementById('previewWrist').src = previewUrls[1];
+    }
   } catch (error) {
     console.warn('telemetry preview refresh failed', error);
   }
@@ -1009,9 +1053,14 @@ function fillObservation(obs) {
   status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · 服务端=${control.mode || 'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open ? 'OPEN' : 'CLOSED'} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
   const joint = obs.schema === 'joint';
   const labels = joint ? ['joint1(rad)', 'joint2(rad)', 'joint3(rad)', 'joint4(rad)', 'joint5(rad)', 'joint6(rad)', 'gripper_opening(m)'] : ['x(m)', 'y(m)', 'z(m)', 'r6d_c0_x', 'r6d_c0_y', 'r6d_c0_z', 'r6d_c1_x', 'r6d_c1_y', 'r6d_c1_z', 'gripper_closed'];
-  const values = (obs.state || []).map((v, i) => `${labels[i] || i}: ${Number(v).toFixed(6)}`);
-  document.getElementById('robotStateTitle').textContent = joint ? '7D joint state' : '10D delivery state';
-  document.getElementById('robotState').textContent = `schema=${obs.schema} arm=${obs.arm_side} dim=${obs.state_dim}\n${values.join('\n')}`;
+  const perArmDim = joint ? 7 : 10;
+  const state = obs.state || [];
+  const formatArm = (side, values) => `[${side}]\n${values.map((v, i) => `${labels[i] || i}: ${Number(v).toFixed(6)}`).join('\n')}`;
+  const values = obs.arm_mode === 'bimanual'
+    ? `${formatArm('left', state.slice(0, perArmDim))}\n\n${formatArm('right', state.slice(perArmDim, perArmDim * 2))}`
+    : state.map((v, i) => `${labels[i] || i}: ${Number(v).toFixed(6)}`).join('\n');
+  document.getElementById('robotStateTitle').textContent = `${obs.state_dim}D ${obs.arm_mode === 'bimanual' ? 'bimanual ' : ''}${obs.schema} state`;
+  document.getElementById('robotState').textContent = `schema=${obs.schema} arm_mode=${obs.arm_mode || 'single'} arm=${obs.arm_side} dim=${obs.state_dim}\n${values}`;
   document.getElementById('policyAction').textContent = `prompt: ${obs.prompt || '-'}\nactions shape: ${JSON.stringify(obs.actions_shape || [])}\nfirst action: ${JSON.stringify(obs.first_action || [])}\nmin/max: ${obs.action_min} / ${obs.action_max}\npolicy elapsed: ${Number(obs.policy_elapsed_s || 0).toFixed(4)}s\nserver gate: ${control.mode || 'shadow'} (revision ${control.revision || 0})\nclient allow: ${Boolean(obs.client_allow_execution)}\nclient state: ${obs.client_execution_state || 'unknown'}\nblocked reason: ${obs.client_blocked_reason || '-'}\nlast command: ${fmtTime(obs.client_last_command_at)}`;
   const key = `${obs.telemetry_session}:${obs.sequence}`;
   if (key !== latestTelemetryKey) {
@@ -1149,7 +1198,11 @@ window.addEventListener('beforeunload', () => {
   previewUrls.forEach(URL.revokeObjectURL);
 });
 
-document.getElementById('policyDataset').addEventListener('change', () => fillCheckpoints((latestStatus && latestStatus.checkpoints) || []));
+document.querySelectorAll('.dataset-select').forEach(select => select.addEventListener('change', () => {
+  syncArmSideForDatasetSelect(select);
+  if (select.id === 'policyDataset') fillCheckpoints((latestStatus && latestStatus.checkpoints) || []);
+  updateClientCommand();
+}));
 document.getElementById('replacePolicy').addEventListener('change', () => updatePolicyOperation(true));
 document.getElementById('policyPort').addEventListener('input', updateClientCommand);
 document.getElementById('editorDataset').addEventListener('change', () => {

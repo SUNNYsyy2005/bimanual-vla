@@ -1,7 +1,8 @@
 """Export collected NPZ episodes to LeRobot v2.1.
 
-The exporter keeps only successful episodes by default and writes the exact
-10D state / 7D action schema required by the Piper delivery format.
+The exporter keeps only successful episodes by default and writes canonical
+LeRobot ``observation.state`` / ``action`` fields for single-arm or bimanual
+Piper episodes in either joint or delivery schema.
 
 Example:
     python export_lerobot.py \
@@ -13,7 +14,6 @@ Example:
 from __future__ import annotations
 
 import argparse
-import inspect
 from pathlib import Path
 
 import numpy as np
@@ -76,20 +76,33 @@ def _validate_inputs(
     return successful
 
 
-def _load_episode_arrays(path: Path):
+def _load_episode(path: Path, contract):
     with np.load(path, allow_pickle=False) as data:
-        return (
-            np.asarray(data["state"], dtype=np.float32),
-            np.asarray(data["actions"], dtype=np.float32),
-            np.asarray(data["image"], dtype=np.uint8),
-            np.asarray(data["wrist_image"], dtype=np.uint8),
-        )
+        state_key = "state" if "state" in data.files else "observation.state"
+        action_key = "actions" if "actions" in data.files else "action"
+        states = np.asarray(data[state_key], dtype=np.float32)
+        actions = np.asarray(data[action_key], dtype=np.float32)
+        timestamps = np.asarray(data["timestamps"], dtype=np.float64)
+        images = {
+            key: np.asarray(data[contract.image_field(key)], dtype=np.uint8)
+            for key in contract.camera_keys
+        }
+        task_name = str(np.asarray(data["task"]).item()) if "task" in data.files else path.stem
+        instruction = str(np.asarray(data["instruction"]).item())
+        success = bool(np.asarray(data["success"]).item())
+    return {
+        "states": states,
+        "actions": actions,
+        "timestamps": timestamps,
+        "images": images,
+        "task_name": task_name,
+        "instruction": instruction,
+        "success": success,
+        "metadata": {"source_npz": path.name},
+    }
 
 
 def run(args):
-    if args.fps != 20:
-        raise SystemExit("The Piper delivery format requires fps=20.")
-
     paths = sorted(Path(args.input_dir).glob("ep_*.npz"))
     if not paths:
         raise SystemExit(f"No episodes found in {args.input_dir}")
@@ -99,62 +112,58 @@ def run(args):
         target_fps=args.fps,
         allow_incomplete_gripper_coverage=args.allow_incomplete_gripper_coverage,
     )
+    if not successful:
+        raise SystemExit("No successful episodes are available for export")
     if args.validate_only:
         print("Validation complete; no LeRobot dataset was written.")
         return
 
-    try:
-        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-        codebase_version = "v2.1"
-    except ImportError:
-        try:
-            from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
-            codebase_version = CODEBASE_VERSION
-        except ImportError as exc:
-            raise SystemExit(
-                "LeRobot is not installed in this environment. Install the project "
-                "environment containing lerobot, then rerun this exporter."
-            ) from exc
+    from pi0_dataset import Pi0LeRobotDatasetWriter
+    from piper_data_contract import infer_episode_contract
 
-    if codebase_version != "v2.1":
-        raise SystemExit(
-            f"Installed LeRobot creates datasets with codebase_version={codebase_version}, "
-            "but this delivery requires LeRobot v2.1. Use the OpenPI-pinned "
-            "LeRobot environment before exporting."
-        )
-
-    create_kwargs = {
-        "repo_id": args.repo_id,
-        "robot_type": "piper",
-        "fps": args.fps,
-        "features": FEATURES,
-        "use_videos": False,
-    }
-    if args.root is not None and "root" in inspect.signature(LeRobotDataset.create).parameters:
-        create_kwargs["root"] = args.root
-    dataset = LeRobotDataset.create(**create_kwargs)
+    first_path = successful[0].path
+    with np.load(first_path, allow_pickle=False) as data:
+        contract = infer_episode_contract(data)
+    root = Path(args.root or args.repo_id).expanduser()
+    writer = Pi0LeRobotDatasetWriter(
+        root,
+        fps=args.fps,
+        robot_type=contract.robot_type,
+        state_names=list(contract.state_names),
+        action_names=list(contract.action_names),
+        camera_keys=list(contract.camera_keys),
+        image_hw=(224, 224),
+        schema=contract.schema,
+        arm_mode=contract.arm_mode,
+        arm_side=contract.arm_side,
+        action_source=contract.action_source,
+        action_alignment=contract.action_alignment,
+        action_offset=contract.action_offset,
+    )
 
     count = 0
     frames = 0
     for stats in successful:
-        state, actions, image, wrist = _load_episode_arrays(stats.path)
-        for i in range(len(state)):
-            dataset.add_frame({
-                "image": image[i],
-                "wrist_image": wrist[i],
-                "state": state[i],
-                "actions": actions[i],
-            }, task=stats.instruction, timestamp=i / args.fps)
-        dataset.save_episode()
+        with np.load(stats.path, allow_pickle=False) as data:
+            episode_contract = infer_episode_contract(data)
+        if episode_contract != contract:
+            raise SystemExit(
+                f"episode contract mismatch: {stats.path}: {episode_contract} != {contract}"
+            )
+        episode = _load_episode(stats.path, contract)
+        index = writer.append_episode(**episode)
         count += 1
-        frames += len(state)
+        frames += len(episode["states"])
         print(
-            f"Exported {stats.path} ({len(state)} frames, "
-            f"instruction={stats.instruction!r})"
+            f"Exported {stats.path} -> episode {index:06d} "
+            f"({len(episode['states'])} frames, instruction={stats.instruction!r})"
         )
 
-    print(f"Export complete: episodes={count}, frames={frames}, fps={args.fps}")
-
+    print(
+        f"Export complete: root={root} schema={contract.schema} "
+        f"arm={contract.arm_mode}/{contract.arm_side} episodes={count} "
+        f"frames={frames} fps={args.fps}"
+    )
 
 def main():
     ap = argparse.ArgumentParser()

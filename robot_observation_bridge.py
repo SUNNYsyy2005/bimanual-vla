@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run the official OpenPI client from the computer attached to one Piper arm.
+"""Run the official OpenPI client attached to one or two Piper arms.
 
-The client is fail-closed and automatically follows a validated ``delivery`` or
-``joint`` policy metadata contract. By default it only sends real observations
+The client is fail-closed and follows validated single-arm/bimanual ``delivery``
+or ``joint`` policy metadata. By default it only sends real observations
 and prints predictions. Robot motion requires both a time-limited Dashboard
 ``execute`` authorization and the local ``--allow-execution`` flag. Only the
 first action of each returned chunk is considered, and every command passes
@@ -51,9 +51,19 @@ JOINT_ACTION_SEMANTICS = frozenset(
 DEFAULT_POLICY_HOST = "192.168.101.9"
 DEFAULT_POLICY_PORT = 8000
 DEFAULT_CAN = "can0"
+DEFAULT_LEFT_CAN = "can0"
+DEFAULT_RIGHT_CAN = "can1"
 DEFAULT_HIGH_DEVICE = "/dev/video8"
 DEFAULT_WRIST_DEVICE = "/dev/video16"
+DEFAULT_LEFT_WRIST_DEVICE = "/dev/video14"
+DEFAULT_RIGHT_WRIST_DEVICE = "/dev/video16"
 CAMERA_SOURCE_HW = (240, 424)
+# Real pick-cube delivery data support, expanded by at least one 15 mm command.
+# Override these CLI bounds for a different calibrated robot/table setup.
+DEFAULT_WORKSPACE_X_M = (-0.04, 0.30)
+DEFAULT_WORKSPACE_Y_M = (0.02, 0.52)
+DEFAULT_WORKSPACE_Z_M = (0.12, 0.50)
+DEFAULT_GRIPPER_RANGE_TOLERANCE = 0.02
 
 
 class ExecutionBlocked(RuntimeError):
@@ -70,6 +80,7 @@ class PolicyProtocol:
     arm_side: str
     action_semantics: str
     camera_keys: tuple[str, ...]
+    arm_mode: str = "single"
 
 
 def connect_piper(can_name: str) -> Any:
@@ -145,38 +156,49 @@ def arm_status_dict(piper: Any) -> dict[str, Any]:
     }
 
 
-def validate_policy_metadata(metadata: dict[str, Any], arm_side: str) -> PolicyProtocol:
-    """Validate and normalize a supported delivery or joint server contract."""
+def validate_policy_metadata(
+    metadata: dict[str, Any],
+    arm_side: str,
+    arm_mode: str = "single",
+) -> PolicyProtocol:
+    """Validate server dimensions/cameras before any robot command is possible."""
+    advertised_mode = str(metadata.get("arm_mode") or "single")
+    expected_side = "both" if arm_mode == "bimanual" else arm_side
+    expected_action_dim = 14 if arm_mode == "bimanual" else 7
     common_expected = {
         "transport": "openpi_websocket_v1",
-        "action_dim": 7,
-        "arm_side": arm_side,
+        "arm_mode": arm_mode,
+        "action_dim": expected_action_dim,
+        "arm_side": expected_side,
     }
+    comparable = dict(metadata, arm_mode=advertised_mode)
     errors = [
-        f"{key}={metadata.get(key)!r}, expected {value!r}"
+        f"{key}={comparable.get(key)!r}, expected {value!r}"
         for key, value in common_expected.items()
-        if metadata.get(key) != value
+        if comparable.get(key) != value
     ]
 
     schema = metadata.get("schema")
     if schema == "delivery":
-        expected_state_dim = 10
+        expected_state_dim = 20 if arm_mode == "bimanual" else 10
         expected_semantics = {"eef_delta_base_xyz_left_rotvec_gripper_target"}
-        expected_camera_keys = {"cam_high", "cam_wrist"}
     elif schema == "joint":
-        expected_state_dim = 7
+        expected_state_dim = 14 if arm_mode == "bimanual" else 7
         expected_semantics = JOINT_ACTION_SEMANTICS
-        expected_camera_keys = {"cam_high", f"cam_{arm_side}_wrist"}
     else:
         expected_state_dim = None
         expected_semantics = set()
-        expected_camera_keys = set()
         errors.append(f"schema={schema!r}, expected 'delivery' or 'joint'")
 
+    if arm_mode == "bimanual":
+        expected_camera_keys = {"cam_high", "cam_left_wrist", "cam_right_wrist"}
+    elif schema == "delivery":
+        expected_camera_keys = {"cam_high", "cam_wrist"}
+    else:
+        expected_camera_keys = {"cam_high", f"cam_{arm_side}_wrist"}
+
     if expected_state_dim is not None and metadata.get("state_dim") != expected_state_dim:
-        errors.append(
-            f"state_dim={metadata.get('state_dim')!r}, expected {expected_state_dim!r}"
-        )
+        errors.append(f"state_dim={metadata.get('state_dim')!r}, expected {expected_state_dim!r}")
     action_semantics = metadata.get("action_semantics")
     if expected_semantics and action_semantics not in expected_semantics:
         errors.append(
@@ -184,12 +206,9 @@ def validate_policy_metadata(metadata: dict[str, Any], arm_side: str) -> PolicyP
         )
     camera_keys = metadata.get("camera_keys")
     if (
-        expected_camera_keys
-        and (
-            not isinstance(camera_keys, (list, tuple))
-            or len(camera_keys) != len(expected_camera_keys)
-            or set(camera_keys) != expected_camera_keys
-        )
+        not isinstance(camera_keys, (list, tuple))
+        or len(camera_keys) != len(expected_camera_keys)
+        or set(camera_keys) != expected_camera_keys
     ):
         errors.append(f"camera_keys={camera_keys!r}, expected {sorted(expected_camera_keys)!r}")
     if errors:
@@ -197,6 +216,7 @@ def validate_policy_metadata(metadata: dict[str, Any], arm_side: str) -> PolicyP
 
     return PolicyProtocol(
         schema=str(schema),
+        arm_mode=advertised_mode,
         state_dim=int(metadata["state_dim"]),
         action_dim=int(metadata["action_dim"]),
         arm_side=str(metadata["arm_side"]),
@@ -205,7 +225,7 @@ def validate_policy_metadata(metadata: dict[str, Any], arm_side: str) -> PolicyP
     )
 
 
-def connect_policy(host: str, port: int, arm_side: str) -> tuple[Any, PolicyProtocol]:
+def connect_policy(host: str, port: int, arm_side: str, arm_mode: str = "single") -> tuple[Any, PolicyProtocol]:
     """Create the official OpenPI client and validate the server handshake."""
     from openpi_client.websocket_client_policy import WebsocketClientPolicy
 
@@ -215,7 +235,7 @@ def connect_policy(host: str, port: int, arm_side: str) -> tuple[Any, PolicyProt
         metadata = policy.get_server_metadata()
         if not isinstance(metadata, dict):
             raise RuntimeError(f"invalid policy metadata: {type(metadata).__name__}")
-        protocol = validate_policy_metadata(metadata, arm_side)
+        protocol = validate_policy_metadata(metadata, arm_side, arm_mode)
     except Exception:
         close_policy(policy)
         raise
@@ -234,7 +254,7 @@ def close_policy(policy: Any | None) -> None:
             pass
 
 
-def first_action(result: dict[str, Any]) -> np.ndarray:
+def first_action(result: dict[str, Any], action_dim: int = 7) -> np.ndarray:
     actions = np.asarray(result.get("actions"), dtype=np.float64)
     if actions.ndim == 1:
         action = actions
@@ -242,8 +262,8 @@ def first_action(result: dict[str, Any]) -> np.ndarray:
         action = actions[0]
     else:
         raise ExecutionBlocked(f"invalid action chunk shape {actions.shape}")
-    if action.shape != (len(ACTION_NAMES),) or not np.all(np.isfinite(action)):
-        raise ExecutionBlocked(f"first action must be finite 7D, got {action.shape}")
+    if action.shape != (action_dim,) or not np.all(np.isfinite(action)):
+        raise ExecutionBlocked(f"first action must be finite {action_dim}D, got {action.shape}")
     return action
 
 
@@ -254,6 +274,7 @@ def build_checked_target(
     max_translation_step_m: float,
     max_rotation_step_rad: float,
     max_gripper_step: float,
+    gripper_range_tolerance: float,
     workspace_x: tuple[float, float],
     workspace_y: tuple[float, float],
     workspace_z: tuple[float, float],
@@ -273,11 +294,17 @@ def build_checked_target(
         raise ExecutionBlocked(
             f"rotation step {rotation_norm:.5f}rad exceeds {max_rotation_step_rad:.5f}rad"
         )
-    if not 0.0 <= float(action[6]) <= 1.0:
-        raise ExecutionBlocked(f"gripper target {action[6]:.5f} is outside [0,1]")
-    if abs(float(action[6] - state[9])) > max_gripper_step:
+    raw_gripper = float(action[6])
+    if raw_gripper < -gripper_range_tolerance or raw_gripper > 1.0 + gripper_range_tolerance:
         raise ExecutionBlocked(
-            f"gripper step {abs(float(action[6] - state[9])):.5f} exceeds {max_gripper_step:.5f}"
+            f"gripper target {raw_gripper:.5f} exceeds [0,1] tolerance "
+            f"{gripper_range_tolerance:.5f}"
+        )
+    gripper = float(np.clip(raw_gripper, 0.0, 1.0))
+    gripper_step = abs(gripper - float(state[9]))
+    if gripper_step > max_gripper_step:
+        raise ExecutionBlocked(
+            f"gripper step {gripper_step:.5f} exceeds {max_gripper_step:.5f}"
         )
 
     target_xyz = state[:3] + action[:3]
@@ -290,7 +317,7 @@ def build_checked_target(
     # Collection uses R_next @ R_current.T, so reconstruct with left multiplication.
     target_rotation = Rotation.from_rotvec(action[3:6]).as_matrix() @ current_rotation
     target_rpy_deg = Rotation.from_matrix(target_rotation).as_euler("xyz", degrees=True)
-    target_gripper_m = (1.0 - float(action[6])) * GRIPPER_MAX_M
+    target_gripper_m = (1.0 - gripper) * GRIPPER_MAX_M
     return target_xyz, target_rpy_deg, target_gripper_m
 
 
@@ -337,10 +364,13 @@ def build_checked_joint_target(
 
 
 class ExecutionController:
-    def __init__(self, piper: Any, args: argparse.Namespace):
-        self.piper = piper
+    def __init__(self, piper: Any | dict[str, Any], args: argparse.Namespace):
         self.args = args
-        self.robot_enabled = False
+        self.arm_mode = getattr(args, "arm_mode", "single")
+        self.arm_side = getattr(args, "arm_side", "right")
+        self.pipers = piper if isinstance(piper, dict) else {self.arm_side: piper}
+        self.piper = next(iter(self.pipers.values()))  # Backward-compatible test/access alias.
+        self.robot_enabled: set[str] = set()
         self.state = "client_disabled" if not args.allow_execution else "shadow"
         self.blocked_reason = "local --allow-execution is absent" if not args.allow_execution else "dashboard is shadow"
         self.last_command_at: float | None = None
@@ -362,14 +392,14 @@ class ExecutionController:
         self.blocked_reason = reason[:500]
         return False
 
-    def _enable_robot(self) -> None:
+    def _enable_robot(self, side: str, piper: Any) -> None:
         deadline = time.monotonic() + self.args.enable_timeout_s
         while time.monotonic() < deadline:
-            if self.piper.EnablePiper():
-                self.robot_enabled = True
+            if piper.EnablePiper():
+                self.robot_enabled.add(side)
                 return
             time.sleep(0.02)
-        raise ExecutionBlocked(f"Piper enable timed out after {self.args.enable_timeout_s:.1f}s")
+        raise ExecutionBlocked(f"{side} Piper enable timed out after {self.args.enable_timeout_s:.1f}s")
 
     def process(
         self,
@@ -380,7 +410,7 @@ class ExecutionController:
         image_timestamps: dict[str, float],
         infer_elapsed_s: float,
     ) -> bool:
-        """Return True only after sending one checked target to Piper."""
+        """Validate every arm first, then publish one synchronized checked command."""
         if not self.args.allow_execution:
             return self._block("client_disabled", "local --allow-execution is absent")
         control = result.get("execution_control")
@@ -414,49 +444,74 @@ class ExecutionController:
         }
         if stale:
             return self._block("blocked", f"stale camera frames: {stale}")
+
+        sides = ("left", "right") if protocol.arm_mode == "bimanual" else (protocol.arm_side,)
+        if set(self.pipers) != set(sides):
+            return self._block(
+                "blocked",
+                f"connected Piper sides {sorted(self.pipers)} do not match policy sides {list(sides)}",
+            )
         try:
-            self.robot_status = arm_status_dict(self.piper)
-            if self.robot_status["arm_status"] != 0 or self.robot_status["err_code"] != 0:
-                raise ExecutionBlocked(f"Piper status is not normal: {self.robot_status}")
-            action = first_action(result)
-            if protocol.schema == "delivery":
-                target_xyz, target_rpy_deg, target_gripper_m = build_checked_target(
-                    delivery_state,
-                    action,
-                    max_translation_step_m=self.args.max_translation_step_m,
-                    max_rotation_step_rad=self.args.max_rotation_step_rad,
-                    max_gripper_step=self.args.max_gripper_step,
-                    workspace_x=tuple(self.args.workspace_x),
-                    workspace_y=tuple(self.args.workspace_y),
-                    workspace_z=tuple(self.args.workspace_z),
-                )
-                target_joints = None
-            elif protocol.schema == "joint":
-                target_joints, target_gripper_m = build_checked_joint_target(
-                    qpos,
-                    action,
-                    max_joint_step_rad=self.args.max_joint_step_rad,
-                    max_gripper_step_m=self.args.max_joint_gripper_step_m,
-                )
-                target_xyz = target_rpy_deg = None
-            else:
-                raise ExecutionBlocked(f"unsupported execution schema: {protocol.schema}")
-            if not self.robot_enabled:
-                self._enable_robot()
+            statuses = {side: arm_status_dict(self.pipers[side]) for side in sides}
+            self.robot_status = statuses if protocol.arm_mode == "bimanual" else statuses[sides[0]]
+            bad_status = {
+                side: status for side, status in statuses.items()
+                if status["arm_status"] != 0 or status["err_code"] != 0
+            }
+            if bad_status:
+                raise ExecutionBlocked(f"Piper status is not normal: {bad_status}")
+
+            action = first_action(result, protocol.action_dim)
+            prepared: dict[str, tuple[Any, ...]] = {}
+            for index, side in enumerate(sides):
+                action_slice = action[index * 7 : (index + 1) * 7]
+                if protocol.schema == "delivery":
+                    state_slice = np.asarray(delivery_state)[index * 10 : (index + 1) * 10]
+                    prepared[side] = build_checked_target(
+                        state_slice,
+                        action_slice,
+                        max_translation_step_m=self.args.max_translation_step_m,
+                        max_rotation_step_rad=self.args.max_rotation_step_rad,
+                        max_gripper_step=self.args.max_gripper_step,
+                        gripper_range_tolerance=self.args.gripper_range_tolerance,
+                        workspace_x=tuple(self.args.workspace_x),
+                        workspace_y=tuple(self.args.workspace_y),
+                        workspace_z=tuple(self.args.workspace_z),
+                    )
+                elif protocol.schema == "joint":
+                    qpos_slice = np.asarray(qpos)[index * 7 : (index + 1) * 7]
+                    prepared[side] = build_checked_joint_target(
+                        qpos_slice,
+                        action_slice,
+                        max_joint_step_rad=self.args.max_joint_step_rad,
+                        max_gripper_step_m=self.args.max_joint_gripper_step_m,
+                    )
+                else:
+                    raise ExecutionBlocked(f"unsupported execution schema: {protocol.schema}")
+
+            missing_enabled = [side for side in sides if side not in self.robot_enabled]
+            if missing_enabled:
+                for side in missing_enabled:
+                    self._enable_robot(side, self.pipers[side])
                 self.state = "armed"
                 self.blocked_reason = "Piper enabled; waiting for the next fresh policy response"
                 return False
-            raw_gripper = round(target_gripper_m * GRIPPER_FACTOR)
-            if protocol.schema == "delivery":
-                raw_xyz = np.rint(target_xyz * 1_000_000.0).astype(np.int64)
-                raw_rpy = np.rint(target_rpy_deg * 1000.0).astype(np.int64)
-                self.piper.MotionCtrl_2(0x01, 0x00, self.args.speed_pct, 0x00)
-                self.piper.EndPoseCtrl(*map(int, np.concatenate((raw_xyz, raw_rpy))))
-            else:
-                raw_joints = np.rint(target_joints * RAD_FACTOR).astype(np.int64)
-                self.piper.ModeCtrl(0x01, 0x01, self.args.speed_pct, 0x00)
-                self.piper.JointCtrl(*map(int, raw_joints))
-            self.piper.GripperCtrl(int(raw_gripper), self.args.gripper_effort, 0x01, 0)
+
+            for side in sides:
+                piper = self.pipers[side]
+                if protocol.schema == "delivery":
+                    target_xyz, target_rpy_deg, target_gripper_m = prepared[side]
+                    raw_xyz = np.rint(target_xyz * 1_000_000.0).astype(np.int64)
+                    raw_rpy = np.rint(target_rpy_deg * 1000.0).astype(np.int64)
+                    piper.MotionCtrl_2(0x01, 0x00, self.args.speed_pct, 0x00)
+                    piper.EndPoseCtrl(*map(int, np.concatenate((raw_xyz, raw_rpy))))
+                else:
+                    target_joints, target_gripper_m = prepared[side]
+                    raw_joints = np.rint(target_joints * RAD_FACTOR).astype(np.int64)
+                    piper.ModeCtrl(0x01, 0x01, self.args.speed_pct, 0x00)
+                    piper.JointCtrl(*map(int, raw_joints))
+                raw_gripper = round(target_gripper_m * GRIPPER_FACTOR)
+                piper.GripperCtrl(int(raw_gripper), self.args.gripper_effort, 0x01, 0)
         except ExecutionBlocked as exc:
             return self._block("blocked", str(exc))
         except Exception as exc:
@@ -481,35 +536,52 @@ def build_observation(
     execution: ExecutionController,
 ) -> dict[str, Any]:
     captured_at = time.time()
-    if protocol.schema == "delivery":
-        state = np.asarray(delivery_state, dtype=np.float32)
-        wrist_key = "cam_wrist"
-    elif protocol.schema == "joint":
-        state = np.asarray(qpos, dtype=np.float32)
-        wrist_key = f"cam_{protocol.arm_side}_wrist"
-    else:
-        raise RuntimeError(f"unsupported observation schema: {protocol.schema}")
+    state = np.asarray(delivery_state if protocol.schema == "delivery" else qpos, dtype=np.float32)
     if state.shape != (protocol.state_dim,) or not np.all(np.isfinite(state)):
         raise RuntimeError(
-            f"{protocol.schema} observation state must be finite {protocol.state_dim}D, "
-            f"got {state.shape}"
+            f"{protocol.arm_mode} {protocol.schema} observation state must be finite "
+            f"{protocol.state_dim}D, got {state.shape}"
         )
-    return {
-        "state": state,
-        "images": {
+    if protocol.arm_mode == "bimanual":
+        observation_images = {
+            key: np.asarray(images[key], dtype=np.uint8) for key in protocol.camera_keys
+        }
+        can_names = {"left": args.left_can, "right": args.right_can}
+        camera_devices = {
+            "cam_high": str(args.cam_high_device),
+            "cam_left_wrist": str(args.cam_left_wrist_device),
+            "cam_right_wrist": str(args.cam_right_wrist_device),
+        }
+    else:
+        wrist_key = next(key for key in protocol.camera_keys if "wrist" in key)
+        observation_images = {
             "cam_high": np.asarray(images["cam_high"], dtype=np.uint8),
             wrist_key: np.asarray(images["cam_wrist"], dtype=np.uint8),
-        },
+        }
+        can_names = {protocol.arm_side: args.can}
+        camera_devices = {
+            "cam_high": str(args.cam_high_device),
+            wrist_key: str(args.cam_wrist_device),
+        }
+    return {
+        "state": state,
+        "images": observation_images,
         "prompt": instruction,
         "client_metadata": {
             "captured_at": captured_at,
             "source_name": source_name,
-            "can_name": args.can,
+            "arm_mode": protocol.arm_mode,
+            "arm_side": protocol.arm_side,
+            "can_names": can_names,
+            "camera_devices": camera_devices,
+            "image_captured_at": {
+                key: float(image_timestamps["cam_wrist"] if protocol.arm_mode == "single" and "wrist" in key else image_timestamps[key])
+                for key in protocol.camera_keys
+            },
+            # Preserve old single-arm telemetry fields.
+            "can_name": next(iter(can_names.values())) if protocol.arm_mode == "single" else "",
             "cam_high_device": str(args.cam_high_device),
-            "cam_wrist_device": str(args.cam_wrist_device),
-            "cam_high_captured_at": float(image_timestamps["cam_high"]),
-            "cam_wrist_captured_at": float(image_timestamps["cam_wrist"]),
-            "arm_side": args.arm_side,
+            "cam_wrist_device": str(args.cam_wrist_device) if protocol.arm_mode == "single" else "",
             "policy_schema": protocol.schema,
             "policy_action_semantics": protocol.action_semantics,
             **execution.metadata(),
@@ -531,13 +603,18 @@ def print_result(
     first = actions[0] if actions.ndim > 1 and len(actions) else actions
     control = result.get("execution_control", {})
     if protocol.schema == "delivery":
-        state_summary = f"eef={np.array2string(state[:3], precision=4)}"
+        state_summary = " ".join(
+            f"{side}_eef={np.array2string(state[i * 10:i * 10 + 3], precision=4)}"
+            for i, side in enumerate(("left", "right") if protocol.arm_mode == "bimanual" else (protocol.arm_side,))
+        )
     else:
-        state_summary = f"joints={np.array2string(qpos[:6], precision=4)}"
+        state_summary = " ".join(
+            f"{side}_joints={np.array2string(qpos[i * 7:i * 7 + 6], precision=4)}"
+            for i, side in enumerate(("left", "right") if protocol.arm_mode == "bimanual" else (protocol.arm_side,))
+        )
     print(
-        f"infer={count} schema={protocol.schema} elapsed={elapsed_s * 1000:.1f}ms "
-        f"{state_summary} "
-        f"gripper={qpos[6] * 1000:.1f}mm actions={actions.shape}\n"
+        f"infer={count} mode={protocol.arm_mode} schema={protocol.schema} elapsed={elapsed_s * 1000:.1f}ms "
+        f"{state_summary} actions={actions.shape}\n"
         f"  first_action={np.array2string(first, precision=5, suppress_small=True)}\n"
         f"  server_mode={control.get('mode', 'missing')} local_allow={execution.args.allow_execution} "
         f"client_state={execution.state} command_sent={command_sent} reason={execution.blocked_reason or '-'}",
@@ -546,7 +623,6 @@ def print_result(
 
 
 def run(args: argparse.Namespace) -> None:
-    # Prevent LAN WebSocket traffic from being routed through an HTTP proxy.
     for key in ("NO_PROXY", "no_proxy"):
         entries = [item.strip() for item in os.environ.get(key, "").split(",") if item.strip()]
         if args.host not in entries:
@@ -554,11 +630,21 @@ def run(args: argparse.Namespace) -> None:
         os.environ[key] = ",".join(entries)
 
     source_name = args.source_name or socket.gethostname()
-    logging.info("Connecting Piper feedback on %s ...", args.can)
-    piper = connect_piper(args.can)
-    execution = ExecutionController(piper, args)
+    if args.arm_mode == "bimanual":
+        logging.info("Connecting Piper feedback: left=%s right=%s ...", args.left_can, args.right_can)
+        pipers = {"left": connect_piper(args.left_can), "right": connect_piper(args.right_can)}
+        camera_ids = {
+            "cam_high": args.cam_high_device,
+            "cam_left_wrist": args.cam_left_wrist_device,
+            "cam_right_wrist": args.cam_right_wrist_device,
+        }
+    else:
+        logging.info("Connecting Piper feedback on %s ...", args.can)
+        pipers = {args.arm_side: connect_piper(args.can)}
+        camera_ids = {"cam_high": args.cam_high_device, "cam_wrist": args.cam_wrist_device}
+    execution = ExecutionController(pipers, args)
     cameras = CameraCapture(
-        cam_ids={"cam_high": args.cam_high_device, "cam_wrist": args.cam_wrist_device},
+        cam_ids=camera_ids,
         fps=args.camera_fps,
         image_hw=IMAGE_HW,
         capture_hw=CAMERA_SOURCE_HW,
@@ -571,16 +657,11 @@ def run(args: argparse.Namespace) -> None:
     try:
         cameras.open()
         for key, info in cameras.verify().items():
-            logging.info(
-                "Camera %s: %s shape=%s latency=%sms",
-                key,
-                "OK" if info["ok"] else "FAIL",
-                info["shape"],
-                info["latency_ms"],
-            )
+            logging.info("Camera %s: %s shape=%s latency=%sms", key, "OK" if info["ok"] else "FAIL", info["shape"], info["latency_ms"])
         logging.warning(
-            "%s client: %s:%d at %.3g Hz. Robot commands still require Dashboard EXECUTE.",
+            "%s %s client: %s:%d at %.3g Hz. Robot commands still require Dashboard EXECUTE.",
             "EXECUTION-CAPABLE" if args.allow_execution else "SHADOW-ONLY",
+            args.arm_mode,
             args.host,
             args.port,
             args.hz,
@@ -589,13 +670,16 @@ def run(args: argparse.Namespace) -> None:
             started = time.monotonic()
             try:
                 if policy is None:
-                    policy, protocol = connect_policy(args.host, args.port, args.arm_side)
+                    policy, protocol = connect_policy(args.host, args.port, args.arm_side, args.arm_mode)
                 if protocol is None:
                     raise RuntimeError("policy protocol is unavailable")
-                state, qpos = read_output_state(piper)
+                states = {side: read_output_state(piper) for side, piper in pipers.items()}
+                sides = ("left", "right") if args.arm_mode == "bimanual" else (args.arm_side,)
+                delivery_state = np.concatenate([states[side][0] for side in sides]).astype(np.float32)
+                qpos = np.concatenate([states[side][1] for side in sides]).astype(np.float32)
                 images, image_timestamps = cameras.read()
                 observation = build_observation(
-                    delivery_state=state,
+                    delivery_state=delivery_state,
                     qpos=qpos,
                     protocol=protocol,
                     images=images,
@@ -611,24 +695,10 @@ def run(args: argparse.Namespace) -> None:
                 if not isinstance(result, dict) or "actions" not in result:
                     raise RuntimeError(f"invalid policy response: {result!r}")
                 command_sent = execution.process(
-                    result,
-                    state,
-                    qpos,
-                    protocol,
-                    image_timestamps,
-                    infer_elapsed,
+                    result, delivery_state, qpos, protocol, image_timestamps, infer_elapsed
                 )
                 count += 1
-                print_result(
-                    count,
-                    state,
-                    qpos,
-                    protocol,
-                    result,
-                    infer_elapsed,
-                    execution,
-                    command_sent,
-                )
+                print_result(count, delivery_state, qpos, protocol, result, infer_elapsed, execution, command_sent)
                 if args.once:
                     return
             except KeyboardInterrupt:
@@ -650,17 +720,23 @@ def run(args: argparse.Namespace) -> None:
     finally:
         close_policy(policy)
         cameras.close()
-        piper.DisconnectPort()
+        for piper in pipers.values():
+            piper.DisconnectPort()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default=os.environ.get("BIMANUAL_VLA_POLICY_HOST", DEFAULT_POLICY_HOST))
     parser.add_argument("--port", type=int, default=int(os.environ.get("BIMANUAL_VLA_POLICY_PORT", DEFAULT_POLICY_PORT)))
-    parser.add_argument("--can", default=DEFAULT_CAN)
-    parser.add_argument("--arm-side", choices=("left", "right"), default="right")
+    parser.add_argument("--arm-mode", choices=("single", "bimanual"), default="single")
+    parser.add_argument("--can", default=DEFAULT_CAN, help="single-arm CAN interface")
+    parser.add_argument("--left-can", default=DEFAULT_LEFT_CAN)
+    parser.add_argument("--right-can", default=DEFAULT_RIGHT_CAN)
+    parser.add_argument("--arm-side", choices=("left", "right", "both"), default="right")
     parser.add_argument("--cam-high-device", default=DEFAULT_HIGH_DEVICE)
-    parser.add_argument("--cam-wrist-device", default=DEFAULT_WRIST_DEVICE)
+    parser.add_argument("--cam-wrist-device", default=DEFAULT_WRIST_DEVICE, help="single-arm wrist camera")
+    parser.add_argument("--cam-left-wrist-device", default=DEFAULT_LEFT_WRIST_DEVICE)
+    parser.add_argument("--cam-right-wrist-device", default=DEFAULT_RIGHT_WRIST_DEVICE)
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument("--hz", type=float, default=5.0, help="inference and maximum command frequency")
     parser.add_argument("--instruction", default="pick up the cube")
@@ -682,6 +758,12 @@ def main() -> None:
         help="maximum delivery-schema gripper closed-fraction change per command",
     )
     parser.add_argument(
+        "--gripper-range-tolerance",
+        type=float,
+        default=DEFAULT_GRIPPER_RANGE_TOLERANCE,
+        help="accept and clip small delivery gripper overshoot outside [0,1]",
+    )
+    parser.add_argument(
         "--max-joint-step-rad",
         type=float,
         default=0.3,
@@ -693,9 +775,18 @@ def main() -> None:
         default=0.02,
         help="maximum joint-schema gripper opening change per command",
     )
-    parser.add_argument("--workspace-x", type=float, nargs=2, default=(0.05, 0.60), metavar=("MIN", "MAX"))
-    parser.add_argument("--workspace-y", type=float, nargs=2, default=(-0.45, 0.45), metavar=("MIN", "MAX"))
-    parser.add_argument("--workspace-z", type=float, nargs=2, default=(0.02, 0.60), metavar=("MIN", "MAX"))
+    parser.add_argument(
+        "--workspace-x", type=float, nargs=2, default=DEFAULT_WORKSPACE_X_M, metavar=("MIN", "MAX"),
+        help="delivery EEF x bounds in base frame metres; default matches the real pick-cube capture",
+    )
+    parser.add_argument(
+        "--workspace-y", type=float, nargs=2, default=DEFAULT_WORKSPACE_Y_M, metavar=("MIN", "MAX"),
+        help="delivery EEF y bounds in base frame metres; default matches the real pick-cube capture",
+    )
+    parser.add_argument(
+        "--workspace-z", type=float, nargs=2, default=DEFAULT_WORKSPACE_Z_M, metavar=("MIN", "MAX"),
+        help="delivery EEF z bounds in base frame metres; default matches the real pick-cube capture",
+    )
     parser.add_argument("--speed-pct", type=int, default=10)
     parser.add_argument("--gripper-effort", type=int, default=1000)
     parser.add_argument("--enable-timeout-s", type=float, default=3.0)
@@ -709,6 +800,7 @@ def main() -> None:
         args.max_translation_step_m,
         args.max_rotation_step_rad,
         args.max_gripper_step,
+        args.gripper_range_tolerance,
         args.max_joint_step_rad,
         args.max_joint_gripper_step_m,
         args.enable_timeout_s,
@@ -723,6 +815,16 @@ def main() -> None:
         bounds = getattr(args, name)
         if bounds[0] >= bounds[1]:
             parser.error(f"{name.replace('_', '-')} MIN must be less than MAX")
+    if args.arm_mode == "bimanual":
+        if args.arm_side not in {"both", "right"}:
+            parser.error("bimanual mode requires --arm-side both")
+        args.arm_side = "both"
+        if args.left_can == args.right_can:
+            parser.error("--left-can and --right-can must differ in bimanual mode")
+        if len({args.cam_high_device, args.cam_left_wrist_device, args.cam_right_wrist_device}) != 3:
+            parser.error("bimanual camera devices must be distinct")
+    elif args.arm_side not in {"left", "right"}:
+        parser.error("single mode requires --arm-side left or right")
     if not args.instruction.strip():
         parser.error("instruction must not be empty")
     args.instruction = args.instruction.strip()

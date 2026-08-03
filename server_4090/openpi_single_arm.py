@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-arm Piper π0.5 training, norm-stat, and policy serving entrypoint.
+"""Single-arm and bimanual Piper π0.5 training, norm-stat, and serving entrypoint.
 
 Run this file with the Python environment of an OpenPI checkout and use the
 checkout as the current working directory. It intentionally builds the config
@@ -20,7 +20,7 @@ from pathlib import Path
 import sys
 import threading
 import time
-from typing import Any, ClassVar
+from typing import Any
 
 import numpy as np
 
@@ -34,7 +34,143 @@ from openpi.training import data_loader
 from openpi.training import weight_loaders
 
 
-CONFIG_NAME = "pi05_piper_single_arm_lora"
+CONFIG_NAMES = {
+    "single": "pi05_piper_single_arm_lora",
+    "bimanual": "pi05_piper_bimanual_lora",
+}
+
+
+def config_name(arm_mode: str) -> str:
+    try:
+        return CONFIG_NAMES[arm_mode]
+    except KeyError as exc:
+        raise ValueError(f"unsupported arm_mode: {arm_mode!r}") from exc
+
+
+@dataclasses.dataclass(frozen=True)
+class DatasetContract:
+    schema: str
+    arm_mode: str
+    arm_side: str
+    layout: str
+    state_dim: int
+    action_dim: int
+    camera_keys: tuple[str, ...]
+    action_semantics: str
+    action_source: str
+    action_alignment: str
+
+
+def _dataset_info(dataset_id: str) -> dict[str, Any]:
+    root = Path(os.environ.get("HF_LEROBOT_HOME", Path.home() / ".cache/huggingface/lerobot"))
+    path = root / dataset_id / "meta" / "info.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"invalid LeRobot info.json: {path}")
+    return value
+
+
+def resolve_dataset_contract(args: argparse.Namespace) -> DatasetContract:
+    info = _dataset_info(args.dataset_id)
+    features = info.get("features", {}) if isinstance(info.get("features", {}), dict) else {}
+    if "observation.state" in features and "action" in features:
+        layout = "canonical"
+        state_key, action_key = "observation.state", "action"
+    elif "state" in features and "actions" in features:
+        layout = "legacy"
+        state_key, action_key = "state", "actions"
+    else:
+        layout = str(args.dataset_layout)
+        if layout == "auto":
+            raise ValueError(
+                f"cannot infer dataset layout for {args.dataset_id!r}; expected canonical "
+                "observation.state/action or legacy state/actions features"
+            )
+        state_key, action_key = (("observation.state", "action") if layout == "canonical" else ("state", "actions"))
+
+    def last_dim(key: str) -> int | None:
+        feature = features.get(key, {})
+        shape = feature.get("shape") if isinstance(feature, dict) else None
+        return int(shape[-1]) if isinstance(shape, list) and shape else None
+
+    state_dim = last_dim(state_key)
+    action_dim = last_dim(action_key)
+    by_dims = {
+        (7, 7): ("joint", "single"),
+        (10, 7): ("delivery", "single"),
+        (14, 14): ("joint", "bimanual"),
+        (20, 14): ("delivery", "bimanual"),
+    }
+    inferred = by_dims.get((state_dim, action_dim))
+    schema = str(info.get("schema") or (inferred[0] if inferred else args.schema)).lower()
+    arm_mode = str(info.get("arm_mode") or (inferred[1] if inferred else args.arm_mode)).lower()
+    if args.schema != "auto" and schema != args.schema:
+        raise ValueError(f"--schema={args.schema} conflicts with dataset schema={schema}")
+    if args.arm_mode != "auto" and arm_mode != args.arm_mode:
+        raise ValueError(f"--arm-mode={args.arm_mode} conflicts with dataset arm_mode={arm_mode}")
+    if schema not in {"joint", "delivery"} or arm_mode not in {"single", "bimanual"}:
+        raise ValueError(f"unsupported dataset contract: schema={schema!r}, arm_mode={arm_mode!r}")
+    expected_dims = {
+        ("joint", "single"): (7, 7),
+        ("delivery", "single"): (10, 7),
+        ("joint", "bimanual"): (14, 14),
+        ("delivery", "bimanual"): (20, 14),
+    }[(schema, arm_mode)]
+    if state_dim is not None and (state_dim, action_dim) != expected_dims:
+        raise ValueError(
+            f"dataset dimensions {(state_dim, action_dim)} disagree with {arm_mode} {schema} "
+            f"expected {expected_dims}"
+        )
+    state_dim, action_dim = expected_dims
+
+    arm_side = "both" if arm_mode == "bimanual" else str(info.get("arm_side") or args.arm_side).lower()
+    if arm_mode == "single" and arm_side not in {"left", "right"}:
+        raise ValueError("single-arm dataset requires arm_side left or right")
+    if arm_mode == "bimanual" and args.arm_side not in {"both", "right"}:
+        raise ValueError("bimanual dataset requires --arm-side both")
+
+    media = [
+        key.removeprefix("observation.images.")
+        for key, value in features.items()
+        if isinstance(value, dict) and value.get("dtype") in {"image", "video"}
+    ]
+    if layout == "legacy":
+        camera_keys = ("cam_high", "cam_wrist")
+    elif arm_mode == "bimanual":
+        camera_keys = ("cam_high", "cam_left_wrist", "cam_right_wrist")
+    else:
+        expected = f"cam_{arm_side}_wrist"
+        wrist = expected if expected in media else "cam_wrist" if "cam_wrist" in media else expected
+        camera_keys = ("cam_high", wrist)
+    missing_media = [
+        f"observation.images.{key}" for key in camera_keys
+        if layout == "canonical" and f"observation.images.{key}" not in features
+    ]
+    if missing_media:
+        raise ValueError(f"dataset is missing required camera features: {missing_media}")
+    if layout == "legacy" and arm_mode != "single":
+        raise ValueError("legacy image/wrist_image layout only supports single-arm delivery data")
+    if layout == "legacy" and schema != "delivery":
+        raise ValueError("legacy state/actions layout only supports delivery schema")
+
+    return DatasetContract(
+        schema=schema,
+        arm_mode=arm_mode,
+        arm_side=arm_side,
+        layout=layout,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        camera_keys=camera_keys,
+        action_semantics=str(
+            info.get("action_semantics")
+            or ("absolute_joint_position" if schema == "joint" else "eef_delta_base_xyz_left_rotvec_gripper_target")
+        ),
+        action_source=str(info.get("action_source") or "unknown"),
+        action_alignment=str(info.get("action_alignment") or "unknown"),
+    )
 
 
 def _as_hwc_uint8(image: np.ndarray) -> np.ndarray:
@@ -55,48 +191,53 @@ def _as_hwc_uint8(image: np.ndarray) -> np.ndarray:
 
 
 @dataclasses.dataclass(frozen=True)
-class PiperSingleArmInputs(transforms.DataTransformFn):
-    """Map a Piper observation and two RGB views into OpenPI inputs."""
+class PiperInputs(transforms.DataTransformFn):
+    """Map single-arm or bimanual Piper observations into OpenPI inputs."""
 
-    arm_side: str = "right"
-    schema: str = "delivery"
-    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = (
-        "cam_high",
-        "cam_left_wrist",
-        "cam_right_wrist",
-    )
+    contract: DatasetContract
 
     def __call__(self, data: dict) -> dict:
         state = np.asarray(data["state"], dtype=np.float32)
-        state_dim = 10 if self.schema == "delivery" else 7
-        if state.shape[-1] != state_dim:
-            raise ValueError(f"Piper {self.schema} state must be {state_dim}D, got {state.shape}")
+        if state.shape[-1] != self.contract.state_dim:
+            raise ValueError(
+                f"Piper {self.contract.arm_mode} {self.contract.schema} state must be "
+                f"{self.contract.state_dim}D, got {state.shape}"
+            )
         images = data["images"]
-        wrist_key = "cam_wrist" if self.schema == "delivery" else f"cam_{self.arm_side}_wrist"
-        allowed = {"cam_high", wrist_key}
-        unknown = set(images) - allowed
-        if unknown:
-            raise ValueError(f"unexpected camera keys: {sorted(unknown)}")
-        if "cam_high" not in images or wrist_key not in images:
-            raise ValueError(f"required cameras are cam_high and {wrist_key}; got {sorted(images)}")
-
+        expected = set(self.contract.camera_keys)
+        if set(images) != expected:
+            raise ValueError(f"camera keys must be {sorted(expected)}, got {sorted(images)}")
         high = _as_hwc_uint8(images["cam_high"])
-        wrist = _as_hwc_uint8(images[wrist_key])
-        mapped_images = {
-            "base_0_rgb": high,
-            "left_wrist_0_rgb": wrist if self.arm_side == "left" else np.zeros_like(wrist),
-            "right_wrist_0_rgb": wrist if self.arm_side == "right" else np.zeros_like(wrist),
-        }
-        image_mask = {
-            "base_0_rgb": np.True_,
-            "left_wrist_0_rgb": np.bool_(self.arm_side == "left"),
-            "right_wrist_0_rgb": np.bool_(self.arm_side == "right"),
-        }
+        if self.contract.arm_mode == "bimanual":
+            left = _as_hwc_uint8(images["cam_left_wrist"])
+            right = _as_hwc_uint8(images["cam_right_wrist"])
+            mapped_images = {
+                "base_0_rgb": high,
+                "left_wrist_0_rgb": left,
+                "right_wrist_0_rgb": right,
+            }
+            image_mask = {key: np.True_ for key in mapped_images}
+        else:
+            wrist_key = next(key for key in self.contract.camera_keys if "wrist" in key)
+            wrist = _as_hwc_uint8(images[wrist_key])
+            mapped_images = {
+                "base_0_rgb": high,
+                "left_wrist_0_rgb": wrist if self.contract.arm_side == "left" else np.zeros_like(wrist),
+                "right_wrist_0_rgb": wrist if self.contract.arm_side == "right" else np.zeros_like(wrist),
+            }
+            image_mask = {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.bool_(self.contract.arm_side == "left"),
+                "right_wrist_0_rgb": np.bool_(self.contract.arm_side == "right"),
+            }
         output = {"image": mapped_images, "image_mask": image_mask, "state": state}
         if "actions" in data:
             actions = np.asarray(data["actions"], dtype=np.float32)
-            if actions.shape[-1] != 7:
-                raise ValueError(f"Piper single-arm actions must be 7D, got {actions.shape}")
+            if actions.shape[-1] != self.contract.action_dim:
+                raise ValueError(
+                    f"Piper {self.contract.arm_mode} actions must be "
+                    f"{self.contract.action_dim}D, got {actions.shape}"
+                )
             output["actions"] = actions
         if "prompt" in data:
             output["prompt"] = data["prompt"]
@@ -104,9 +245,11 @@ class PiperSingleArmInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
-class PiperSingleArmOutputs(transforms.DataTransformFn):
+class PiperOutputs(transforms.DataTransformFn):
+    action_dim: int
+
     def __call__(self, data: dict) -> dict:
-        return {"actions": np.asarray(data["actions"])[..., :7]}
+        return {"actions": np.asarray(data["actions"])[..., : self.action_dim]}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,17 +265,14 @@ class RemoveStrings(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
-class PiperSingleArmDataConfig(training_config.DataConfigFactory):
-    arm_side: str = "right"
-    schema: str = "delivery"
+class PiperDataConfig(training_config.DataConfigFactory):
+    contract: DatasetContract | None = None
     default_prompt: str | None = None
 
-    def create(
-        self,
-        assets_dirs: Path,
-        model_config,
-    ) -> training_config.DataConfig:
-        if self.schema == "delivery":
+    def create(self, assets_dirs: Path, model_config) -> training_config.DataConfig:
+        if self.contract is None:
+            raise ValueError("dataset contract is required")
+        if self.contract.layout == "legacy":
             repack_mapping = {
                 "images": {"cam_high": "image", "cam_wrist": "wrist_image"},
                 "state": "state",
@@ -140,28 +280,28 @@ class PiperSingleArmDataConfig(training_config.DataConfigFactory):
                 "prompt": "prompt",
             }
             action_sequence_keys = ("actions",)
-        elif self.schema == "joint":
-            wrist_key = f"cam_{self.arm_side}_wrist"
+        else:
             repack_mapping = {
                 "images": {
-                    "cam_high": "observation.images.cam_high",
-                    wrist_key: f"observation.images.{wrist_key}",
+                    key: f"observation.images.{key}" for key in self.contract.camera_keys
                 },
                 "state": "observation.state",
                 "actions": "action",
                 "prompt": "prompt",
             }
             action_sequence_keys = ("action",)
-        else:
-            raise ValueError(f"unsupported schema: {self.schema}")
 
         repack = transforms.Group(inputs=[transforms.RepackTransform(repack_mapping)])
         robot_transforms = transforms.Group(
-            inputs=[PiperSingleArmInputs(arm_side=self.arm_side, schema=self.schema)],
-            outputs=[PiperSingleArmOutputs()],
+            inputs=[PiperInputs(contract=self.contract)],
+            outputs=[PiperOutputs(action_dim=self.contract.action_dim)],
         )
-        if self.schema == "joint":
-            mask = transforms.make_bool_mask(6, -1)
+        if self.contract.schema == "joint":
+            mask = (
+                transforms.make_bool_mask(6, -1, 6, -1)
+                if self.contract.arm_mode == "bimanual"
+                else transforms.make_bool_mask(6, -1)
+            )
             robot_transforms = robot_transforms.push(
                 inputs=[transforms.DeltaActions(mask)],
                 outputs=[transforms.AbsoluteActions(mask)],
@@ -177,6 +317,7 @@ class PiperSingleArmDataConfig(training_config.DataConfigFactory):
 
 
 def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
+    contract = resolve_dataset_contract(args)
     model = pi0_config.Pi0Config(
         pi05=True,
         paligemma_variant="gemma_2b_lora",
@@ -184,30 +325,18 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
     )
     base_checkpoint = Path(args.base_checkpoint).expanduser().resolve()
     params_path = base_checkpoint / "params"
-    if args.command in {"train"} and not params_path.exists():
+    if args.command == "train" and not params_path.exists():
         raise FileNotFoundError(
             f"base checkpoint params not found: {params_path}. "
             "Download gs://openpi-assets/checkpoints/pi05_base first."
         )
-    data_factory = PiperSingleArmDataConfig(
+    data_factory = PiperDataConfig(
         repo_id=args.dataset_id,
-        arm_side=args.arm_side,
-        schema=args.schema,
+        contract=contract,
         base_config=training_config.DataConfig(prompt_from_task=True),
     )
-    state_dim = 10 if args.schema == "delivery" else 7
-    action_semantics = (
-        "eef_delta_base_xyz_left_rotvec_gripper_target"
-        if args.schema == "delivery"
-        else "absolute_joint_position"
-    )
-    camera_keys = (
-        ["cam_high", "cam_wrist"]
-        if args.schema == "delivery"
-        else ["cam_high", f"cam_{args.arm_side}_wrist"]
-    )
     return training_config.TrainConfig(
-        name=CONFIG_NAME,
+        name=config_name(contract.arm_mode),
         exp_name=getattr(args, "exp_name", "runtime"),
         model=model,
         data=data_factory,
@@ -225,13 +354,17 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
         overwrite=getattr(args, "overwrite", False),
         wandb_enabled=getattr(args, "wandb_enabled", False),
         policy_metadata={
-            "robot_type": "piper_single_arm",
-            "arm_side": args.arm_side,
-            "schema": args.schema,
-            "state_dim": state_dim,
-            "action_dim": 7,
-            "camera_keys": camera_keys,
-            "action_semantics": action_semantics,
+            "robot_type": "piper_bimanual" if contract.arm_mode == "bimanual" else "piper_single_arm",
+            "arm_mode": contract.arm_mode,
+            "arm_side": contract.arm_side,
+            "schema": contract.schema,
+            "dataset_layout": contract.layout,
+            "state_dim": contract.state_dim,
+            "action_dim": contract.action_dim,
+            "camera_keys": list(contract.camera_keys),
+            "action_semantics": contract.action_semantics,
+            "action_source": contract.action_source,
+            "action_alignment": contract.action_alignment,
             "transport": "openpi_websocket_v1",
         },
     )
@@ -390,9 +523,15 @@ class PolicyTelemetry:
             if not isinstance(client, dict):
                 client = {}
             images = observation.get("images", {})
-            wrist_key = "cam_wrist" if "cam_wrist" in images else f"cam_{self.metadata['arm_side']}_wrist"
-            high_shape = self._atomic_image(self.root / "cam_high.jpg", images["cam_high"])
-            wrist_shape = self._atomic_image(self.root / "cam_wrist.jpg", images[wrist_key])
+            camera_shapes: dict[str, list[int]] = {}
+            for camera_key in self.metadata["camera_keys"]:
+                camera_shapes[camera_key] = self._atomic_image(
+                    self.root / f"{camera_key}.jpg", images[camera_key]
+                )
+            if self.metadata["arm_mode"] == "single":
+                wrist_key = next(key for key in self.metadata["camera_keys"] if "wrist" in key)
+                if wrist_key != "cam_wrist":
+                    self._atomic_image(self.root / "cam_wrist.jpg", images[wrist_key])
             actions = np.asarray(result.get("actions"), dtype=np.float32)
             state = np.asarray(observation.get("state"), dtype=np.float32)
             now = time.time()
@@ -411,13 +550,17 @@ class PolicyTelemetry:
                 "client_control_revision": client.get("control_revision"),
                 "robot_arm_status": client.get("robot_arm_status"),
                 "schema": self.metadata["schema"],
+                "arm_mode": self.metadata["arm_mode"],
                 "arm_side": self.metadata["arm_side"],
                 "transport": "openpi_websocket_v1",
                 "state": state.tolist(),
                 "state_dim": int(state.shape[-1]),
                 "prompt": str(observation.get("prompt", ""))[:500],
-                "cam_high_shape": high_shape,
-                "cam_wrist_shape": wrist_shape,
+                "camera_shapes": camera_shapes,
+                "cam_high_shape": camera_shapes.get("cam_high"),
+                "cam_wrist_shape": next(
+                    (shape for key, shape in camera_shapes.items() if "wrist" in key), None
+                ) if self.metadata["arm_mode"] == "single" else None,
                 "actions_shape": list(actions.shape),
                 "first_action": actions[0].tolist() if actions.ndim > 1 and len(actions) else actions.tolist(),
                 "action_min": float(actions.min()) if actions.size else None,
@@ -495,8 +638,10 @@ def run_serve(args: argparse.Namespace) -> None:
 
 def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dataset-id", required=True)
-    parser.add_argument("--arm-side", choices=("left", "right"), default="right")
-    parser.add_argument("--schema", choices=("delivery", "joint"), default="delivery")
+    parser.add_argument("--arm-mode", choices=("auto", "single", "bimanual"), default="auto")
+    parser.add_argument("--arm-side", choices=("left", "right", "both"), default="right")
+    parser.add_argument("--schema", choices=("auto", "delivery", "joint"), default="auto")
+    parser.add_argument("--dataset-layout", choices=("auto", "legacy", "canonical"), default="auto")
     parser.add_argument("--assets-base-dir", default="./assets")
     parser.add_argument("--checkpoint-base-dir", default="./checkpoints")
     parser.add_argument(
