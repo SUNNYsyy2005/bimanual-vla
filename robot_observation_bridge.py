@@ -4,9 +4,10 @@
 The client is fail-closed and follows validated single-arm/bimanual ``delivery``
 or ``joint`` policy metadata. By default it only sends real observations
 and prints predictions. Robot motion requires both a time-limited Dashboard
-``execute`` authorization and the local ``--allow-execution`` flag. Only the
-first action of each returned chunk is considered, and every command passes
-schema-specific freshness, range, delta, and Piper-status checks.
+``execute`` authorization and the local ``--allow-execution`` flag. Model-rate
+actions are combined to match the lower synchronous robot command rate, and
+every command passes schema-specific freshness, range, delta, and Piper-status
+checks.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import logging
+import math
 import os
 import socket
 import time
@@ -50,6 +52,7 @@ JOINT_ACTION_SEMANTICS = frozenset(
 )
 DEFAULT_POLICY_HOST = "192.168.101.9"
 DEFAULT_POLICY_PORT = 8000
+DEFAULT_ACTION_HZ = 20.0
 DEFAULT_CAN = "can0"
 DEFAULT_LEFT_CAN = "can0"
 DEFAULT_RIGHT_CAN = "can1"
@@ -81,6 +84,8 @@ class PolicyProtocol:
     action_semantics: str
     camera_keys: tuple[str, ...]
     arm_mode: str = "single"
+    # Dataset/action sampling frequency. Older servers may omit it.
+    action_hz: float | None = None
 
 
 def connect_piper(can_name: str) -> Any:
@@ -205,6 +210,16 @@ def validate_policy_metadata(
             f"action_semantics={action_semantics!r}, expected one of {sorted(expected_semantics)!r}"
         )
     camera_keys = metadata.get("camera_keys")
+    raw_action_hz = metadata.get("action_hz")
+    action_hz: float | None = None
+    if raw_action_hz is not None:
+        try:
+            action_hz = float(raw_action_hz)
+        except (TypeError, ValueError):
+            errors.append(f"action_hz={raw_action_hz!r} must be a positive number")
+        else:
+            if not math.isfinite(action_hz) or action_hz <= 0:
+                errors.append(f"action_hz={raw_action_hz!r} must be a positive number")
     if (
         not isinstance(camera_keys, (list, tuple))
         or len(camera_keys) != len(expected_camera_keys)
@@ -222,7 +237,74 @@ def validate_policy_metadata(
         arm_side=str(metadata["arm_side"]),
         action_semantics=str(action_semantics),
         camera_keys=tuple(str(key) for key in camera_keys),
+        action_hz=action_hz,
     )
+
+
+def resolve_action_chunk_steps(
+    *,
+    action_hz: float,
+    command_hz: float,
+    override: int | None = None,
+) -> int:
+    """Return how many model-rate actions one robot command should consume.
+
+    Delivery actions are frame-to-frame deltas. If the dataset was recorded at
+    20 Hz but the synchronous client sends commands at 5 Hz, four consecutive
+    model actions represent one command interval.
+    """
+    if override is not None:
+        if int(override) != override or int(override) <= 0:
+            raise ValueError(f"action chunk steps must be a positive integer, got {override!r}")
+        return int(override)
+    if not math.isfinite(float(action_hz)) or float(action_hz) <= 0:
+        raise ValueError(f"action_hz must be positive, got {action_hz!r}")
+    if not math.isfinite(float(command_hz)) or float(command_hz) <= 0:
+        raise ValueError(f"command_hz must be positive, got {command_hz!r}")
+    return max(1, int(math.floor(float(action_hz) / float(command_hz) + 0.5)))
+
+
+def aggregate_action_chunk(
+    actions: np.ndarray,
+    protocol: PolicyProtocol,
+    steps: int,
+) -> tuple[np.ndarray, int]:
+    """Convert a model-rate action chunk into one robot command.
+
+    For delivery actions, xyz deltas are summed and left-multiplied rotation
+    deltas are composed in order. The gripper target is the final target in the
+    consumed prefix. For joint actions, each row is an absolute target, so the
+    final target is selected without arithmetic on joint coordinates.
+    """
+    values = np.asarray(actions, dtype=np.float64)
+    if values.ndim == 1:
+        values = values[None, :]
+    if values.ndim != 2 or values.shape[1] != protocol.action_dim or values.shape[0] <= 0:
+        raise ExecutionBlocked(
+            f"action chunk must have shape (T,{protocol.action_dim}), got {values.shape}"
+        )
+    if not np.all(np.isfinite(values)):
+        raise ExecutionBlocked("action chunk contains non-finite values")
+    if int(steps) <= 0:
+        raise ExecutionBlocked(f"action chunk steps must be positive, got {steps!r}")
+    used_steps = min(int(steps), values.shape[0])
+    prefix = values[:used_steps]
+    if protocol.schema == "joint":
+        return prefix[-1].copy(), used_steps
+    if protocol.schema != "delivery":
+        raise ExecutionBlocked(f"unsupported action schema: {protocol.schema}")
+
+    command = np.empty(protocol.action_dim, dtype=np.float64)
+    arm_count = 2 if protocol.arm_mode == "bimanual" else 1
+    for arm_index in range(arm_count):
+        offset = arm_index * 7
+        command[offset : offset + 3] = prefix[:, offset : offset + 3].sum(axis=0)
+        total_rotation = np.eye(3, dtype=np.float64)
+        for rotvec in prefix[:, offset + 3 : offset + 6]:
+            total_rotation = Rotation.from_rotvec(rotvec).as_matrix() @ total_rotation
+        command[offset + 3 : offset + 6] = Rotation.from_matrix(total_rotation).as_rotvec()
+        command[offset + 6] = prefix[-1, offset + 6]
+    return command, used_steps
 
 
 def connect_policy(host: str, port: int, arm_side: str, arm_mode: str = "single") -> tuple[Any, PolicyProtocol]:
@@ -255,6 +337,7 @@ def close_policy(policy: Any | None) -> None:
 
 
 def first_action(result: dict[str, Any], action_dim: int = 7) -> np.ndarray:
+    """Return the first raw model action for backward-compatible callers."""
     actions = np.asarray(result.get("actions"), dtype=np.float64)
     if actions.ndim == 1:
         action = actions
@@ -376,6 +459,39 @@ class ExecutionController:
         self.last_command_at: float | None = None
         self.control_revision: int | None = None
         self.robot_status: dict[str, Any] | None = None
+        self.policy_action_hz: float = float(
+            getattr(args, "action_hz", None) or DEFAULT_ACTION_HZ
+        )
+        self.action_chunk_steps: int = max(
+            1, int(getattr(args, "action_chunk_steps", None) or 1)
+        )
+        self.last_action_chunk_steps: int = 0
+        self.last_composed_action: list[float] | None = None
+        self.last_composed_action_at: float | None = None
+
+    def configure_protocol(self, protocol: PolicyProtocol) -> None:
+        """Resolve model-rate to command-rate conversion after handshake."""
+        override = getattr(self.args, "action_chunk_steps", None)
+        action_hz = getattr(self.args, "action_hz", None) or protocol.action_hz or DEFAULT_ACTION_HZ
+        self.policy_action_hz = float(action_hz)
+        self.action_chunk_steps = resolve_action_chunk_steps(
+            action_hz=self.policy_action_hz,
+            command_hz=float(getattr(self.args, "hz", 5.0)),
+            override=override,
+        )
+        source = "CLI" if getattr(self.args, "action_hz", None) else (
+            "policy metadata" if protocol.action_hz else f"fallback {DEFAULT_ACTION_HZ:g} Hz"
+        )
+        self.last_action_chunk_steps = 0
+        self.last_composed_action = None
+        self.last_composed_action_at = None
+        logging.info(
+            "Action timing: model=%.3g Hz (%s), command=%.3g Hz, consume=%d model steps/command",
+            self.policy_action_hz,
+            source,
+            float(getattr(self.args, "hz", 5.0)),
+            self.action_chunk_steps,
+        )
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -385,6 +501,12 @@ class ExecutionController:
             "last_command_at": self.last_command_at,
             "control_revision": self.control_revision,
             "robot_arm_status": self.robot_status,
+            "policy_action_hz": self.policy_action_hz,
+            "command_hz": float(getattr(self.args, "hz", 5.0)),
+            "action_chunk_steps": self.action_chunk_steps,
+            "last_action_chunk_steps": self.last_action_chunk_steps,
+            "last_composed_action": self.last_composed_action,
+            "last_composed_action_at": self.last_composed_action_at,
         }
 
     def _block(self, state: str, reason: str) -> bool:
@@ -411,6 +533,19 @@ class ExecutionController:
         infer_elapsed_s: float,
     ) -> bool:
         """Validate every arm first, then publish one synchronized checked command."""
+        try:
+            action, used_steps = aggregate_action_chunk(
+                result.get("actions"), protocol, self.action_chunk_steps
+            )
+        except ExecutionBlocked as exc:
+            self.last_action_chunk_steps = 0
+            self.last_composed_action = None
+            self.last_composed_action_at = time.time()
+            return self._block("blocked", str(exc))
+        self.last_action_chunk_steps = used_steps
+        self.last_composed_action = action.tolist()
+        self.last_composed_action_at = time.time()
+
         if not self.args.allow_execution:
             return self._block("client_disabled", "local --allow-execution is absent")
         control = result.get("execution_control")
@@ -461,7 +596,6 @@ class ExecutionController:
             if bad_status:
                 raise ExecutionBlocked(f"Piper status is not normal: {bad_status}")
 
-            action = first_action(result, protocol.action_dim)
             prepared: dict[str, tuple[Any, ...]] = {}
             for index, side in enumerate(sides):
                 action_slice = action[index * 7 : (index + 1) * 7]
@@ -601,6 +735,13 @@ def print_result(
 ) -> None:
     actions = np.asarray(result.get("actions"), dtype=np.float32)
     first = actions[0] if actions.ndim > 1 and len(actions) else actions
+    try:
+        command_action, used_steps = aggregate_action_chunk(
+            actions, protocol, execution.action_chunk_steps
+        )
+    except ExecutionBlocked as exc:
+        command_action, used_steps = np.asarray([], dtype=np.float64), 0
+        logging.warning("Cannot summarize command action: %s", exc)
     control = result.get("execution_control", {})
     if protocol.schema == "delivery":
         state_summary = " ".join(
@@ -616,6 +757,7 @@ def print_result(
         f"infer={count} mode={protocol.arm_mode} schema={protocol.schema} elapsed={elapsed_s * 1000:.1f}ms "
         f"{state_summary} actions={actions.shape}\n"
         f"  first_action={np.array2string(first, precision=5, suppress_small=True)}\n"
+        f"  command_action[{used_steps} steps]={np.array2string(command_action, precision=5, suppress_small=True)}\n"
         f"  server_mode={control.get('mode', 'missing')} local_allow={execution.args.allow_execution} "
         f"client_state={execution.state} command_sent={command_sent} reason={execution.blocked_reason or '-'}",
         flush=True,
@@ -671,6 +813,7 @@ def run(args: argparse.Namespace) -> None:
             try:
                 if policy is None:
                     policy, protocol = connect_policy(args.host, args.port, args.arm_side, args.arm_mode)
+                    execution.configure_protocol(protocol)
                 if protocol is None:
                     raise RuntimeError("policy protocol is unavailable")
                 states = {side: read_output_state(piper) for side, piper in pipers.items()}
@@ -738,7 +881,19 @@ def main() -> None:
     parser.add_argument("--cam-left-wrist-device", default=DEFAULT_LEFT_WRIST_DEVICE)
     parser.add_argument("--cam-right-wrist-device", default=DEFAULT_RIGHT_WRIST_DEVICE)
     parser.add_argument("--camera-fps", type=int, default=30)
-    parser.add_argument("--hz", type=float, default=5.0, help="inference and maximum command frequency")
+    parser.add_argument("--hz", type=float, default=5.0, help="policy inference and robot command frequency")
+    parser.add_argument(
+        "--action-hz",
+        type=float,
+        default=None,
+        help=f"override model/dataset action rate; default uses policy metadata or {DEFAULT_ACTION_HZ:g} Hz",
+    )
+    parser.add_argument(
+        "--action-chunk-steps",
+        type=int,
+        default=None,
+        help="model-rate actions consumed per robot command; default rounds action-hz / hz (legacy=1)",
+    )
     parser.add_argument("--instruction", default="pick up the cube")
     parser.add_argument("--source-name", default=None)
     parser.add_argument("--reconnect-delay", type=float, default=2.0)
@@ -796,6 +951,7 @@ def main() -> None:
     positive = (
         args.hz,
         args.camera_fps,
+        args.action_hz if args.action_hz is not None else 1.0,
         args.max_action_age_s,
         args.max_translation_step_m,
         args.max_rotation_step_rad,
@@ -807,6 +963,8 @@ def main() -> None:
     )
     if any(value <= 0 for value in positive) or args.reconnect_delay < 0:
         parser.error("frequencies, freshness/safety limits, and timeout must be positive")
+    if args.action_chunk_steps is not None and args.action_chunk_steps <= 0:
+        parser.error("action-chunk-steps must be positive")
     if not 1 <= args.speed_pct <= 100:
         parser.error("speed-pct must be in [1,100]")
     if not 0 <= args.gripper_effort <= 5000:

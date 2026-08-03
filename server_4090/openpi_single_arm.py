@@ -112,6 +112,7 @@ class DatasetContract:
     state_dim: int
     action_dim: int
     camera_keys: tuple[str, ...]
+    action_hz: float | None
     action_semantics: str
     action_source: str
     action_alignment: str
@@ -215,6 +216,16 @@ def resolve_dataset_contract(args: argparse.Namespace) -> DatasetContract:
     if layout == "legacy" and schema != "delivery":
         raise ValueError("legacy state/actions layout only supports delivery schema")
 
+    raw_action_hz = info.get("fps")
+    action_hz: float | None = None
+    if raw_action_hz is not None:
+        try:
+            action_hz = float(raw_action_hz)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"dataset fps must be a positive number, got {raw_action_hz!r}") from exc
+        if not np.isfinite(action_hz) or action_hz <= 0:
+            raise ValueError(f"dataset fps must be a positive number, got {raw_action_hz!r}")
+
     return DatasetContract(
         schema=schema,
         arm_mode=arm_mode,
@@ -223,6 +234,7 @@ def resolve_dataset_contract(args: argparse.Namespace) -> DatasetContract:
         state_dim=state_dim,
         action_dim=action_dim,
         camera_keys=camera_keys,
+        action_hz=action_hz,
         action_semantics=str(
             info.get("action_semantics")
             or ("absolute_joint_position" if schema == "joint" else "eef_delta_base_xyz_left_rotvec_gripper_target")
@@ -424,6 +436,7 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
             "state_dim": contract.state_dim,
             "action_dim": contract.action_dim,
             "camera_keys": list(contract.camera_keys),
+            "action_hz": contract.action_hz,
             "action_semantics": contract.action_semantics,
             "action_source": contract.action_source,
             "action_alignment": contract.action_alignment,
@@ -638,6 +651,32 @@ class PolicyTelemetry:
             return ":".join(map(str, remote_address))
         return str(remote_address or "unknown")
 
+    @staticmethod
+    def _finite_float(value: Any) -> float | None:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if np.isfinite(result) else None
+
+    @staticmethod
+    def _positive_int(value: Any) -> int | None:
+        try:
+            result = int(value)
+        except (TypeError, ValueError):
+            return None
+        return result if result > 0 else None
+
+    @staticmethod
+    def _finite_vector(value: Any, expected_dim: int) -> list[float] | None:
+        try:
+            result = np.asarray(value, dtype=np.float64)
+        except (TypeError, ValueError):
+            return None
+        if result.shape != (expected_dim,) or not np.all(np.isfinite(result)):
+            return None
+        return result.tolist()
+
     def _publish_connections(self, *, event: str, address: str) -> None:
         now = time.time()
         payload = {
@@ -711,6 +750,18 @@ class PolicyTelemetry:
                     self._atomic_image(self.root / "cam_wrist.jpg", images[wrist_key])
             actions = np.asarray(result.get("actions"), dtype=np.float32)
             state = np.asarray(observation.get("state"), dtype=np.float32)
+            client_policy_action_hz = self._finite_float(client.get("policy_action_hz"))
+            client_command_hz = self._finite_float(client.get("command_hz"))
+            client_action_chunk_steps = self._positive_int(client.get("action_chunk_steps"))
+            client_last_action_chunk_steps = self._positive_int(
+                client.get("last_action_chunk_steps")
+            )
+            client_last_composed_action = self._finite_vector(
+                client.get("last_composed_action"), int(self.metadata["action_dim"])
+            )
+            client_last_composed_action_at = self._finite_float(
+                client.get("last_composed_action_at")
+            )
             now = time.time()
             payload = {
                 "sequence": self.sequence,
@@ -725,6 +776,13 @@ class PolicyTelemetry:
                 "client_blocked_reason": str(client.get("blocked_reason", ""))[:500],
                 "client_last_command_at": client.get("last_command_at"),
                 "client_control_revision": client.get("control_revision"),
+                "action_hz": self.metadata.get("action_hz"),
+                "client_policy_action_hz": client_policy_action_hz,
+                "client_command_hz": client_command_hz,
+                "client_action_chunk_steps": client_action_chunk_steps,
+                "client_last_action_chunk_steps": client_last_action_chunk_steps,
+                "client_last_composed_action": client_last_composed_action,
+                "client_last_composed_action_at": client_last_composed_action_at,
                 "robot_arm_status": client.get("robot_arm_status"),
                 "schema": self.metadata["schema"],
                 "arm_mode": self.metadata["arm_mode"],
