@@ -19,7 +19,7 @@
 - 页面顶部按“总览 / 数据集 / 训练 / Policy / 实时遥测”分模块导航；总览集中显示 GPU、数据量和活动任务。
 - Dashboard 可以新建、健康检测、停止、强制结束 Policy，并用新 checkpoint 替换运行中的 Policy。
 - 已完成、失败、丢失或停止的训练 / Policy 历史任务可从对应模块删除任务记录和日志；checkpoint、模型与训练输出不会被删除。
-- 机械臂客户端默认是 shadow-only；只有显式添加 `--allow-execution`、Dashboard 对同一 Policy 给出未过期的 EXECUTE 授权、telemetry 新鲜且本地安全检查全部通过时，才会发布第一步 action。
+- 机械臂客户端默认是 shadow-only；只有显式添加 `--allow-execution`、Dashboard 对同一 Policy 给出未过期的 EXECUTE 授权、telemetry 新鲜且本地安全检查全部通过时，才会发布按模型频率合成后的短 chunk 命令。
 
 ## 部署并启动 Dashboard
 
@@ -284,9 +284,17 @@ python robot_observation_bridge.py \
 2. 单臂同时构造 10D delivery state 和 7D joint qpos；双臂同时构造 20D delivery state 和 14D joint qpos。
 3. 单臂并行读取顶部与单腕部两路相机，双臂并行读取顶部与左右腕部三路相机，并转换为 256×256 RGB。
 4. 使用 `openpi_client.websocket_client_policy.WebsocketClientPolicy` 直连所选 Policy 端口。
-5. 校验服务端 metadata：`transport`、`schema`、`arm_mode`、`state_dim`、`action_dim`、`arm_side`、`action_semantics` 和 `camera_keys`；不一致时 fail closed。
+5. 校验服务端 metadata：`transport`、`schema`、`arm_mode`、`state_dim`、`action_dim`、`arm_side`、`action_semantics`、`camera_keys` 和可选的 `action_hz`；不一致时 fail closed。
 6. 根据 metadata 自动发送匹配的 7D/10D/14D/20D state 和相机字段，并只接受匹配的 7D/14D action。
-7. 打印 action chunk；切换模型造成断线时自动重连并重新协商合同。
+7. 同时打印模型首步 action 和按命令周期合成后的 `command_action`；切换模型造成断线时自动重连并重新协商合同。
+
+Policy 会从数据集 `meta/info.json` 的 `fps` 发布 `action_hz`。客户端默认按
+`round(action_hz / --hz)` 消费 action chunk：例如训练数据为 20 Hz、客户端为
+5 Hz 时，每个机器人命令消费 4 个模型步。`delivery` schema 对前 N 步 xyz
+增量求和、按顺序组合 rotvec，并使用第 N 步夹爪目标；`joint` schema 的 action
+是绝对关节目标，因此直接选择第 N 步，不能把关节值相加。旧 Policy 未发布
+`action_hz` 时默认按 20 Hz 处理，也可以用 `--action-hz` 覆盖；如需临时恢复旧版
+“只执行首步”的行为，可显式使用 `--action-chunk-steps 1`。
 
 该脚本不需要 Dashboard URL 或 Token。上述默认命令不会调用动作控制 API。
 
@@ -296,7 +304,7 @@ python robot_observation_bridge.py \
   --allow-execution
 ```
 
-这只打开客户端本地安全门，并不立即执行。网页还必须为同一个运行中 Policy 输入 task id，授权最多 5 分钟的 EXECUTE；任一门关闭、授权过期、连接断开、telemetry 过期、delivery 动作/工作空间超限、joint 目标/单步变化超限或 Piper 状态异常都会阻断下发。网页可随时点击“只推理 / SHADOW”立即撤销服务端授权。joint 默认限制为每关节 `0.3 rad/step`、夹爪 `0.02 m/step`，可分别用 `--max-joint-step-rad` 和 `--max-joint-gripper-step-m` 收紧。
+这只打开客户端本地安全门，并不立即执行。网页还必须为同一个运行中 Policy 输入 task id，授权最多 5 分钟的 EXECUTE；任一门关闭、授权过期、连接断开、telemetry 过期、合成后的 delivery 命令/工作空间超限、joint 目标/命令变化超限或 Piper 状态异常都会阻断下发。网页可随时点击“只推理 / SHADOW”立即撤销服务端授权。频率合成不会绕过、放大或 clamp 安全限制，所有限制都作用于最终实际命令。joint 默认限制为每关节 `0.3 rad/command`、夹爪 `0.02 m/command`，可分别用 `--max-joint-step-rad` 和 `--max-joint-gripper-step-m` 收紧。
 
 ## Policy 进程管理与模型切换
 
@@ -328,5 +336,5 @@ python robot_observation_bridge.py \
 - 真实观测不经过 Dashboard HTTP API。
 - Dashboard telemetry 是 Policy 收到数据后的只读镜像。
 - 服务端 EXECUTE 授权最长 1 小时，网页默认 5 分钟；Dashboard 重启、Policy 停止或模型切换都会回到 SHADOW。
-- 客户端没有 `--allow-execution` 时永远不会发布动作；即使双重门打开，动作新鲜度、单步位移/旋转/夹爪变化、工作空间和 Piper 状态仍会在本地逐次检查。
+- 客户端没有 `--allow-execution` 时永远不会发布动作；即使双重门打开，动作新鲜度、合成命令的位移/旋转/夹爪变化、工作空间和 Piper 状态仍会在本地逐次检查。
 - 默认拒绝在已有计算进程的 GPU 上启动任务；如修改 `allow_busy_gpus`，应明确确认不会干扰其他任务。

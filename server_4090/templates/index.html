@@ -170,10 +170,10 @@
             <div class="row"><div><label>模型系列</label><select name="model_variant" class="model-variant-select"><option value="pi05">π0.5</option><option value="pi0">π0</option></select></div><div><label>基础模型 / 初始化 checkpoint</label><select name="base_checkpoint" class="base-model-select" required></select></div></div>
             <p class="muted base-model-info">可选择预训练权重，也可从已有完整 checkpoint 继续微调。</p>
             <div class="row3"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU IDs</label><input name="gpu_ids" value="0,1" placeholder="0,1"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div>
-            <div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>Batch</label><input name="batch_size" type="number" value="8"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div>
-            <div class="row"><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div><div><label>Episode 划分</label><input value="自动加载数据集已保存的 norm 划分" disabled></div></div>
+            <div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>全局 Batch</label><input name="batch_size" type="number" value="2"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div>
+            <div class="row3"><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div><div><label>JAX 显存预分配比例</label><input name="xla_memory_fraction" type="number" value="0.90" min="0.50" max="0.95" step="0.01"></div><div><label>Episode 划分</label><input value="自动加载已保存的 norm 划分" disabled></div></div>
             <label>启动方式</label><select name="mode"><option value="auto">auto（推荐）</option><option value="new">new</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select>
-            <p class="muted">训练自动加载数据集持久化的测试集比例、划分种子和 episode 清单，不需要重复填写；缺少划分时使用默认 10% / seed 42。所选模型缺少匹配 norm stats 时自动执行 norm→train。</p><p><button type="submit">提交训练</button></p>
+            <p class="muted">2×24 GiB RTX 4090 上 π0.5 LoRA 建议使用全局 batch 2、FSDP 2、显存比例 0.90；全局 batch 4 在首步编译/通信阶段可能 NCCL OOM。训练会拒绝剩余显存低于安全阈值的 GPU，并自动加载已保存的 episode 划分。</p><p><button type="submit">提交训练</button></p>
           </form>
         </div>
         <div class="card two-third">
@@ -938,7 +938,13 @@ function telemetrySummary(t) {
   const clientGate = t.client_allow_execution ? '<span class="warn">客户端允许执行</span>' : '<span class="muted">客户端禁止执行</span>';
   const dualGate = t.dual_gate_open ? '<span class="bad">双重门已打开</span>' : '<span class="ok">双重门已关闭</span>';
   const actual = `实际状态=<code>${esc(t.client_execution_state || 'unknown')}</code>${t.client_blocked_reason ? `<br>原因=${esc(t.client_blocked_reason)}` : ''}${t.client_last_command_at ? `<br>最近下发=${esc(fmtTime(t.client_last_command_at))}` : ''}`;
-  return `${connection}<br>${freshness}<br>${serverGate}<br>${clientGate} · ${dualGate}<br>${actual}${t.received_at == null ? '' : `<br>source=${esc(t.source_name || '-')} · action=${esc(JSON.stringify(t.actions_shape || []))}`}`;
+  const modelHz = t.client_policy_action_hz ?? t.action_hz;
+  const commandHz = t.client_command_hz;
+  const chunkSteps = t.client_action_chunk_steps;
+  const timing = modelHz && commandHz && chunkSteps
+    ? `频率=${esc(modelHz)}Hz → ${esc(commandHz)}Hz · 每命令 ${esc(chunkSteps)} steps`
+    : '等待新版客户端上报 action 频率';
+  return `${connection}<br>${freshness}<br>${serverGate}<br>${clientGate} · ${dualGate}<br>${actual}<br>${timing}${t.received_at == null ? '' : `<br>source=${esc(t.source_name || '-')} · action=${esc(JSON.stringify(t.actions_shape || []))}`}`;
 }
 
 function policyControlButtons(task) {
@@ -981,7 +987,7 @@ function fillTasks(items) {
     const active = ACTIVE_STATES.has(t.state);
     const split = m.train_episodes !== undefined ? `<br>split=${esc(m.train_episodes)} train / ${esc(m.test_episodes)} test · ratio ${esc(m.test_ratio)} · seed ${esc(m.split_seed)}${m.split_source ? ` · ${esc(m.split_source)}` : ''}` : '';
     const model = `<br>model=${esc(modelVariantLabel(m.model_variant))}${m.base_checkpoint ? ` · base=<code class="path" title="${esc(m.base_checkpoint)}">${esc(shortPath(m.base_checkpoint))}</code>` : ''}`;
-    const params = `dataset=${esc(m.dataset_id || '-')} · arm=${esc(m.arm_mode || '-')} · schema=${esc(m.schema || '-')}${model}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}<br>train batch=${esc(m.batch_size || '-')} · norm batch=${esc(m.norm_batch_size || '等待/未知')}` : `<br>norm batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}${split}`;
+    const params = `dataset=${esc(m.dataset_id || '-')} · arm=${esc(m.arm_mode || '-')} · schema=${esc(m.schema || '-')}${model}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}<br>train batch=${esc(m.batch_size || '-')} · FSDP ${esc(m.fsdp_devices || '-')} · XLA ${esc(m.xla_memory_fraction || '-')}<br>norm batch=${esc(m.norm_batch_size || '等待/未知')}` : `<br>norm batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}${split}`;
     const deletable = TERMINAL_STATES.has(t.state);
     return `<tr><td><code>${esc(t.id)}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${jobDependencySummary(t)}${t.start_error ? `<br><span class="bad">${esc(t.start_error)}</span>` : ''}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}','training')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','training')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="4" class="muted">暂无 Norm / Train 任务</td></tr>';
@@ -1124,7 +1130,14 @@ function fillObservation(obs) {
     : state.map((v, i) => `${labels[i] || i}: ${Number(v).toFixed(6)}`).join('\n');
   document.getElementById('robotStateTitle').textContent = `${obs.state_dim}D ${obs.arm_mode === 'bimanual' ? 'bimanual ' : ''}${obs.schema} state`;
   document.getElementById('robotState').textContent = `schema=${obs.schema} arm_mode=${obs.arm_mode || 'single'} arm=${obs.arm_side} dim=${obs.state_dim}\n${values}`;
-  document.getElementById('policyAction').textContent = `prompt: ${obs.prompt || '-'}\nactions shape: ${JSON.stringify(obs.actions_shape || [])}\nfirst action: ${JSON.stringify(obs.first_action || [])}\nmin/max: ${obs.action_min} / ${obs.action_max}\npolicy elapsed: ${Number(obs.policy_elapsed_s || 0).toFixed(4)}s\nserver gate: ${control.mode || 'shadow'} (revision ${control.revision || 0})\nclient allow: ${Boolean(obs.client_allow_execution)}\nclient state: ${obs.client_execution_state || 'unknown'}\nblocked reason: ${obs.client_blocked_reason || '-'}\nlast command: ${fmtTime(obs.client_last_command_at)}`;
+  const modelHz = obs.client_policy_action_hz ?? obs.action_hz;
+  const commandHz = obs.client_command_hz;
+  const chunkSteps = obs.client_action_chunk_steps;
+  const usedSteps = obs.client_last_action_chunk_steps;
+  const composed = Array.isArray(obs.client_last_composed_action)
+    ? JSON.stringify(obs.client_last_composed_action)
+    : '-';
+  document.getElementById('policyAction').textContent = `prompt: ${obs.prompt || '-'}\nactions shape: ${JSON.stringify(obs.actions_shape || [])}\nraw first action: ${JSON.stringify(obs.first_action || [])}\nclient composed action (previous cycle, ${usedSteps || '-'} steps): ${composed}\nmodel / command rate: ${modelHz || '-'} Hz / ${commandHz || '-'} Hz\nconfigured chunk steps: ${chunkSteps || '-'}\ncomposed at: ${fmtTime(obs.client_last_composed_action_at)}\nmin/max: ${obs.action_min} / ${obs.action_max}\npolicy elapsed: ${Number(obs.policy_elapsed_s || 0).toFixed(4)}s\nserver gate: ${control.mode || 'shadow'} (revision ${control.revision || 0})\nclient allow: ${Boolean(obs.client_allow_execution)}\nclient state: ${obs.client_execution_state || 'unknown'}\nblocked reason: ${obs.client_blocked_reason || '-'}\nlast command sent: ${fmtTime(obs.client_last_command_at)}`;
   const key = `${obs.telemetry_session}:${obs.sequence}`;
   if (key !== latestTelemetryKey) {
     latestTelemetryKey = key;

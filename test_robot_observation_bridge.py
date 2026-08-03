@@ -10,9 +10,12 @@ from robot_observation_bridge import (
     ExecutionBlocked,
     ExecutionController,
     PolicyProtocol,
+    RAD_FACTOR,
+    aggregate_action_chunk,
     build_checked_joint_target,
     build_checked_target,
     build_observation,
+    resolve_action_chunk_steps,
     validate_policy_metadata,
 )
 
@@ -25,6 +28,7 @@ DELIVERY_METADATA = {
     "arm_side": "right",
     "action_semantics": "eef_delta_base_xyz_left_rotvec_gripper_target",
     "camera_keys": ["cam_high", "cam_wrist"],
+    "action_hz": 20,
 }
 
 JOINT_METADATA = {
@@ -99,12 +103,126 @@ class FakePiper:
         self.calls.append(("GripperCtrl", *args))
 
 
+class ActionChunkTimingTest(unittest.TestCase):
+    def test_resolves_model_steps_per_command_interval(self):
+        self.assertEqual(resolve_action_chunk_steps(action_hz=20, command_hz=5), 4)
+        self.assertEqual(resolve_action_chunk_steps(action_hz=20, command_hz=10), 2)
+        self.assertEqual(resolve_action_chunk_steps(action_hz=20, command_hz=30), 1)
+        self.assertEqual(
+            resolve_action_chunk_steps(action_hz=20, command_hz=5, override=3),
+            3,
+        )
+
+    def test_aggregates_single_arm_delivery_prefix(self):
+        protocol = validate_policy_metadata(DELIVERY_METADATA, "right")
+        actions = np.zeros((4, 7), dtype=np.float64)
+        actions[:, :3] = [
+            [0.001, 0.002, 0.0],
+            [0.002, 0.0, 0.001],
+            [0.0, -0.001, 0.002],
+            [0.003, 0.001, -0.001],
+        ]
+        actions[0, 3:6] = [0.1, 0.0, 0.0]
+        actions[1, 3:6] = [0.0, 0.2, 0.0]
+        actions[2, 3:6] = [0.0, 0.0, -0.1]
+        actions[:, 6] = [0.1, 0.2, 0.3, 0.4]
+
+        command, used_steps = aggregate_action_chunk(actions, protocol, 4)
+
+        self.assertEqual(used_steps, 4)
+        np.testing.assert_allclose(command[:3], actions[:, :3].sum(axis=0), atol=1e-12)
+        expected_rotation = np.eye(3)
+        for rotvec in actions[:, 3:6]:
+            from scipy.spatial.transform import Rotation
+
+            expected_rotation = Rotation.from_rotvec(rotvec).as_matrix() @ expected_rotation
+        from scipy.spatial.transform import Rotation
+
+        np.testing.assert_allclose(
+            Rotation.from_rotvec(command[3:6]).as_matrix(),
+            expected_rotation,
+            atol=1e-12,
+        )
+        self.assertAlmostEqual(command[6], 0.4)
+
+    def test_aggregates_each_bimanual_delivery_arm_independently(self):
+        protocol = validate_policy_metadata(BIMANUAL_DELIVERY_METADATA, "both", "bimanual")
+        actions = np.zeros((2, 14), dtype=np.float64)
+        actions[:, 0] = [0.001, 0.002]
+        actions[:, 8] = [-0.003, -0.004]
+        actions[:, 6] = [0.1, 0.2]
+        actions[:, 13] = [0.8, 0.7]
+
+        command, used_steps = aggregate_action_chunk(actions, protocol, 4)
+
+        self.assertEqual(used_steps, 2)
+        self.assertAlmostEqual(command[0], 0.003)
+        self.assertAlmostEqual(command[8], -0.007)
+        self.assertAlmostEqual(command[6], 0.2)
+        self.assertAlmostEqual(command[13], 0.7)
+
+    def test_joint_chunk_selects_future_absolute_target(self):
+        protocol = validate_policy_metadata(JOINT_METADATA, "right")
+        actions = np.arange(28, dtype=np.float64).reshape(4, 7) / 100.0
+
+        command, used_steps = aggregate_action_chunk(actions, protocol, 4)
+
+        self.assertEqual(used_steps, 4)
+        np.testing.assert_allclose(command, actions[3])
+
+    def test_rejects_malformed_or_nonfinite_chunk(self):
+        protocol = validate_policy_metadata(DELIVERY_METADATA, "right")
+        with self.assertRaisesRegex(ExecutionBlocked, "shape"):
+            aggregate_action_chunk(np.zeros((2, 6)), protocol, 2)
+        actions = np.zeros((2, 7))
+        actions[1, 0] = np.nan
+        with self.assertRaisesRegex(ExecutionBlocked, "non-finite"):
+            aggregate_action_chunk(actions, protocol, 2)
+
+    def test_shadow_client_still_reports_composed_action_preview(self):
+        args = SimpleNamespace(
+            arm_mode="single",
+            arm_side="right",
+            allow_execution=False,
+            hz=5.0,
+            action_hz=None,
+            action_chunk_steps=None,
+        )
+        execution = ExecutionController(FakePiper(), args)
+        protocol = validate_policy_metadata(DELIVERY_METADATA, "right")
+        execution.configure_protocol(protocol)
+        actions = np.zeros((4, 7), dtype=np.float64)
+        actions[:, 0] = 0.002
+        actions[:, 6] = [0.1, 0.2, 0.3, 0.4]
+
+        self.assertFalse(
+            execution.process(
+                {"actions": actions},
+                np.zeros(10, dtype=np.float32),
+                np.zeros(7, dtype=np.float32),
+                protocol,
+                {},
+                0.01,
+            )
+        )
+        metadata = execution.metadata()
+        self.assertEqual(metadata["last_action_chunk_steps"], 4)
+        np.testing.assert_allclose(
+            metadata["last_composed_action"],
+            [0.008, 0.0, 0.0, 0.0, 0.0, 0.0, 0.4],
+        )
+        self.assertIsNotNone(metadata["last_composed_action_at"])
+        self.assertEqual(metadata["execution_state"], "client_disabled")
+
+
 class ProtocolCompatibilityTest(unittest.TestCase):
     def test_accepts_delivery_and_joint_metadata(self):
         delivery = validate_policy_metadata(DELIVERY_METADATA, "right")
         joint = validate_policy_metadata(JOINT_METADATA, "right")
         self.assertEqual(delivery.schema, "delivery")
+        self.assertEqual(delivery.action_hz, 20.0)
         self.assertEqual(joint.schema, "joint")
+        self.assertIsNone(joint.action_hz)
         self.assertEqual(joint.camera_keys, ("cam_high", "cam_right_wrist"))
 
     def test_accepts_bimanual_joint_and_delivery_metadata(self):
@@ -366,6 +484,63 @@ class JointExecutionSafetyTest(unittest.TestCase):
         self.assertIn("JointCtrl", names)
         self.assertIn("GripperCtrl", names)
         self.assertNotIn("EndPoseCtrl", names)
+
+    def test_execution_controller_uses_configured_future_joint_target(self):
+        args = SimpleNamespace(
+            arm_mode="single",
+            arm_side="right",
+            allow_execution=True,
+            enable_timeout_s=0.1,
+            max_action_age_s=2.0,
+            max_translation_step_m=0.015,
+            max_rotation_step_rad=0.15,
+            max_gripper_step=0.25,
+            gripper_range_tolerance=0.02,
+            max_joint_step_rad=0.3,
+            max_joint_gripper_step_m=0.02,
+            workspace_x=(0.05, 0.60),
+            workspace_y=(-0.45, 0.45),
+            workspace_z=(0.02, 0.60),
+            speed_pct=10,
+            gripper_effort=1000,
+            hz=5.0,
+            action_hz=None,
+            action_chunk_steps=None,
+        )
+        piper = FakePiper()
+        execution = ExecutionController(piper, args)
+        protocol = validate_policy_metadata(dict(JOINT_METADATA, action_hz=20), "right")
+        execution.configure_protocol(protocol)
+        targets = np.stack(
+            [self.qpos + np.array([step, 0, 0, 0, 0, 0, 0]) for step in (0.02, 0.04, 0.06, 0.08)]
+        )
+        now = time.time()
+        result = {
+            "actions": targets,
+            "execution_control": {
+                "mode": "execute",
+                "task_id": "policy-test",
+                "session_id": "session-test",
+                "server_time": now,
+                "expires_at": now + 30.0,
+                "revision": 1,
+            },
+        }
+        image_timestamps = {"cam_high": now, "cam_wrist": now}
+        delivery_state = np.zeros(10, dtype=np.float32)
+
+        self.assertFalse(
+            execution.process(result, delivery_state, self.qpos, protocol, image_timestamps, 0.01)
+        )
+        self.assertTrue(
+            execution.process(result, delivery_state, self.qpos, protocol, image_timestamps, 0.01)
+        )
+        self.assertEqual(execution.action_chunk_steps, 4)
+        self.assertEqual(execution.last_action_chunk_steps, 4)
+        np.testing.assert_allclose(execution.last_composed_action, targets[3])
+        self.assertIsNotNone(execution.last_composed_action_at)
+        joint_call = next(call for call in reversed(piper.calls) if call[0] == "JointCtrl")
+        self.assertEqual(joint_call[1], int(np.rint(targets[3, 0] * RAD_FACTOR)))
 
     def test_bimanual_joint_execution_commands_both_arms(self):
         args = SimpleNamespace(
