@@ -5,350 +5,1174 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Bimanual-VLA · 4×4090 控制台</title>
   <style>
-    :root { color-scheme:dark; --bg:#090d14; --card:#111827; --line:#263244; --muted:#94a3b8; --text:#e5edf8; --blue:#38bdf8; --green:#34d399; --yellow:#fbbf24; --red:#fb7185; }
+    :root {
+      color-scheme:dark;
+      --bg:#07101d; --bg-soft:#0c1626; --card:#111d30; --card-strong:#15243a;
+      --line:#263a55; --line-soft:#1d3049; --muted:#91a4bd; --text:#edf4ff;
+      --blue:#42c7ff; --blue-strong:#0ea5e9; --green:#3ee6a8; --yellow:#ffd166;
+      --red:#ff6f91; --purple:#a78bfa; --nav-height:132px;
+    }
     * { box-sizing:border-box; }
-    body { margin:0; font:14px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; background:radial-gradient(circle at top,#17213a 0,#090d14 42%); color:var(--text); }
-    main { max-width:1600px; margin:auto; padding:24px; }
-    header { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:18px; }
-    h1 { font-size:24px; margin:0; } h2 { font-size:17px; margin:0 0 14px; } h3 { font-size:14px; margin:12px 0 8px; color:#cbd5e1; }
-    .muted { color:var(--muted); } .ok { color:var(--green); } .bad { color:var(--red); } .warn { color:var(--yellow); }
+    html { scroll-behavior:smooth; }
+    body { margin:0; min-height:100vh; font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; color:var(--text); background:radial-gradient(circle at 12% 0,#17335b 0,transparent 34%),radial-gradient(circle at 88% 12%,#122b40 0,transparent 28%),var(--bg); }
+    button,input,select,textarea { font:inherit; }
+    button { cursor:pointer; }
+    .top-shell { position:sticky; top:0; z-index:50; border-bottom:1px solid rgba(66,199,255,.22); background:rgba(7,16,29,.9); backdrop-filter:blur(18px); box-shadow:0 16px 44px rgba(0,0,0,.24); }
+    .topbar { max-width:1640px; margin:auto; padding:15px 24px 11px; display:flex; align-items:center; justify-content:space-between; gap:20px; }
+    .brand { display:flex; align-items:center; gap:12px; min-width:300px; }
+    .brand-mark { width:42px; height:42px; display:grid; place-items:center; border-radius:13px; color:#07101d; font-weight:900; background:linear-gradient(135deg,var(--blue),var(--green)); box-shadow:0 0 28px rgba(66,199,255,.28); }
+    h1 { margin:0; font-size:21px; letter-spacing:.01em; }
+    h2 { margin:0 0 14px; font-size:17px; } h3 { margin:14px 0 8px; color:#d6e4f7; font-size:14px; }
+    .auth-panel { display:flex; flex-direction:column; align-items:flex-end; gap:7px; }
+    .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .auth-panel input { width:190px; }
+    .module-nav { max-width:1640px; margin:auto; padding:0 24px 11px; display:flex; gap:7px; overflow-x:auto; scrollbar-width:thin; }
+    .nav-button { width:auto; flex:0 0 auto; display:flex; align-items:center; gap:8px; padding:8px 13px; border:1px solid transparent; border-radius:10px; color:#aebfd5; background:transparent; font-weight:700; }
+    .nav-button:hover { color:#fff; background:#12233a; }
+    .nav-button.active { color:#fff; border-color:#1e91c4; background:linear-gradient(180deg,#123554,#10283e); box-shadow:inset 0 0 0 1px rgba(66,199,255,.08); }
+    .nav-count { min-width:20px; padding:0 6px; border-radius:999px; color:#bfeaff; background:#153f5d; font-size:11px; text-align:center; }
+    main { max-width:1640px; margin:auto; padding:20px 24px 42px; }
+    .dashboard-module[hidden] { display:none !important; }
+    .module-heading { display:flex; justify-content:space-between; gap:16px; align-items:flex-end; margin:2px 0 16px; }
+    .module-heading h2 { margin:0; font-size:22px; }
+    .module-heading p { margin:3px 0 0; color:var(--muted); }
     .grid { display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:14px; }
-    .card { grid-column:span 12; background:rgba(17,24,39,.94); border:1px solid var(--line); border-radius:14px; padding:16px; box-shadow:0 14px 38px rgba(0,0,0,.22); }
-    .half { grid-column:span 6; } .third { grid-column:span 4; } .two-third { grid-column:span 8; }
-    @media(max-width:1100px){.half,.third,.two-third{grid-column:span 12}}
-    label { display:block; color:#cbd5e1; margin:9px 0 4px; }
-    input,select,textarea,button { width:100%; border:1px solid #334155; border-radius:8px; background:#0b1220; color:var(--text); padding:9px 10px; font:inherit; }
-    button { cursor:pointer; background:#075985; border-color:#0ea5e9; font-weight:650; }
-    button:hover { filter:brightness(1.18); } button.secondary { background:#1e293b; border-color:#475569; } button.danger { background:#881337; border-color:#e11d48; }
-    button.inline { width:auto; padding:6px 9px; margin:2px; }
-    button:disabled { cursor:not-allowed; opacity:.45; filter:none; }
+    .card { grid-column:span 12; min-width:0; padding:16px; border:1px solid var(--line-soft); border-radius:15px; background:linear-gradient(155deg,rgba(21,36,58,.96),rgba(13,24,41,.96)); box-shadow:0 16px 42px rgba(0,0,0,.18); }
+    .half { grid-column:span 6; } .third { grid-column:span 4; } .two-third { grid-column:span 8; } .quarter { grid-column:span 3; }
+    .stat-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-bottom:14px; }
+    .stat-card { padding:14px 15px; border:1px solid var(--line-soft); border-radius:14px; background:linear-gradient(145deg,#11223a,#0c192b); }
+    .stat-label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+    .stat-value { margin-top:5px; font-size:25px; font-weight:800; color:#f7fbff; }
+    .stat-detail { margin-top:2px; color:#9fb3cc; font-size:12px; }
+    .muted { color:var(--muted); } .ok { color:var(--green); } .bad { color:var(--red); } .warn { color:var(--yellow); }
+    label { display:block; margin:9px 0 4px; color:#cad8e9; }
+    input,select,textarea,button { width:100%; padding:9px 10px; border:1px solid #34506f; border-radius:9px; color:var(--text); background:#091525; }
+    input:focus,select:focus,textarea:focus { outline:2px solid rgba(66,199,255,.22); border-color:var(--blue-strong); }
+    button { border-color:#159bd2; background:linear-gradient(180deg,#087bad,#075b85); font-weight:700; }
+    button:hover { filter:brightness(1.14); } button.secondary { border-color:#49627e; background:#1b2b40; } button.danger { border-color:#e33d69; background:#8c1638; }
+    button.inline { width:auto; padding:6px 9px; margin:2px; } button:disabled { cursor:not-allowed; opacity:.45; filter:none; }
     .row { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; } .row3 { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
-    @media(max-width:700px){.row,.row3{grid-template-columns:1fr}}
-    table { width:100%; border-collapse:collapse; font-size:13px; } th,td { border-bottom:1px solid #253044; padding:8px; text-align:left; vertical-align:top; } th { color:#93c5fd; }
-    code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; } code { color:#bae6fd; }
-    pre { background:#070b12; border:1px solid #263244; border-radius:10px; padding:12px; max-height:500px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
-    .pill { display:inline-block; border:1px solid #475569; border-radius:999px; padding:2px 8px; margin:2px; color:#cbd5e1; }
-    .toolbar { display:flex; gap:8px; align-items:center; } .toolbar input { min-width:310px; }
-    .login-toolbar { margin-top:8px; } .login-toolbar input { min-width:140px; }
-    #message { position:sticky; top:8px; z-index:5; display:none; padding:10px 14px; border-radius:9px; margin-bottom:12px; background:#172554; border:1px solid #3b82f6; }
-    .preview-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:12px 0; }
-    .preview-grid img { width:100%; max-height:360px; object-fit:contain; background:#05080d; border:1px solid #334155; border-radius:10px; }
+    .table-wrap { overflow:auto; border:1px solid var(--line-soft); border-radius:10px; }
+    table { width:100%; border-collapse:collapse; font-size:13px; } th,td { padding:9px; border-bottom:1px solid #21364f; text-align:left; vertical-align:top; } th { position:sticky; top:0; z-index:1; color:#9edcff; background:#102038; } tr:last-child td { border-bottom:0; }
+    code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; } code { color:#bfeaff; }
+    pre { max-height:500px; margin:8px 0; padding:12px; overflow:auto; white-space:pre-wrap; word-break:break-word; border:1px solid #233b57; border-radius:10px; background:#06101c; }
+    .pill { display:inline-block; margin:2px; padding:2px 8px; border:1px solid #45617f; border-radius:999px; color:#d3dfed; background:#102239; }
     .architecture { display:grid; grid-template-columns:1fr auto 1fr auto 1fr; gap:8px; align-items:center; text-align:center; }
-    .architecture > span { border:1px solid #334155; border-radius:9px; padding:8px; background:#0b1220; }
-    @media(max-width:700px){.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}}
+    .architecture > span { padding:9px; border:1px solid #34506f; border-radius:10px; background:#0a1728; }
     .path { max-width:460px; overflow-wrap:anywhere; }
+    #message { position:sticky; top:calc(var(--nav-height) + 8px); z-index:40; display:none; margin-bottom:12px; padding:10px 14px; border:1px solid #3b82f6; border-radius:9px; background:#172554; box-shadow:0 8px 30px rgba(0,0,0,.3); }
     .episode-editor-grid { display:grid; grid-template-columns:minmax(520px,1.35fr) minmax(360px,.85fr); gap:14px; margin-top:14px; }
-    @media(max-width:1050px){.episode-editor-grid{grid-template-columns:1fr}}
-    .episode-panel { border:1px solid #334155; border-radius:10px; padding:12px; background:#0b1220; }
-    .episode-videos { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
-    .episode-videos video { width:100%; max-height:280px; background:#05080d; border:1px solid #334155; border-radius:8px; }
-    .checkbox-cell input { width:auto; }
-    .editor-summary { min-height:22px; margin:8px 0; }
+    .episode-panel { padding:12px; border:1px solid #334c69; border-radius:11px; background:#091727; }
+    .episode-videos,.preview-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:12px 0; }
+    .media-card { min-width:0; padding:10px; border:1px solid #304b68; border-radius:11px; background:#07121f; }
+    .media-card header { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:8px; }
+    .media-card video,.media-card img,.preview-grid img { display:block; width:100%; max-height:330px; object-fit:contain; border:1px solid #2e465f; border-radius:9px; background:#03070c; }
+    .frame-controls { display:grid; grid-template-columns:auto 1fr auto; gap:8px; align-items:center; margin-top:8px; }
+    .frame-controls input[type=range] { padding:0; }
+    .checkbox-cell input { width:auto; } .editor-summary { min-height:22px; margin:8px 0; }
+    .chart-shell { position:relative; min-height:360px; padding:10px; border:1px solid #2b4664; border-radius:12px; background:#07121f; }
+    #trainMetricsChart { display:block; width:100%; height:340px; }
+    .chart-toolbar { display:grid; grid-template-columns:minmax(260px,1fr) auto; gap:10px; align-items:end; margin-bottom:10px; }
+    .metric-legend { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    .metric-toggle { width:auto; padding:5px 9px; border-color:#3c5878; background:#12233a; font-size:12px; }
+    .metric-toggle.off { opacity:.45; }
+    .progress-track { height:8px; overflow:hidden; border-radius:999px; background:#07101c; }
+    .progress-bar { height:100%; width:0; background:linear-gradient(90deg,var(--blue),var(--green)); }
+    .section-note { padding:10px 12px; border-left:3px solid var(--blue); border-radius:7px; background:#0b1b2e; color:#aac0d8; }
+    @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid{grid-template-columns:repeat(2,1fr)}.episode-editor-grid{grid-template-columns:1fr}}
+    @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid{grid-template-columns:1fr}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
   </style>
 </head>
-<body><main>
-  <header>
-    <div>
-      <h1>4×4090 · π0.5 数据 / 微调 / Policy 管理</h1>
-      <div class="muted">Policy 按 checkpoint 固定 schema；机械臂客户端按 metadata 发送对应观测</div>
-    </div>
-    <div>
-      <div class="toolbar"><input id="token" type="password" placeholder="Dashboard API Token"><button class="inline" onclick="saveToken()">保存 Token</button><button class="inline secondary" onclick="refreshAll()">刷新</button></div>
-      <div class="toolbar login-toolbar"><input id="loginUser" autocomplete="username" placeholder="Dashboard 登录账号"><input id="loginPassword" type="password" autocomplete="current-password" placeholder="Dashboard 登录密码"><button class="inline secondary" onclick="requestToken()">账号密码获取 Token</button></div>
-    </div>
-  </header>
-  <div id="message"></div>
-
-  <section class="grid">
-    <div class="card half">
-      <h2>链路与服务器</h2>
-      <div class="architecture">
-        <span>机械臂控制电脑<br><small class="muted">Piper + 两路相机</small></span><b class="arrow">→</b>
-        <span>OpenPI 官方 WebSocket<br><small class="muted">真实数据面</small></span><b class="arrow">→</b>
-        <span>4×4090 Policy<br><small class="muted">推理 + telemetry 镜像</small></span>
+<body>
+  <div class="top-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">π</div>
+        <div><h1>4×4090 · Bimanual-VLA 控制台</h1><div class="muted">数据集、训练、Policy 与实机遥测统一管理</div></div>
       </div>
-      <p class="muted">Dashboard 负责进程、GPU、checkpoint、训练和短时执行授权。真实 state / 图像不上传 Dashboard，也不由网页代发推理；机械臂电脑上的本地执行开关始终独立生效。</p>
-      <div id="serverInfo" class="muted">输入 Token 后刷新。</div>
-      <div id="gpuList"></div>
-    </div>
-
-    <div class="card half">
-      <h2>上传数据集</h2>
-      <p>后端提供并行分块、SHA256 和断点续传接口。目录数据集请在采集机执行：</p>
-      <pre id="uploadCommand">python upload_dataset_4090.py DATASET_DIR --name my_dataset --server http://192.168.101.9:8090 --token TOKEN --workers 4 --merge</pre>
-      <p class="muted"><code>--merge</code> 会把上传目录中的全部 episodes 追加到同名兼容数据集；同名数据集不存在时按首次安装处理。<code>--overwrite</code> 与 <code>--merge</code> 互斥。</p>
-      <p class="muted">服务端安装前检查 tar 路径安全、LeRobot v2.1 结构、视频帧数，并用实际 LeRobot loader 读取首尾样本。</p>
-    </div>
-
-    <div class="card">
-      <h2>已接收数据集</h2>
-      <div style="overflow:auto"><table><thead><tr><th>ID</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div>
-    </div>
-
-    <div class="card">
-      <h2>Episode 级数据集编辑</h2>
-      <p class="muted">只修改 episode 的 instruction、task name、success 和附加 metadata；不修改 episode 内的 state/action/图像帧。合并、删除或编辑会先构造临时数据集、重新编号并校验，成功后原子替换；已有 norm stats 会失效。</p>
-      <div class="row3">
-        <div><label>目标数据集</label><select id="editorDataset"></select></div>
-        <div><label>合并来源（已有数据集）</label><select id="mergeSourceDataset"></select></div>
-        <div><label>&nbsp;</label><button type="button" id="mergeDatasetButton" onclick="mergeDatasetEpisodes()">把来源 episodes 增量合并到目标</button></div>
+      <div class="auth-panel">
+        <div class="toolbar"><input id="token" type="password" placeholder="Dashboard API Token"><button class="inline" onclick="saveToken()">保存 Token</button><button class="inline secondary" onclick="refreshAll()">刷新</button></div>
+        <div class="toolbar"><input id="loginUser" autocomplete="username" placeholder="登录账号"><input id="loginPassword" type="password" autocomplete="current-password" placeholder="登录密码"><button class="inline secondary" onclick="requestToken()">获取 Token</button></div>
       </div>
-      <div class="toolbar">
-        <button class="inline secondary" type="button" onclick="loadDatasetEpisodes(0)">刷新 episodes</button>
-        <button class="inline danger" type="button" onclick="deleteSelectedEpisodes()">删除选中 episodes</button>
+    </header>
+    <nav id="moduleNav" class="module-nav" aria-label="Dashboard modules">
+      <button class="nav-button active" data-module="overview">总览 <span id="navOverviewCount" class="nav-count">-</span></button>
+      <button class="nav-button" data-module="datasets">数据集 <span id="navDatasetCount" class="nav-count">-</span></button>
+      <button class="nav-button" data-module="training">训练 <span id="navTrainingCount" class="nav-count">-</span></button>
+      <button class="nav-button" data-module="policy">Policy <span id="navPolicyCount" class="nav-count">-</span></button>
+      <button class="nav-button" data-module="telemetry">实时遥测 <span id="navTelemetryCount" class="nav-count">-</span></button>
+    </nav>
+  </div>
+
+  <main>
+    <div id="message"></div>
+
+    <section id="module-overview" class="dashboard-module" data-module="overview">
+      <div class="module-heading"><div><h2>系统总览</h2><p>快速查看服务器资源、数据资产和任务运行状态。</p></div><div id="lastRefresh" class="muted">尚未刷新</div></div>
+      <div class="stat-grid">
+        <div class="stat-card"><div class="stat-label">GPU 可用</div><div id="summaryGpu" class="stat-value">-</div><div id="summaryGpuDetail" class="stat-detail">等待状态数据</div></div>
+        <div class="stat-card"><div class="stat-label">数据集</div><div id="summaryDatasets" class="stat-value">-</div><div id="summaryFrames" class="stat-detail">-</div></div>
+        <div class="stat-card"><div class="stat-label">训练任务</div><div id="summaryTraining" class="stat-value">-</div><div id="summaryTrainingDetail" class="stat-detail">-</div></div>
+        <div class="stat-card"><div class="stat-label">Policy</div><div id="summaryPolicies" class="stat-value">-</div><div id="summaryPolicyDetail" class="stat-detail">-</div></div>
       </div>
-      <div id="episodeEditorSummary" class="muted editor-summary">选择数据集后加载。</div>
-      <div class="episode-editor-grid">
-        <div class="episode-panel" style="overflow:auto">
-          <table><thead><tr><th></th><th>Episode</th><th>帧数</th><th>Instruction</th><th>Task</th><th>Success</th><th>操作</th></tr></thead><tbody id="episodeRows"></tbody></table>
-          <div class="toolbar" style="margin-top:10px"><button class="inline secondary" type="button" onclick="changeEpisodePage(-1)">上一页</button><span id="episodePage" class="muted">-</span><button class="inline secondary" type="button" onclick="changeEpisodePage(1)">下一页</button></div>
+      <div class="grid">
+        <div class="card half">
+          <h2>链路与服务器</h2>
+          <div class="architecture"><span>机械臂控制电脑<br><small class="muted">Piper + 两路相机</small></span><b class="arrow">→</b><span>OpenPI WebSocket<br><small class="muted">真实数据面</small></span><b class="arrow">→</b><span>4×4090 Policy<br><small class="muted">推理 + telemetry</small></span></div>
+          <p class="muted">Dashboard 仅管理进程、GPU、checkpoint、训练和短时执行授权。真实 state / 图像不经 Dashboard HTTP 转发。</p>
+          <div id="serverInfo" class="muted">输入 Token 后刷新。</div>
         </div>
-        <div class="episode-panel">
-          <h3>编辑 Episode 参数</h3>
-          <form id="episodeForm">
-            <input id="episodeIndex" type="hidden">
-            <label>Episode</label><input id="episodeIndexDisplay" disabled>
-            <label>Instruction</label><textarea id="episodeInstruction" rows="3" required></textarea>
-            <label>Task name</label><input id="episodeTaskName">
-            <label>Success</label><select id="episodeSuccess"><option value="true">true</option><option value="false">false</option></select>
-            <label>附加 metadata（JSON object）</label><textarea id="episodeMetadata" rows="7">{}</textarea>
-            <label>删除 metadata 字段（逗号分隔）</label><input id="episodeRemoveMetadata" placeholder="例如 operator_note, bad_reason">
-            <p><button type="submit">保存 Episode 参数</button></p>
-          </form>
-          <h3>Episode 摄像头视频</h3>
-          <div id="episodeVideos" class="episode-videos"><span class="muted">选择 episode 后加载。</span></div>
+        <div class="card half"><h2>GPU 资源</h2><div id="gpuList"><span class="muted">等待状态数据。</span></div></div>
+        <div class="card two-third"><h2>Norm / Train 任务</h2><div class="table-wrap"><table><thead><tr><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div></div>
+        <div class="card third"><h2>任务日志</h2><p class="muted">从任务表或 Policy 表点击“日志”。</p><pre id="taskLog">尚未选择任务。</pre></div>
+      </div>
+    </section>
+
+    <section id="module-datasets" class="dashboard-module" data-module="datasets" hidden>
+      <div class="module-heading"><div><h2>数据集管理</h2><p>上传、检查、编辑 Episode，并独立预览每一路相机媒体。</p></div></div>
+      <div class="grid">
+        <div class="card half"><h2>上传数据集</h2><p>采集机执行：</p><pre id="uploadCommand">python upload_dataset_4090.py DATASET_DIR --name my_dataset --server http://192.168.101.9:8090 --token TOKEN --workers 4 --merge</pre><p class="muted"><code>--merge</code> 增量追加；<code>--overwrite</code> 替换，二者互斥。服务端会执行 SHA256、路径安全、结构和 loader 校验。</p></div>
+        <div class="card half"><h2>媒体格式说明</h2><div class="section-note">Dashboard 同时支持 LeRobot <code>dtype: video</code> 的 MP4 和 <code>dtype: image</code> 的逐帧图片序列。图片序列会按数据集 FPS 在浏览器播放，无需重新编码数据集。</div></div>
+        <div class="card"><h2>已接收数据集</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div></div>
+        <div class="card">
+          <h2>Episode 级数据集编辑与相机预览</h2>
+          <p class="muted">参数编辑不修改 state/action/图像帧；合并、删除或编辑会先构造临时数据集并校验，成功后原子替换。已有 norm stats 将失效。</p>
+          <div class="row3"><div><label>目标数据集</label><select id="editorDataset"></select></div><div><label>合并来源</label><select id="mergeSourceDataset"></select></div><div><label>&nbsp;</label><button type="button" id="mergeDatasetButton" onclick="mergeDatasetEpisodes()">增量合并到目标</button></div></div>
+          <div class="toolbar"><button class="inline secondary" type="button" onclick="loadDatasetEpisodes(0)">刷新 episodes</button><button class="inline danger" type="button" onclick="deleteSelectedEpisodes()">删除选中 episodes</button></div>
+          <div id="episodeEditorSummary" class="muted editor-summary">选择数据集后加载。</div>
+          <div class="episode-editor-grid">
+            <div class="episode-panel table-wrap"><table><thead><tr><th></th><th>Episode</th><th>帧数</th><th>Instruction</th><th>Task</th><th>Success</th><th>操作</th></tr></thead><tbody id="episodeRows"></tbody></table><div class="toolbar" style="margin:10px"><button class="inline secondary" type="button" onclick="changeEpisodePage(-1)">上一页</button><span id="episodePage" class="muted">-</span><button class="inline secondary" type="button" onclick="changeEpisodePage(1)">下一页</button></div></div>
+            <div class="episode-panel">
+              <form id="episodeForm"><input id="episodeIndex" type="hidden"><label>Episode</label><input id="episodeIndexDisplay" disabled><label>Instruction</label><textarea id="episodeInstruction" rows="3" required></textarea><label>Task name</label><input id="episodeTaskName"><label>Success</label><select id="episodeSuccess"><option value="true">true</option><option value="false">false</option></select><label>附加 metadata（JSON object）</label><textarea id="episodeMetadata" rows="7">{}</textarea><label>删除 metadata 字段（逗号分隔）</label><input id="episodeRemoveMetadata" placeholder="operator_note, bad_reason"><p><button type="submit">保存 Episode 参数</button></p></form>
+              <h3>相机媒体</h3><div id="episodeVideos" class="episode-videos"><span class="muted">选择 episode 后加载。</span></div>
+            </div>
+          </div>
         </div>
       </div>
-    </div>
+    </section>
 
-    <div class="card third">
-      <h2>1. 计算归一化统计</h2>
-      <p class="muted">可选的手动入口；直接提交训练时，如统计文件缺失，服务端会自动创建完整 norm 任务并在成功后启动训练。</p>
-      <form id="normForm">
-        <label>数据集</label><select name="dataset_id" class="dataset-select"></select>
-        <label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option></select>
-        <div class="row"><div><label>Batch size</label><input name="batch_size" type="number" value="16" min="1"></div><div><label>Workers</label><input name="num_workers" type="number" value="2" min="1"></div></div>
-        <label>最多帧数（留空=全部）</label><input name="max_frames" type="number" min="1">
-        <p><button type="submit">提交 norm stats</button></p>
-      </form>
-    </div>
-
-    <div class="card third">
-      <h2>2. 提交 LoRA 微调</h2>
-      <form id="trainForm">
-        <label>数据集</label><select name="dataset_id" class="dataset-select"></select>
-        <div class="row"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option></select></div><div><label>GPU IDs</label><input name="gpu_ids" value="0,1" placeholder="例如 0,1"></div></div>
-        <label>实验名</label><input name="exp_name" required placeholder="pick_cube_r1">
-        <div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>Batch</label><input name="batch_size" type="number" value="8"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div>
-        <p class="muted">缺少 norm stats 时会自动执行 norm→train 串联；任务持久化，Dashboard 重启后可继续。RTX 4090 建议至少 2 张空闲卡；FSDP 等于所选 GPU 数。</p>
-        <div class="row"><div><label>Workers</label><input name="num_workers" type="number" value="2"></div><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div></div>
-        <label>启动方式</label><select name="mode"><option value="auto">auto（推荐：存在则续训，不存在则新建）</option><option value="new">new（目录必须不存在）</option><option value="resume">resume（续训；目录不存在也会新建）</option><option value="overwrite">overwrite（删除原目录后重训）</option></select>
-        <p><button type="submit">提交训练</button></p>
-      </form>
-    </div>
-
-    <div class="card third">
-      <h2>3. 新建 / 切换 Policy 进程</h2>
-      <form id="policyForm">
-        <label>操作对象</label>
-        <select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select>
-        <p id="replaceInfo" class="muted">留空会创建新进程；选择运行中的 Policy 会先停止旧进程，再用下列 checkpoint 启动新进程。</p>
-        <label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select>
-        <div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div>
-        <label>Checkpoint（按数据集过滤，最新完整 step 优先）</label><select name="checkpoint" id="checkpointSelect" required></select>
-        <div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div>
-        <div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div><div><label>默认 prompt（可空）</label><input name="default_prompt"></div></div>
-        <p><button id="policySubmit" type="submit">新建 Policy 进程</button></p>
-        <p class="warn">切换模型会断开旧 WebSocket；机械臂客户端会按配置自动重连。切换不启动动作执行。</p>
-      </form>
-    </div>
-
-    <div class="card">
-      <h2>Policy 进程管理</h2>
-      <p class="muted">可新建、检测、正常停止或强制结束 Policy，并为单个 Policy 设置短时 EXECUTE / SHADOW。实际下发必须同时满足服务端授权、客户端 <code>--allow-execution</code> 和本地安全检查。</p>
-      <div style="overflow:auto"><table><thead><tr><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端 / 推理 telemetry</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div>
-      <h3>Policy 日志</h3><pre id="taskLog">点击进程的“日志”。</pre>
-    </div>
-
-    <div class="card">
-      <h2>Norm / Train 任务</h2>
-      <div style="overflow:auto"><table><thead><tr><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div>
-    </div>
-
-    <div class="card">
-      <h2>官方 Policy 链路 · 真实推理只读可视化</h2>
-      <p class="muted">在直接控制机械臂的电脑运行以下默认 shadow 客户端。它通过 <code>openpi_client.WebsocketClientPolicy</code> 直接请求 Policy；Dashboard 仅显示 Policy 镜像出的 observation / action telemetry。</p>
-      <pre id="policyClientCommand">python robot_observation_bridge.py --host 192.168.101.9 --port 8000 --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16 --instruction "pick up the cube"</pre>
-      <div id="robotObservation" class="warn">尚未收到官方 Policy telemetry。</div>
-      <div class="row">
-        <div><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div>
-        <div><h3>Prompt / predicted action</h3><pre id="policyAction">action: -</pre></div>
+    <section id="module-training" class="dashboard-module" data-module="training" hidden>
+      <div class="module-heading"><div><h2>训练中心</h2><p>归一化、LoRA 微调、训练进度和 loss 曲线。</p></div></div>
+      <div class="grid">
+        <div class="card third"><h2>1. 归一化统计</h2><p class="muted">训练提交时若缺失 norm stats 会自动串联执行。</p><form id="normForm"><label>数据集</label><select name="dataset_id" class="dataset-select"></select><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option></select><div class="row"><div><label>Batch size</label><input name="batch_size" type="number" value="16" min="1"></div><div><label>Workers</label><input name="num_workers" type="number" value="2" min="1"></div></div><label>最多帧数（留空=全部）</label><input name="max_frames" type="number" min="1"><p><button type="submit">提交 norm stats</button></p></form></div>
+        <div class="card two-third"><h2>2. 提交 LoRA 微调</h2><form id="trainForm"><div class="row"><div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div><div><label>实验名</label><input name="exp_name" required placeholder="pick_cube_r1"></div></div><div class="row3"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option></select></div><div><label>GPU IDs</label><input name="gpu_ids" value="0,1" placeholder="0,1"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div><div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>Batch</label><input name="batch_size" type="number" value="8"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div><div class="row"><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div><div><label>启动方式</label><select name="mode"><option value="auto">auto（推荐）</option><option value="new">new</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select></div></div><p class="muted">缺少 norm stats 时自动执行 norm→train；任务持久化并支持续训。</p><p><button type="submit">提交训练</button></p></form></div>
+        <div class="card two-third">
+          <h2>训练指标曲线</h2>
+          <div class="chart-toolbar"><div><label>训练任务</label><select id="trainMetricsTask"></select></div><button class="inline secondary" type="button" onclick="loadTrainingMetrics()">刷新曲线</button></div>
+          <div id="trainMetricsSummary" class="muted">选择训练任务后加载指标。</div><div class="progress-track" style="margin:10px 0"><div id="trainProgressBar" class="progress-bar"></div></div>
+          <div class="chart-shell"><canvas id="trainMetricsChart"></canvas></div><div id="trainMetricLegend" class="metric-legend"></div>
+        </div>
+        <div class="card third"><h2>Checkpoint</h2><div class="table-wrap"><table><thead><tr><th>实验 / step</th><th>数据集</th><th>大小 / 时间</th></tr></thead><tbody id="checkpoints"></tbody></table></div></div>
       </div>
-      <div class="preview-grid"><div><h3>cam_high（Policy 实际收到）</h3><img id="previewHigh" alt="cam_high preview"></div><div><h3>cam_wrist（Policy 实际收到）</h3><img id="previewWrist" alt="cam_wrist preview"></div></div>
-      <p class="warn">默认命令不会发送动作。只有在机械臂电脑显式追加 <code>--allow-execution</code>、网页为同一 Policy 临时授权 EXECUTE、telemetry 新鲜且所有本地安全检查通过时，客户端才会发布第一步 action。</p>
-    </div>
-  </section>
-</main>
+    </section>
+
+    <section id="module-policy" class="dashboard-module" data-module="policy" hidden>
+      <div class="module-heading"><div><h2>Policy 管理</h2><p>从 checkpoint 启动、切换、健康检测和实机执行授权。</p></div></div>
+      <div class="grid">
+        <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div><div><label>默认 prompt</label><input name="default_prompt"></div></div><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
+        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code> 和本地安全检查。</p><div class="table-wrap"><table><thead><tr><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端 / telemetry</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div></div>
+        <div class="card"><h2>机械臂客户端命令</h2><pre id="policyClientCommand">python robot_observation_bridge.py --host 192.168.101.9 --port 8000 --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16 --instruction "pick up the cube"</pre></div>
+      </div>
+    </section>
+
+    <section id="module-telemetry" class="dashboard-module" data-module="telemetry" hidden>
+      <div class="module-heading"><div><h2>实时遥测</h2><p>只读展示 Policy 实际收到的 state、两路图像、prompt 和预测 action。</p></div></div>
+      <div class="grid">
+        <div class="card"><h2>Policy 实时观测</h2><div id="robotObservation" class="warn">尚未收到 telemetry。</div><div class="preview-grid"><div><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div><div><h3>Prompt / predicted action</h3><pre id="policyAction">action: -</pre></div></div><div id="robotImages" class="preview-grid"><img id="previewHigh" alt="high camera"><img id="previewWrist" alt="wrist camera"></div></div>
+      </div>
+    </section>
+  </main>
 <script>
-const tokenInput=document.getElementById('token');
-tokenInput.value=localStorage.getItem('bimanualVlaToken')||'';
-const loginUserInput=document.getElementById('loginUser');
-const loginPasswordInput=document.getElementById('loginPassword');
-loginUserInput.value=localStorage.getItem('bimanualVlaLoginUser')||'';
-let latestStatus=null;
-let latestTelemetryKey=null;
-let previewUrls=[];
-let episodeVideoUrls=[];
-let episodeDatasetData=null;
-let episodeOffset=0;
-const episodeLimit=100;
-function saveToken(){localStorage.setItem('bimanualVlaToken',tokenInput.value);show('Token 已保存。',false);refreshAll();refreshObservation();}
-function show(text,bad=true){const el=document.getElementById('message');el.textContent=text;el.style.display='block';el.style.borderColor=bad?'#e11d48':'#10b981';setTimeout(()=>el.style.display='none',6000);}
-async function requestToken(){
-  const username=loginUserInput.value;
-  const password=loginPasswordInput.value;
-  if(!username||!password){show('请输入 Dashboard 登录账号和密码。');return;}
-  try{
-    const response=await fetch('/api/auth/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password})});
-    const body=await response.json().catch(()=>({error:'invalid JSON response'}));
-    if(!response.ok)throw new Error(body.error||`HTTP ${response.status}`);
-    tokenInput.value=body.token||'';
-    localStorage.setItem('bimanualVlaToken',tokenInput.value);
-    localStorage.setItem('bimanualVlaLoginUser',username);
-    loginPasswordInput.value='';
-    show('账号密码验证成功，Token 已获取并保存。',false);
+const tokenInput = document.getElementById('token');
+const loginUserInput = document.getElementById('loginUser');
+const loginPasswordInput = document.getElementById('loginPassword');
+tokenInput.value = localStorage.getItem('bimanualVlaToken') || '';
+loginUserInput.value = localStorage.getItem('bimanualVlaLoginUser') || '';
+
+const ACTIVE_STATES = new Set(['starting', 'running', 'stopping', 'waiting_norm', 'waiting_gpu']);
+const MODULES = new Set(['overview', 'datasets', 'training', 'policy', 'telemetry']);
+const METRIC_COLORS = ['#42c7ff', '#3ee6a8', '#ffd166', '#ff6f91', '#a78bfa', '#fb923c', '#67e8f9'];
+let latestStatus = null;
+let latestTelemetryKey = null;
+let previewUrls = [];
+let episodeMediaPlayers = [];
+let episodeDatasetData = null;
+let episodeOffset = 0;
+let trainingMetricsData = null;
+let enabledMetrics = new Set();
+let metricsRequestSerial = 0;
+const episodeLimit = 100;
+
+function saveToken() {
+  localStorage.setItem('bimanualVlaToken', tokenInput.value);
+  show('Token 已保存。', false);
+  refreshAll();
+  refreshObservation();
+}
+
+function show(text, bad = true) {
+  const el = document.getElementById('message');
+  el.textContent = text;
+  el.style.display = 'block';
+  el.style.borderColor = bad ? '#e11d48' : '#10b981';
+  setTimeout(() => { el.style.display = 'none'; }, 6000);
+}
+
+async function requestToken() {
+  const username = loginUserInput.value;
+  const password = loginPasswordInput.value;
+  if (!username || !password) {
+    show('请输入 Dashboard 登录账号和密码。');
+    return;
+  }
+  try {
+    const response = await fetch('/api/auth/token', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username, password}),
+    });
+    const body = await response.json().catch(() => ({error: 'invalid JSON response'}));
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    tokenInput.value = body.token || '';
+    localStorage.setItem('bimanualVlaToken', tokenInput.value);
+    localStorage.setItem('bimanualVlaLoginUser', username);
+    loginPasswordInput.value = '';
+    show('账号密码验证成功，Token 已获取并保存。', false);
     await refreshAll();
     await refreshObservation();
-  }catch(error){show(error.message);}
+  } catch (error) {
+    show(error.message);
+  }
 }
-async function api(path,options={}){options.headers=options.headers||{};options.headers.Authorization='Bearer '+tokenInput.value;const response=await fetch(path,options);const body=await response.json().catch(()=>({error:'invalid JSON response'}));if(!response.ok)throw new Error(body.error||`HTTP ${response.status}`);return body;}
-async function apiBlob(path){const response=await fetch(path,{headers:{Authorization:'Bearer '+tokenInput.value},cache:'no-store'});if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||`HTTP ${response.status}`);}return response.blob();}
-function esc(value){return String(value??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
-function stateClass(state){return ['completed','running','installed','stopped'].includes(state)?'ok':['failed','lost'].includes(state)?'bad':'warn';}
-function shortPath(path){const parts=String(path||'').split('/').filter(Boolean);return parts.slice(-3).join('/')||'-';}
-function fillDatasets(items){
-  document.getElementById('datasets').innerHTML=items.map(d=>`<tr><td><code>${esc(d.id)}</code><br><span class="muted">${esc(d.robot_type)}</span></td><td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps<br>${d.norm_stats_ready?'<span class="ok">norm ready</span>':'<span class="warn">norm 需计算</span>'}</td><td><span class="pill">${esc(d.schema)}</span><br>state ${esc(JSON.stringify(d.state_shape))}, action ${esc(JSON.stringify(d.action_shape))}<br>${(d.cameras||[]).map(c=>`<span class="pill">${esc(c.replace('observation.images.',''))}</span>`).join('')}</td><td>${esc(d.action_semantics)}<br>offset=${esc(d.action_offset)}</td><td><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button></td></tr>`).join('')||'<tr><td colspan="5" class="muted">暂无数据集</td></tr>';
-  document.querySelectorAll('.dataset-select').forEach(select=>{const old=select.value;select.innerHTML=items.map(d=>`<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.schema)}</option>`).join('');if(items.some(d=>d.id===old))select.value=old;});
-  const editor=document.getElementById('editorDataset');const previous=editor.value;editor.innerHTML=items.map(d=>`<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.episodes)} episodes</option>`).join('');if(items.some(d=>d.id===previous))editor.value=previous;updateMergeSourceOptions(items);
+
+async function api(path, options = {}) {
+  options.headers = options.headers || {};
+  options.headers.Authorization = 'Bearer ' + tokenInput.value;
+  const response = await fetch(path, options);
+  const body = await response.json().catch(() => ({error: 'invalid JSON response'}));
+  if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+  return body;
 }
-function updateMergeSourceOptions(items=(latestStatus&&latestStatus.datasets)||[]){
-  const target=document.getElementById('editorDataset').value;const source=document.getElementById('mergeSourceDataset');const previous=source.value;const choices=items.filter(d=>d.id!==target);source.innerHTML=choices.map(d=>`<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.episodes)} episodes</option>`).join('');if(choices.some(d=>d.id===previous))source.value=previous;document.getElementById('mergeDatasetButton').disabled=!target||!choices.length;
+
+async function apiBlob(path) {
+  const response = await fetch(path, {
+    headers: {Authorization: 'Bearer ' + tokenInput.value},
+    cache: 'no-store',
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error || `HTTP ${response.status}`);
+  }
+  return response.blob();
 }
-async function openDatasetEditor(datasetId){document.getElementById('editorDataset').value=datasetId;updateMergeSourceOptions();await loadDatasetEpisodes(0);document.getElementById('episodeEditorSummary').scrollIntoView({behavior:'smooth',block:'center'});}
-async function loadDatasetEpisodes(offset=episodeOffset){
-  const datasetId=document.getElementById('editorDataset').value;if(!datasetId){document.getElementById('episodeRows').innerHTML='<tr><td colspan="7" class="muted">暂无数据集</td></tr>';return;}
-  try{episodeOffset=Math.max(0,offset);episodeDatasetData=await api(`/api/datasets/${encodeURIComponent(datasetId)}?offset=${episodeOffset}&limit=${episodeLimit}`);renderEpisodeRows();}catch(e){show(e.message);}
+
+function esc(value) {
+  return String(value ?? '').replace(/[&<>'"]/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
+  }[c]));
 }
-function renderEpisodeRows(){
-  const data=episodeDatasetData||{episodes:[],total:0,offset:0,limit:episodeLimit};document.getElementById('episodeRows').innerHTML=(data.episodes||[]).map(e=>`<tr><td class="checkbox-cell"><input type="checkbox" class="episode-check" value="${esc(e.episode_index)}"></td><td><code>${esc(e.episode_index)}</code></td><td>${esc(e.length)}</td><td>${esc(e.instruction)}</td><td>${esc(e.task_name||'-')}</td><td class="${e.success===false?'bad':e.success===true?'ok':'muted'}">${esc(e.success)}</td><td><button class="inline secondary" onclick="editEpisode(${Number(e.episode_index)})">编辑</button></td></tr>`).join('')||'<tr><td colspan="7" class="muted">没有 episode</td></tr>';
-  const start=data.total?data.offset+1:0;const end=Math.min(data.total,data.offset+data.limit);document.getElementById('episodeEditorSummary').textContent=`dataset=${data.id||'-'} · episodes=${data.total} · frames=${(data.info||{}).total_frames??'-'} · tasks=${(data.info||{}).total_tasks??'-'} · 当前 ${start}-${end}`;document.getElementById('episodePage').textContent=`${start}-${end} / ${data.total}`;
+
+function stateClass(state) {
+  return ['completed', 'running', 'installed', 'stopped'].includes(state)
+    ? 'ok'
+    : ['failed', 'lost'].includes(state) ? 'bad' : 'warn';
 }
-function changeEpisodePage(direction){if(!episodeDatasetData)return;const next=episodeOffset+direction*episodeLimit;if(next<0||next>=episodeDatasetData.total)return;loadDatasetEpisodes(next);}
-async function editEpisode(index){
-  const episode=(episodeDatasetData&&episodeDatasetData.episodes||[]).find(item=>Number(item.episode_index)===Number(index));if(!episode)return;
-  document.getElementById('episodeIndex').value=episode.episode_index;document.getElementById('episodeIndexDisplay').value=episode.episode_index;document.getElementById('episodeInstruction').value=episode.instruction||'';document.getElementById('episodeTaskName').value=episode.task_name||'';document.getElementById('episodeSuccess').value=episode.success===false?'false':'true';document.getElementById('episodeMetadata').value=JSON.stringify(episode.parameters||{},null,2);document.getElementById('episodeRemoveMetadata').value='';
-  episodeVideoUrls.forEach(URL.revokeObjectURL);episodeVideoUrls=[];const container=document.getElementById('episodeVideos');container.innerHTML='<span class="muted">视频加载中…</span>';
-  try{const datasetId=document.getElementById('editorDataset').value;const entries=await Promise.all((episode.video_keys||[]).map(async key=>[key,await apiBlob(`/api/datasets/${encodeURIComponent(datasetId)}/episodes/${episode.episode_index}/video/${encodeURIComponent(key)}`)]));container.innerHTML='';for(const [key,blob] of entries){const url=URL.createObjectURL(blob);episodeVideoUrls.push(url);const item=document.createElement('div');const label=document.createElement('div');label.className='muted';label.textContent=key.replace('observation.images.','');const video=document.createElement('video');video.controls=true;video.preload='metadata';video.src=url;item.append(label,video);container.appendChild(item);}if(!entries.length)container.innerHTML='<span class="muted">该 schema 没有独立 video 文件。</span>';}catch(e){container.innerHTML=`<span class="bad">${esc(e.message)}</span>`;}
+
+function shortPath(path) {
+  const parts = String(path || '').split('/').filter(Boolean);
+  return parts.slice(-3).join('/') || '-';
 }
-async function deleteSelectedEpisodes(){
-  const datasetId=document.getElementById('editorDataset').value;const indexes=[...document.querySelectorAll('.episode-check:checked')].map(x=>Number(x.value));if(!indexes.length){show('请先选择要删除的 episodes。');return;}if(!confirm(`将从 ${datasetId} 删除 episodes ${indexes.join(', ')}，其余 episode 会重新编号；确认继续？`))return;
-  try{const result=await api(`/api/datasets/${encodeURIComponent(datasetId)}/episodes/delete`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({episode_indexes:indexes})});show(`已删除 ${indexes.length} 个 episodes；当前共 ${result.episodes} 个。norm stats 已失效。`,false);await refreshAll();await loadDatasetEpisodes(0);}catch(e){show(e.message);}
+
+function showModule(name, updateHash = true) {
+  const moduleName = MODULES.has(name) ? name : 'overview';
+  document.querySelectorAll('.dashboard-module').forEach(section => {
+    section.hidden = section.dataset.module !== moduleName;
+  });
+  document.querySelectorAll('.nav-button').forEach(button => {
+    const active = button.dataset.module === moduleName;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-current', active ? 'page' : 'false');
+  });
+  if (updateHash && location.hash !== `#${moduleName}`) {
+    history.replaceState(null, '', `#${moduleName}`);
+  }
+  if (moduleName === 'training') {
+    requestAnimationFrame(drawTrainingMetrics);
+    if (document.getElementById('trainMetricsTask').value && !trainingMetricsData) {
+      loadTrainingMetrics({quiet: true});
+    }
+  }
 }
-async function mergeDatasetEpisodes(){
-  const target=document.getElementById('editorDataset').value;const source=document.getElementById('mergeSourceDataset').value;if(!target||!source)return;if(!confirm(`把 ${source} 的全部 episodes 增量合并到 ${target}？源数据集不会被删除，目标 norm stats 会失效。`))return;
-  try{const result=await api(`/api/datasets/${encodeURIComponent(target)}/merge`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_dataset_id:source})});show(`合并完成：${target} 现有 ${result.episodes} episodes。`,false);await refreshAll();await loadDatasetEpisodes(0);}catch(e){show(e.message);}
+
+function fillDatasets(items) {
+  document.getElementById('datasets').innerHTML = items.map(d => `
+    <tr>
+      <td><code>${esc(d.id)}</code><br><span class="muted">${esc(d.robot_type)}</span></td>
+      <td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps<br>${d.norm_stats_ready ? '<span class="ok">norm ready</span>' : '<span class="warn">norm 需计算</span>'}</td>
+      <td><span class="pill">${esc(d.schema)}</span><br>state ${esc(JSON.stringify(d.state_shape))}, action ${esc(JSON.stringify(d.action_shape))}<br>${(d.cameras || []).map(c => `<span class="pill">${esc(c.replace('observation.images.', ''))}</span>`).join('')}</td>
+      <td>${esc(d.action_semantics)}<br>offset=${esc(d.action_offset)}</td>
+      <td><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button></td>
+    </tr>`).join('') || '<tr><td colspan="5" class="muted">暂无数据集</td></tr>';
+
+  document.querySelectorAll('.dataset-select').forEach(select => {
+    const old = select.value;
+    select.innerHTML = items.map(d => `<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.schema)}</option>`).join('');
+    if (items.some(d => d.id === old)) select.value = old;
+  });
+  const editor = document.getElementById('editorDataset');
+  const previous = editor.value;
+  editor.innerHTML = items.map(d => `<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.episodes)} episodes</option>`).join('');
+  if (items.some(d => d.id === previous)) editor.value = previous;
+  updateMergeSourceOptions(items);
 }
-function checkpointLabel(c){const size=c.size_gib==null?'':` · ${Number(c.size_gib).toFixed(1)} GiB`;return `${c.experiment} / step ${c.step} · ${c.updated_at}${size}`;}
-function fillCheckpoints(items){
-  const select=document.getElementById('checkpointSelect');const dataset=document.getElementById('policyDataset').value;const old=select.value;const matches=items.filter(c=>Array.isArray(c.dataset_ids)&&c.dataset_ids.includes(dataset));
-  select.innerHTML=matches.map(c=>`<option value="${esc(c.path)}">${esc(checkpointLabel(c))}</option>`).join('');if(matches.some(c=>c.path===old))select.value=old;
-  const selected=matches.find(c=>c.path===select.value);document.getElementById('checkpointInfo').textContent=selected?`完整 checkpoint；当前：${selected.path}`:`数据集 ${dataset||'-'} 暂无完整 checkpoint，请先完成训练。`;document.getElementById('policySubmit').disabled=!selected;
+
+function updateMergeSourceOptions(items = (latestStatus && latestStatus.datasets) || []) {
+  const target = document.getElementById('editorDataset').value;
+  const source = document.getElementById('mergeSourceDataset');
+  const previous = source.value;
+  const choices = items.filter(d => d.id !== target);
+  source.innerHTML = choices.map(d => `<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.episodes)} episodes</option>`).join('');
+  if (choices.some(d => d.id === previous)) source.value = previous;
+  document.getElementById('mergeDatasetButton').disabled = !target || !choices.length;
 }
-function fillGpus(items){document.getElementById('gpuList').innerHTML=items.map(g=>`<div><span class="pill">GPU ${g.index}</span> ${esc(g.name)} · ${g.memory_used_mib}/${g.memory_total_mib} MiB · ${g.processes.length?'<span class="warn">busy</span>':'<span class="ok">free</span>'}${g.processes.map(p=>`<div class="muted">PID ${p.pid} ${esc(p.name)} ${p.memory_mib} MiB</div>`).join('')}</div>`).join('')||'<div class="bad">nvidia-smi 不可用</div>';}
-function fillReplacePolicies(items){
-  const select=document.getElementById('replacePolicy');const old=select.value;const active=items.filter(t=>t.type==='policy'&&['starting','running','stopping'].includes(t.state));
-  select.innerHTML='<option value="">新建独立 Policy 进程</option>'+active.map(t=>`<option value="${esc(t.id)}">切换 ${esc(t.id)} · PID ${esc(t.pid)} · port ${esc((t.metadata||{}).port)}</option>`).join('');if(active.some(t=>t.id===old))select.value=old;updatePolicyOperation(false);
+
+async function openDatasetEditor(datasetId) {
+  showModule('datasets');
+  document.getElementById('editorDataset').value = datasetId;
+  updateMergeSourceOptions();
+  await loadDatasetEpisodes(0);
+  document.getElementById('episodeEditorSummary').scrollIntoView({behavior: 'smooth', block: 'center'});
 }
-function fmtTime(epoch){return epoch?new Date(Number(epoch)*1000).toLocaleTimeString():'-';}
-function telemetrySummary(t){
-  if(!t)return '<span class="muted">客户端未连接，尚无 telemetry</span>';
-  const control=t.execution_control||{};
-  const connection=t.client_connected?`<span class="ok">WebSocket 已连接 ×${esc(t.active_clients)}</span>`:'<span class="muted">WebSocket 未连接</span>';
-  const freshness=t.received_at==null?'<span class="muted">尚无推理请求</span>':t.fresh?`<span class="ok">近期推理</span> · age=${esc(t.age_s)}s · seq=${esc(t.sequence)}`:`<span class="warn">最近推理已过期</span> · age=${esc(t.age_s)}s`;
-  const serverGate=control.mode==='execute'?`<span class="warn">服务端 EXECUTE</span> · 到期 ${esc(fmtTime(control.expires_at))}`:`<span class="muted">服务端 SHADOW</span>${control.expired?' · 上次授权已过期':''}`;
-  const clientGate=t.client_allow_execution?'<span class="warn">客户端允许执行</span>':'<span class="muted">客户端禁止执行</span>';
-  const dualGate=t.dual_gate_open?'<span class="bad">双重门已打开</span>':'<span class="ok">双重门已关闭</span>';
-  const actual=`实际状态=<code>${esc(t.client_execution_state||'unknown')}</code>${t.client_blocked_reason?`<br>原因=${esc(t.client_blocked_reason)}`:''}${t.client_last_command_at?`<br>最近下发=${esc(fmtTime(t.client_last_command_at))}`:''}`;
-  return `${connection}<br>${freshness}<br>${serverGate}<br>${clientGate} · ${dualGate}<br>${actual}${t.received_at==null?'':`<br>source=${esc(t.source_name||'-')} · action=${esc(JSON.stringify(t.actions_shape||[]))}`}`;
+
+async function loadDatasetEpisodes(offset = episodeOffset) {
+  clearEpisodeMedia();
+  const datasetId = document.getElementById('editorDataset').value;
+  if (!datasetId) {
+    document.getElementById('episodeRows').innerHTML = '<tr><td colspan="7" class="muted">暂无数据集</td></tr>';
+    return;
+  }
+  try {
+    episodeOffset = Math.max(0, offset);
+    episodeDatasetData = await api(`/api/datasets/${encodeURIComponent(datasetId)}?offset=${episodeOffset}&limit=${episodeLimit}`);
+    renderEpisodeRows();
+  } catch (error) {
+    show(error.message);
+  }
 }
-function policyControlButtons(task){
-  const metadata=task.metadata||{};if(!metadata.telemetry_session)return '<span class="muted">外部/旧版 Policy：可停止或切换；执行控制需切换为 Dashboard 启动的进程后可用。</span>';
-  const t=task.telemetry||{};const control=t.execution_control||{};const running=task.state==='running';
-  const canArm=running&&t.client_connected&&t.fresh&&t.client_allow_execution;
-  const why=!running?'Policy 未运行':!t.client_connected?'机械臂客户端未连接':!t.fresh?'telemetry 不新鲜':!t.client_allow_execution?'客户端未使用 --allow-execution':'';
-  const shadow=`<button class="inline secondary" onclick="setPolicyShadow('${esc(task.id)}')" ${control.mode==='shadow'?'disabled':''}>只推理 / SHADOW</button>`;
-  const execute=`<button class="inline danger" onclick="armPolicy('${esc(task.id)}')" ${canArm&&control.mode!=='execute'?'':`disabled title="${esc(why||'已经授权执行')}"`}>授权执行 5 分钟</button>`;
+
+function renderEpisodeRows() {
+  const data = episodeDatasetData || {episodes: [], total: 0, offset: 0, limit: episodeLimit};
+  document.getElementById('episodeRows').innerHTML = (data.episodes || []).map(e => `
+    <tr>
+      <td class="checkbox-cell"><input type="checkbox" class="episode-check" value="${esc(e.episode_index)}"></td>
+      <td><code>${esc(e.episode_index)}</code></td><td>${esc(e.length)}</td>
+      <td>${esc(e.instruction)}</td><td>${esc(e.task_name || '-')}</td>
+      <td class="${e.success === false ? 'bad' : e.success === true ? 'ok' : 'muted'}">${esc(e.success)}</td>
+      <td><button class="inline secondary" onclick="editEpisode(${Number(e.episode_index)})">编辑</button></td>
+    </tr>`).join('') || '<tr><td colspan="7" class="muted">没有 episode</td></tr>';
+  const start = data.total ? data.offset + 1 : 0;
+  const end = Math.min(data.total, data.offset + data.limit);
+  const info = data.info || {};
+  const videoCount = Number(info.total_videos || 0);
+  const mediaNote = videoCount ? `MP4=${videoCount}` : 'MP4=0（可能为逐帧图片）';
+  document.getElementById('episodeEditorSummary').textContent = `dataset=${data.id || '-'} · episodes=${data.total} · frames=${info.total_frames ?? '-'} · ${mediaNote} · tasks=${info.total_tasks ?? '-'} · 当前 ${start}-${end}`;
+  document.getElementById('episodePage').textContent = `${start}-${end} / ${data.total}`;
+}
+
+function changeEpisodePage(direction) {
+  if (!episodeDatasetData) return;
+  const next = episodeOffset + direction * episodeLimit;
+  if (next < 0 || next >= episodeDatasetData.total) return;
+  loadDatasetEpisodes(next);
+}
+
+function clearEpisodeMedia() {
+  for (const player of episodeMediaPlayers) {
+    if (player.timer) clearInterval(player.timer);
+    player.generation = (player.generation || 0) + 1;
+    if (player.url) URL.revokeObjectURL(player.url);
+  }
+  episodeMediaPlayers = [];
+}
+
+async function loadImageFrame(player, frameIndex) {
+  if (player.loading || player.frames <= 0) return;
+  const index = Math.max(0, Math.min(player.frames - 1, Math.floor(frameIndex)));
+  player.loading = true;
+  const generation = player.generation;
+  try {
+    const blob = await apiBlob(`/api/datasets/${encodeURIComponent(player.datasetId)}/episodes/${player.episodeIndex}/image/${encodeURIComponent(player.key)}/${index}`);
+    if (generation !== player.generation) return;
+    const url = URL.createObjectURL(blob);
+    if (player.url) URL.revokeObjectURL(player.url);
+    player.url = url;
+    player.image.src = url;
+    player.frame = index;
+    player.slider.value = String(index);
+    player.counter.textContent = `${index + 1} / ${player.frames}`;
+  } catch (error) {
+    player.status.textContent = `加载失败：${error.message}`;
+    player.status.className = 'bad';
+    player.playing = false;
+    player.button.textContent = '播放';
+  } finally {
+    player.loading = false;
+  }
+}
+
+function setImagePlayerPlaying(player, playing) {
+  player.playing = playing;
+  player.button.textContent = playing ? '暂停' : '播放';
+  if (player.timer) clearInterval(player.timer);
+  player.timer = null;
+  if (!playing || player.frames <= 1) return;
+  const renderFps = Math.max(1, Math.min(Number(player.fps) || 20, 10));
+  const sourceFps = Math.max(1, Number(player.fps) || 20);
+  player.timer = setInterval(() => {
+    if (!player.playing || player.loading) return;
+    player.position = (player.position + sourceFps / renderFps) % player.frames;
+    loadImageFrame(player, Math.floor(player.position));
+  }, 1000 / renderFps);
+}
+
+function createImagePlayer(container, datasetId, episode, media) {
+  const card = document.createElement('div');
+  card.className = 'media-card';
+  const header = document.createElement('header');
+  const title = document.createElement('strong');
+  title.textContent = media.key.replace('observation.images.', '');
+  const status = document.createElement('span');
+  status.className = 'muted';
+  status.textContent = `图片序列 · ${media.fps || 20} fps`;
+  header.append(title, status);
+  const image = document.createElement('img');
+  image.alt = `${title.textContent} frame`;
+  const controls = document.createElement('div');
+  controls.className = 'frame-controls';
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'inline secondary';
+  button.textContent = '暂停';
+  const slider = document.createElement('input');
+  slider.type = 'range';
+  slider.min = '0';
+  slider.max = String(Math.max(0, Number(media.frames || episode.length || 1) - 1));
+  slider.value = '0';
+  const counter = document.createElement('span');
+  counter.className = 'muted';
+  counter.textContent = `1 / ${Number(media.frames || episode.length || 1)}`;
+  controls.append(button, slider, counter);
+  card.append(header, image, controls);
+  container.appendChild(card);
+
+  const player = {
+    type: 'image', datasetId, episodeIndex: episode.episode_index, key: media.key,
+    fps: Number(media.fps || 20), frames: Number(media.frames || episode.length || 0),
+    frame: 0, position: 0, image, slider, counter, button, status,
+    playing: true, loading: false, timer: null, url: null, generation: 0,
+  };
+  episodeMediaPlayers.push(player);
+  button.addEventListener('click', () => setImagePlayerPlaying(player, !player.playing));
+  slider.addEventListener('input', () => {
+    player.position = Number(slider.value);
+    loadImageFrame(player, player.position);
+  });
+  loadImageFrame(player, 0);
+  setImagePlayerPlaying(player, true);
+}
+
+async function createVideoPlayer(container, datasetId, episode, media) {
+  const card = document.createElement('div');
+  card.className = 'media-card';
+  const header = document.createElement('header');
+  const title = document.createElement('strong');
+  title.textContent = media.key.replace('observation.images.', '');
+  const status = document.createElement('span');
+  status.className = 'muted';
+  status.textContent = 'MP4';
+  header.append(title, status);
+  const video = document.createElement('video');
+  video.controls = true;
+  video.preload = 'metadata';
+  card.append(header, video);
+  container.appendChild(card);
+  const player = {type: 'video', timer: null, url: null, generation: 0};
+  episodeMediaPlayers.push(player);
+  try {
+    const blob = await apiBlob(`/api/datasets/${encodeURIComponent(datasetId)}/episodes/${episode.episode_index}/video/${encodeURIComponent(media.key)}`);
+    if (!episodeMediaPlayers.includes(player)) return;
+    player.url = URL.createObjectURL(blob);
+    video.src = player.url;
+  } catch (error) {
+    status.textContent = `加载失败：${error.message}`;
+    status.className = 'bad';
+  }
+}
+
+async function editEpisode(index) {
+  const episode = ((episodeDatasetData && episodeDatasetData.episodes) || [])
+    .find(item => Number(item.episode_index) === Number(index));
+  if (!episode) return;
+  document.getElementById('episodeIndex').value = episode.episode_index;
+  document.getElementById('episodeIndexDisplay').value = episode.episode_index;
+  document.getElementById('episodeInstruction').value = episode.instruction || '';
+  document.getElementById('episodeTaskName').value = episode.task_name || '';
+  document.getElementById('episodeSuccess').value = episode.success === false ? 'false' : 'true';
+  document.getElementById('episodeMetadata').value = JSON.stringify(episode.parameters || {}, null, 2);
+  document.getElementById('episodeRemoveMetadata').value = '';
+
+  clearEpisodeMedia();
+  const container = document.getElementById('episodeVideos');
+  container.innerHTML = '';
+  const media = Array.isArray(episode.media) ? episode.media : [
+    ...(episode.video_keys || []).map(key => ({key, type: 'video', frames: episode.length})),
+    ...(episode.image_keys || []).map(key => ({key, type: 'image', frames: episode.length, fps: (episodeDatasetData.info || {}).fps})),
+  ];
+  if (!media.length) {
+    container.innerHTML = '<span class="muted">该 episode 未发现 video 或 image 相机媒体。</span>';
+    return;
+  }
+  const datasetId = document.getElementById('editorDataset').value;
+  for (const item of media) {
+    if (item.type === 'image') createImagePlayer(container, datasetId, episode, item);
+    else if (item.type === 'video') createVideoPlayer(container, datasetId, episode, item);
+  }
+}
+
+async function deleteSelectedEpisodes() {
+  const datasetId = document.getElementById('editorDataset').value;
+  const indexes = [...document.querySelectorAll('.episode-check:checked')].map(x => Number(x.value));
+  if (!indexes.length) {
+    show('请先选择要删除的 episodes。');
+    return;
+  }
+  if (!confirm(`将从 ${datasetId} 删除 episodes ${indexes.join(', ')}，其余 episode 会重新编号；确认继续？`)) return;
+  try {
+    const result = await api(`/api/datasets/${encodeURIComponent(datasetId)}/episodes/delete`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({episode_indexes: indexes}),
+    });
+    show(`已删除 ${indexes.length} 个 episodes；当前共 ${result.episodes} 个。norm stats 已失效。`, false);
+    await refreshAll();
+    await loadDatasetEpisodes(0);
+  } catch (error) {
+    show(error.message);
+  }
+}
+
+async function mergeDatasetEpisodes() {
+  const target = document.getElementById('editorDataset').value;
+  const source = document.getElementById('mergeSourceDataset').value;
+  if (!target || !source) return;
+  if (!confirm(`把 ${source} 的全部 episodes 增量合并到 ${target}？源数据集不会被删除，目标 norm stats 会失效。`)) return;
+  try {
+    const result = await api(`/api/datasets/${encodeURIComponent(target)}/merge`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({source_dataset_id: source}),
+    });
+    show(`合并完成：${target} 现有 ${result.episodes} episodes。`, false);
+    await refreshAll();
+    await loadDatasetEpisodes(0);
+  } catch (error) {
+    show(error.message);
+  }
+}
+
+function checkpointLabel(c) {
+  const size = c.size_gib == null ? '' : ` · ${Number(c.size_gib).toFixed(1)} GiB`;
+  return `${c.experiment} / step ${c.step} · ${c.updated_at}${size}`;
+}
+
+function fillCheckpoints(items) {
+  document.getElementById('checkpoints').innerHTML = items.map(c => `
+    <tr><td><strong>${esc(c.experiment)}</strong><br>step ${esc(c.step)}</td>
+    <td>${(c.dataset_ids || []).map(id => `<span class="pill">${esc(id)}</span>`).join('') || '<span class="muted">-</span>'}</td>
+    <td>${c.size_gib == null ? '-' : `${Number(c.size_gib).toFixed(1)} GiB`}<br><span class="muted">${esc(c.updated_at || '-')}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">暂无完整 checkpoint</td></tr>';
+
+  const select = document.getElementById('checkpointSelect');
+  const dataset = document.getElementById('policyDataset').value;
+  const old = select.value;
+  const matches = items.filter(c => Array.isArray(c.dataset_ids) && c.dataset_ids.includes(dataset));
+  select.innerHTML = matches.map(c => `<option value="${esc(c.path)}">${esc(checkpointLabel(c))}</option>`).join('');
+  if (matches.some(c => c.path === old)) select.value = old;
+  const selected = matches.find(c => c.path === select.value);
+  document.getElementById('checkpointInfo').textContent = selected
+    ? `完整 checkpoint；当前：${selected.path}`
+    : `数据集 ${dataset || '-'} 暂无完整 checkpoint，请先完成训练。`;
+  document.getElementById('policySubmit').disabled = !selected;
+}
+
+function fillGpus(items) {
+  document.getElementById('gpuList').innerHTML = items.map(g => `
+    <div><span class="pill">GPU ${g.index}</span> ${esc(g.name)} · ${g.memory_used_mib}/${g.memory_total_mib} MiB · ${g.processes.length ? '<span class="warn">busy</span>' : '<span class="ok">free</span>'}
+    ${g.processes.map(p => `<div class="muted">PID ${p.pid} ${esc(p.name)} ${p.memory_mib} MiB</div>`).join('')}</div>`).join('') || '<div class="bad">nvidia-smi 不可用</div>';
+}
+
+function fillReplacePolicies(items) {
+  const select = document.getElementById('replacePolicy');
+  const old = select.value;
+  const active = items.filter(t => t.type === 'policy' && ['starting', 'running', 'stopping'].includes(t.state));
+  select.innerHTML = '<option value="">新建独立 Policy 进程</option>' + active.map(t => `<option value="${esc(t.id)}">切换 ${esc(t.id)} · PID ${esc(t.pid)} · port ${esc((t.metadata || {}).port)}</option>`).join('');
+  if (active.some(t => t.id === old)) select.value = old;
+  updatePolicyOperation(false);
+}
+
+function fillTrainingTasks(items) {
+  const select = document.getElementById('trainMetricsTask');
+  const old = select.value;
+  const tasks = items.filter(task => task.type === 'train')
+    .sort((a, b) => String(b.created_at || b.id).localeCompare(String(a.created_at || a.id)));
+  select.innerHTML = tasks.map(task => {
+    const exp = (task.metadata || {}).exp_name || '-';
+    return `<option value="${esc(task.id)}">${esc(exp)} · ${esc(task.state)} · ${esc(task.id)}</option>`;
+  }).join('');
+  if (tasks.some(task => task.id === old)) select.value = old;
+  if (!tasks.length) {
+    trainingMetricsData = null;
+    document.getElementById('trainMetricsSummary').textContent = '暂无训练任务。';
+    document.getElementById('trainMetricLegend').innerHTML = '';
+    document.getElementById('trainProgressBar').style.width = '0%';
+    drawTrainingMetrics();
+  }
+}
+
+function compactNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '-';
+  if (number === 0) return '0';
+  if (Math.abs(number) >= 1000 || Math.abs(number) < 0.001) return number.toExponential(3);
+  return number.toFixed(5).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+async function loadTrainingMetrics(options = {}) {
+  const select = document.getElementById('trainMetricsTask');
+  const taskId = select.value;
+  if (!taskId) return;
+  const serial = ++metricsRequestSerial;
+  if (!options.quiet) document.getElementById('trainMetricsSummary').textContent = '正在读取训练日志指标…';
+  try {
+    const data = await api(`/api/tasks/${encodeURIComponent(taskId)}/metrics?max_points=1200`);
+    if (serial !== metricsRequestSerial || select.value !== taskId) return;
+    const previousSeries = trainingMetricsData && trainingMetricsData.task && trainingMetricsData.task.id === taskId
+      ? enabledMetrics : new Set();
+    trainingMetricsData = data;
+    if (!previousSeries.size) {
+      const defaults = ['loss', 'loss_physical_14d', 'loss_padding_18d'].filter(key => data.series.includes(key));
+      enabledMetrics = new Set(defaults.length ? defaults : data.series.filter(key => key !== 'param_norm').slice(0, 3));
+    }
+    renderTrainingMetrics();
+  } catch (error) {
+    if (serial !== metricsRequestSerial) return;
+    document.getElementById('trainMetricsSummary').textContent = `指标读取失败：${error.message}`;
+    if (!options.quiet) show(error.message);
+  }
+}
+
+function renderTrainingMetrics() {
+  const data = trainingMetricsData;
+  if (!data) return;
+  const task = data.task || {};
+  const loss = data.summary && data.summary.loss;
+  const progress = data.progress == null ? null : Math.max(0, Math.min(1, Number(data.progress)));
+  document.getElementById('trainProgressBar').style.width = progress == null ? '0%' : `${(progress * 100).toFixed(1)}%`;
+  document.getElementById('trainMetricsSummary').innerHTML = `
+    <span class="${stateClass(task.state)}">${esc(task.state || '-')}</span> ·
+    step <strong>${esc(data.latest_step)}</strong>${data.planned_steps ? ` / ${esc(data.planned_steps)}` : ''}${progress == null ? '' : ` · ${(progress * 100).toFixed(1)}%`}
+    · 原始点 ${esc(data.total_points)} / 绘制点 ${esc(data.sampled_points)}
+    ${loss ? ` · loss=<strong>${esc(compactNumber(loss.latest))}</strong> (min ${esc(compactNumber(loss.min))})` : ''}`;
+  document.getElementById('trainMetricLegend').innerHTML = (data.series || []).map((key, index) => {
+    const item = (data.summary || {})[key] || {};
+    const on = enabledMetrics.has(key);
+    return `<button type="button" class="metric-toggle${on ? '' : ' off'}" data-metric="${esc(key)}" style="border-color:${METRIC_COLORS[index % METRIC_COLORS.length]}">
+      ${esc(key)} · ${esc(compactNumber(item.latest))}
+    </button>`;
+  }).join('') || '<span class="muted">日志中尚无 Step 指标。</span>';
+  document.querySelectorAll('#trainMetricLegend [data-metric]').forEach(button => {
+    button.addEventListener('click', () => {
+      const metric = button.dataset.metric;
+      if (enabledMetrics.has(metric)) enabledMetrics.delete(metric);
+      else enabledMetrics.add(metric);
+      renderTrainingMetrics();
+    });
+  });
+  drawTrainingMetrics();
+}
+
+function drawTrainingMetrics() {
+  const canvas = document.getElementById('trainMetricsChart');
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const width = Math.max(320, Math.floor(rect.width || 800));
+  const height = Math.max(260, Math.floor(rect.height || 340));
+  const ratio = Math.max(1, window.devicePixelRatio || 1);
+  canvas.width = Math.floor(width * ratio);
+  canvas.height = Math.floor(height * ratio);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#07121f';
+  ctx.fillRect(0, 0, width, height);
+
+  const data = trainingMetricsData;
+  const points = (data && data.points) || [];
+  const selected = ((data && data.series) || []).filter(key => enabledMetrics.has(key));
+  if (!points.length || !selected.length) {
+    ctx.fillStyle = '#91a4bd';
+    ctx.font = '14px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText(points.length ? '从下方图例选择要显示的指标' : '暂无可绘制的训练指标', width / 2, height / 2);
+    return;
+  }
+
+  const values = [];
+  for (const point of points) {
+    for (const key of selected) {
+      const value = Number(point[key]);
+      if (Number.isFinite(value)) values.push(value);
+    }
+  }
+  if (!values.length) return;
+  const steps = points.map(point => Number(point.step)).filter(Number.isFinite);
+  let minStep = Math.min(...steps);
+  let maxStep = Math.max(...steps);
+  let minValue = Math.min(...values);
+  let maxValue = Math.max(...values);
+  if (minStep === maxStep) maxStep = minStep + 1;
+  if (minValue === maxValue) {
+    const pad = Math.abs(minValue || 1) * 0.1;
+    minValue -= pad;
+    maxValue += pad;
+  } else {
+    const pad = (maxValue - minValue) * 0.08;
+    minValue -= pad;
+    maxValue += pad;
+  }
+
+  const margin = {left: 72, right: 18, top: 18, bottom: 42};
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const x = step => margin.left + (step - minStep) / (maxStep - minStep) * plotWidth;
+  const y = value => margin.top + (maxValue - value) / (maxValue - minValue) * plotHeight;
+  ctx.strokeStyle = '#223a55';
+  ctx.fillStyle = '#91a4bd';
+  ctx.lineWidth = 1;
+  ctx.font = '11px ui-monospace, monospace';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  for (let i = 0; i <= 5; i++) {
+    const yy = margin.top + plotHeight * i / 5;
+    const value = maxValue - (maxValue - minValue) * i / 5;
+    ctx.beginPath(); ctx.moveTo(margin.left, yy); ctx.lineTo(width - margin.right, yy); ctx.stroke();
+    ctx.fillText(compactNumber(value), margin.left - 8, yy);
+  }
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  for (let i = 0; i <= 5; i++) {
+    const xx = margin.left + plotWidth * i / 5;
+    const step = Math.round(minStep + (maxStep - minStep) * i / 5);
+    ctx.fillText(String(step), xx, height - margin.bottom + 10);
+  }
+  ctx.fillStyle = '#b8c9dc';
+  ctx.fillText('step', margin.left + plotWidth / 2, height - 16);
+
+  selected.forEach(key => {
+    const colorIndex = (data.series || []).indexOf(key);
+    ctx.strokeStyle = METRIC_COLORS[(colorIndex < 0 ? 0 : colorIndex) % METRIC_COLORS.length];
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    for (const point of points) {
+      const value = Number(point[key]);
+      const step = Number(point.step);
+      if (!Number.isFinite(value) || !Number.isFinite(step)) continue;
+      if (!started) { ctx.moveTo(x(step), y(value)); started = true; }
+      else ctx.lineTo(x(step), y(value));
+    }
+    if (started) ctx.stroke();
+  });
+}
+
+function fmtTime(epoch) {
+  return epoch ? new Date(Number(epoch) * 1000).toLocaleTimeString() : '-';
+}
+
+function telemetrySummary(t) {
+  if (!t) return '<span class="muted">客户端未连接，尚无 telemetry</span>';
+  const control = t.execution_control || {};
+  const connection = t.client_connected ? `<span class="ok">WebSocket 已连接 ×${esc(t.active_clients)}</span>` : '<span class="muted">WebSocket 未连接</span>';
+  const freshness = t.received_at == null ? '<span class="muted">尚无推理请求</span>' : t.fresh ? `<span class="ok">近期推理</span> · age=${esc(t.age_s)}s · seq=${esc(t.sequence)}` : `<span class="warn">最近推理已过期</span> · age=${esc(t.age_s)}s`;
+  const serverGate = control.mode === 'execute' ? `<span class="warn">服务端 EXECUTE</span> · 到期 ${esc(fmtTime(control.expires_at))}` : `<span class="muted">服务端 SHADOW</span>${control.expired ? ' · 上次授权已过期' : ''}`;
+  const clientGate = t.client_allow_execution ? '<span class="warn">客户端允许执行</span>' : '<span class="muted">客户端禁止执行</span>';
+  const dualGate = t.dual_gate_open ? '<span class="bad">双重门已打开</span>' : '<span class="ok">双重门已关闭</span>';
+  const actual = `实际状态=<code>${esc(t.client_execution_state || 'unknown')}</code>${t.client_blocked_reason ? `<br>原因=${esc(t.client_blocked_reason)}` : ''}${t.client_last_command_at ? `<br>最近下发=${esc(fmtTime(t.client_last_command_at))}` : ''}`;
+  return `${connection}<br>${freshness}<br>${serverGate}<br>${clientGate} · ${dualGate}<br>${actual}${t.received_at == null ? '' : `<br>source=${esc(t.source_name || '-')} · action=${esc(JSON.stringify(t.actions_shape || []))}`}`;
+}
+
+function policyControlButtons(task) {
+  const metadata = task.metadata || {};
+  if (!metadata.telemetry_session) return '<span class="muted">外部/旧版 Policy：可停止或切换；执行控制需切换为 Dashboard 启动的进程后可用。</span>';
+  const t = task.telemetry || {};
+  const control = t.execution_control || {};
+  const running = task.state === 'running';
+  const canArm = running && t.client_connected && t.fresh && t.client_allow_execution;
+  const why = !running ? 'Policy 未运行' : !t.client_connected ? '机械臂客户端未连接' : !t.fresh ? 'telemetry 不新鲜' : !t.client_allow_execution ? '客户端未使用 --allow-execution' : '';
+  const shadow = `<button class="inline secondary" onclick="setPolicyShadow('${esc(task.id)}')" ${control.mode === 'shadow' ? 'disabled' : ''}>只推理 / SHADOW</button>`;
+  const execute = `<button class="inline danger" onclick="armPolicy('${esc(task.id)}')" ${canArm && control.mode !== 'execute' ? '' : `disabled title="${esc(why || '已经授权执行')}"`}>授权执行 5 分钟</button>`;
   return `${shadow}${execute}`;
 }
-function jobDependencySummary(task){
-  const dependency=task.dependency||{};const id=dependency.task_id||(task.metadata||{}).depends_on;if(!id)return '';
-  if(task.dependency_failed)return `<br><span class="bad">norm 串联失败</span><br><span class="muted">${esc(task.dependency_error||'依赖任务失败')}</span>`;
-  if(task.state==='waiting_norm')return `<br><span class="warn">等待 norm</span><br><code>${esc(id)}</code> · ${esc(task.dependency_state||'pending')}`;
-  if(task.state==='waiting_gpu')return `<br><span class="warn">norm 已完成，等待 GPU</span><br><code>${esc(id)}</code><br><span class="muted">${esc(task.waiting_reason||'GPU 暂不可用')}</span>`;
+
+function jobDependencySummary(task) {
+  const dependency = task.dependency || {};
+  const id = dependency.task_id || (task.metadata || {}).depends_on;
+  if (!id) return '';
+  if (task.dependency_failed) return `<br><span class="bad">norm 串联失败</span><br><span class="muted">${esc(task.dependency_error || '依赖任务失败')}</span>`;
+  if (task.state === 'waiting_norm') return `<br><span class="warn">等待 norm</span><br><code>${esc(id)}</code> · ${esc(task.dependency_state || 'pending')}`;
+  if (task.state === 'waiting_gpu') return `<br><span class="warn">norm 已完成，等待 GPU</span><br><code>${esc(id)}</code><br><span class="muted">${esc(task.waiting_reason || 'GPU 暂不可用')}</span>`;
   return `<br><span class="ok">由 norm 自动串联</span><br><code>${esc(id)}</code>`;
 }
-function fillTasks(items){
-  const policies=items.filter(t=>t.type==='policy');
-  document.getElementById('policies').innerHTML=policies.map(t=>{const m=t.metadata||{};const active=['starting','running','stopping'].includes(t.state);const health=t.policy_healthy===true?'<span class="ok">/healthz OK</span>':t.state==='running'?'<span class="bad">/healthz FAIL</span>':'<span class="muted">未运行</span>';const badge=m.external?'<br><span class="pill warn">外部进程已接管</span>':'';return `<tr><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid||'-')}${badge}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal?`<br>${esc(t.stop_signal)}`:''}</td><td>GPU ${esc((m.gpu_ids||[]).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.schema||'-')}</span></td><td>dataset=${esc(m.dataset_id)}<br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}')">日志</button>${active?`<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>`:''}${t.state==='stopping'?`<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>`:''}</td></tr>`;}).join('')||'<tr><td colspan="6" class="muted">暂无 Policy 进程；可在上方创建。</td></tr>';
-  const jobs=items.filter(t=>t.type!=='policy');
-  document.getElementById('jobs').innerHTML=jobs.map(t=>{const m=t.metadata||{};const active=['starting','running','stopping','waiting_norm','waiting_gpu'].includes(t.state);const params=`dataset=${esc(m.dataset_id||'-')} · schema=${esc(m.schema||'-')}${m.exp_name?`<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids||[]).join(','))}`:`<br>batch=${esc(m.batch_size||'-')} · workers=${esc(m.num_workers||'-')}${m.automatic?' · 自动创建':''}`}`;return `<tr><td><code>${esc(t.id)}</code><br>${esc(t.type)} · PID ${esc(t.pid||'-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${jobDependencySummary(t)}${t.start_error?`<br><span class="bad">${esc(t.start_error)}</span>`:''}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}')">日志</button>${active?`<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_')?'取消':'停止'}</button>`:''}${t.state==='stopping'?`<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>`:''}</td></tr>`;}).join('')||'<tr><td colspan="4" class="muted">暂无 Norm / Train 任务</td></tr>';
-  fillReplacePolicies(items);updateClientCommand();
+
+function fillTasks(items) {
+  const policies = items.filter(t => t.type === 'policy');
+  document.getElementById('policies').innerHTML = policies.map(t => {
+    const m = t.metadata || {};
+    const active = ['starting', 'running', 'stopping'].includes(t.state);
+    const health = t.policy_healthy === true ? '<span class="ok">/healthz OK</span>' : t.state === 'running' ? '<span class="bad">/healthz FAIL</span>' : '<span class="muted">未运行</span>';
+    const badge = m.external ? '<br><span class="pill warn">外部进程已接管</span>' : '';
+    return `<tr><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid || '-')}${badge}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal ? `<br>${esc(t.stop_signal)}` : ''}</td><td>GPU ${esc((m.gpu_ids || []).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.schema || '-')}</span></td><td>dataset=${esc(m.dataset_id)}<br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}</td></tr>`;
+  }).join('') || '<tr><td colspan="6" class="muted">暂无 Policy 进程；可在上方创建。</td></tr>';
+
+  const jobs = items.filter(t => t.type !== 'policy');
+  document.getElementById('jobs').innerHTML = jobs.map(t => {
+    const m = t.metadata || {};
+    const active = ACTIVE_STATES.has(t.state);
+    const params = `dataset=${esc(m.dataset_id || '-')} · schema=${esc(m.schema || '-')}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}` : `<br>batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}`;
+    return `<tr><td><code>${esc(t.id)}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${jobDependencySummary(t)}${t.start_error ? `<br><span class="bad">${esc(t.start_error)}</span>` : ''}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}</td></tr>`;
+  }).join('') || '<tr><td colspan="4" class="muted">暂无 Norm / Train 任务</td></tr>';
+  fillReplacePolicies(items);
+  updateClientCommand();
 }
-function updatePolicyOperation(applyTask=true){
-  const id=document.getElementById('replacePolicy').value;const button=document.getElementById('policySubmit');const info=document.getElementById('replaceInfo');button.textContent=id?'停止旧进程并切换 Policy 模型':'新建 Policy 进程';
-  if(!id){info.textContent='将创建新的独立 Policy 进程。多个 Policy 必须使用不同端口和空闲 GPU。';updateClientCommand();return;}
-  const task=latestStatus&&latestStatus.tasks.find(t=>t.id===id);if(!task)return;const m=task.metadata||{};info.textContent=`将停止 PID ${task.pid}，断开 port ${m.port} 的客户端，再使用所选 checkpoint 启动替代进程。`;
-  if(applyTask){if(m.dataset_id)document.getElementById('policyDataset').value=m.dataset_id;if(m.arm_side)document.getElementById('policyArm').value=m.arm_side;if(Array.isArray(m.gpu_ids))document.getElementById('policyGpu').value=m.gpu_ids.join(',');if(m.port)document.getElementById('policyPort').value=m.port;fillCheckpoints((latestStatus&&latestStatus.checkpoints)||[]);}updateClientCommand();
+
+function updateSummaries(data) {
+  const gpus = data.gpus || [];
+  const datasets = data.datasets || [];
+  const tasks = data.tasks || [];
+  const freeGpus = gpus.filter(gpu => !(gpu.processes || []).length).length;
+  const freeMemory = gpus.reduce((sum, gpu) => sum + Math.max(0, Number(gpu.memory_total_mib || 0) - Number(gpu.memory_used_mib || 0)), 0);
+  const frames = datasets.reduce((sum, dataset) => sum + Number(dataset.frames || 0), 0);
+  const trainTasks = tasks.filter(task => task.type === 'train');
+  const normTasks = tasks.filter(task => task.type === 'norm');
+  const activeTraining = [...trainTasks, ...normTasks].filter(task => ACTIVE_STATES.has(task.state));
+  const policies = tasks.filter(task => task.type === 'policy');
+  const activePolicies = policies.filter(task => ['starting', 'running', 'stopping'].includes(task.state));
+  const observation = data.robot_observation;
+
+  document.getElementById('summaryGpu').textContent = `${freeGpus} / ${gpus.length}`;
+  document.getElementById('summaryGpuDetail').textContent = `${(freeMemory / 1024).toFixed(1)} GiB 显存可用`;
+  document.getElementById('summaryDatasets').textContent = String(datasets.length);
+  document.getElementById('summaryFrames').textContent = `${frames.toLocaleString()} frames`;
+  document.getElementById('summaryTraining').textContent = String(activeTraining.length);
+  document.getElementById('summaryTrainingDetail').textContent = `${trainTasks.length} train · ${normTasks.length} norm`;
+  document.getElementById('summaryPolicies').textContent = String(activePolicies.length);
+  document.getElementById('summaryPolicyDetail').textContent = observation && observation.fresh ? 'telemetry 新鲜' : '暂无新鲜 telemetry';
+  document.getElementById('navOverviewCount').textContent = String(activeTraining.length + activePolicies.length);
+  document.getElementById('navDatasetCount').textContent = String(datasets.length);
+  document.getElementById('navTrainingCount').textContent = String(activeTraining.length);
+  document.getElementById('navPolicyCount').textContent = String(activePolicies.length);
+  document.getElementById('navTelemetryCount').textContent = observation && observation.fresh ? '1' : '0';
+  document.getElementById('lastRefresh').textContent = `刷新于 ${new Date().toLocaleTimeString()}`;
 }
-function updateClientCommand(){
-  let port=document.getElementById('policyPort').value||8000;const selected=document.getElementById('replacePolicy').value;if(selected&&latestStatus){const task=latestStatus.tasks.find(t=>t.id===selected);if(task&&task.metadata&&task.metadata.port)port=task.metadata.port;}
-  document.getElementById('policyClientCommand').textContent=`python robot_observation_bridge.py \\\n  --host 192.168.101.9 \\\n  --port ${port} \\\n  --can can0 \\\n  --cam-high-device /dev/video8 \\\n  --cam-wrist-device /dev/video16 \\\n  --instruction "pick up the cube"`;
+
+function updatePolicyOperation(applyTask = true) {
+  const id = document.getElementById('replacePolicy').value;
+  const button = document.getElementById('policySubmit');
+  const info = document.getElementById('replaceInfo');
+  button.textContent = id ? '停止旧进程并切换 Policy 模型' : '新建 Policy 进程';
+  if (!id) {
+    info.textContent = '将创建新的独立 Policy 进程。多个 Policy 必须使用不同端口和空闲 GPU。';
+    updateClientCommand();
+    return;
+  }
+  const task = latestStatus && latestStatus.tasks.find(t => t.id === id);
+  if (!task) return;
+  const m = task.metadata || {};
+  info.textContent = `将停止 PID ${task.pid}，断开 port ${m.port} 的客户端，再使用所选 checkpoint 启动替代进程。`;
+  if (applyTask) {
+    if (m.dataset_id) document.getElementById('policyDataset').value = m.dataset_id;
+    if (m.arm_side) document.getElementById('policyArm').value = m.arm_side;
+    if (Array.isArray(m.gpu_ids)) document.getElementById('policyGpu').value = m.gpu_ids.join(',');
+    if (m.port) document.getElementById('policyPort').value = m.port;
+    fillCheckpoints((latestStatus && latestStatus.checkpoints) || []);
+  }
+  updateClientCommand();
 }
-async function loadObservationPreviews(obs){
-  if(!obs||!obs.telemetry_session)return;try{const suffix=`?v=${encodeURIComponent(obs.sequence)}`;const [high,wrist]=await Promise.all([apiBlob(`/api/policy-telemetry/${encodeURIComponent(obs.telemetry_session)}/image/cam_high${suffix}`),apiBlob(`/api/policy-telemetry/${encodeURIComponent(obs.telemetry_session)}/image/cam_wrist${suffix}`)]);previewUrls.forEach(URL.revokeObjectURL);previewUrls=[URL.createObjectURL(high),URL.createObjectURL(wrist)];document.getElementById('previewHigh').src=previewUrls[0];document.getElementById('previewWrist').src=previewUrls[1];}catch(e){console.warn('telemetry preview refresh failed',e);}
+
+function updateClientCommand() {
+  let port = document.getElementById('policyPort').value || 8000;
+  const selected = document.getElementById('replacePolicy').value;
+  if (selected && latestStatus) {
+    const task = latestStatus.tasks.find(t => t.id === selected);
+    if (task && task.metadata && task.metadata.port) port = task.metadata.port;
+  }
+  document.getElementById('policyClientCommand').textContent = `python robot_observation_bridge.py \\\n  --host 192.168.101.9 \\\n  --port ${port} \\\n  --can can0 \\\n  --cam-high-device /dev/video8 \\\n  --cam-wrist-device /dev/video16 \\\n  --instruction "pick up the cube"`;
 }
-function fillObservation(obs){
-  if(!latestStatus)latestStatus={};latestStatus.robot_observation=obs;const status=document.getElementById('robotObservation');
-  if(!obs){status.className='warn';status.textContent='尚未收到官方 Policy telemetry；请先启动 Policy，再在机械臂控制电脑启动 WebSocket shadow 客户端。';document.getElementById('robotStateTitle').textContent='Policy state';document.getElementById('robotState').textContent='state: -';document.getElementById('policyAction').textContent='action: -';return;}
-  const control=obs.execution_control||{};status.className=obs.dual_gate_open?'bad':obs.fresh?'ok':'warn';const captured=new Date(Number(obs.captured_at)*1000).toLocaleString();status.textContent=`${obs.fresh?'官方链路近期有真实推理':'Policy 正常，但最近 telemetry 已过期'} · 服务端=${control.mode||'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open?'OPEN':'CLOSED'} · 实际=${obs.client_execution_state||'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · source=${obs.source_name||'-'} · captured=${captured} · transport=${obs.transport}`;
-  const joint=obs.schema==='joint';const labels=joint?['joint1(rad)','joint2(rad)','joint3(rad)','joint4(rad)','joint5(rad)','joint6(rad)','gripper_opening(m)']:['x(m)','y(m)','z(m)','r6d_c0_x','r6d_c0_y','r6d_c0_z','r6d_c1_x','r6d_c1_y','r6d_c1_z','gripper_closed'];const values=(obs.state||[]).map((v,i)=>`${labels[i]||i}: ${Number(v).toFixed(6)}`);document.getElementById('robotStateTitle').textContent=joint?'7D joint state':'10D delivery state';document.getElementById('robotState').textContent=`schema=${obs.schema} arm=${obs.arm_side} dim=${obs.state_dim}\n${values.join('\n')}`;
-  document.getElementById('policyAction').textContent=`prompt: ${obs.prompt||'-'}\nactions shape: ${JSON.stringify(obs.actions_shape||[])}\nfirst action: ${JSON.stringify(obs.first_action||[])}\nmin/max: ${obs.action_min} / ${obs.action_max}\npolicy elapsed: ${Number(obs.policy_elapsed_s||0).toFixed(4)}s\nserver gate: ${control.mode||'shadow'} (revision ${control.revision||0})\nclient allow: ${Boolean(obs.client_allow_execution)}\nclient state: ${obs.client_execution_state||'unknown'}\nblocked reason: ${obs.client_blocked_reason||'-'}\nlast command: ${fmtTime(obs.client_last_command_at)}`;
-  const key=`${obs.telemetry_session}:${obs.sequence}`;if(key!==latestTelemetryKey){latestTelemetryKey=key;loadObservationPreviews(obs);}
+
+async function loadObservationPreviews(obs) {
+  if (!obs || !obs.telemetry_session) return;
+  try {
+    const suffix = `?v=${encodeURIComponent(obs.sequence)}`;
+    const [high, wrist] = await Promise.all([
+      apiBlob(`/api/policy-telemetry/${encodeURIComponent(obs.telemetry_session)}/image/cam_high${suffix}`),
+      apiBlob(`/api/policy-telemetry/${encodeURIComponent(obs.telemetry_session)}/image/cam_wrist${suffix}`),
+    ]);
+    previewUrls.forEach(URL.revokeObjectURL);
+    previewUrls = [URL.createObjectURL(high), URL.createObjectURL(wrist)];
+    document.getElementById('previewHigh').src = previewUrls[0];
+    document.getElementById('previewWrist').src = previewUrls[1];
+  } catch (error) {
+    console.warn('telemetry preview refresh failed', error);
+  }
 }
-async function refreshObservation(){if(!tokenInput.value)return;try{const data=await api('/api/robot/observation');fillObservation(data.observation);}catch(e){console.warn('telemetry refresh failed',e);}}
-async function refreshAll(){
-  if(!tokenInput.value){show('请先输入 Dashboard API Token。');return;}
-  try{const data=await api('/api/status');latestStatus=data;fillDatasets(data.datasets||[]);fillCheckpoints(data.checkpoints||[]);fillGpus(data.gpus||[]);fillTasks(data.tasks||[]);fillObservation(data.robot_observation);document.getElementById('serverInfo').innerHTML=`管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>Base: <code>${esc(data.config.base_checkpoint)}</code>`;if(!episodeDatasetData&&document.getElementById('editorDataset').value)loadDatasetEpisodes(0);}catch(e){show(e.message);}
+
+function fillObservation(obs) {
+  if (!latestStatus) latestStatus = {};
+  latestStatus.robot_observation = obs;
+  const status = document.getElementById('robotObservation');
+  if (!obs) {
+    status.className = 'warn';
+    status.textContent = '尚未收到官方 Policy telemetry；请先启动 Policy，再在机械臂控制电脑启动 WebSocket shadow 客户端。';
+    document.getElementById('robotStateTitle').textContent = 'Policy state';
+    document.getElementById('robotState').textContent = 'state: -';
+    document.getElementById('policyAction').textContent = 'action: -';
+    return;
+  }
+  const control = obs.execution_control || {};
+  status.className = obs.dual_gate_open ? 'bad' : obs.fresh ? 'ok' : 'warn';
+  const captured = new Date(Number(obs.captured_at) * 1000).toLocaleString();
+  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · 服务端=${control.mode || 'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open ? 'OPEN' : 'CLOSED'} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
+  const joint = obs.schema === 'joint';
+  const labels = joint ? ['joint1(rad)', 'joint2(rad)', 'joint3(rad)', 'joint4(rad)', 'joint5(rad)', 'joint6(rad)', 'gripper_opening(m)'] : ['x(m)', 'y(m)', 'z(m)', 'r6d_c0_x', 'r6d_c0_y', 'r6d_c0_z', 'r6d_c1_x', 'r6d_c1_y', 'r6d_c1_z', 'gripper_closed'];
+  const values = (obs.state || []).map((v, i) => `${labels[i] || i}: ${Number(v).toFixed(6)}`);
+  document.getElementById('robotStateTitle').textContent = joint ? '7D joint state' : '10D delivery state';
+  document.getElementById('robotState').textContent = `schema=${obs.schema} arm=${obs.arm_side} dim=${obs.state_dim}\n${values.join('\n')}`;
+  document.getElementById('policyAction').textContent = `prompt: ${obs.prompt || '-'}\nactions shape: ${JSON.stringify(obs.actions_shape || [])}\nfirst action: ${JSON.stringify(obs.first_action || [])}\nmin/max: ${obs.action_min} / ${obs.action_max}\npolicy elapsed: ${Number(obs.policy_elapsed_s || 0).toFixed(4)}s\nserver gate: ${control.mode || 'shadow'} (revision ${control.revision || 0})\nclient allow: ${Boolean(obs.client_allow_execution)}\nclient state: ${obs.client_execution_state || 'unknown'}\nblocked reason: ${obs.client_blocked_reason || '-'}\nlast command: ${fmtTime(obs.client_last_command_at)}`;
+  const key = `${obs.telemetry_session}:${obs.sequence}`;
+  if (key !== latestTelemetryKey) {
+    latestTelemetryKey = key;
+    loadObservationPreviews(obs);
+  }
 }
-async function armPolicy(id){
-  const typed=prompt(`这是实机动作授权。请输入完整 Policy task id 以确认：\n${id}`,'');if(typed!==id){if(typed!==null)show('task id 不匹配，未授权执行。');return;}
-  try{await api(`/api/tasks/${encodeURIComponent(id)}/execution-control`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'execute',expires_in_s:300,confirm_task_id:typed})});show('已授权执行 5 分钟；客户端本地安全门仍独立生效。',false);await refreshAll();}catch(e){show(e.message);}
+
+async function refreshObservation() {
+  if (!tokenInput.value) return;
+  try {
+    const data = await api('/api/robot/observation');
+    fillObservation(data.observation);
+    if (latestStatus) updateSummaries(latestStatus);
+  } catch (error) {
+    console.warn('telemetry refresh failed', error);
+  }
 }
-async function setPolicyShadow(id){
-  try{await api(`/api/tasks/${encodeURIComponent(id)}/execution-control`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'shadow'})});show('已切回只推理 / SHADOW。',false);await refreshAll();}catch(e){show(e.message);}
+
+async function refreshAll() {
+  if (!tokenInput.value) {
+    show('请先输入 Dashboard API Token。');
+    return;
+  }
+  try {
+    const data = await api('/api/status');
+    latestStatus = data;
+    fillDatasets(data.datasets || []);
+    fillCheckpoints(data.checkpoints || []);
+    fillGpus(data.gpus || []);
+    fillTasks(data.tasks || []);
+    fillTrainingTasks(data.tasks || []);
+    fillObservation(data.robot_observation);
+    updateSummaries(data);
+    document.getElementById('serverInfo').innerHTML = `管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>Base: <code>${esc(data.config.base_checkpoint)}</code>`;
+    if (!episodeDatasetData && document.getElementById('editorDataset').value) loadDatasetEpisodes(0);
+    const trainingVisible = !document.getElementById('module-training').hidden;
+    if (trainingVisible && document.getElementById('trainMetricsTask').value) loadTrainingMetrics({quiet: true});
+  } catch (error) {
+    show(error.message);
+  }
 }
-async function loadLog(id){try{const data=await api(`/api/tasks/${encodeURIComponent(id)}/log?max_bytes=131072`);document.getElementById('taskLog').textContent=data.log||'(empty)';}catch(e){show(e.message);}}
-async function stopTask(id,force=false){const verb=force?'强制结束':'停止';if(!confirm(`${verb} ${id}？${force?' 将发送 SIGKILL。':''}`))return;try{await api(`/api/tasks/${encodeURIComponent(id)}/stop`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({force})});show(`${verb}请求已发送。`,false);await refreshAll();}catch(e){show(e.message);}}
-function formJSON(form){const out={};new FormData(form).forEach((v,k)=>out[k]=v);return out;}
-document.getElementById('policyDataset').addEventListener('change',()=>fillCheckpoints((latestStatus&&latestStatus.checkpoints)||[]));
-document.getElementById('replacePolicy').addEventListener('change',()=>updatePolicyOperation(true));
-document.getElementById('policyPort').addEventListener('input',updateClientCommand);
-document.getElementById('editorDataset').addEventListener('change',()=>{episodeDatasetData=null;updateMergeSourceOptions();loadDatasetEpisodes(0);});
-document.getElementById('episodeForm').onsubmit=async e=>{e.preventDefault();const datasetId=document.getElementById('editorDataset').value;const episodeIndex=document.getElementById('episodeIndex').value;if(episodeIndex===''){show('请先从列表选择一个 episode。');return;}let metadata;try{metadata=JSON.parse(document.getElementById('episodeMetadata').value||'{}');if(!metadata||Array.isArray(metadata)||typeof metadata!=='object')throw new Error('metadata 必须是 JSON object');}catch(err){show(`metadata JSON 无效：${err.message}`);return;}const remove_metadata=document.getElementById('episodeRemoveMetadata').value.split(',').map(x=>x.trim()).filter(Boolean);const payload={instruction:document.getElementById('episodeInstruction').value,task_name:document.getElementById('episodeTaskName').value,success:document.getElementById('episodeSuccess').value==='true',metadata,remove_metadata};if(!confirm(`保存 ${datasetId} episode ${episodeIndex} 的参数？该操作会重新校验数据集并使 norm stats 失效。`))return;try{await api(`/api/datasets/${encodeURIComponent(datasetId)}/episodes/${episodeIndex}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});show(`Episode ${episodeIndex} 参数已保存。`,false);await refreshAll();await loadDatasetEpisodes(episodeOffset);editEpisode(Number(episodeIndex));}catch(err){show(err.message);}};
-document.getElementById('normForm').onsubmit=async e=>{e.preventDefault();const p=formJSON(e.target);if(!p.max_frames)delete p.max_frames;try{await api('/api/tasks/norm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});show('norm stats 任务已提交。',false);refreshAll();}catch(err){show(err.message);}};
-document.getElementById('trainForm').onsubmit=async e=>{e.preventDefault();const p=formJSON(e.target);p.gpu_ids=p.gpu_ids.split(',').map(x=>x.trim()).filter(Boolean);if(p.mode==='overwrite'&&!confirm(`overwrite 会删除实验 ${p.exp_name} 的原 checkpoint 目录并重新训练，确认继续？`))return;try{const task=await api('/api/tasks/train',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});const dep=(task.dependency||{}).task_id;if(task.state==='waiting_norm')show(`训练已排队；正在自动计算 norm stats：${dep}`,false);else if(task.state==='waiting_gpu')show(`norm stats 已就绪；训练正在等待 GPU：${task.waiting_reason||''}`,false);else show(`训练任务已启动：${task.id}`,false);refreshAll();}catch(err){show(err.message);}};
-document.getElementById('policyForm').onsubmit=async e=>{e.preventDefault();const p=formJSON(e.target);p.gpu_ids=p.gpu_ids.split(',').map(x=>x.trim()).filter(Boolean);const switching=Boolean(p.replace_task_id);if(switching&&!confirm(`确认停止 ${p.replace_task_id} 并切换到所选 checkpoint？`))return;try{const task=await api('/api/tasks/policy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});show(`${switching?'Policy 模型已切换':'Policy 进程已创建'}：${task.id}`,false);document.getElementById('replacePolicy').value='';await refreshAll();}catch(err){show(err.message);}};
-if(tokenInput.value){refreshAll();refreshObservation();}
-setInterval(()=>{if(tokenInput.value)refreshAll();},8000);
-setInterval(refreshObservation,1500);
+
+async function armPolicy(id) {
+  const typed = prompt(`这是实机动作授权。请输入完整 Policy task id 以确认：\n${id}`, '');
+  if (typed !== id) {
+    if (typed !== null) show('task id 不匹配，未授权执行。');
+    return;
+  }
+  try {
+    await api(`/api/tasks/${encodeURIComponent(id)}/execution-control`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode: 'execute', expires_in_s: 300, confirm_task_id: typed}),
+    });
+    show('已授权执行 5 分钟；客户端本地安全门仍独立生效。', false);
+    await refreshAll();
+  } catch (error) {
+    show(error.message);
+  }
+}
+
+async function setPolicyShadow(id) {
+  try {
+    await api(`/api/tasks/${encodeURIComponent(id)}/execution-control`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode: 'shadow'}),
+    });
+    show('已切回只推理 / SHADOW。', false);
+    await refreshAll();
+  } catch (error) {
+    show(error.message);
+  }
+}
+
+async function loadLog(id) {
+  try {
+    const data = await api(`/api/tasks/${encodeURIComponent(id)}/log?max_bytes=131072`);
+    document.getElementById('taskLog').textContent = data.log || '(empty)';
+    showModule('overview');
+  } catch (error) {
+    show(error.message);
+  }
+}
+
+async function stopTask(id, force = false) {
+  const verb = force ? '强制结束' : '停止';
+  if (!confirm(`${verb} ${id}？${force ? ' 将发送 SIGKILL。' : ''}`)) return;
+  try {
+    await api(`/api/tasks/${encodeURIComponent(id)}/stop`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({force}),
+    });
+    show(`${verb}请求已发送。`, false);
+    await refreshAll();
+  } catch (error) {
+    show(error.message);
+  }
+}
+
+function formJSON(form) {
+  const out = {};
+  new FormData(form).forEach((value, key) => { out[key] = value; });
+  return out;
+}
+
+document.querySelectorAll('.nav-button').forEach(button => {
+  button.addEventListener('click', () => showModule(button.dataset.module));
+});
+window.addEventListener('hashchange', () => showModule(location.hash.slice(1), false));
+window.addEventListener('resize', () => requestAnimationFrame(drawTrainingMetrics));
+window.addEventListener('beforeunload', () => {
+  clearEpisodeMedia();
+  previewUrls.forEach(URL.revokeObjectURL);
+});
+
+document.getElementById('policyDataset').addEventListener('change', () => fillCheckpoints((latestStatus && latestStatus.checkpoints) || []));
+document.getElementById('replacePolicy').addEventListener('change', () => updatePolicyOperation(true));
+document.getElementById('policyPort').addEventListener('input', updateClientCommand);
+document.getElementById('editorDataset').addEventListener('change', () => {
+  episodeDatasetData = null;
+  clearEpisodeMedia();
+  updateMergeSourceOptions();
+  loadDatasetEpisodes(0);
+});
+document.getElementById('trainMetricsTask').addEventListener('change', () => {
+  trainingMetricsData = null;
+  enabledMetrics = new Set();
+  loadTrainingMetrics();
+});
+
+document.getElementById('episodeForm').onsubmit = async event => {
+  event.preventDefault();
+  const datasetId = document.getElementById('editorDataset').value;
+  const episodeIndex = document.getElementById('episodeIndex').value;
+  if (episodeIndex === '') {
+    show('请先从列表选择一个 episode。');
+    return;
+  }
+  let metadata;
+  try {
+    metadata = JSON.parse(document.getElementById('episodeMetadata').value || '{}');
+    if (!metadata || Array.isArray(metadata) || typeof metadata !== 'object') throw new Error('metadata 必须是 JSON object');
+  } catch (error) {
+    show(`metadata JSON 无效：${error.message}`);
+    return;
+  }
+  const removeMetadata = document.getElementById('episodeRemoveMetadata').value.split(',').map(x => x.trim()).filter(Boolean);
+  const payload = {
+    instruction: document.getElementById('episodeInstruction').value,
+    task_name: document.getElementById('episodeTaskName').value,
+    success: document.getElementById('episodeSuccess').value === 'true',
+    metadata,
+    remove_metadata: removeMetadata,
+  };
+  if (!confirm(`保存 ${datasetId} episode ${episodeIndex} 的参数？该操作会重新校验数据集并使 norm stats 失效。`)) return;
+  try {
+    await api(`/api/datasets/${encodeURIComponent(datasetId)}/episodes/${episodeIndex}`, {
+      method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
+    });
+    show(`Episode ${episodeIndex} 参数已保存。`, false);
+    await refreshAll();
+    await loadDatasetEpisodes(episodeOffset);
+    editEpisode(Number(episodeIndex));
+  } catch (error) {
+    show(error.message);
+  }
+};
+
+document.getElementById('normForm').onsubmit = async event => {
+  event.preventDefault();
+  const payload = formJSON(event.target);
+  if (!payload.max_frames) delete payload.max_frames;
+  try {
+    await api('/api/tasks/norm', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+    show('norm stats 任务已提交。', false);
+    refreshAll();
+  } catch (error) {
+    show(error.message);
+  }
+};
+
+document.getElementById('trainForm').onsubmit = async event => {
+  event.preventDefault();
+  const payload = formJSON(event.target);
+  payload.gpu_ids = payload.gpu_ids.split(',').map(x => x.trim()).filter(Boolean);
+  if (payload.mode === 'overwrite' && !confirm(`overwrite 会删除实验 ${payload.exp_name} 的原 checkpoint 目录并重新训练，确认继续？`)) return;
+  try {
+    const task = await api('/api/tasks/train', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+    const dependency = (task.dependency || {}).task_id;
+    if (task.state === 'waiting_norm') show(`训练已排队；正在自动计算 norm stats：${dependency}`, false);
+    else if (task.state === 'waiting_gpu') show(`norm stats 已就绪；训练正在等待 GPU：${task.waiting_reason || ''}`, false);
+    else show(`训练任务已启动：${task.id}`, false);
+    showModule('training');
+    refreshAll();
+  } catch (error) {
+    show(error.message);
+  }
+};
+
+document.getElementById('policyForm').onsubmit = async event => {
+  event.preventDefault();
+  const payload = formJSON(event.target);
+  payload.gpu_ids = payload.gpu_ids.split(',').map(x => x.trim()).filter(Boolean);
+  const switching = Boolean(payload.replace_task_id);
+  if (switching && !confirm(`确认停止 ${payload.replace_task_id} 并切换到所选 checkpoint？`)) return;
+  try {
+    const task = await api('/api/tasks/policy', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+    show(`${switching ? 'Policy 模型已切换' : 'Policy 进程已创建'}：${task.id}`, false);
+    document.getElementById('replacePolicy').value = '';
+    await refreshAll();
+  } catch (error) {
+    show(error.message);
+  }
+};
+
+showModule(location.hash.slice(1), false);
+if (tokenInput.value) {
+  refreshAll();
+  refreshObservation();
+}
+setInterval(() => { if (tokenInput.value) refreshAll(); }, 8000);
+setInterval(refreshObservation, 1500);
 </script></body></html>

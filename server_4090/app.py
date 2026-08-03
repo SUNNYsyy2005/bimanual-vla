@@ -43,10 +43,57 @@ TASK_TYPES = {"norm", "train", "policy"}
 PROCESS_STATES = {"starting", "running", "stopping"}
 WAITING_STATES = {"waiting_norm", "waiting_gpu"}
 TERMINAL_STATES = {"completed", "failed", "lost", "stopped"}
+ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+TRAIN_STEP = re.compile(r"\bStep\s+(\d+)\s*:\s*(.*)$", re.IGNORECASE)
+TRAIN_METRIC = re.compile(
+    r"([A-Za-z][A-Za-z0-9_.-]*)\s*=\s*"
+    r"(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+)
 
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def parse_training_metrics(log_text: str, *, max_points: int = 1200) -> dict[str, Any]:
+    """Extract OpenPI's ``Step N: key=value`` progress records from a task log."""
+    clean = ANSI_ESCAPE.sub("", log_text).replace("\r", "\n")
+    by_step: dict[int, dict[str, float | int]] = {}
+    for line in clean.splitlines():
+        match = TRAIN_STEP.search(line.strip())
+        if not match:
+            continue
+        point: dict[str, float | int] = {"step": int(match.group(1))}
+        for key, value in TRAIN_METRIC.findall(match.group(2)):
+            try:
+                number = float(value)
+            except ValueError:
+                continue
+            if math.isfinite(number):
+                point[key] = number
+        if len(point) > 1:
+            by_step[int(point["step"])] = point
+
+    all_points = [by_step[step] for step in sorted(by_step)]
+    total_points = len(all_points)
+    series = sorted({key for point in all_points for key in point if key != "step"})
+    summary: dict[str, dict[str, float]] = {}
+    for key in series:
+        values = [float(point[key]) for point in all_points if key in point]
+        if values:
+            summary[key] = {"latest": values[-1], "min": min(values), "max": max(values)}
+
+    points = all_points
+    if max_points > 1 and total_points > max_points:
+        indexes = sorted({round(index * (total_points - 1) / (max_points - 1)) for index in range(max_points)})
+        points = [all_points[index] for index in indexes]
+    return {
+        "points": points,
+        "series": series,
+        "summary": summary,
+        "total_points": total_points,
+        "sampled_points": len(points),
+    }
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -1418,6 +1465,12 @@ def create_app(config_path: Path) -> Flask:
         path = dataset_editor.video_path(dataset_id, episode_index, video_key)
         return send_file(path, mimetype="video/mp4", conditional=True, max_age=0)
 
+    @app.get("/api/datasets/<dataset_id>/episodes/<int:episode_index>/image/<image_key>/<int:frame_index>")
+    def dataset_episode_image(dataset_id: str, episode_index: int, image_key: str, frame_index: int):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        path = dataset_editor.image_path(dataset_id, episode_index, image_key, frame_index)
+        return send_file(path, conditional=True, max_age=3600)
+
     @app.patch("/api/datasets/<dataset_id>/episodes/<int:episode_index>")
     def update_dataset_episode(dataset_id: str, episode_index: int):
         dataset_id = safe_name(dataset_id, "dataset id")
@@ -1823,6 +1876,29 @@ def create_app(config_path: Path) -> Flask:
         max_bytes = safe_int(request.args.get("max_bytes", 64 * 1024), "max_bytes", 1024, 1024 * 1024)
         task = tasks.get(task_id)
         return jsonify({"task": task, "log": tasks.log_tail(task_id, max_bytes)})
+
+    @app.get("/api/tasks/<task_id>/metrics")
+    def task_metrics(task_id: str):
+        task = tasks.get(task_id)
+        if task.get("type") != "train":
+            raise ValueError("metrics are only available for train tasks")
+        max_points = safe_int(request.args.get("max_points", 1200), "max_points", 50, 5000)
+        result = parse_training_metrics(tasks.log_tail(task_id, 16 * 1024 * 1024), max_points=max_points)
+        planned_steps = task.get("metadata", {}).get("steps")
+        latest_step = int(result["points"][-1]["step"]) if result["points"] else 0
+        result.update(
+            {
+                "task": task,
+                "planned_steps": planned_steps,
+                "latest_step": latest_step,
+                "progress": (
+                    min(1.0, latest_step / int(planned_steps))
+                    if planned_steps and int(planned_steps) > 0
+                    else None
+                ),
+            }
+        )
+        return jsonify(result)
 
 
     return app
