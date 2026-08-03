@@ -9,8 +9,10 @@ Videos are hard-linked when possible and are never re-encoded.
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import math
+import mimetypes
 import os
 from pathlib import Path
 import re
@@ -26,6 +28,7 @@ import pyarrow.parquet as pq
 
 
 EPISODE_FILE = re.compile(r"episode_(\d+)\.parquet$")
+DATASET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RESERVED_EPISODE_FIELDS = {
     "episode_index",
     "tasks",
@@ -115,6 +118,13 @@ def _clone_tree(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, copy_function=copy_file)
 
 
+def _safe_dataset_id(value: str) -> str:
+    value = str(value or "")
+    if not DATASET_ID.fullmatch(value) or value in {".", ".."} or ".." in value:
+        raise ValueError("invalid dataset id: use letters, numbers, dot, underscore, or dash")
+    return value
+
+
 def _video_keys(info: dict[str, Any]) -> list[str]:
     features = info.get("features", {})
     if not isinstance(features, dict):
@@ -133,6 +143,82 @@ def _image_keys(info: dict[str, Any]) -> list[str]:
         key for key, feature in features.items()
         if isinstance(feature, dict) and feature.get("dtype") == "image"
     )
+
+
+def _image_cell(table: pa.Table, image_key: str, frame_index: int) -> dict[str, Any]:
+    column_index = table.schema.get_field_index(image_key)
+    if column_index < 0:
+        return {}
+    value = table.column(column_index)[frame_index].as_py()
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"bytes": bytes(value)}
+    return {}
+
+
+def _safe_relative_path(value: Any) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = Path(value.strip())
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        return None
+    return path
+
+
+def _external_image_path(
+    root: Path,
+    info: dict[str, Any],
+    image_key: str,
+    episode_index: int,
+    frame_index: int,
+    stored_path: Any = None,
+) -> Path | None:
+    chunk = episode_index // int(info.get("chunks_size", 1000))
+    episode_name = f"episode_{episode_index:06d}"
+    default_name = f"frame_{frame_index:06d}.png"
+    stored = _safe_relative_path(stored_path)
+    frame_name = stored.name if stored is not None else default_name
+    root_resolved = root.resolve()
+    candidates = [
+        root / "images" / image_key / episode_name / default_name,
+        root / "images" / f"chunk-{chunk:03d}" / image_key / episode_name / default_name,
+    ]
+    if stored is not None:
+        candidates.extend(
+            [
+                root / stored,
+                root / "images" / stored,
+                root / "images" / image_key / episode_name / frame_name,
+                root / "images" / f"chunk-{chunk:03d}" / image_key / episode_name / frame_name,
+            ]
+        )
+    for episode_dir in (
+        root / "images" / image_key / episode_name,
+        root / "images" / f"chunk-{chunk:03d}" / image_key / episode_name,
+    ):
+        candidates.extend(sorted(episode_dir.glob(f"frame_{frame_index:06d}.*")))
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved.is_relative_to(root_resolved) and resolved.is_file():
+            return resolved
+    return None
+
+
+def _image_mimetype(blob: bytes, stored_path: Any = None) -> str:
+    if blob.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if blob.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if blob.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if blob.startswith(b"RIFF") and blob[8:12] == b"WEBP":
+        return "image/webp"
+    guessed, _encoding = mimetypes.guess_type(str(stored_path or ""))
+    return guessed or "application/octet-stream"
 
 
 def _format_episode_path(root: Path, info: dict[str, Any], key: str, episode_index: int, **extra: Any) -> Path:
@@ -306,7 +392,7 @@ class DatasetEditor:
                     "length": int(length),
                     "instruction": str(task_values[0]) if task_values else "",
                     "tasks": task_values,
-                    "task_name": row.get("task_name", ""),
+                    "task_name": row.get("task_name"),
                     "success": row.get("success"),
                     "parameters": parameters,
                     "video_keys": video_keys,
@@ -346,6 +432,17 @@ class DatasetEditor:
         return path
 
     def image_path(self, dataset_id: str, episode_index: int, image_key: str, frame_index: int) -> Path:
+        source, _mimetype = self.image_source(dataset_id, episode_index, image_key, frame_index)
+        if isinstance(source, Path):
+            return source
+        raise FileNotFoundError(
+            f"image is embedded in parquet and has no external path: dataset={dataset_id} "
+            f"episode={episode_index} key={image_key} frame={frame_index}"
+        )
+
+    def image_source(
+        self, dataset_id: str, episode_index: int, image_key: str, frame_index: int
+    ) -> tuple[Path | io.BytesIO, str | None]:
         root = self._dataset_path(dataset_id)
         info = _read_json(root / "meta" / "info.json")
         if not isinstance(info, dict):
@@ -360,51 +457,106 @@ class DatasetEditor:
         if not 0 <= frame_index < frame_count:
             raise ValueError(f"frame index must be in [0, {max(0, frame_count - 1)}]")
 
-        chunk = episode_index // int(info.get("chunks_size", 1000))
-        episode_name = f"episode_{episode_index:06d}"
-        root_resolved = root.resolve()
-
-        def existing_candidate(candidates: list[Path]) -> Path | None:
-            for candidate in candidates:
-                try:
-                    resolved = candidate.resolve()
-                except OSError:
-                    continue
-                if resolved.is_relative_to(root_resolved) and resolved.is_file():
-                    return resolved
-            return None
-
-        default_name = f"frame_{frame_index:06d}.png"
-        result = existing_candidate(
-            [
-                root / "images" / image_key / episode_name / default_name,
-                root / "images" / f"chunk-{chunk:03d}" / image_key / episode_name / default_name,
-            ]
-        )
-        if result is not None:
-            return result
-
-        stored_path = ""
+        table = None
+        cell: dict[str, Any] = {}
         try:
-            paths = pq.read_table(parquet_path, columns=[f"{image_key}.path"]).column(0)
-            stored_path = str(paths[frame_index].as_py() or "")
+            table = pq.read_table(parquet_path, columns=[image_key])
+            cell = _image_cell(table, image_key, frame_index)
         except (KeyError, IndexError, OSError, TypeError, ValueError, pa.ArrowInvalid):
-            pass
-        frame_name = Path(stored_path).name if stored_path else default_name
-        result = existing_candidate(
-            [
-                root / stored_path,
-                root / "images" / stored_path,
-                root / "images" / image_key / episode_name / frame_name,
-                root / "images" / f"chunk-{chunk:03d}" / image_key / episode_name / frame_name,
-            ]
+            cell = {}
+        stored_path = cell.get("path")
+        result = _external_image_path(
+            root, info, image_key, episode_index, frame_index, stored_path
         )
         if result is not None:
-            return result
+            return result, None
+        blob = cell.get("bytes")
+        if isinstance(blob, (bytes, bytearray, memoryview)) and blob:
+            data = bytes(blob)
+            return io.BytesIO(data), _image_mimetype(data, stored_path)
         raise FileNotFoundError(
             f"image frame not found: dataset={dataset_id} episode={episode_index} "
             f"key={image_key} frame={frame_index}"
         )
+
+    def rename_dataset(self, old_id: str, new_id: str) -> dict[str, Any]:
+        old_id = _safe_dataset_id(old_id)
+        new_id = _safe_dataset_id(new_id)
+        if old_id == new_id:
+            raise ValueError("new dataset id must differ from the current id")
+        with self._locks_for(old_id, new_id):
+            self.assert_idle(old_id)
+            source = self._dataset_path(old_id)
+            target = self._dataset_path(new_id)
+            if not source.is_dir():
+                raise FileNotFoundError(f"dataset is not installed: {old_id}")
+            if target.exists():
+                raise FileExistsError(f"dataset already exists: {new_id}")
+
+            assets_root = self.assets_base_dir / "pi05_piper_single_arm_lora"
+            source_assets = assets_root / old_id
+            target_assets = assets_root / new_id
+            if source_assets.exists() and target_assets.exists():
+                raise FileExistsError(f"norm stats directory already exists for: {new_id}")
+
+            moved_assets = False
+            os.replace(source, target)
+            try:
+                loader_output = self.validate_installed(new_id)
+                if source_assets.exists():
+                    target_assets.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(source_assets, target_assets)
+                    moved_assets = True
+            except Exception:
+                if moved_assets and target_assets.exists() and not source_assets.exists():
+                    os.replace(target_assets, source_assets)
+                if target.exists() and not source.exists():
+                    os.replace(target, source)
+                raise
+            return {
+                "operation": "rename_dataset",
+                "old_dataset_id": old_id,
+                "dataset_id": new_id,
+                "path": str(target),
+                "loader_validation": loader_output,
+                "norm_stats_moved": moved_assets,
+                "warning": "historical checkpoints and task records still reference the old dataset id",
+            }
+
+    def delete_dataset(self, dataset_id: str) -> dict[str, Any]:
+        dataset_id = _safe_dataset_id(dataset_id)
+        with self._lock(dataset_id):
+            self.assert_idle(dataset_id)
+            target = self._dataset_path(dataset_id)
+            if not target.is_dir():
+                raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
+
+            suffix = f"deleted-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            dataset_trash = self.dataset_root / f".{dataset_id}.{suffix}"
+            assets = self.assets_base_dir / "pi05_piper_single_arm_lora" / dataset_id
+            assets_trash = assets.parent / f".{dataset_id}.{suffix}"
+            moved_assets = False
+            os.replace(target, dataset_trash)
+            try:
+                if assets.exists():
+                    os.replace(assets, assets_trash)
+                    moved_assets = True
+                shutil.rmtree(dataset_trash)
+                if moved_assets:
+                    shutil.rmtree(assets_trash)
+            except Exception:
+                if dataset_trash.exists() and not target.exists():
+                    os.replace(dataset_trash, target)
+                if moved_assets and assets_trash.exists() and not assets.exists():
+                    os.replace(assets_trash, assets)
+                raise
+            return {
+                "operation": "delete_dataset",
+                "dataset_id": dataset_id,
+                "dataset_deleted": True,
+                "norm_stats_deleted": moved_assets,
+                "warning": "historical checkpoints, models, and task records were not deleted",
+            }
 
     def install_upload(self, dataset_id: str, extracted: Path, *, overwrite: bool, merge: bool) -> dict[str, Any]:
         if overwrite and merge:
@@ -507,13 +659,16 @@ class DatasetEditor:
                 raise ValueError("instruction must contain 1-4096 characters")
             result["instruction"] = instruction
         if "task_name" in updates:
-            task_name = str(updates["task_name"]).strip()
-            if len(task_name) > 256:
-                raise ValueError("task_name must not exceed 256 characters")
-            result["task_name"] = task_name
+            if updates["task_name"] is None:
+                result["task_name"] = None
+            else:
+                task_name = str(updates["task_name"]).strip()
+                if len(task_name) > 256:
+                    raise ValueError("task_name must not exceed 256 characters")
+                result["task_name"] = task_name or None
         if "success" in updates:
-            if not isinstance(updates["success"], bool):
-                raise ValueError("success must be a JSON boolean")
+            if updates["success"] is not None and not isinstance(updates["success"], bool):
+                raise ValueError("success must be a JSON boolean or null")
             result["success"] = updates["success"]
         metadata = updates.get("metadata", {})
         if metadata is None:
@@ -558,7 +713,7 @@ class DatasetEditor:
 
         candidate = self.dataset_root / f".{dataset_id}.editing-{uuid.uuid4().hex}"
         _clone_tree(base, candidate)
-        for name in ("data", "videos", "raw"):
+        for name in ("data", "videos", "images", "raw"):
             path = candidate / name
             if path.exists():
                 shutil.rmtree(path)
@@ -646,13 +801,28 @@ class DatasetEditor:
                         _link_or_copy(source_video, destination_video)
                         total_videos += 1
 
+                    self._copy_episode_images(
+                        source,
+                        info,
+                        table,
+                        old_episode_index=old_episode_index,
+                        candidate=candidate,
+                        new_episode_index=new_episode_index,
+                    )
+
                     source_row["episode_index"] = new_episode_index
                     source_row["length"] = frame_count
                     source_row["tasks"] = _unique_strings(task_texts)
                     if "task_name" in update:
-                        source_row["task_name"] = update["task_name"]
+                        if update["task_name"] is None:
+                            source_row.pop("task_name", None)
+                        else:
+                            source_row["task_name"] = update["task_name"]
                     if "success" in update:
-                        source_row["success"] = update["success"]
+                        if update["success"] is None:
+                            source_row.pop("success", None)
+                        else:
+                            source_row["success"] = update["success"]
                     for key in update.get("remove_metadata", []):
                         source_row.pop(key, None)
                     source_row.update(update.get("metadata", {}))
@@ -705,6 +875,47 @@ class DatasetEditor:
             raise
 
     @staticmethod
+    def _copy_episode_images(
+        source: Path,
+        info: dict[str, Any],
+        table: pa.Table,
+        *,
+        old_episode_index: int,
+        candidate: Path,
+        new_episode_index: int,
+    ) -> None:
+        for image_key in _image_keys(info):
+            if table.schema.get_field_index(image_key) < 0:
+                raise ValueError(f"episode parquet is missing image column {image_key}")
+            for frame_index in range(table.num_rows):
+                cell = _image_cell(table, image_key, frame_index)
+                external = _external_image_path(
+                    source,
+                    info,
+                    image_key,
+                    old_episode_index,
+                    frame_index,
+                    cell.get("path"),
+                )
+                if external is None:
+                    blob = cell.get("bytes")
+                    if isinstance(blob, (bytes, bytearray, memoryview)) and blob:
+                        continue
+                    raise FileNotFoundError(
+                        f"image frame payload is missing: dataset={source.name} "
+                        f"episode={old_episode_index} key={image_key} frame={frame_index}"
+                    )
+                suffix = external.suffix.lower() or Path(str(cell.get("path") or "")).suffix.lower() or ".png"
+                destination = (
+                    candidate
+                    / "images"
+                    / image_key
+                    / f"episode_{new_episode_index:06d}"
+                    / f"frame_{frame_index:06d}{suffix}"
+                )
+                _link_or_copy(external, destination)
+
+    @staticmethod
     def _rewrite_raw(
         source: Path,
         destination: Path,
@@ -727,9 +938,13 @@ class DatasetEditor:
         tasks = episode_row.get("tasks", [])
         if tasks:
             payload["instruction"] = np.asarray(str(tasks[0]))
-        if "task_name" in episode_row:
+        if "task_name" in update and "task_name" not in episode_row:
+            payload.pop("task_name", None)
+        elif "task_name" in episode_row:
             payload["task_name"] = np.asarray(str(episode_row["task_name"]))
-        if "success" in episode_row:
+        if "success" in update and "success" not in episode_row:
+            payload.pop("success", None)
+        elif "success" in episode_row:
             payload["success"] = np.asarray(bool(episode_row["success"]), dtype=np.bool_)
         for key in update.get("remove_metadata", []):
             payload.pop(f"meta.{key}", None)

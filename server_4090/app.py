@@ -127,6 +127,95 @@ def safe_int(value: Any, label: str, minimum: int, maximum: int) -> int:
     return parsed
 
 
+def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
+    """Describe common single-arm and bimanual LeRobot feature layouts for the UI."""
+    features = info.get("features", {})
+    if not isinstance(features, dict):
+        features = {}
+
+    def feature_for(*keys: str) -> tuple[str | None, dict[str, Any]]:
+        for key in keys:
+            value = features.get(key)
+            if isinstance(value, dict):
+                return key, value
+        return None, {}
+
+    state_key, state_feature = feature_for("state", "observation.state")
+    action_key, action_feature = feature_for("actions", "action")
+    state_shape = state_feature.get("shape")
+    action_shape = action_feature.get("shape")
+    state_dim = state_shape[-1] if isinstance(state_shape, list) and state_shape else None
+    action_dim = action_shape[-1] if isinstance(action_shape, list) and action_shape else None
+
+    layouts = {
+        (7, 7): ("joint", "single_arm", "单臂 Joint 7D"),
+        (10, 7): ("delivery", "single_arm", "单臂 Delivery 10D"),
+        (14, 14): ("bimanual_joint", "bimanual", "双臂 Joint 14D"),
+        (20, 14): ("bimanual_delivery", "bimanual", "双臂 Delivery 20D"),
+    }
+    schema, arm_layout, schema_label = layouts.get(
+        (state_dim, action_dim),
+        (
+            "custom",
+            "unknown",
+            f"通用格式 {state_dim if state_dim is not None else '?'}D / "
+            f"{action_dim if action_dim is not None else '?'}D",
+        ),
+    )
+    media = sorted(
+        (
+            {"key": key, "type": value.get("dtype")}
+            for key, value in features.items()
+            if isinstance(value, dict) and value.get("dtype") in {"image", "video"}
+        ),
+        key=lambda item: (str(item["type"]), str(item["key"])),
+    )
+    media_keys = {str(item["key"]) for item in media}
+    single_joint_media = "observation.images.cam_high" in media_keys and any(
+        key in media_keys
+        for key in ("observation.images.cam_left_wrist", "observation.images.cam_right_wrist")
+    )
+    delivery_media = {"image", "wrist_image"}.issubset(media_keys)
+    training_schema = None
+    if (
+        (state_dim, action_dim) == (7, 7)
+        and state_key == "observation.state"
+        and action_key == "action"
+        and single_joint_media
+    ):
+        training_schema = "joint"
+    elif (
+        (state_dim, action_dim) == (10, 7)
+        and state_key == "state"
+        and action_key == "actions"
+        and delivery_media
+    ):
+        training_schema = "delivery"
+
+    default_semantics = (
+        "eef_delta_base_xyz_left_rotvec_gripper_target"
+        if schema == "delivery"
+        else "absolute_joint_position" if schema == "joint" else None
+    )
+    return {
+        "schema": schema,
+        "schema_label": schema_label,
+        "arm_layout": arm_layout,
+        "state_key": state_key,
+        "action_key": action_key,
+        "state_shape": state_shape,
+        "action_shape": action_shape,
+        "state_dim": state_dim,
+        "action_dim": action_dim,
+        "cameras": [str(item["key"]) for item in media],
+        "media": media,
+        "training_schema": training_schema,
+        "training_supported": training_schema is not None,
+        "action_semantics": info.get("action_semantics") or default_semantics,
+        "action_offset": info.get("action_offset", 0 if schema == "delivery" else None),
+    }
+
+
 def resolve_under(value: str | Path, roots: list[Path], *, must_exist: bool = True) -> Path:
     candidate = Path(value).expanduser().resolve()
     if not any(candidate == root or candidate.is_relative_to(root) for root in roots):
@@ -649,6 +738,40 @@ class TaskManager:
             task["stop_signal"] = "SIGKILL" if force else "SIGTERM"
             atomic_json(self._path(task_id), task)
             return task
+
+    def delete(self, task_id: str) -> dict[str, Any]:
+        """Delete a terminal task record and its log without touching outputs/checkpoints."""
+        with self.lock:
+            task = self.get(task_id)
+            state = task.get("state")
+            if state not in TERMINAL_STATES:
+                raise ValueError(f"cannot delete active task {task_id} in state {state}")
+
+            process = self.processes.get(task_id)
+            if process is not None and process.poll() is None:
+                raise ValueError(f"cannot delete task {task_id} while its process is still alive")
+
+            active_dependents = []
+            for path in self.root.glob("*/task.json"):
+                dependent = read_json(path)
+                if not isinstance(dependent, dict) or dependent.get("id") == task_id:
+                    continue
+                dependency_id = (
+                    dependent.get("metadata", {}).get("depends_on")
+                    or dependent.get("dependency", {}).get("task_id")
+                )
+                if dependency_id != task_id:
+                    continue
+                if dependent.get("state") not in TERMINAL_STATES:
+                    active_dependents.append(str(dependent.get("id", path.parent.name)))
+            if active_dependents:
+                names = ", ".join(sorted(active_dependents))
+                raise ValueError(f"cannot delete task {task_id}; active dependent task(s): {names}")
+
+            task_dir = self._path(task_id).parent
+            self.processes.pop(task_id, None)
+            shutil.rmtree(task_dir)
+            return {"deleted": True, "task": task}
 
     def log_tail(self, task_id: str, max_bytes: int = 64 * 1024) -> str:
         path = self._log_path(task_id)
@@ -1306,24 +1429,7 @@ def create_app(config_path: Path) -> Flask:
             info = read_json(directory / "meta" / "info.json")
             if not isinstance(info, dict):
                 continue
-            features = info.get("features", {})
-            if features.get("state", {}).get("shape") == [10] and features.get("actions", {}).get("shape") == [7]:
-                schema = "delivery"
-                state_shape = features["state"]["shape"]
-                action_shape = features["actions"]["shape"]
-                camera_keys = [key for key in ("image", "wrist_image") if key in features]
-                action_semantics = "eef_delta_base_xyz_left_rotvec_gripper_target"
-                action_offset = 0
-            else:
-                schema = "joint"
-                state_shape = features.get("observation.state", {}).get("shape")
-                action_shape = features.get("action", {}).get("shape")
-                camera_keys = [
-                    key for key, value in features.items()
-                    if value.get("dtype") in {"image", "video"} and key.startswith("observation.images.")
-                ]
-                action_semantics = info.get("action_semantics") or "absolute_joint_position"
-                action_offset = info.get("action_offset")
+            schema = describe_dataset_schema(info)
             datasets.append(
                 {
                     "id": directory.name,
@@ -1332,12 +1438,7 @@ def create_app(config_path: Path) -> Flask:
                     "frames": info.get("total_frames"),
                     "fps": info.get("fps"),
                     "robot_type": info.get("robot_type"),
-                    "schema": schema,
-                    "state_shape": state_shape,
-                    "action_shape": action_shape,
-                    "cameras": camera_keys,
-                    "action_semantics": action_semantics,
-                    "action_offset": action_offset,
+                    **schema,
                     "norm_stats_ready": (
                         Path(config["assets_base_dir"])
                         / "pi05_piper_single_arm_lora"
@@ -1459,6 +1560,25 @@ def create_app(config_path: Path) -> Flask:
         limit = safe_int(request.args.get("limit", 200), "limit", 1, 500)
         return jsonify(dataset_editor.details(dataset_id, offset=offset, limit=limit))
 
+    @app.patch("/api/datasets/<dataset_id>")
+    def rename_dataset(dataset_id: str):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        payload = request.get_json(force=True)
+        new_dataset_id = safe_name(
+            payload.get("new_dataset_id") if isinstance(payload, dict) else None,
+            "new dataset id",
+        )
+        return jsonify(dataset_editor.rename_dataset(dataset_id, new_dataset_id))
+
+    @app.delete("/api/datasets/<dataset_id>")
+    def delete_dataset(dataset_id: str):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        payload = request.get_json(silent=True)
+        confirmation = payload.get("confirm_dataset_id") if isinstance(payload, dict) else None
+        if confirmation != dataset_id:
+            raise ValueError("confirm_dataset_id must exactly match the dataset id")
+        return jsonify(dataset_editor.delete_dataset(dataset_id))
+
     @app.get("/api/datasets/<dataset_id>/episodes/<int:episode_index>/video/<video_key>")
     def dataset_episode_video(dataset_id: str, episode_index: int, video_key: str):
         dataset_id = safe_name(dataset_id, "dataset id")
@@ -1468,8 +1588,8 @@ def create_app(config_path: Path) -> Flask:
     @app.get("/api/datasets/<dataset_id>/episodes/<int:episode_index>/image/<image_key>/<int:frame_index>")
     def dataset_episode_image(dataset_id: str, episode_index: int, image_key: str, frame_index: int):
         dataset_id = safe_name(dataset_id, "dataset id")
-        path = dataset_editor.image_path(dataset_id, episode_index, image_key, frame_index)
-        return send_file(path, conditional=True, max_age=3600)
+        source, mimetype = dataset_editor.image_source(dataset_id, episode_index, image_key, frame_index)
+        return send_file(source, mimetype=mimetype, conditional=True, max_age=3600)
 
     @app.patch("/api/datasets/<dataset_id>/episodes/<int:episode_index>")
     def update_dataset_episode(dataset_id: str, episode_index: int):
@@ -1866,6 +1986,10 @@ def create_app(config_path: Path) -> Flask:
         if task.get("type") == "policy" and task.get("metadata", {}).get("telemetry_session"):
             observations.set_control(task, mode="shadow", updated_by="policy_stop")
         return jsonify(tasks.stop(task_id, force=bool(payload.get("force", False))))
+
+    @app.delete("/api/tasks/<task_id>")
+    def delete_task(task_id: str):
+        return jsonify(tasks.delete(task_id))
 
     @app.get("/api/tasks/<task_id>")
     def get_task(task_id: str):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -244,6 +245,41 @@ class DatasetEditorTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "frame index"):
             editor.image_path("target", 0, "image", 3)
 
+        editor.update_episode("target", 0, {"metadata": {"reviewed": True}})
+        for frame_index in range(3):
+            rebuilt = editor.image_path("target", 0, "image", frame_index)
+            self.assertTrue(rebuilt.is_file())
+            self.assertEqual(
+                rebuilt.read_bytes(),
+                b"synthetic-jpeg" if frame_index == 1 else b"synthetic-png",
+            )
+
+    def test_embedded_image_bytes_are_served_without_external_image_directory(self):
+        target = make_dataset(self.datasets, "target", [1])
+        info_path = target / "meta" / "info.json"
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        info["features"]["image"] = {"dtype": "image", "shape": [1, 1, 3]}
+        info_path.write_text(json.dumps(info), encoding="utf-8")
+        parquet_path = target / DATA_PATH.format(episode_chunk=0, episode_index=0)
+        table = pq.read_table(parquet_path)
+        image = pa.array(
+            [{"bytes": b"\x89PNG\r\n\x1a\nsynthetic", "path": "frame_000000.png"}],
+            type=pa.struct([("bytes", pa.binary()), ("path", pa.string())]),
+        )
+        pq.write_table(table.append_column("image", image), parquet_path)
+
+        editor = self.editor()
+        source, mimetype = editor.image_source("target", 0, "image", 0)
+        self.assertIsInstance(source, io.BytesIO)
+        self.assertEqual(source.getvalue(), b"\x89PNG\r\n\x1a\nsynthetic")
+        self.assertEqual(mimetype, "image/png")
+
+        editor.update_episode("target", 0, {"metadata": {"embedded": True}})
+        source, mimetype = editor.image_source("target", 0, "image", 0)
+        self.assertIsInstance(source, io.BytesIO)
+        self.assertEqual(source.getvalue(), b"\x89PNG\r\n\x1a\nsynthetic")
+        self.assertEqual(mimetype, "image/png")
+
     def test_episode_metadata_supports_nested_json_and_invalidates_norm(self):
         target = make_dataset(self.datasets, "target", [2])
         norm = self.assets / "pi05_piper_single_arm_lora" / "target" / "norm_stats.json"
@@ -272,6 +308,68 @@ class DatasetEditorTest(unittest.TestCase):
         with np.load(target / "raw" / "episode_000000.npz", allow_pickle=False) as raw:
             self.assertEqual(raw["meta.nested"].item(), '{"attempt":2}')
             np.testing.assert_array_equal(raw["meta.scores"], [1, 2, 3])
+
+        self.editor().update_episode(
+            "target", 0, {"instruction": "new instruction", "task_name": None, "success": None}
+        )
+        episode_row = json.loads((target / "meta" / "episodes.jsonl").read_text().splitlines()[0])
+        self.assertNotIn("task_name", episode_row)
+        self.assertNotIn("success", episode_row)
+        details = self.editor().details("target")["episodes"][0]
+        self.assertIsNone(details["task_name"])
+        self.assertIsNone(details["success"])
+
+    def test_rename_moves_norm_stats_and_delete_removes_dataset_only(self):
+        make_dataset(self.datasets, "target", [2])
+        norm_dir = self.assets / "pi05_piper_single_arm_lora" / "target"
+        norm_dir.mkdir(parents=True)
+        (norm_dir / "norm_stats.json").write_text("{}", encoding="utf-8")
+
+        result = self.editor().rename_dataset("target", "renamed")
+        self.assertEqual(result["dataset_id"], "renamed")
+        self.assertFalse((self.datasets / "target").exists())
+        self.assertTrue((self.datasets / "renamed").is_dir())
+        self.assertTrue(
+            (self.assets / "pi05_piper_single_arm_lora" / "renamed" / "norm_stats.json").is_file()
+        )
+
+        result = self.editor().delete_dataset("renamed")
+        self.assertTrue(result["dataset_deleted"])
+        self.assertTrue(result["norm_stats_deleted"])
+        self.assertFalse((self.datasets / "renamed").exists())
+        self.assertFalse((self.assets / "pi05_piper_single_arm_lora" / "renamed").exists())
+
+    def test_rename_conflict_and_loader_failure_leave_original_untouched(self):
+        target = make_dataset(self.datasets, "target", [2])
+        make_dataset(self.datasets, "existing", [1])
+        before = snapshot(target)
+        with self.assertRaisesRegex(FileExistsError, "already exists"):
+            self.editor().rename_dataset("target", "existing")
+        self.assertEqual(snapshot(target), before)
+
+        def reject_renamed(dataset_id: str) -> str:
+            if dataset_id == "renamed":
+                raise RuntimeError("synthetic rename validation failure")
+            return basic_validate(self.datasets / dataset_id)
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic rename validation failure"):
+            self.editor(installed=reject_renamed).rename_dataset("target", "renamed")
+        self.assertEqual(snapshot(target), before)
+        self.assertFalse((self.datasets / "renamed").exists())
+
+    def test_active_task_blocks_dataset_rename_and_delete(self):
+        target = make_dataset(self.datasets, "target", [2])
+        before = snapshot(target)
+
+        def busy(_dataset_id: str) -> None:
+            raise RuntimeError("dataset is busy")
+
+        editor = self.editor(assert_idle=busy)
+        with self.assertRaisesRegex(RuntimeError, "dataset is busy"):
+            editor.rename_dataset("target", "renamed")
+        with self.assertRaisesRegex(RuntimeError, "dataset is busy"):
+            editor.delete_dataset("target")
+        self.assertEqual(snapshot(target), before)
 
     def test_incompatible_merge_is_rejected_without_modifying_target(self):
         target = make_dataset(self.datasets, "target", [2])

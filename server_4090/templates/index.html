@@ -130,7 +130,7 @@
       <div class="module-heading"><div><h2>数据集管理</h2><p>上传、检查、编辑 Episode，并独立预览每一路相机媒体。</p></div></div>
       <div class="grid">
         <div class="card half"><h2>上传数据集</h2><p>采集机执行：</p><pre id="uploadCommand">python upload_dataset_4090.py DATASET_DIR --name my_dataset --server http://192.168.101.9:8090 --token TOKEN --workers 4 --merge</pre><p class="muted"><code>--merge</code> 增量追加；<code>--overwrite</code> 替换，二者互斥。服务端会执行 SHA256、路径安全、结构和 loader 校验。</p></div>
-        <div class="card half"><h2>媒体格式说明</h2><div class="section-note">Dashboard 同时支持 LeRobot <code>dtype: video</code> 的 MP4 和 <code>dtype: image</code> 的逐帧图片序列。图片序列会按数据集 FPS 在浏览器播放，无需重新编码数据集。</div></div>
+        <div class="card half"><h2>格式与媒体说明</h2><div class="section-note">Dashboard 可识别单臂 7D / 10D、双臂 14D / 20D 和其他自定义维度，并显示所有 <code>dtype: video</code> / <code>dtype: image</code> 相机。图片既可来自外部逐帧目录，也可直接读取 Parquet 内嵌 bytes。</div></div>
         <div class="card"><h2>已接收数据集</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div></div>
         <div class="card">
           <h2>Episode 级数据集编辑与相机预览</h2>
@@ -141,7 +141,7 @@
           <div class="episode-editor-grid">
             <div class="episode-panel table-wrap"><table><thead><tr><th></th><th>Episode</th><th>帧数</th><th>Instruction</th><th>Task</th><th>Success</th><th>操作</th></tr></thead><tbody id="episodeRows"></tbody></table><div class="toolbar" style="margin:10px"><button class="inline secondary" type="button" onclick="changeEpisodePage(-1)">上一页</button><span id="episodePage" class="muted">-</span><button class="inline secondary" type="button" onclick="changeEpisodePage(1)">下一页</button></div></div>
             <div class="episode-panel">
-              <form id="episodeForm"><input id="episodeIndex" type="hidden"><label>Episode</label><input id="episodeIndexDisplay" disabled><label>Instruction</label><textarea id="episodeInstruction" rows="3" required></textarea><label>Task name</label><input id="episodeTaskName"><label>Success</label><select id="episodeSuccess"><option value="true">true</option><option value="false">false</option></select><label>附加 metadata（JSON object）</label><textarea id="episodeMetadata" rows="7">{}</textarea><label>删除 metadata 字段（逗号分隔）</label><input id="episodeRemoveMetadata" placeholder="operator_note, bad_reason"><p><button type="submit">保存 Episode 参数</button></p></form>
+              <form id="episodeForm"><input id="episodeIndex" type="hidden"><label>Episode</label><input id="episodeIndexDisplay" disabled><label>Instruction</label><textarea id="episodeInstruction" rows="3" required></textarea><label>Task name（可选）</label><input id="episodeTaskName" placeholder="未设置"><label>Success（可选）</label><select id="episodeSuccess"><option value="">未设置</option><option value="true">true</option><option value="false">false</option></select><label>附加 metadata（JSON object）</label><textarea id="episodeMetadata" rows="7">{}</textarea><label>删除 metadata 字段（逗号分隔）</label><input id="episodeRemoveMetadata" placeholder="operator_note, bad_reason"><p><button type="submit">保存 Episode 参数</button></p></form>
               <h3>相机媒体</h3><div id="episodeVideos" class="episode-videos"><span class="muted">选择 episode 后加载。</span></div>
             </div>
           </div>
@@ -156,7 +156,7 @@
         <div class="card two-third"><h2>2. 提交 LoRA 微调</h2><form id="trainForm"><div class="row"><div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div><div><label>实验名</label><input name="exp_name" required placeholder="pick_cube_r1"></div></div><div class="row3"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option></select></div><div><label>GPU IDs</label><input name="gpu_ids" value="0,1" placeholder="0,1"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div><div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>Batch</label><input name="batch_size" type="number" value="8"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div><div class="row"><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div><div><label>启动方式</label><select name="mode"><option value="auto">auto（推荐）</option><option value="new">new</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select></div></div><p class="muted">缺少 norm stats 时自动执行 norm→train；任务持久化并支持续训。</p><p><button type="submit">提交训练</button></p></form></div>
         <div class="card two-third">
           <h2>训练进程管理</h2>
-          <p class="muted">查看 Norm / Train 任务状态、PID、依赖关系，并停止不需要的训练进程。</p>
+          <p class="muted">查看 Norm / Train 任务状态、PID、依赖关系；已结束任务可删除记录和日志，不会删除 checkpoint 或训练输出。</p>
           <div class="table-wrap"><table><thead><tr><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div>
         </div>
         <div class="card third" id="trainingTaskLogCard">
@@ -178,7 +178,8 @@
       <div class="module-heading"><div><h2>Policy 管理</h2><p>从 checkpoint 启动、切换、健康检测和实机执行授权。</p></div></div>
       <div class="grid">
         <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div><div><label>默认 prompt</label><input name="default_prompt"></div></div><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
-        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code> 和本地安全检查。</p><div class="table-wrap"><table><thead><tr><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端 / telemetry</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div></div>
+        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code> 和本地安全检查。已结束的历史进程可删除记录和日志。</p><div class="table-wrap"><table><thead><tr><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端 / telemetry</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div></div>
+        <div class="card" id="policyTaskLogCard"><h2>Policy 进程日志</h2><p class="muted">从 Policy 进程表点击“日志”查看最近输出。</p><pre id="policyTaskLog">尚未选择 Policy 进程。</pre></div>
         <div class="card"><h2>机械臂客户端命令</h2><pre id="policyClientCommand">python robot_observation_bridge.py --host 192.168.101.9 --port 8000 --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16 --instruction "pick up the cube"</pre></div>
       </div>
     </section>
@@ -198,6 +199,7 @@ tokenInput.value = localStorage.getItem('bimanualVlaToken') || '';
 loginUserInput.value = localStorage.getItem('bimanualVlaLoginUser') || '';
 
 const ACTIVE_STATES = new Set(['starting', 'running', 'stopping', 'waiting_norm', 'waiting_gpu']);
+const TERMINAL_STATES = new Set(['completed', 'failed', 'lost', 'stopped']);
 const MODULES = new Set(['overview', 'datasets', 'training', 'policy', 'telemetry']);
 const METRIC_COLORS = ['#42c7ff', '#3ee6a8', '#ffd166', '#ff6f91', '#a78bfa', '#fb923c', '#67e8f9'];
 let latestStatus = null;
@@ -209,6 +211,7 @@ let episodeOffset = 0;
 let trainingMetricsData = null;
 let enabledMetrics = new Set();
 let metricsRequestSerial = 0;
+const selectedTaskLogs = {training: null, policy: null};
 const episodeLimit = 100;
 
 function saveToken() {
@@ -317,15 +320,16 @@ function fillDatasets(items) {
     <tr>
       <td><code>${esc(d.id)}</code><br><span class="muted">${esc(d.robot_type)}</span></td>
       <td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps<br>${d.norm_stats_ready ? '<span class="ok">norm ready</span>' : '<span class="warn">norm 需计算</span>'}</td>
-      <td><span class="pill">${esc(d.schema)}</span><br>state ${esc(JSON.stringify(d.state_shape))}, action ${esc(JSON.stringify(d.action_shape))}<br>${(d.cameras || []).map(c => `<span class="pill">${esc(c.replace('observation.images.', ''))}</span>`).join('')}</td>
-      <td>${esc(d.action_semantics)}<br>offset=${esc(d.action_offset)}</td>
-      <td><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button></td>
+      <td><span class="pill">${esc(d.schema_label || d.schema)}</span> ${d.training_supported ? '<span class="ok">训练兼容</span>' : '<span class="muted">仅管理 / 预览</span>'}<br><code>${esc(d.state_key || 'state?')}</code> ${esc(JSON.stringify(d.state_shape))} → <code>${esc(d.action_key || 'action?')}</code> ${esc(JSON.stringify(d.action_shape))}<br>${(d.media || []).map(m => `<span class="pill">${esc(m.type)} · ${esc(String(m.key).replace('observation.images.', ''))}</span>`).join('') || '<span class="muted">无相机媒体</span>'}</td>
+      <td>${esc(d.action_semantics || '-')}<br>offset=${d.action_offset == null ? '-' : esc(d.action_offset)}</td>
+      <td><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button><button class="inline secondary" onclick="renameDataset('${esc(d.id)}')">重命名</button><button class="inline danger" onclick="deleteDataset('${esc(d.id)}')">删除数据集</button></td>
     </tr>`).join('') || '<tr><td colspan="5" class="muted">暂无数据集</td></tr>';
 
+  const trainable = items.filter(d => d.training_supported);
   document.querySelectorAll('.dataset-select').forEach(select => {
     const old = select.value;
-    select.innerHTML = items.map(d => `<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.schema)}</option>`).join('');
-    if (items.some(d => d.id === old)) select.value = old;
+    select.innerHTML = trainable.map(d => `<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.schema_label || d.schema)}</option>`).join('') || '<option value="" disabled>没有兼容单臂训练的数据集</option>';
+    if (trainable.some(d => d.id === old)) select.value = old;
   });
   const editor = document.getElementById('editorDataset');
   const previous = editor.value;
@@ -352,6 +356,50 @@ async function openDatasetEditor(datasetId) {
   document.getElementById('episodeEditorSummary').scrollIntoView({behavior: 'smooth', block: 'center'});
 }
 
+async function renameDataset(datasetId) {
+  const newDatasetId = prompt(`将数据集 ${datasetId} 重命名为：`, datasetId);
+  if (newDatasetId == null || newDatasetId.trim() === datasetId) return;
+  if (!confirm(`确认将数据集 ${datasetId} 重命名为 ${newDatasetId.trim()}？\n历史 checkpoint 和任务记录仍会保留旧数据集 ID。`)) return;
+  try {
+    const result = await api(`/api/datasets/${encodeURIComponent(datasetId)}`, {
+      method: 'PATCH', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({new_dataset_id: newDatasetId.trim()}),
+    });
+    episodeDatasetData = null;
+    clearEpisodeMedia();
+    await refreshAll();
+    document.getElementById('editorDataset').value = result.dataset_id;
+    updateMergeSourceOptions();
+    await loadDatasetEpisodes(0);
+    show(`数据集已重命名：${datasetId} → ${result.dataset_id}。`, false);
+  } catch (error) {
+    show(error.message);
+  }
+}
+
+async function deleteDataset(datasetId) {
+  const confirmation = prompt(`删除整个数据集会移除全部 Episode、媒体和当前 norm stats。\n不会删除历史 checkpoint、模型或任务记录。\n请输入完整数据集 ID 确认：`, '');
+  if (confirmation == null) return;
+  if (confirmation !== datasetId) {
+    show('数据集 ID 不匹配，已取消删除。');
+    return;
+  }
+  if (!confirm(`最后确认：永久删除数据集 ${datasetId}？`)) return;
+  try {
+    await api(`/api/datasets/${encodeURIComponent(datasetId)}`, {
+      method: 'DELETE', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({confirm_dataset_id: confirmation}),
+    });
+    episodeDatasetData = null;
+    clearEpisodeMedia();
+    await refreshAll();
+    if (document.getElementById('editorDataset').value) await loadDatasetEpisodes(0);
+    show(`数据集 ${datasetId} 已删除；历史 checkpoint、模型和任务记录未删除。`, false);
+  } catch (error) {
+    show(error.message);
+  }
+}
+
 async function loadDatasetEpisodes(offset = episodeOffset) {
   clearEpisodeMedia();
   const datasetId = document.getElementById('editorDataset').value;
@@ -374,8 +422,8 @@ function renderEpisodeRows() {
     <tr>
       <td class="checkbox-cell"><input type="checkbox" class="episode-check" value="${esc(e.episode_index)}"></td>
       <td><code>${esc(e.episode_index)}</code></td><td>${esc(e.length)}</td>
-      <td>${esc(e.instruction)}</td><td>${esc(e.task_name || '-')}</td>
-      <td class="${e.success === false ? 'bad' : e.success === true ? 'ok' : 'muted'}">${esc(e.success)}</td>
+      <td>${esc(e.instruction)}</td><td>${e.task_name == null || e.task_name === '' ? '<span class="muted">-</span>' : esc(e.task_name)}</td>
+      <td class="${e.success === false ? 'bad' : e.success === true ? 'ok' : 'muted'}">${e.success == null ? '-' : esc(e.success)}</td>
       <td><button class="inline secondary" onclick="editEpisode(${Number(e.episode_index)})">编辑</button></td>
     </tr>`).join('') || '<tr><td colspan="7" class="muted">没有 episode</td></tr>';
   const start = data.total ? data.offset + 1 : 0;
@@ -525,7 +573,7 @@ async function editEpisode(index) {
   document.getElementById('episodeIndexDisplay').value = episode.episode_index;
   document.getElementById('episodeInstruction').value = episode.instruction || '';
   document.getElementById('episodeTaskName').value = episode.task_name || '';
-  document.getElementById('episodeSuccess').value = episode.success === false ? 'false' : 'true';
+  document.getElementById('episodeSuccess').value = episode.success == null ? '' : episode.success === false ? 'false' : 'true';
   document.getElementById('episodeMetadata').value = JSON.stringify(episode.parameters || {}, null, 2);
   document.getElementById('episodeRemoveMetadata').value = '';
 
@@ -846,7 +894,8 @@ function fillTasks(items) {
     const active = ['starting', 'running', 'stopping'].includes(t.state);
     const health = t.policy_healthy === true ? '<span class="ok">/healthz OK</span>' : t.state === 'running' ? '<span class="bad">/healthz FAIL</span>' : '<span class="muted">未运行</span>';
     const badge = m.external ? '<br><span class="pill warn">外部进程已接管</span>' : '';
-    return `<tr><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid || '-')}${badge}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal ? `<br>${esc(t.stop_signal)}` : ''}</td><td>GPU ${esc((m.gpu_ids || []).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.schema || '-')}</span></td><td>dataset=${esc(m.dataset_id)}<br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}</td></tr>`;
+    const deletable = TERMINAL_STATES.has(t.state);
+    return `<tr><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid || '-')}${badge}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal ? `<br>${esc(t.stop_signal)}` : ''}</td><td>GPU ${esc((m.gpu_ids || []).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.schema || '-')}</span></td><td>dataset=${esc(m.dataset_id)}<br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}','policy')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','policy')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="6" class="muted">暂无 Policy 进程；可在上方创建。</td></tr>';
 
   const jobs = items.filter(t => t.type !== 'policy');
@@ -854,7 +903,8 @@ function fillTasks(items) {
     const m = t.metadata || {};
     const active = ACTIVE_STATES.has(t.state);
     const params = `dataset=${esc(m.dataset_id || '-')} · schema=${esc(m.schema || '-')}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}` : `<br>batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}`;
-    return `<tr><td><code>${esc(t.id)}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${jobDependencySummary(t)}${t.start_error ? `<br><span class="bad">${esc(t.start_error)}</span>` : ''}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}</td></tr>`;
+    const deletable = TERMINAL_STATES.has(t.state);
+    return `<tr><td><code>${esc(t.id)}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${jobDependencySummary(t)}${t.start_error ? `<br><span class="bad">${esc(t.start_error)}</span>` : ''}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}','training')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','training')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="4" class="muted">暂无 Norm / Train 任务</td></tr>';
   fillReplacePolicies(items);
   updateClientCommand();
@@ -1036,12 +1086,34 @@ async function setPolicyShadow(id) {
   }
 }
 
-async function loadLog(id) {
+async function loadLog(id, moduleName = 'training') {
+  const targetModule = moduleName === 'policy' ? 'policy' : 'training';
+  const logId = targetModule === 'policy' ? 'policyTaskLog' : 'taskLog';
+  const cardId = targetModule === 'policy' ? 'policyTaskLogCard' : 'trainingTaskLogCard';
   try {
     const data = await api(`/api/tasks/${encodeURIComponent(id)}/log?max_bytes=131072`);
-    document.getElementById('taskLog').textContent = data.log || '(empty)';
-    showModule('training');
-    document.getElementById('trainingTaskLogCard').scrollIntoView({behavior: 'smooth', block: 'center'});
+    document.getElementById(logId).textContent = data.log || '(empty)';
+    selectedTaskLogs[targetModule] = id;
+    showModule(targetModule);
+    document.getElementById(cardId).scrollIntoView({behavior: 'smooth', block: 'center'});
+  } catch (error) {
+    show(error.message);
+  }
+}
+
+async function deleteTask(id, moduleName = 'training') {
+  const targetModule = moduleName === 'policy' ? 'policy' : 'training';
+  const kind = targetModule === 'policy' ? 'Policy' : '训练';
+  if (!confirm(`删除历史${kind}任务 ${id}？\n将删除 Dashboard 任务记录和日志，但不会删除 checkpoint、模型或训练输出。`)) return;
+  try {
+    await api(`/api/tasks/${encodeURIComponent(id)}`, {method: 'DELETE'});
+    if (selectedTaskLogs[targetModule] === id) {
+      const logId = targetModule === 'policy' ? 'policyTaskLog' : 'taskLog';
+      document.getElementById(logId).textContent = targetModule === 'policy' ? '尚未选择 Policy 进程。' : '尚未选择任务。';
+      selectedTaskLogs[targetModule] = null;
+    }
+    show(`历史任务 ${id} 已删除。`, false);
+    await refreshAll();
   } catch (error) {
     show(error.message);
   }
@@ -1109,10 +1181,11 @@ document.getElementById('episodeForm').onsubmit = async event => {
     return;
   }
   const removeMetadata = document.getElementById('episodeRemoveMetadata').value.split(',').map(x => x.trim()).filter(Boolean);
+  const successValue = document.getElementById('episodeSuccess').value;
   const payload = {
     instruction: document.getElementById('episodeInstruction').value,
-    task_name: document.getElementById('episodeTaskName').value,
-    success: document.getElementById('episodeSuccess').value === 'true',
+    task_name: document.getElementById('episodeTaskName').value.trim() || null,
+    success: successValue === '' ? null : successValue === 'true',
     metadata,
     remove_metadata: removeMetadata,
   };
