@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import os
 from pathlib import Path
@@ -9,7 +9,31 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from upload_dataset_4090 import classify_dataset_source, main, prepare_dataset_directory
+from upload_dataset_4090 import classify_dataset_source, complete_upload, main, prepare_dataset_directory
+
+
+class UploadCompletionDiagnosticsTest(unittest.TestCase):
+    def test_failed_completion_prints_server_validation_details(self):
+        class FakeClient:
+            def json(self, method, path, payload=None):
+                raise RuntimeError("HTTP 400: dataset structural validation failed")
+
+            def request(self, method, path):
+                return {
+                    "state": "failed",
+                    "error": "dataset structural validation failed",
+                    "structural_validation": "FAILED: missing video",
+                }
+
+        error_output = io.StringIO()
+        with redirect_stderr(error_output):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 400"):
+                complete_upload(FakeClient(), "upload-id")
+
+        output = error_output.getvalue()
+        self.assertIn("Server upload diagnostics", output)
+        self.assertIn("dataset structural validation failed", output)
+        self.assertIn("FAILED: missing video", output)
 
 
 class DatasetUploadInputTest(unittest.TestCase):

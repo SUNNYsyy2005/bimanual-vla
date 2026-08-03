@@ -93,7 +93,7 @@ def build_archive(dataset_root: Path, dataset_name: str, cache_dir: Path, rebuil
     return archive, sha256, archive.stat().st_size
 
 
-RAW_EXPORT_CACHE_VERSION = 1
+RAW_EXPORT_CACHE_VERSION = 2
 
 
 def classify_dataset_source(source: Path) -> str:
@@ -269,6 +269,37 @@ class Client:
     def json(self, method: str, path: str, payload: dict | None = None) -> dict:
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         return self.request(method, path, body=body, headers={"Content-Type": "application/json"})
+
+
+def complete_upload(client: Client, upload_id: str) -> dict:
+    """Complete an upload and surface server-side validation diagnostics."""
+    try:
+        return client.json("POST", f"/api/uploads/{upload_id}/complete", {})
+    except RuntimeError:
+        try:
+            status = client.request("GET", f"/api/uploads/{upload_id}")
+        except RuntimeError as status_error:
+            print(
+                f"Could not retrieve server upload diagnostics: {status_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print("Server upload diagnostics:", file=sys.stderr, flush=True)
+            found = False
+            for key in ("state", "error", "structural_validation", "loader_validation"):
+                value = status.get(key)
+                if value in (None, ""):
+                    continue
+                found = True
+                print(f"--- {key} ---", file=sys.stderr, flush=True)
+                if isinstance(value, (dict, list)):
+                    print(json.dumps(value, ensure_ascii=False, indent=2), file=sys.stderr, flush=True)
+                else:
+                    print(str(value), file=sys.stderr, flush=True)
+            if not found:
+                print(json.dumps(status, ensure_ascii=False, indent=2), file=sys.stderr, flush=True)
+        raise
 
 
 def upload_one(
@@ -448,7 +479,7 @@ def main() -> int:
         return 1
 
     print("All chunks uploaded; server is assembling, validating, and atomically installing...", flush=True)
-    result = client.json("POST", f"/api/uploads/{upload_id}/complete", {})
+    result = complete_upload(client, upload_id)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     operation = result.get("operation", "install")
     print(f"Dataset {operation} complete: {dataset_name}")
