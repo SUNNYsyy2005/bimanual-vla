@@ -90,27 +90,36 @@ ssh 4x4090-wg 'bash /home/sunny/bimanual-vla/server_4090/start_server.sh'
 
 ## 上传数据集
 
+上传器自动支持两种输入目录：
+
+- GUI 原始采集目录：顶层包含 `ep_*.npz`，客户端自动校验并导出 LeRobot；
+- 已导出的 LeRobot v2.1 目录：包含 `meta/info.json`，直接打包上传。
+
+直接上传 GUI 原始采集目录并增量追加：
+
+```bash
+python upload_dataset_4090.py /path/to/gui_episodes \
+  --name pick_cube_piper_r1 \
+  --server http://192.168.101.9:8090 \
+  --token "$BIMANUAL_VLA_SERVER_TOKEN" \
+  --workers 4 \
+  --fps 20 \
+  --merge
+```
+
+上传已导出的 LeRobot 目录：
+
 ```bash
 python upload_dataset_4090.py /path/to/pi0_dataset_single \
   --name pick_cube_piper_r1 \
   --server http://192.168.101.9:8090 \
   --token "$BIMANUAL_VLA_SERVER_TOKEN" \
   --workers 4 \
-  --chunk-mib 32
-```
-
-同一命令重跑会查询已存在分块并续传。服务端完成 SHA256、tar 安全、LeRobot v2.1 结构、视频帧数和 OpenPI loader 校验后才安装数据集。
-
-增量追加到已有同名数据集：
-
-```bash
-python upload_dataset_4090.py /path/to/new_episodes \
-  --name pick_cube_piper_r1 \
-  --server http://192.168.101.9:8090 \
-  --token "$BIMANUAL_VLA_SERVER_TOKEN" \
-  --workers 4 \
+  --chunk-mib 32 \
   --merge
 ```
+
+原始 NPZ 自动导出缓存在 `~/.cache/bimanual-vla/uploads/exports`。同一命令重跑会复用未变化的导出和 tar，并查询服务端已有分块后断点续传；`--rebuild` 强制重建本地缓存。服务端完成 SHA256、tar 安全、LeRobot v2.1 结构、视频帧数和 OpenPI loader 校验后才安装数据集。
 
 - `--merge` 和 `--overwrite` 互斥；目标不存在时按首次安装处理。
 - 合并要求版本、robot type、FPS、chunk size、features、action semantics 和 action offset 完全兼容。

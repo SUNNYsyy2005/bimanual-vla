@@ -102,21 +102,30 @@ def _load_episode(path: Path, contract):
     }
 
 
-def run(args):
-    paths = sorted(Path(args.input_dir).glob("ep_*.npz"))
+def export_dataset(
+    input_dir: str | Path,
+    root: str | Path,
+    *,
+    fps: int = 20,
+    allow_incomplete_gripper_coverage: bool = False,
+    validate_only: bool = False,
+) -> Path | None:
+    """Validate GUI NPZ episodes and export successful ones to LeRobot v2.1."""
+    input_root = Path(input_dir).expanduser()
+    paths = sorted(input_root.glob("ep_*.npz"))
     if not paths:
-        raise SystemExit(f"No episodes found in {args.input_dir}")
+        raise SystemExit(f"No episodes found in {input_root}")
 
     successful = _validate_inputs(
         paths,
-        target_fps=args.fps,
-        allow_incomplete_gripper_coverage=args.allow_incomplete_gripper_coverage,
+        target_fps=fps,
+        allow_incomplete_gripper_coverage=allow_incomplete_gripper_coverage,
     )
     if not successful:
         raise SystemExit("No successful episodes are available for export")
-    if args.validate_only:
+    if validate_only:
         print("Validation complete; no LeRobot dataset was written.")
-        return
+        return None
 
     from pi0_dataset import Pi0LeRobotDatasetWriter
     from piper_data_contract import infer_episode_contract
@@ -124,10 +133,10 @@ def run(args):
     first_path = successful[0].path
     with np.load(first_path, allow_pickle=False) as data:
         contract = infer_episode_contract(data)
-    root = Path(args.root or args.repo_id).expanduser()
+    output_root = Path(root).expanduser()
     writer = Pi0LeRobotDatasetWriter(
-        root,
-        fps=args.fps,
+        output_root,
+        fps=fps,
         robot_type=contract.robot_type,
         state_names=list(contract.state_names),
         action_names=list(contract.action_names),
@@ -160,9 +169,20 @@ def run(args):
         )
 
     print(
-        f"Export complete: root={root} schema={contract.schema} "
+        f"Export complete: root={output_root} schema={contract.schema} "
         f"arm={contract.arm_mode}/{contract.arm_side} episodes={count} "
-        f"frames={frames} fps={args.fps}"
+        f"frames={frames} fps={fps}"
+    )
+    return output_root
+
+
+def run(args):
+    return export_dataset(
+        args.input_dir,
+        args.root or args.repo_id,
+        fps=args.fps,
+        allow_incomplete_gripper_coverage=args.allow_incomplete_gripper_coverage,
+        validate_only=args.validate_only,
     )
 
 def main():
