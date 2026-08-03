@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Load a local single-arm or bimanual Piper dataset as OpenPI will."""
+"""Validate an installed LeRobot dataset and exercise the loader.
+
+This accepts both canonical Piper delivery (10D/10D or 20D/20D absolute EEF)
+and the observed metadata-free/marked ``legacy_v2`` layout (10D/7D or
+20D/14D step delta). The dimensions, contract marker, timestamps and video
+checks are performed before sampling the LeRobot loader.
+"""
 
 from __future__ import annotations
 
@@ -7,15 +13,25 @@ import argparse
 import json
 import os
 from pathlib import Path
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 
+from check_pi05_dataset import _dataset_contract, check_dataset
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
 
-def _dataset_info(dataset_id: str) -> dict:
+def _dataset_root(dataset_id: str) -> Path:
     root = Path(os.environ.get("HF_LEROBOT_HOME", Path.home() / ".cache/huggingface/lerobot"))
-    path = root / dataset_id / "meta" / "info.json"
+    return root / dataset_id
+
+
+def _dataset_info(dataset_id: str) -> dict:
+    path = _dataset_root(dataset_id) / "meta" / "info.json"
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -23,44 +39,21 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset_id")
     args = parser.parse_args()
+    root = _dataset_root(args.dataset_id)
     info = _dataset_info(args.dataset_id)
+    errors = check_dataset(root)
+    if errors:
+        raise ValueError("dataset contract validation failed:\n  - " + "\n  - ".join(errors))
+    contract = _dataset_contract(info)
+
     metadata = LeRobotDatasetMetadata(args.dataset_id)
     dataset = LeRobotDataset(args.dataset_id)
     if len(dataset) <= 0:
         raise ValueError("dataset is empty")
 
     features = info.get("features", {})
-    legacy = "state" in features and "actions" in features
-    if legacy:
-        state_key, action_key = "state", "actions"
-        camera_fields = [key for key in ("image", "wrist_image") if key in features]
-        state_dim = int(features[state_key]["shape"][0])
-        action_dim = int(features[action_key]["shape"][0])
-        camera_keys = ["cam_high", "cam_wrist"]
-    else:
-        state_key, action_key = "observation.state", "action"
-        state_dim = int(features[state_key]["shape"][0])
-        action_dim = int(features[action_key]["shape"][0])
-        camera_fields = sorted(
-            key for key, value in features.items()
-            if key.startswith("observation.images.") and value.get("dtype") in {"image", "video"}
-        )
-        camera_keys = [key.removeprefix("observation.images.") for key in camera_fields]
-
-    schema = str(info.get("schema") or ("delivery" if state_dim in {10, 20} else "joint"))
-    per_arm = 10 if schema == "delivery" else 7
-    arm_mode = str(info.get("arm_mode") or ("bimanual" if state_dim == 2 * per_arm else "single"))
-    expected_state = per_arm * (2 if arm_mode == "bimanual" else 1)
-    expected_action = 7 * (2 if arm_mode == "bimanual" else 1)
-    expected_cameras = 3 if arm_mode == "bimanual" else 2
-    if state_dim != expected_state or action_dim != expected_action:
-        raise ValueError(
-            f"metadata dims {state_dim}/{action_dim} disagree with {schema}/{arm_mode} "
-            f"expected {expected_state}/{expected_action}"
-        )
-    if len(camera_fields) != expected_cameras:
-        raise ValueError(f"camera fields {camera_fields}, expected {expected_cameras}")
-
+    state_key, action_key = contract["state_key"], contract["action_key"]
+    camera_fields = contract["camera_features"]
     indexes = sorted({0, len(dataset) - 1})
     samples = []
     for index in indexes:
@@ -70,25 +63,42 @@ def main() -> int:
             raise ValueError(f"sample {index}: missing fields {missing}")
         state = np.asarray(sample[state_key])
         action = np.asarray(sample[action_key])
-        if state.shape[-1] != state_dim or action.shape[-1] != action_dim:
+        if state.shape[-1] != contract["state_dim"] or action.shape[-1] != contract["raw_action_dim"]:
             raise ValueError(
                 f"sample {index}: state={state.shape}, action={action.shape}, "
-                f"expected last dims {state_dim}/{action_dim}"
+                f"expected last dims {contract['state_dim']}/{contract['raw_action_dim']}"
             )
-        samples.append({"index": index, "state_shape": list(state.shape), "action_shape": list(action.shape)})
-    print(json.dumps({
-        "dataset_id": args.dataset_id,
-        "schema": schema,
-        "arm_mode": arm_mode,
-        "arm_side": info.get("arm_side", "both" if arm_mode == "bimanual" else "right"),
-        "state_dim": state_dim,
-        "action_dim": action_dim,
-        "camera_keys": camera_keys,
-        "layout": "legacy" if legacy else "canonical",
-        "frames": len(dataset),
-        "fps": metadata.fps,
-        "samples": samples,
-    }))
+        if not np.isfinite(state).all() or not np.isfinite(action).all():
+            raise ValueError(f"sample {index}: state/action contains NaN/Inf")
+        samples.append(
+            {
+                "index": index,
+                "state_shape": list(state.shape),
+                "action_shape": list(action.shape),
+                "camera_fields": camera_fields,
+            }
+        )
+    print(
+        json.dumps(
+            {
+                "dataset_id": args.dataset_id,
+                "schema": contract["schema"],
+                "arm_mode": contract["arm_mode"],
+                "arm_side": contract["arm_side"],
+                "state_dim": contract["state_dim"],
+                "raw_action_dim": contract["raw_action_dim"],
+                "model_action_dim": contract["model_action_dim"],
+                "contract_format": contract["contract_format"],
+                "legacy_format": contract["legacy_format"],
+                "camera_keys": contract["camera_keys"],
+                "layout": contract["column_layout"],
+                "frames": len(dataset),
+                "fps": metadata.fps,
+                "samples": samples,
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 

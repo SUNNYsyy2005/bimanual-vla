@@ -100,6 +100,97 @@ def make_dataset(root: Path, name: str, episode_lengths: list[int], *, robot_typ
     return dataset
 
 
+def make_legacy_delivery_dataset(
+    root: Path, name: str, episode_lengths: list[int], *, marked: bool = False
+) -> Path:
+    dataset = root / name
+    info = {
+        "codebase_version": "v2.1",
+        "robot_type": "piper_single_arm_right",
+        "fps": 20,
+        "chunks_size": 1000,
+        "features": {
+            "state": {"dtype": "float32", "shape": [10]},
+            "actions": {"dtype": "float32", "shape": [7]},
+        },
+        "data_path": DATA_PATH,
+        "video_path": VIDEO_PATH,
+        "total_episodes": len(episode_lengths),
+        "total_frames": sum(episode_lengths),
+        "total_tasks": len(episode_lengths),
+        "total_videos": 0,
+        "total_chunks": 1,
+        "splits": {"train": f"0:{len(episode_lengths)}"},
+    }
+    if marked:
+        info.update(
+            {
+                "schema": "delivery",
+                "arm_mode": "single",
+                "arm_side": "right",
+                "state_dim": 10,
+                "action_dim": 7,
+                "raw_action_dim": 7,
+                "model_action_dim": 7,
+                "contract_format": "legacy_v2",
+                "legacy": True,
+                "legacy_format": "legacy_v2",
+                "delivery_action_format": "step_delta",
+                "action_semantics": "eef_delta_base_xyz_left_rotvec_gripper_target",
+                "action_source": "next_measured_eef",
+                "action_alignment": "next_observation",
+                "action_offset": 1,
+                "action_horizon": 50,
+                "gripper_semantics": "absolute_closed_fraction_0_open_1_closed",
+                "rotation_semantics": "state_rotation6d_action_left_rotvec_base_frame",
+                "coordinate_frame": "slave_base",
+            }
+        )
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text(json.dumps(info), encoding="utf-8")
+    write_jsonl(
+        dataset / "meta" / "tasks.jsonl",
+        [{"task_index": index, "task": f"legacy instruction {index}"} for index in range(len(episode_lengths))],
+    )
+    write_jsonl(
+        dataset / "meta" / "episodes.jsonl",
+        [
+            {"episode_index": index, "tasks": [f"legacy instruction {index}"], "length": length}
+            for index, length in enumerate(episode_lengths)
+        ],
+    )
+    write_jsonl(
+        dataset / "meta" / "episodes_stats.jsonl",
+        [{"episode_index": index, "stats": {}} for index in range(len(episode_lengths))],
+    )
+    global_index = 0
+    for episode_index, length in enumerate(episode_lengths):
+        path = dataset / DATA_PATH.format(episode_chunk=0, episode_index=episode_index)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        states = np.zeros((length, 10), dtype=np.float32)
+        states[:, 3] = 1.0
+        states[:, 7] = 1.0
+        states[:, 9] = 0.5
+        actions = np.zeros((length, 7), dtype=np.float32)
+        actions[:, 6] = 0.5
+        pq.write_table(
+            pa.table(
+                {
+                    "state": states.tolist(),
+                    "actions": actions.tolist(),
+                    "timestamp": np.arange(length, dtype=np.float32) / 20.0,
+                    "frame_index": np.arange(length, dtype=np.int64),
+                    "episode_index": np.full(length, episode_index, dtype=np.int64),
+                    "index": np.arange(global_index, global_index + length, dtype=np.int64),
+                    "task_index": np.full(length, episode_index, dtype=np.int64),
+                }
+            ),
+            path,
+        )
+        global_index += length
+    return dataset
+
+
 def snapshot(root: Path) -> dict[str, bytes]:
     return {
         str(path.relative_to(root)): path.read_bytes()
@@ -450,6 +541,34 @@ class DatasetEditorTest(unittest.TestCase):
             )
         self.assertEqual(snapshot(target), before)
         self.assertEqual(list(self.datasets.glob(".target.editing-*")), [])
+
+    def test_legacy_v2_is_visible_and_edit_rewrites_metadata_and_stats(self):
+        target = make_legacy_delivery_dataset(self.datasets, "legacy", [2, 3])
+        details = self.editor().details("legacy")
+        self.assertEqual(details["info"]["contract_format"], "legacy_v2")
+        self.assertEqual(details["info"]["raw_action_dim"], 7)
+        self.assertEqual(details["info"]["model_action_dim"], 7)
+
+        self.editor().delete_episodes("legacy", [0])
+        info = json.loads((target / "meta" / "info.json").read_text(encoding="utf-8"))
+        self.assertEqual(info["legacy_format"], "legacy_v2")
+        self.assertTrue(info["legacy_delivery_v2"] if "legacy_delivery_v2" in info else info["legacy"])
+        episode = json.loads((target / "meta" / "episodes.jsonl").read_text().splitlines()[0])
+        self.assertEqual(episode["legacy_format"], "legacy_v2")
+        stats = json.loads((target / "meta" / "episodes_stats.jsonl").read_text().splitlines()[0])
+        self.assertEqual(stats["stats"]["index"]["count"], [3])
+        self.assertEqual(stats["stats"]["index"]["min"], [0.0])
+        self.assertEqual(stats["stats"]["index"]["max"], [2.0])
+        policy = json.loads((target / "meta" / "policy_contract.json").read_text())
+        self.assertEqual(policy["legacy_format"], "legacy_v2")
+
+    def test_marked_and_metadata_free_legacy_v2_can_merge(self):
+        target = make_legacy_delivery_dataset(self.datasets, "target", [2], marked=False)
+        make_legacy_delivery_dataset(self.datasets, "source", [1], marked=True)
+        result = self.editor().merge_existing("target", "source")
+        self.assertEqual((result["episodes"], result["frames"]), (2, 3))
+        info = json.loads((target / "meta" / "info.json").read_text())
+        self.assertEqual(info["contract_format"], "legacy_v2")
 
 
 if __name__ == "__main__":

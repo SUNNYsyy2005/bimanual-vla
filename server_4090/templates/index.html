@@ -54,6 +54,18 @@
     .row { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; } .row3 { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
     .table-wrap { overflow:auto; border:1px solid var(--line-soft); border-radius:10px; }
     table { width:100%; border-collapse:collapse; font-size:13px; } th,td { padding:9px; border-bottom:1px solid #21364f; text-align:left; vertical-align:top; } th { position:sticky; top:0; z-index:1; color:#9edcff; background:#102038; } tr:last-child td { border-bottom:0; }
+    /* Keep training task management readable without making the status cell
+       determine the table's minimum width. Long dependency IDs/errors wrap in
+       their own column, so parameters and actions remain visible. */
+    .training-jobs-wrap { overflow-x:hidden; }
+    .training-jobs-table { table-layout:fixed; }
+    .training-jobs-table th:nth-child(1), .training-jobs-table td:nth-child(1) { width:21%; }
+    .training-jobs-table th:nth-child(2), .training-jobs-table td:nth-child(2) { width:17%; }
+    .training-jobs-table th:nth-child(3), .training-jobs-table td:nth-child(3) { width:45%; }
+    .training-jobs-table th:nth-child(4), .training-jobs-table td:nth-child(4) { width:17%; }
+    .training-jobs-table th, .training-jobs-table td { min-width:0; overflow-wrap:anywhere; word-break:break-word; }
+    .training-jobs-table .task-ref { display:inline-block; max-width:100%; overflow-wrap:anywhere; word-break:break-all; }
+    .training-jobs-table td:last-child .inline { white-space:normal; }
     code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; } code { color:#bfeaff; }
     pre { max-height:500px; margin:8px 0; padding:12px; overflow:auto; white-space:pre-wrap; word-break:break-word; border:1px solid #233b57; border-radius:10px; background:#06101c; }
     .pill { display:inline-block; margin:2px; padding:2px 8px; border:1px solid #45617f; border-radius:999px; color:#d3dfed; background:#102239; }
@@ -179,7 +191,7 @@
         <div class="card two-third">
           <h2>训练进程管理</h2>
           <p class="muted">查看 Norm / Train 任务状态、PID、依赖关系；已结束任务可删除记录和日志，不会删除 checkpoint 或训练输出。</p>
-          <div class="table-wrap"><table><thead><tr><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div>
+          <div class="table-wrap training-jobs-wrap"><table class="training-jobs-table"><thead><tr><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div>
         </div>
         <div class="card third" id="trainingTaskLogCard">
           <h2>训练任务日志</h2>
@@ -200,14 +212,14 @@
       <div class="module-heading"><div><h2>Policy 管理</h2><p>从 checkpoint 启动、切换、健康检测和实机执行授权。</p></div></div>
       <div class="grid">
         <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><input type="hidden" name="model_variant" id="policyModelVariant" value="pi05"><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div><div><label>默认 prompt</label><input name="default_prompt"></div></div><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
-        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code> 和本地安全检查。已结束的历史进程可删除记录和日志。</p><div class="table-wrap"><table><thead><tr><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端 / telemetry</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div></div>
+        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code>、<code>action_horizon &gt;= 16</code> 和本地逐 20 Hz command 安全检查。异步客户端默认 4 Hz 启动推理（推理+传输通常约 200 ms），旧 chunk 在推理期间持续执行；新 chunk 到达后按实时 arrival 延迟动态过期 prefix，融合 2~4 步后切换 generation。已结束的历史进程可删除记录和日志。</p><div class="table-wrap"><table><thead><tr><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端 / telemetry</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div></div>
         <div class="card" id="policyTaskLogCard"><h2>Policy 进程日志</h2><p class="muted">从 Policy 进程表点击“日志”查看最近输出。</p><pre id="policyTaskLog">尚未选择 Policy 进程。</pre></div>
-        <div class="card"><h2>机械臂客户端命令</h2><pre id="policyClientCommand">python robot_observation_bridge.py --host 192.168.101.9 --port 8000 --arm-mode single --arm-side right --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16 --instruction "pick up the cube"</pre></div>
+        <div class="card"><h2>机械臂客户端命令</h2><pre id="policyClientCommand">python robot_observation_bridge.py --host 192.168.101.9 --port 8000 --hz 4 --arm-mode single --arm-side right --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16 --instruction "pick up the cube"</pre></div>
       </div>
     </section>
 
     <section id="module-telemetry" class="dashboard-module" data-module="telemetry" hidden>
-      <div class="module-heading"><div><h2>实时遥测</h2><p>只读展示 Policy 实际收到的 state、Policy 要求的全部相机图像、prompt 和预测 action。</p></div></div>
+      <div class="module-heading"><div><h2>实时遥测</h2><p>只读展示 Policy 实际收到的 state、相机、prompt、预测 action 和异步 chunk 生命周期。默认 delivery 安全阈值来自 <code>8_3_64eps</code> 全量 20 Hz 统计：translation 0.05 m/step、rotation 0.18 rad/step、gripper 0.30 fraction/step，workspace x[-0.05,0.30]、y[0.01,0.50]、z[0.14,0.52]；每条 20 Hz command 仍独立检查，CLI 可继续收紧。</p></div></div>
       <div class="grid">
         <div class="card"><h2>Policy 实时观测</h2><div id="robotObservation" class="warn">尚未收到 telemetry。</div><div class="preview-grid"><div><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div><div><h3>Prompt / predicted action</h3><pre id="policyAction">action: -</pre></div></div><div id="robotImages" class="preview-grid"><figure><figcaption>顶部全局</figcaption><img id="previewHigh" alt="high camera"></figure><figure id="singleWristPreview"><figcaption>单臂腕部</figcaption><img id="previewWrist" alt="wrist camera"></figure><figure id="leftWristPreview" hidden><figcaption>左臂腕部</figcaption><img id="previewLeftWrist" alt="left wrist camera"></figure><figure id="rightWristPreview" hidden><figcaption>右臂腕部</figcaption><img id="previewRightWrist" alt="right wrist camera"></figure></div></div>
       </div>
@@ -316,6 +328,11 @@ function shortPath(path) {
   return parts.slice(-3).join('/') || '-';
 }
 
+function shortTaskId(id) {
+  const value = String(id || '');
+  return value.length > 23 ? `${value.slice(0, 13)}…${value.slice(-8)}` : value;
+}
+
 function showModule(name, updateHash = true) {
   const moduleName = MODULES.has(name) ? name : 'overview';
   document.querySelectorAll('.dashboard-module').forEach(section => {
@@ -337,13 +354,20 @@ function showModule(name, updateHash = true) {
   }
 }
 
+function cameraDisplayName(key, armSide = 'right') {
+  const value = String(key || '').replace('observation.images.', '');
+  if (value === 'image') return 'cam_high';
+  if (value === 'wrist_image') return `cam_${armSide || 'right'}_wrist`;
+  return value;
+}
+
 function fillDatasets(items) {
   document.getElementById('datasets').innerHTML = items.map(d => `
     <tr>
       <td><code>${esc(d.id)}</code><br><span class="muted">${esc(d.robot_type)}</span></td>
       <td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps<br>${d.train_episodes == null ? '<span class="muted">尚未生成 train/test 划分</span>' : `<span class="pill">${esc(d.train_episodes)} train</span> <span class="pill">${esc(d.test_episodes)} test</span>`}<br>${(d.norm_model_variants || []).length ? `<span class="ok">norm ready: ${esc((d.norm_model_variants || []).map(modelVariantLabel).join(', '))}</span>` : '<span class="warn">norm 需计算或划分已变化</span>'}</td>
-      <td><span class="pill">${esc(d.schema_label || d.schema)}</span> <span class="pill">${esc(d.arm_mode || '-')}</span> <span class="pill">${esc(d.dataset_layout || '-')}</span> ${d.training_supported ? '<span class="ok">训练兼容</span>' : '<span class="muted">仅管理 / 预览</span>'}<br><code>${esc(d.state_key || 'state?')}</code> ${esc(JSON.stringify(d.state_shape))} → <code>${esc(d.action_key || 'action?')}</code> ${esc(JSON.stringify(d.action_shape))}<br>state/action=${esc(d.state_dim || '?')}D/${esc(d.action_dim || '?')}D · arm=${esc(d.arm_side || '-')}<br>${(d.media || []).map(m => `<span class="pill">${esc(m.type)} · ${esc(String(m.key).replace('observation.images.', ''))}</span>`).join('') || '<span class="muted">无相机媒体</span>'}</td>
-      <td>${esc(d.action_semantics || '-')}<br>offset=${d.action_offset == null ? '-' : esc(d.action_offset)}</td>
+      <td><span class="pill">${esc(d.schema_label || d.schema)}</span> <span class="pill">${esc(d.arm_mode || '-')}</span> <span class="pill">${esc(d.dataset_layout || '-')}</span> <span class="pill">contract v${esc(d.contract_version || '?')}</span> ${d.training_supported ? '<span class="ok">训练兼容</span>' : '<span class="warn">仅管理 / 预览</span>'}<br><code>${esc(d.state_key || 'state?')}</code> ${esc(JSON.stringify(d.state_shape))} → <code>${esc(d.action_key || 'action?')}</code> ${esc(JSON.stringify(d.action_shape))}<br>state=${esc(d.state_dim || '?')}D · raw action=${esc(d.raw_action_dim || '?')}D · model/wire=${esc(d.model_action_dim || '?')}D · arm=${esc(d.arm_side || '-')}<br>${d.contract_error ? `<span class="bad">${esc(d.contract_error)}</span><br>` : ''}${d.training_error ? `<span class="warn">${esc(d.training_error)}</span><br>` : ''}${(d.media || []).map(m => `<span class="pill">${esc(m.type)} · ${esc(cameraDisplayName(m.key, d.arm_side))}</span>`).join(' ') || '<span class="muted">无相机媒体</span>'}</td>
+      <td><strong>raw</strong> ${esc(d.raw_action_semantics || '-')}<br><span class="muted">convention=${esc(d.raw_action_convention || '-')}</span><br><strong>model</strong> ${esc(d.model_action_semantics || '-')}<br><span class="muted">convention=${esc(d.model_action_convention || '-')}</span><br><strong>gripper</strong> raw=${esc(d.raw_gripper_semantics || '-')} → wire=${esc(d.wire_gripper_semantics || '-')}<br><span class="muted">raw offset=${d.action_offset == null ? '-' : esc(d.action_offset)} · model start=+${esc(d.model_action_start_offset ?? 1)} step</span></td>
       <td><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button><button class="inline secondary" onclick="renameDataset('${esc(d.id)}')">重命名</button><button class="inline danger" onclick="deleteDataset('${esc(d.id)}')">删除数据集</button></td>
     </tr>`).join('') || '<tr><td colspan="5" class="muted">暂无数据集</td></tr>';
 
@@ -705,12 +729,13 @@ function fillBaseModels(items) {
 
 function checkpointLabel(c) {
   const size = c.size_gib == null ? '' : ` · ${Number(c.size_gib).toFixed(1)} GiB`;
-  return `${c.experiment} / step ${c.step} · ${modelVariantLabel(c.model_variant)} · ${c.arm_mode || '-'} · ${c.updated_at}${size}`;
+  const contract = c.model_action_dim == null ? 'unmarked contract' : `raw/model ${c.raw_action_dim}D/${c.model_action_dim}D · ${c.model_action_convention || '-'} · ${c.gripper_semantics || '-'}`;
+  return `${c.experiment} / step ${c.step} · ${modelVariantLabel(c.model_variant)} · ${c.arm_mode || '-'} · ${contract} · ${c.updated_at}${size}`;
 }
 
 function fillCheckpoints(items) {
   document.getElementById('checkpoints').innerHTML = items.map(c => `
-    <tr><td><strong>${esc(c.experiment)}</strong><br>step ${esc(c.step)} · <span class="pill">${esc(modelVariantLabel(c.model_variant))}</span> <span class="pill">${esc(c.arm_mode || '-')}</span></td>
+    <tr><td><strong>${esc(c.experiment)}</strong><br>step ${esc(c.step)} · <span class="pill">${esc(modelVariantLabel(c.model_variant))}</span> <span class="pill">${esc(c.arm_mode || '-')}</span><br><span class="muted">contract v${esc(c.contract_version || '?')} · raw/model ${esc(c.raw_action_dim || '?')}D/${esc(c.model_action_dim || '?')}D · ${esc(c.model_action_convention || 'unmarked')} · ${esc(c.gripper_semantics || '-')}</span></td>
     <td>${(c.dataset_ids || []).map(id => `<span class="pill">${esc(id)}</span>`).join('') || '<span class="muted">-</span>'}<br><span class="muted">${esc(c.config_name || '-')}</span></td>
     <td>${c.size_gib == null ? '-' : `${Number(c.size_gib).toFixed(1)} GiB`}<br><span class="muted">${esc(c.updated_at || '-')}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">暂无完整 checkpoint</td></tr>';
 
@@ -939,13 +964,23 @@ function telemetrySummary(t) {
   const clientGate = t.client_allow_execution ? '<span class="warn">客户端允许执行</span>' : '<span class="muted">客户端禁止执行</span>';
   const dualGate = t.dual_gate_open ? '<span class="bad">双重门已打开</span>' : '<span class="ok">双重门已关闭</span>';
   const actual = `实际状态=<code>${esc(t.client_execution_state || 'unknown')}</code>${t.client_blocked_reason ? `<br>原因=${esc(t.client_blocked_reason)}` : ''}${t.client_last_command_at ? `<br>最近下发=${esc(fmtTime(t.client_last_command_at))}` : ''}`;
-  const modelHz = t.client_policy_action_hz ?? t.action_hz;
-  const commandHz = t.client_command_hz;
-  const chunkSteps = t.client_action_chunk_steps;
-  const timing = modelHz && commandHz && chunkSteps
-    ? `频率=${esc(modelHz)}Hz → ${esc(commandHz)}Hz · 每命令 ${esc(chunkSteps)} steps`
-    : '等待新版客户端上报 action 频率';
-  return `${connection}<br>${freshness}<br>${serverGate}<br>${clientGate} · ${dualGate}<br>${actual}<br>${timing}${t.received_at == null ? '' : `<br>source=${esc(t.source_name || '-')} · action=${esc(JSON.stringify(t.actions_shape || []))}`}`;
+  const launchHz = t.client_inference_launch_hz ?? t.client_inference_hz ?? t.recommended_inference_launch_hz ?? 4;
+  const actionHz = t.client_policy_action_hz ?? t.action_hz ?? 20;
+  const controlHz = t.client_control_hz ?? t.client_command_hz ?? actionHz;
+  const chunkRows = t.client_chunk_rows ?? ((t.actions_shape || [])[0] ?? '-');
+  const minHorizon = t.minimum_horizon ?? 16;
+  const horizon = t.action_horizon ?? '-';
+  const horizonState = t.horizon_execution_ready ? '<span class="ok">horizon 可执行</span>' : `<span class="bad">horizon 阻断</span>${t.horizon_error ? ` · ${esc(t.horizon_error)}` : ''}`;
+  const timing = `inference launch=${esc(launchHz ?? '-')} Hz · action/control=${esc(actionHz ?? '-')}/${esc(controlHz ?? '-')} Hz<br>chunk rows=${esc(chunkRows)} · action horizon=${esc(horizon)} · min horizon=${esc(minHorizon)} (client=${esc(t.client_minimum_horizon ?? '-')}) · ${horizonState} · in-flight=${esc(t.client_in_flight ?? '-')}`;
+  const targetTimes = Array.isArray(t.client_plan_target_times) ? JSON.stringify(t.client_plan_target_times) : '-';
+  const lifecycle = `launch/capture/arrival=${esc(fmtTime(t.client_launch_at))}/${esc(fmtTime(t.client_capture_at ?? t.captured_at))}/${esc(fmtTime(t.client_arrival_at))}<br>latency=${esc(t.client_latency_ms ?? '-')} ms / ${esc(t.client_latency_steps ?? '-')} steps · actuator=${esc(t.client_actuator_delay_ms ?? '-')} ms · expired prefix=${esc(t.client_expired_prefix ?? t.client_skipped_prefix ?? '-')} · blend=${esc(t.client_blend_steps ?? '-')} steps<br>target dt/start=${esc(t.action_time_step_s ?? '-')}s/${esc(t.action_start_offset_steps ?? '-')} step · target monotonic/age=${esc(t.client_target_monotonic ?? '-')}/${esc(t.client_target_age_s ?? '-')}s`;
+  const rejected = t.client_rejected_result && typeof t.client_rejected_result === 'object'
+    ? JSON.stringify(t.client_rejected_result)
+    : (t.client_rejected_result ?? false);
+  const plan = `active plan=${esc(t.client_active_plan_generation ?? t.client_queue_generation ?? '-')} · index/remaining=${esc(t.client_active_plan_index ?? '-')}/${esc(t.client_active_plan_remaining ?? t.client_new_remaining ?? '-')} · in-flight=${esc(t.client_in_flight ?? '-')} · hold=${esc(t.client_hold_active ?? false)}(${esc(t.client_hold_steps ?? 0)}) · blend=${esc(t.client_blend_active ?? false)}(${esc(t.client_blend_remaining ?? '-')}) · gripper filter=${esc(t.client_gripper_filter_active ?? false)}`;
+  const queue = `generation active/result=${esc(t.client_queue_generation ?? '-')}/${esc(t.client_result_generation ?? '-')} · old/new remaining=${esc(t.client_old_remaining ?? '-')}/${esc(t.client_new_remaining ?? '-')} · underrun=${esc(t.client_underrun ?? false)} (${esc(t.client_underrun_count ?? 0)}) · rejected=${esc(rejected)} (${esc(t.client_rejected_result_count ?? 0)})${t.client_drop_reason ? `<br>drop=${esc(t.client_drop_reason)}` : ''}<br>${plan}<br>target times=${esc(targetTimes)}`;
+  const contract = `contract=v${esc(t.contract_version || '?')} · raw/model=${esc(t.raw_action_dim || '?')}D/${esc(t.model_action_dim || '?')}D · ${esc(t.model_action_convention || '-')}<br>gripper=${esc(t.raw_gripper_semantics || '-')} → ${esc(t.wire_gripper_semantics || '-')}`;
+  return `${connection}<br>${freshness}<br>${serverGate}<br>${clientGate} · ${dualGate}<br>${actual}<br>${timing}<br>${lifecycle}<br>${queue}<br>${contract}${t.received_at == null ? '' : `<br>source=${esc(t.source_name || '-')} · action=${esc(JSON.stringify(t.actions_shape || []))}`}`;
 }
 
 function policyControlButtons(task) {
@@ -954,8 +989,10 @@ function policyControlButtons(task) {
   const t = task.telemetry || {};
   const control = t.execution_control || {};
   const running = task.state === 'running';
-  const canArm = running && t.client_connected && t.fresh && t.client_allow_execution;
-  const why = !running ? 'Policy 未运行' : !t.client_connected ? '机械臂客户端未连接' : !t.fresh ? 'telemetry 不新鲜' : !t.client_allow_execution ? '客户端未使用 --allow-execution' : '';
+  const horizonReady = t.horizon_execution_ready === true;
+  const timeReady = t.time_contract_ready === true;
+  const canArm = running && t.client_connected && t.fresh && t.client_allow_execution && horizonReady && timeReady;
+  const why = !running ? 'Policy 未运行' : !t.client_connected ? '机械臂客户端未连接' : !t.fresh ? 'telemetry 不新鲜' : !t.client_allow_execution ? '客户端未使用 --allow-execution' : !horizonReady ? (t.horizon_error || 'action_horizon 必须至少为 16') : t.time_contract_ready !== true ? (t.time_contract_error || 'action timing contract is invalid') : '';
   const shadow = `<button class="inline secondary" onclick="setPolicyShadow('${esc(task.id)}')" ${control.mode === 'shadow' ? 'disabled' : ''}>只推理 / SHADOW</button>`;
   const execute = `<button class="inline danger" onclick="armPolicy('${esc(task.id)}')" ${canArm && control.mode !== 'execute' ? '' : `disabled title="${esc(why || '已经授权执行')}"`}>授权执行 5 分钟</button>`;
   return `${shadow}${execute}`;
@@ -966,9 +1003,9 @@ function jobDependencySummary(task) {
   const id = dependency.task_id || (task.metadata || {}).depends_on;
   if (!id) return '';
   if (task.dependency_failed) return `<br><span class="bad">norm 串联失败</span><br><span class="muted">${esc(task.dependency_error || '依赖任务失败')}</span>`;
-  if (task.state === 'waiting_norm') return `<br><span class="warn">等待 norm</span><br><code>${esc(id)}</code> · ${esc(task.dependency_state || 'pending')}`;
-  if (task.state === 'waiting_gpu') return `<br><span class="warn">norm 已完成，等待 GPU</span><br><code>${esc(id)}</code><br><span class="muted">${esc(task.waiting_reason || 'GPU 暂不可用')}</span>`;
-  return `<br><span class="ok">由 norm 自动串联</span><br><code>${esc(id)}</code>`;
+  if (task.state === 'waiting_norm') return `<br><span class="warn">等待 norm</span><br><code class="task-ref" title="${esc(id)}">${esc(shortTaskId(id))}</code> · ${esc(task.dependency_state || 'pending')}`;
+  if (task.state === 'waiting_gpu') return `<br><span class="warn">norm 已完成，等待 GPU</span><br><code class="task-ref" title="${esc(id)}">${esc(shortTaskId(id))}</code><br><span class="muted">${esc(task.waiting_reason || 'GPU 暂不可用')}</span>`;
+  return `<br><span class="ok">由 norm 自动串联</span><br><code class="task-ref" title="${esc(id)}">${esc(shortTaskId(id))}</code>`;
 }
 
 function fillTasks(items) {
@@ -979,7 +1016,7 @@ function fillTasks(items) {
     const health = t.policy_healthy === true ? '<span class="ok">/healthz OK</span>' : t.state === 'running' ? '<span class="bad">/healthz FAIL</span>' : '<span class="muted">未运行</span>';
     const badge = m.external ? '<br><span class="pill warn">外部进程已接管</span>' : '';
     const deletable = TERMINAL_STATES.has(t.state);
-    return `<tr><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid || '-')}${badge}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal ? `<br>${esc(t.stop_signal)}` : ''}</td><td>GPU ${esc((m.gpu_ids || []).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.arm_mode || '-')}</span> <span class="pill">${esc(m.schema || '-')}</span></td><td>dataset=${esc(m.dataset_id)} · <span class="pill">${esc(modelVariantLabel(m.model_variant))}</span><br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}','policy')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','policy')">删除记录</button>` : ''}</td></tr>`;
+    return `<tr><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid || '-')}${badge}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal ? `<br>${esc(t.stop_signal)}` : ''}</td><td>GPU ${esc((m.gpu_ids || []).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.arm_mode || '-')}</span> <span class="pill">${esc(m.schema || '-')}</span></td><td>dataset=${esc(m.dataset_id)} · <span class="pill">${esc(modelVariantLabel(m.model_variant))}</span><br>contract v${esc(m.contract_version || '?')} · raw/model ${esc(m.raw_action_dim || '?')}D/${esc(m.model_action_dim || '?')}D · offset ${esc(m.action_offset ?? '-')}/+${esc(m.model_action_start_offset ?? 1)}<br>${esc(m.model_action_convention || '-')} · gripper ${esc(m.raw_gripper_semantics || '-')} → ${esc(m.gripper_semantics || m.wire_gripper_semantics || '-')}<br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}','policy')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','policy')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="6" class="muted">暂无 Policy 进程；可在上方创建。</td></tr>';
 
   const jobs = items.filter(t => t.type !== 'policy');
@@ -988,9 +1025,10 @@ function fillTasks(items) {
     const active = ACTIVE_STATES.has(t.state);
     const split = m.train_episodes !== undefined ? `<br>split=${esc(m.train_episodes)} train / ${esc(m.test_episodes)} test · ratio ${esc(m.test_ratio)} · seed ${esc(m.split_seed)}${m.split_source ? ` · ${esc(m.split_source)}` : ''}` : '';
     const model = `<br>model=${esc(modelVariantLabel(m.model_variant))}${m.base_checkpoint ? ` · base=<code class="path" title="${esc(m.base_checkpoint)}">${esc(shortPath(m.base_checkpoint))}</code>` : ''}`;
-    const params = `dataset=${esc(m.dataset_id || '-')} · arm=${esc(m.arm_mode || '-')} · schema=${esc(m.schema || '-')}${model}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}<br>train batch=${esc(m.batch_size || '-')} · FSDP ${esc(m.fsdp_devices || '-')} · XLA ${esc(m.xla_memory_fraction || '-')}<br>norm batch=${esc(m.norm_batch_size || '等待/未知')}` : `<br>norm batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}${split}`;
+    const contract = `<br>contract=v${esc(m.contract_version || '?')} · raw/model=${esc(m.raw_action_dim || '?')}D/${esc(m.model_action_dim || '?')}D · offset=${esc(m.action_offset ?? '-')}/+${esc(m.model_action_start_offset ?? 1)} · ${esc(m.model_action_convention || '-')}<br>gripper=${esc(m.raw_gripper_semantics || '-')} → ${esc(m.gripper_semantics || m.wire_gripper_semantics || '-')}`;
+    const params = `dataset=${esc(m.dataset_id || '-')} · arm=${esc(m.arm_mode || '-')} · schema=${esc(m.schema || '-')}${contract}${model}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}<br>train batch=${esc(m.batch_size || '-')} · FSDP ${esc(m.fsdp_devices || '-')} · XLA ${esc(m.xla_memory_fraction || '-')}<br>norm batch=${esc(m.norm_batch_size || '等待/未知')}` : `<br>norm batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}${split}`;
     const deletable = TERMINAL_STATES.has(t.state);
-    return `<tr><td><code>${esc(t.id)}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${jobDependencySummary(t)}${t.start_error ? `<br><span class="bad">${esc(t.start_error)}</span>` : ''}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}','training')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','training')">删除记录</button>` : ''}</td></tr>`;
+    return `<tr><td><code class="task-ref" title="${esc(t.id)}">${esc(shortTaskId(t.id))}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${jobDependencySummary(t)}${t.start_error ? `<br><span class="bad">${esc(t.start_error)}</span>` : ''}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}','training')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','training')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="4" class="muted">暂无 Norm / Train 任务</td></tr>';
   fillReplacePolicies(items);
   updateClientCommand();
@@ -1076,6 +1114,7 @@ function updateClientCommand() {
   document.getElementById('policyClientCommand').textContent = `python robot_observation_bridge.py \\
   --host 192.168.101.9 \\
   --port ${port} \\
+  --hz 4 \\
 ${robotArgs} \\
   --instruction "pick up the cube"`;
 }
@@ -1119,10 +1158,16 @@ function fillObservation(obs) {
   }
   const control = obs.execution_control || {};
   status.className = obs.dual_gate_open ? 'bad' : obs.fresh ? 'ok' : 'warn';
-  const captured = new Date(Number(obs.captured_at) * 1000).toLocaleString();
+  const captured = fmtTime(obs.client_capture_at ?? obs.captured_at);
   status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · 服务端=${control.mode || 'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open ? 'OPEN' : 'CLOSED'} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
   const joint = obs.schema === 'joint';
-  const labels = joint ? ['joint1(rad)', 'joint2(rad)', 'joint3(rad)', 'joint4(rad)', 'joint5(rad)', 'joint6(rad)', 'gripper_opening(m)'] : ['x(m)', 'y(m)', 'z(m)', 'r6d_c0_x', 'r6d_c0_y', 'r6d_c0_z', 'r6d_c1_x', 'r6d_c1_y', 'r6d_c1_z', 'gripper_closed'];
+  const stateGripper = String(obs.state_gripper_semantics || obs.raw_gripper_semantics || '');
+  const gripperLabel = stateGripper.includes('metre') || stateGripper.endsWith('_m')
+    ? 'gripper_opening(m)'
+    : stateGripper.includes('closed_fraction')
+      ? 'gripper_closed_fraction'
+      : 'gripper_opening_fraction';
+  const labels = joint ? ['joint1(rad)', 'joint2(rad)', 'joint3(rad)', 'joint4(rad)', 'joint5(rad)', 'joint6(rad)', gripperLabel] : ['x(m)', 'y(m)', 'z(m)', 'r6d_c0_x', 'r6d_c0_y', 'r6d_c0_z', 'r6d_c1_x', 'r6d_c1_y', 'r6d_c1_z', gripperLabel];
   const perArmDim = joint ? 7 : 10;
   const state = obs.state || [];
   const formatArm = (side, values) => `[${side}]\n${values.map((v, i) => `${labels[i] || i}: ${Number(v).toFixed(6)}`).join('\n')}`;
@@ -1131,14 +1176,63 @@ function fillObservation(obs) {
     : state.map((v, i) => `${labels[i] || i}: ${Number(v).toFixed(6)}`).join('\n');
   document.getElementById('robotStateTitle').textContent = `${obs.state_dim}D ${obs.arm_mode === 'bimanual' ? 'bimanual ' : ''}${obs.schema} state`;
   document.getElementById('robotState').textContent = `schema=${obs.schema} arm_mode=${obs.arm_mode || 'single'} arm=${obs.arm_side} dim=${obs.state_dim}\n${values}`;
-  const modelHz = obs.client_policy_action_hz ?? obs.action_hz;
-  const commandHz = obs.client_command_hz;
-  const chunkSteps = obs.client_action_chunk_steps;
-  const usedSteps = obs.client_last_action_chunk_steps;
-  const composed = Array.isArray(obs.client_last_composed_action)
-    ? JSON.stringify(obs.client_last_composed_action)
+  const launchHz = obs.client_inference_launch_hz ?? obs.client_inference_hz ?? obs.recommended_inference_launch_hz ?? 4;
+  const actionHz = obs.client_policy_action_hz ?? obs.action_hz ?? 20;
+  const controlHz = obs.client_control_hz ?? obs.client_command_hz ?? actionHz;
+  const chunkRows = obs.client_chunk_rows ?? ((obs.actions_shape || [])[0] ?? '-');
+  const queueAnchor = Array.isArray(obs.client_queue_anchor_state)
+    ? JSON.stringify(obs.client_queue_anchor_state)
     : '-';
-  document.getElementById('policyAction').textContent = `prompt: ${obs.prompt || '-'}\nactions shape: ${JSON.stringify(obs.actions_shape || [])}\nraw first action: ${JSON.stringify(obs.first_action || [])}\nclient composed action (previous cycle, ${usedSteps || '-'} steps): ${composed}\nmodel / command rate: ${modelHz || '-'} Hz / ${commandHz || '-'} Hz\nconfigured chunk steps: ${chunkSteps || '-'}\ncomposed at: ${fmtTime(obs.client_last_composed_action_at)}\nmin/max: ${obs.action_min} / ${obs.action_max}\npolicy elapsed: ${Number(obs.policy_elapsed_s || 0).toFixed(4)}s\nserver gate: ${control.mode || 'shadow'} (revision ${control.revision || 0})\nclient allow: ${Boolean(obs.client_allow_execution)}\nclient state: ${obs.client_execution_state || 'unknown'}\nblocked reason: ${obs.client_blocked_reason || '-'}\nlast command sent: ${fmtTime(obs.client_last_command_at)}`;
+  const lastWire = Array.isArray(obs.client_last_wire_action)
+    ? JSON.stringify(obs.client_last_wire_action)
+    : '-';
+  const decoded = obs.client_last_decoded_target ?? obs.client_last_decoded_absolute_target;
+  const decodedTarget = decoded ? JSON.stringify(decoded) : '-';
+  const targetTimes = Array.isArray(obs.client_plan_target_times) ? JSON.stringify(obs.client_plan_target_times) : '-';
+  const rejectedResult = obs.client_rejected_result ? JSON.stringify(obs.client_rejected_result) : false;
+  const horizonStatus = obs.horizon_execution_ready
+    ? `ready (>= ${obs.minimum_horizon ?? 16})`
+    : `BLOCKED: ${obs.horizon_error || 'action_horizon must be >= 16'}`;
+  document.getElementById('policyAction').textContent = `prompt: ${obs.prompt || '-'}
+contract: v${obs.contract_version || '?'} · raw/model=${obs.raw_action_dim || '?'}D/${obs.model_action_dim || '?'}D
+raw semantics: ${obs.raw_action_semantics || '-'} · ${obs.raw_action_convention || '-'}
+model semantics: ${obs.model_action_semantics || '-'} · ${obs.model_action_convention || '-'}
+wire semantics: ${obs.wire_action_semantics || '-'} · ${obs.wire_action_convention || '-'}
+gripper: raw=${obs.raw_gripper_semantics || '-'} · state=${obs.state_gripper_semantics || '-'} · wire=${obs.wire_gripper_semantics || '-'}
+actions shape / chunk rows: ${JSON.stringify(obs.actions_shape || [])} / ${chunkRows}
+action_hz / control_hz / inference launch_hz: ${actionHz ?? '-'} / ${controlHz ?? '-'} / ${launchHz ?? '-'} Hz
+action_horizon / min horizon: ${obs.action_horizon ?? '-'} / ${obs.minimum_horizon ?? 16} (client=${obs.client_minimum_horizon ?? '-'}) · ${horizonStatus}
+time contract: offset=${obs.action_offset ?? '-'} · model/wire start=${obs.model_action_start_offset ?? '-'}/${obs.action_start_offset_steps ?? '-'} · dt=${obs.action_time_step_s ?? '-'}s · ${obs.time_contract_ready ? 'ready' : ('BLOCKED: ' + (obs.time_contract_error || 'invalid'))}
+in-flight: ${obs.client_in_flight ?? '-'} · actuator delay=${obs.client_actuator_delay_ms ?? '-'} ms / ${obs.client_actuator_delay_steps ?? '-'} steps
+launch / capture / arrival: ${fmtTime(obs.client_launch_at)} / ${fmtTime(obs.client_capture_at ?? obs.captured_at)} / ${fmtTime(obs.client_arrival_at)}
+latency: ${obs.client_latency_ms ?? '-'} ms / ${obs.client_latency_steps ?? '-'} steps
+expired prefix / skipped prefix / blend: ${obs.client_expired_prefix ?? '-'} / ${obs.client_skipped_prefix ?? '-'} / ${obs.client_blend_steps ?? '-'} steps
+active plan generation/index/remaining: ${obs.client_active_plan_generation ?? '-'} / ${obs.client_active_plan_index ?? '-'} / ${obs.client_active_plan_remaining ?? '-'}
+queue generation active/result: ${obs.client_queue_generation ?? '-'} / ${obs.client_result_generation ?? '-'} · old/new remaining: ${obs.client_old_remaining ?? '-'} / ${obs.client_new_remaining ?? '-'}
+hold: ${obs.client_hold_active ?? false} steps=${obs.client_hold_steps ?? 0} reason=${obs.client_hold_reason || '-'}
+blend active/remaining: ${obs.client_blend_active ?? false} / ${obs.client_blend_remaining ?? '-'}
+gripper filter: ${obs.client_gripper_filter_active ?? false} · ${obs.client_gripper_filter ? JSON.stringify(obs.client_gripper_filter) : '-'}
+underrun: ${obs.client_underrun ?? false} (count=${obs.client_underrun_count ?? 0})
+rejected result: ${rejectedResult} (count=${obs.client_rejected_result_count ?? 0})
+drop reason: ${obs.client_drop_reason || '-'}
+plan target times: ${targetTimes}
+current timed target: ${obs.client_timed_target ? JSON.stringify(obs.client_timed_target) : '-'}
+last safe target: ${obs.client_last_safe_target ? JSON.stringify(obs.client_last_safe_target) : '-'}
+queue anchor: ${queueAnchor}
+safety profile: ${obs.client_safety_profile || '-'}
+safety limits: ${obs.client_delivery_safety_limits ? JSON.stringify(obs.client_delivery_safety_limits) : 'translation=0.05m, rotation=0.18rad, gripper=0.30 fraction; workspace x[-0.05,0.30] y[0.01,0.50] z[0.14,0.52]'}
+last wire action: ${lastWire}
+last decoded target: ${decodedTarget}
+async switch: old chunk keeps executing during inference; returned chunk expires a dynamically measured prefix, blends for 2~4 steps, then switches generation
+last feedback: ${fmtTime(obs.client_last_feedback_at)}
+min/max: ${obs.action_min} / ${obs.action_max}
+policy elapsed: ${Number(obs.policy_elapsed_s || 0).toFixed(4)}s
+server gate: ${control.mode || 'shadow'} (revision ${control.revision || 0})
+client allow: ${Boolean(obs.client_allow_execution)}
+client state: ${obs.client_execution_state || 'unknown'}
+blocked reason: ${obs.client_blocked_reason || '-'}
+last command sent: ${fmtTime(obs.client_last_command_at)}
+safety @20Hz: translation<=0.05m, rotation<=0.18rad, gripper<=0.30 fraction; workspace x[-0.05,0.30] y[0.01,0.50] z[0.14,0.52]; CLI may tighten`;
   const key = `${obs.telemetry_session}:${obs.sequence}`;
   if (key !== latestTelemetryKey) {
     latestTelemetryKey = key;
