@@ -36,6 +36,7 @@ from robot_observation_bridge import (
     DEFAULT_WORKSPACE_Z_M,
     ExecutionBlocked,
     ExecutionController,
+    IK_FEEDBACK_LIMIT_TOLERANCE_RAD,
     PiperContinuousIK,
     PiperFeedbackStaleError,
     GRIPPER_CLOSED_FRACTION,
@@ -333,6 +334,55 @@ class ContinuousIKTest(unittest.TestCase):
                 rotation_tolerance_rad=0.005,
                 max_nfev=50,
             )
+
+    def test_accepts_small_zero_offset_and_does_not_move_farther_outward(self):
+        joints = self.joints.copy()
+        joints[1] = -0.0345
+        joints[2] = 0.0491
+        xyz, rotation = self.solver.pose(joints)
+        target_rpy = Rotation.from_matrix(rotation).as_euler("xyz", degrees=True)
+        solved = self.solver.solve(
+            joints,
+            xyz,
+            target_rpy,
+            max_joint_step_rad=0.08,
+            position_tolerance_m=0.0015,
+            rotation_tolerance_rad=0.02,
+            max_nfev=100,
+        )
+        np.testing.assert_allclose(solved, joints, atol=2e-6)
+        self.assertGreaterEqual(solved[1], joints[1] - 1e-8)
+        self.assertLessEqual(solved[2], joints[2] + 1e-8)
+
+    def test_rejects_feedback_beyond_zero_offset_tolerance(self):
+        joints = self.joints.copy()
+        joints[2] = IK_FEEDBACK_LIMIT_TOLERANCE_RAD + 0.01
+        xyz, rotation = self.solver.pose(joints)
+        target_rpy = Rotation.from_matrix(rotation).as_euler("xyz", degrees=True)
+        with self.assertRaisesRegex(ExecutionBlocked, "too far outside IK limits"):
+            self.solver.solve(
+                joints,
+                xyz,
+                target_rpy,
+                max_joint_step_rad=0.08,
+                position_tolerance_m=0.0015,
+                rotation_tolerance_rad=0.02,
+                max_nfev=100,
+            )
+
+
+class EnableHoldTest(unittest.TestCase):
+    def test_enable_holds_measured_zero_offset_without_clipping(self):
+        piper = FakePiper()
+        execution = ExecutionController(piper, execution_args())
+        measured = np.array([1.0, -0.0345, 0.0491, 0.1, 0.2, -0.3, 0.035])
+        execution._enable_robot("right", piper, measured)
+        joint_call = next(call for call in piper.calls if call[0] == "JointCtrl")
+        np.testing.assert_array_equal(
+            np.asarray(joint_call[1:]),
+            np.rint(measured[:6] * RAD_FACTOR).astype(np.int64),
+        )
+        np.testing.assert_allclose(execution.arm_hold_targets["right"], measured[:6])
 
 
 class MetadataCompatibilityTest(unittest.TestCase):

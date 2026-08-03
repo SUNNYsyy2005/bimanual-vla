@@ -25,6 +25,7 @@ from dataclasses import dataclass, replace
 import logging
 import math
 import os
+import re
 import socket
 import time
 from typing import Any, Callable
@@ -110,6 +111,11 @@ DEFAULT_WORKSPACE_Z_M = (0.14, 0.52)  # observed [0.14706, 0.50322]
 DEFAULT_GRIPPER_RANGE_TOLERANCE = 0.02
 PIPER_FEEDBACK_MAX_AGE_S = 0.5
 IK_JOINT_LIMIT_MARGIN_RAD = 0.002
+# Piper feedback can sit a few degrees beyond the SDK's nominal zero-angle
+# limits while the controller reports a healthy, non-limit status.  This is a
+# feedback/calibration tolerance only: local IK may start from that measured
+# pose, but it may not move farther out past it.
+IK_FEEDBACK_LIMIT_TOLERANCE_RAD = 0.06
 DEFAULT_IK_MAX_JOINT_STEP_RAD = 0.08
 DEFAULT_IK_POSITION_TOLERANCE_M = 0.0015
 DEFAULT_IK_ROTATION_TOLERANCE_RAD = 0.02
@@ -274,10 +280,18 @@ class PiperContinuousIK:
 
         hard_lower = JOINT_LIMITS_RAD[:, 0] + IK_JOINT_LIMIT_MARGIN_RAD
         hard_upper = JOINT_LIMITS_RAD[:, 1] - IK_JOINT_LIMIT_MARGIN_RAD
-        if np.any(current < hard_lower - 0.05) or np.any(current > hard_upper + 0.05):
+        if np.any(current < hard_lower - IK_FEEDBACK_LIMIT_TOLERANCE_RAD) or np.any(
+            current > hard_upper + IK_FEEDBACK_LIMIT_TOLERANCE_RAD
+        ):
             raise ExecutionBlocked("current joints are too far outside IK limits")
-        lower = np.maximum(hard_lower, current - max_joint_step_rad)
-        upper = np.minimum(hard_upper, current + max_joint_step_rad)
+        # Keep the measured pose itself in the numerical interval when a joint
+        # is just beyond a nominal zero limit.  The interval only extends from
+        # that measured value back toward the nominal range, so IK cannot drive
+        # an already-outside joint farther outward.
+        feedback_lower = np.minimum(hard_lower, current)
+        feedback_upper = np.maximum(hard_upper, current)
+        lower = np.maximum(feedback_lower, current - max_joint_step_rad)
+        upper = np.minimum(feedback_upper, current + max_joint_step_rad)
         if np.any(lower >= upper):
             raise ExecutionBlocked("continuous IK has no valid local joint interval")
         initial = np.clip(current, lower + 1e-8, upper - 1e-8)
@@ -309,6 +323,10 @@ class PiperContinuousIK:
             np.linalg.norm(Rotation.from_matrix(target_rotation @ solved_rotation.T).as_rotvec())
         )
         joint_step = float(np.max(np.abs(solved - current)))
+        if np.any(solved < hard_lower - IK_FEEDBACK_LIMIT_TOLERANCE_RAD) or np.any(
+            solved > hard_upper + IK_FEEDBACK_LIMIT_TOLERANCE_RAD
+        ):
+            raise ExecutionBlocked("continuous IK target is outside tolerated joint limits")
         if position_error > position_tolerance_m or rotation_error > rotation_tolerance_rad:
             raise ExecutionBlocked(
                 "continuous IK could not reach a nearby solution: "
@@ -1642,6 +1660,22 @@ class ExecutionController:
     def _block(self, state: str, reason: str) -> bool:
         self.state = state
         self.blocked_reason = reason[:500]
+        # Safety failures used to be visible only in Dashboard telemetry. Emit
+        # a rate-limited local message as well so an operator can distinguish
+        # "chunk accepted" from "robot command actually sent" at the terminal.
+        reason_class = re.sub(r"[-+]?\d+(?:\.\d+)?", "#", self.blocked_reason)
+        log_key = (self.state, reason_class)
+        now = time.monotonic()
+        last_key = getattr(self, "_last_block_log_key", None)
+        last_at = float(getattr(self, "_last_block_log_at", 0.0))
+        if log_key != last_key or now - last_at >= 2.0:
+            logging.warning(
+                "Robot command not sent: state=%s reason=%s",
+                self.state,
+                self.blocked_reason,
+            )
+            self._last_block_log_key = log_key
+            self._last_block_log_at = now
         return False
 
     def _reject_result(self, generation: int, reason: str, arrived_at: float) -> bool:
@@ -1662,11 +1696,14 @@ class ExecutionController:
         lower = JOINT_LIMITS_RAD[:, 0]
         upper = JOINT_LIMITS_RAD[:, 1]
         excess = np.maximum(lower - hold_qpos[:6], hold_qpos[:6] - upper)
-        if float(np.max(excess)) > 0.05:
+        if float(np.max(excess)) > IK_FEEDBACK_LIMIT_TOLERANCE_RAD:
             raise ExecutionBlocked(
                 f"{side} Piper measured joints are too far outside limits to hold safely"
             )
-        hold_joints = np.clip(hold_qpos[:6], lower + 0.002, upper - 0.002)
+        # Hold the measured pose exactly.  Clipping a calibrated zero-offset
+        # feedback value to the SDK's nominal limits would itself create an
+        # unsolicited enable-time motion.
+        hold_joints = hold_qpos[:6].copy()
         hold_gripper_m = float(np.clip(hold_qpos[6], 0.0, GRIPPER_MAX_M))
         deadline = time.monotonic() + self.args.enable_timeout_s
         while time.monotonic() < deadline:
