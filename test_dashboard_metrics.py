@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 import unittest
+from unittest import mock
 
 from server_4090.app import (
     describe_dataset_schema,
+    gpu_inventory,
     infer_model_variant,
     parse_training_metrics,
     policy_config_name,
@@ -40,6 +42,27 @@ class TrainingMetricsParserTest(unittest.TestCase):
         self.assertEqual(result["points"][0]["step"], 0)
         self.assertEqual(result["points"][-1]["step"], 99)
         self.assertEqual(result["summary"]["loss"]["max"], 9.5)
+
+
+class GpuInventoryTest(unittest.TestCase):
+    @mock.patch("server_4090.app.subprocess.check_output")
+    def test_ignores_nvidia_smi_na_process_rows(self, check_output):
+        check_output.side_effect = [
+            "0, GPU-0, NVIDIA RTX 4090, 24564, 30\n",
+            "GPU-0, [N/A], [N/A], [N/A]\n",
+        ]
+
+        self.assertEqual(
+            gpu_inventory(),
+            [{
+                "index": 0,
+                "uuid": "GPU-0",
+                "name": "NVIDIA RTX 4090",
+                "memory_total_mib": 24564,
+                "memory_used_mib": 30,
+                "processes": [],
+            }],
+        )
 
 
 class ModelVariantTest(unittest.TestCase):
