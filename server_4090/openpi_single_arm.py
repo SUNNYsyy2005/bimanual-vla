@@ -23,6 +23,7 @@ import time
 from typing import Any
 
 import numpy as np
+from websockets.exceptions import ConnectionClosedError, InvalidMessage
 
 from openpi import transforms
 from openpi.models import pi0_config
@@ -32,6 +33,36 @@ from openpi.shared import normalize
 from openpi.training import config as training_config
 from openpi.training import data_loader
 from openpi.training import weight_loaders
+
+
+class _ExpectedWebsocketProbeFilter(logging.Filter):
+    """Drop expected health-check and bare-TCP probe noise from websockets."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        # OpenPI serves HTTP /healthz from process_request. websockets reports
+        # every successful health response as a rejected WebSocket connection.
+        if message == "connection rejected (200 OK)":
+            return False
+        # Port scanners and TCP readiness probes may connect and close without
+        # sending an HTTP Upgrade request. Keep all other handshake errors.
+        exception = record.exc_info[1] if record.exc_info else None
+        if message == "opening handshake failed":
+            if isinstance(exception, ConnectionClosedError):
+                return False
+            if isinstance(exception, InvalidMessage):
+                cause: BaseException | None = exception
+                while cause is not None:
+                    if isinstance(cause, EOFError):
+                        return False
+                    cause = cause.__cause__
+        return True
+
+
+def _install_websocket_probe_filter() -> None:
+    logger = logging.getLogger("websockets.server")
+    if not any(isinstance(item, _ExpectedWebsocketProbeFilter) for item in logger.filters):
+        logger.addFilter(_ExpectedWebsocketProbeFilter())
 
 
 CONFIG_NAMES = {
@@ -610,6 +641,7 @@ class TelemetryPolicy:
 
 
 def run_serve(args: argparse.Namespace) -> None:
+    _install_websocket_probe_filter()
     config = build_config(args)
     policy = policy_config.create_trained_policy(
         config,
