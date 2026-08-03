@@ -8,6 +8,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from collection_session import CollectionConfig, CollectionSession, SessionState
+from collect_output_arm import PiperFeedbackStaleError, _require_fresh_feedback
 from piper_data_contract import (
     ACTION_NAMES,
     IMAGE_HW,
@@ -17,6 +18,7 @@ from piper_data_contract import (
     EpisodeBuffer,
     build_delivery_state,
 )
+from validate_piper_data import EpisodeValidationError, validate_episode
 
 
 class PiperDataContractTest(unittest.TestCase):
@@ -78,6 +80,38 @@ class PiperDataContractTest(unittest.TestCase):
         self.assertEqual(LEROBOT_FEATURES["actions"]["shape"], (len(ACTION_NAMES),))
         self.assertEqual(LEROBOT_FEATURES["image"]["shape"], (*IMAGE_HW, 3))
         self.assertEqual(LEROBOT_FEATURES["wrist_image"]["shape"], (*IMAGE_HW, 3))
+
+    def test_successful_static_episode_is_rejected(self):
+        buffer = EpisodeBuffer(fps=20)
+        state = self.make_state([0.1, 0.2, 0.3], np.eye(3), 0.0)
+        high = np.full((3, *IMAGE_HW), 20, dtype=np.uint8)
+        wrist = np.full((3, *IMAGE_HW), 80, dtype=np.uint8)
+        for index in range(4):
+            timestamp = 100.0 + index * 0.05
+            buffer.add(
+                state,
+                {"cam_high": high + index, "cam_wrist": wrist + index},
+                {"cam_high": timestamp, "cam_wrist": timestamp},
+                qpos=np.zeros(7, dtype=np.float32),
+                state_timestamp=timestamp,
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ep_0000.npz"
+            buffer.save(path, "pick_cube", "pick up the cube", True)
+            with self.assertRaisesRegex(EpisodeValidationError, "100% no-op"):
+                validate_episode(path, target_fps=20)
+
+    def test_stale_piper_feedback_is_rejected(self):
+        class Message:
+            def __init__(self, timestamp):
+                self.time_stamp = timestamp
+                self.Hz = 100.0
+
+        import time
+
+        _require_fresh_feedback({"joint": Message(time.time())})
+        with self.assertRaises(PiperFeedbackStaleError):
+            _require_fresh_feedback({"joint": Message(time.time() - 1.0)})
 
 
 class FakePiper:

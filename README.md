@@ -2,6 +2,8 @@
 
 双臂 / 单臂 Piper 遥操作采集、pi0.5/openpi 推理接入与训练数据导出工具集。
 
+现场采集、回放、批次导出和增量上传请参阅 [Piper 数据采集操作指南](DATA_COLLECTION_GUIDE.md)。
+
 ## 当前可用能力
 
 - 双臂主从遥操作采集：`teleop.py`

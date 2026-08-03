@@ -22,6 +22,7 @@ episodes_piper_v21/
 piper/
 pi0_dataset_bimanual/
 pi0_dataset_single/
+lerobot_datasets/
 eval_videos/
 
 # 本地汇报文档（可选，按需去掉注释保留）

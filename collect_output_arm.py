@@ -37,16 +37,47 @@ from teleop import KeyListener
 RAD_FACTOR = 57295.7795  # Piper unit: 0.001 degree -> rad
 GRIPPER_FACTOR = 1_000_000.0  # Piper unit: 0.001 mm -> metre
 DEFAULT_CAN = "can0"
-DEFAULT_HIGH_DEVICE = "/dev/video8"
-DEFAULT_WRIST_DEVICE = "/dev/video16"
+DEFAULT_HIGH_DEVICE = "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:4:1.3-video-index0"
+DEFAULT_WRIST_DEVICE = "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:5.2:1.0-video-index4"
 DEFAULT_CAMERA_FPS = 30
 CAMERA_SOURCE_HW = (240, 424)
+PIPER_FEEDBACK_MAX_AGE_S = 0.5
 
 
-def read_output_qpos(piper: C_PiperInterface_V2) -> np.ndarray:
-    """Read measured output-arm joint feedback and gripper position only."""
-    joints = piper.GetArmJointMsgs().joint_state
-    gripper = piper.GetArmGripperMsgs().gripper_state
+class PiperFeedbackStaleError(RuntimeError):
+    """Raised when Piper SDK getters only contain old cached CAN feedback."""
+
+
+def _require_fresh_feedback(
+    messages: dict[str, object],
+    *,
+    max_age_s: float = PIPER_FEEDBACK_MAX_AGE_S,
+) -> None:
+    """Fail when SDK feedback timestamps have stopped advancing.
+
+    Piper SDK getters keep returning the last decoded values after CAN traffic
+    stops. Their wrapper timestamps originate from SocketCAN receive frames,
+    so an age check prevents frozen robot state from being recorded alongside
+    live camera images.
+    """
+    now = time.time()
+    failures = []
+    for name, message in messages.items():
+        timestamp = float(getattr(message, "time_stamp", 0.0) or 0.0)
+        hz = float(getattr(message, "Hz", 0.0) or 0.0)
+        age_s = now - timestamp if timestamp > 0 else float("inf")
+        if timestamp <= 0 or age_s > max_age_s or age_s < -1.0:
+            failures.append(f"{name}: age={age_s:.3f}s Hz={hz:.1f}")
+    if failures:
+        raise PiperFeedbackStaleError(
+            "Piper CAN feedback is missing or stale; reconnect before collecting: "
+            + "; ".join(failures)
+        )
+
+
+def _qpos_from_feedback(joints_message, gripper_message) -> np.ndarray:
+    joints = joints_message.joint_state
+    gripper = gripper_message.gripper_state
     values = np.array(
         [
             joints.joint_1,
@@ -61,10 +92,28 @@ def read_output_qpos(piper: C_PiperInterface_V2) -> np.ndarray:
     return np.append(values, float(gripper.grippers_angle) / GRIPPER_FACTOR)
 
 
+def read_output_qpos(piper: C_PiperInterface_V2) -> np.ndarray:
+    """Read measured output-arm joint feedback and gripper position only."""
+    joints_message = piper.GetArmJointMsgs()
+    gripper_message = piper.GetArmGripperMsgs()
+    _require_fresh_feedback({"joint": joints_message, "gripper": gripper_message})
+    return _qpos_from_feedback(joints_message, gripper_message)
+
+
 def read_output_state(piper: C_PiperInterface_V2) -> tuple[np.ndarray, np.ndarray]:
     """Return delivery state (10D) and diagnostic joint qpos (7D)."""
-    qpos = read_output_qpos(piper)
-    pose = piper.GetArmEndPoseMsgs().end_pose
+    joints_message = piper.GetArmJointMsgs()
+    gripper_message = piper.GetArmGripperMsgs()
+    pose_message = piper.GetArmEndPoseMsgs()
+    _require_fresh_feedback(
+        {
+            "joint": joints_message,
+            "gripper": gripper_message,
+            "end_pose": pose_message,
+        }
+    )
+    qpos = _qpos_from_feedback(joints_message, gripper_message)
+    pose = pose_message.end_pose
     xyz_m = np.array([pose.X_axis, pose.Y_axis, pose.Z_axis], dtype=np.float64) / 1_000_000.0
     rpy_rad = np.deg2rad(np.array([pose.RX_axis, pose.RY_axis, pose.RZ_axis], dtype=np.float64) / 1000.0)
     rotation = Rotation.from_euler("xyz", rpy_rad).as_matrix()
