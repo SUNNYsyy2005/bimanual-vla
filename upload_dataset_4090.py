@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Pack and resumably upload a LeRobot dataset to the 4x4090 dashboard.
+"""Prepare and resumably upload a dataset to the 4x4090 dashboard.
 
-The archive is intentionally uncompressed: videos are already compressed, and this
-avoids wasting CPU during collection and server-side installation.
+Input may be either a canonical LeRobot v2.1 directory or a GUI collection
+directory containing ``ep_*.npz``. Raw GUI episodes are validated and exported
+to a signature-keyed LeRobot cache before the normal resumable upload path.
+The archive is intentionally uncompressed because videos are already compressed.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import tarfile
 import threading
@@ -88,6 +91,144 @@ def build_archive(dataset_root: Path, dataset_name: str, cache_dir: Path, rebuil
     }
     sidecar.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return archive, sha256, archive.stat().st_size
+
+
+RAW_EXPORT_CACHE_VERSION = 1
+
+
+def classify_dataset_source(source: Path) -> str:
+    """Return ``lerobot`` or ``raw_npz`` for a supported directory."""
+    if not source.is_dir():
+        raise ValueError(f"dataset directory does not exist: {source}")
+    if (source / "meta" / "info.json").is_file():
+        return "lerobot"
+    if any(source.glob("ep_*.npz")):
+        return "raw_npz"
+    raise ValueError(
+        "dataset must be either a LeRobot directory containing meta/info.json "
+        "or a GUI collection directory containing ep_*.npz"
+    )
+
+
+def _raw_export_key(
+    source: Path,
+    *,
+    fps: int,
+    allow_incomplete_gripper_coverage: bool,
+) -> tuple[str, str]:
+    source_hash = source_signature(source)
+    options = (
+        f"version={RAW_EXPORT_CACHE_VERSION}\n"
+        f"source={source_hash}\n"
+        f"fps={fps}\n"
+        f"allow_incomplete_gripper_coverage={int(allow_incomplete_gripper_coverage)}\n"
+    )
+    return source_hash, hashlib.sha256(options.encode()).hexdigest()
+
+
+def prepare_raw_npz_dataset(
+    source: Path,
+    dataset_name: str,
+    cache_dir: Path,
+    *,
+    fps: int,
+    allow_incomplete_gripper_coverage: bool,
+    rebuild: bool,
+) -> Path:
+    """Export raw GUI episodes to a reusable, atomically published cache."""
+    source_hash, export_key = _raw_export_key(
+        source,
+        fps=fps,
+        allow_incomplete_gripper_coverage=allow_incomplete_gripper_coverage,
+    )
+    export_cache = cache_dir / "exports"
+    export_cache.mkdir(parents=True, exist_ok=True)
+    output_root = export_cache / f"{dataset_name}-{export_key[:16]}"
+    marker = output_root.parent / f"{output_root.name}.json"
+    expected_marker = {
+        "cache_version": RAW_EXPORT_CACHE_VERSION,
+        "source_root": str(source),
+        "source_signature": source_hash,
+        "export_key": export_key,
+        "fps": fps,
+        "allow_incomplete_gripper_coverage": allow_incomplete_gripper_coverage,
+    }
+    if output_root.is_dir() and marker.is_file() and not rebuild:
+        try:
+            cached = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cached = {}
+        if (
+            all(cached.get(key) == value for key, value in expected_marker.items())
+            and (output_root / "meta" / "info.json").is_file()
+        ):
+            print(f"Detected GUI NPZ directory; reusing cached LeRobot export: {output_root}")
+            return output_root
+
+    temp_root = output_root.with_name(output_root.name + ".building")
+    shutil.rmtree(temp_root, ignore_errors=True)
+    print(
+        f"Detected GUI NPZ directory: {source}\n"
+        f"Validating and exporting to LeRobot cache: {output_root}",
+        flush=True,
+    )
+    try:
+        from export_lerobot import export_dataset
+
+        exported = export_dataset(
+            source,
+            temp_root,
+            fps=fps,
+            allow_incomplete_gripper_coverage=allow_incomplete_gripper_coverage,
+        )
+        if exported != temp_root or not (temp_root / "meta" / "info.json").is_file():
+            raise RuntimeError("raw NPZ export did not produce a valid LeRobot meta/info.json")
+        shutil.rmtree(output_root, ignore_errors=True)
+        os.replace(temp_root, output_root)
+        marker_temp = marker.parent / f"{marker.name}.building"
+        marker_temp.write_text(
+            json.dumps(
+                {
+                    **expected_marker,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(marker_temp, marker)
+    except BaseException:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
+    return output_root
+
+
+def prepare_dataset_directory(
+    source: Path,
+    dataset_name: str,
+    cache_dir: Path,
+    *,
+    fps: int,
+    allow_incomplete_gripper_coverage: bool,
+    rebuild: bool,
+) -> tuple[Path, str]:
+    """Resolve a LeRobot input directly or auto-export a GUI NPZ directory."""
+    kind = classify_dataset_source(source)
+    if kind == "lerobot":
+        print(f"Detected LeRobot dataset directory: {source}")
+        return source, kind
+    return (
+        prepare_raw_npz_dataset(
+            source,
+            dataset_name,
+            cache_dir,
+            fps=fps,
+            allow_incomplete_gripper_coverage=allow_incomplete_gripper_coverage,
+            rebuild=rebuild,
+        ),
+        kind,
+    )
 
 
 def sha256_file(path: Path) -> str:
@@ -170,7 +311,7 @@ def upload_one(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("dataset", type=Path, help="LeRobot dataset directory, or .tar with --archive")
+    parser.add_argument("dataset", type=Path, help="LeRobot directory, GUI ep_*.npz directory, or .tar with --archive")
     parser.add_argument("--name", default=None, help="server-side LeRobot repo/directory name")
     parser.add_argument("--server", default=os.environ.get("BIMANUAL_VLA_SERVER", DEFAULT_SERVER))
     parser.add_argument("--token", default=os.environ.get("BIMANUAL_VLA_SERVER_TOKEN"))
@@ -180,7 +321,22 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--cache-dir", type=Path, default=Path.home() / ".cache" / "bimanual-vla" / "uploads")
     parser.add_argument("--archive", action="store_true", help="input is an existing uncompressed .tar")
-    parser.add_argument("--rebuild", action="store_true")
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=20,
+        help="expected/exported FPS for a raw GUI NPZ directory (default: 20)",
+    )
+    parser.add_argument(
+        "--allow-incomplete-gripper-coverage",
+        action="store_true",
+        help="allow raw GUI export without both fully-open and fully-closed gripper samples",
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="rebuild cached raw export and upload archive",
+    )
     install_mode = parser.add_mutually_exclusive_group()
     install_mode.add_argument(
         "--merge",
@@ -196,8 +352,8 @@ def main() -> int:
 
     if not args.token or len(args.token) < 20:
         parser.error("provide --token or BIMANUAL_VLA_SERVER_TOKEN (at least 20 characters)")
-    if args.workers <= 0 or args.chunk_mib <= 0 or args.attempts <= 0:
-        parser.error("workers, chunk-mib, and attempts must be positive")
+    if args.workers <= 0 or args.chunk_mib <= 0 or args.attempts <= 0 or args.fps <= 0:
+        parser.error("workers, chunk-mib, attempts, and fps must be positive")
     source = args.dataset.expanduser().resolve()
     dataset_name = safe_dataset_name(args.name or source.stem if args.archive else args.name or source.name)
 
@@ -208,9 +364,24 @@ def main() -> int:
         size = archive.stat().st_size
         archive_sha = sha256_file(archive)
     else:
-        if not source.is_dir() or not (source / "meta" / "info.json").exists():
-            parser.error("dataset must be a LeRobot directory containing meta/info.json")
-        archive, archive_sha, size = build_archive(source, dataset_name, args.cache_dir.expanduser(), args.rebuild)
+        cache_dir = args.cache_dir.expanduser().resolve()
+        try:
+            dataset_root, _ = prepare_dataset_directory(
+                source,
+                dataset_name,
+                cache_dir,
+                fps=args.fps,
+                allow_incomplete_gripper_coverage=args.allow_incomplete_gripper_coverage,
+                rebuild=args.rebuild,
+            )
+        except (OSError, RuntimeError, ValueError, SystemExit) as exc:
+            parser.error(str(exc))
+        archive, archive_sha, size = build_archive(
+            dataset_root,
+            dataset_name,
+            cache_dir,
+            args.rebuild,
+        )
 
     chunk_size = args.chunk_mib * 1024 * 1024
     client = Client(args.server, args.token, args.timeout)

@@ -464,18 +464,24 @@ Piper 单臂 LoRA 使用 `pi05_base`。脚本支持 HuggingFace 镜像优先、G
 bash deploy_4090_server.sh
 ```
 
-上传已导出的 LeRobot v2.1 数据集：
+上传器支持两种目录，自动识别输入格式：
+
+1. GUI 直接采集的原始目录（包含 `ep_*.npz`），上传前自动校验并导出 LeRobot；
+2. 已经导出的 LeRobot v2.1 目录（包含 `meta/info.json`），直接打包上传。
+
+直接上传 GUI 采集批次并追加到服务器同名数据集：
 
 ```bash
-python upload_dataset_4090.py piper/piper_v1 \
+python upload_dataset_4090.py episodes_batches/20260803_pick_cube_01 \
   --name piper_v1 \
   --server http://192.168.101.9:8090 \
   --token "$BIMANUAL_VLA_SERVER_TOKEN" \
   --workers 4 \
-  --chunk-mib 32
+  --fps 20 \
+  --merge
 ```
 
-要把新采集的 episodes 追加到服务器同名数据集，增加 `--merge`：
+上传已导出的 LeRobot 数据集：
 
 ```bash
 python upload_dataset_4090.py piper/piper_v1_increment \
@@ -486,7 +492,7 @@ python upload_dataset_4090.py piper/piper_v1_increment \
   --merge
 ```
 
-`--merge` 与 `--overwrite` 互斥；目标不存在时 `--merge` 按首次安装处理。服务端会检查两个数据集的版本、robot type、FPS、chunk size、features、action semantics 和 action offset，随后重新编号新增 episode/global/task index，并在临时目录完成结构与 loader 校验后原子替换。
+原始 NPZ 的自动导出结果保存在 `~/.cache/bimanual-vla/uploads/exports`，源目录未变化时会复用；`--rebuild` 可强制重新导出并重建 tar。若一个原始目录混合了不同 arm mode/schema，导出会拒绝。`--merge` 与 `--overwrite` 互斥；目标不存在时 `--merge` 按首次安装处理。服务端会检查两个数据集的版本、robot type、FPS、chunk size、features、action semantics 和 action offset，随后重新编号新增 episode/global/task index，并在临时目录完成结构与 loader 校验后原子替换。
 
 网页地址：`http://192.168.101.9:8090`。页面作为管理面，可执行：
 

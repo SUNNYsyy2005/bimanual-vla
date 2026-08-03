@@ -129,7 +129,7 @@
     <section id="module-datasets" class="dashboard-module" data-module="datasets" hidden>
       <div class="module-heading"><div><h2>数据集管理</h2><p>上传、检查、编辑 Episode，并独立预览每一路相机媒体。</p></div></div>
       <div class="grid">
-        <div class="card half"><h2>上传数据集</h2><p>采集机执行：</p><pre id="uploadCommand">python upload_dataset_4090.py DATASET_DIR --name my_dataset --server http://192.168.101.9:8090 --token TOKEN --workers 4 --merge</pre><p class="muted"><code>--merge</code> 增量追加；<code>--overwrite</code> 替换，二者互斥。服务端会执行 SHA256、路径安全、结构和 loader 校验。</p></div>
+        <div class="card half"><h2>上传数据集</h2><p>采集机执行：</p><pre id="uploadCommand">python upload_dataset_4090.py LEROBOT_OR_GUI_NPZ_DIR --name my_dataset --server http://192.168.101.9:8090 --token TOKEN --workers 4 --merge</pre><p class="muted">支持含 <code>meta/info.json</code> 的 LeRobot 目录，或含 <code>ep_*.npz</code> 的 GUI 采集目录（自动导出）。<code>--merge</code> 增量追加；<code>--overwrite</code> 替换，二者互斥。</p></div>
         <div class="card half"><h2>格式与媒体说明</h2><div class="section-note">Dashboard 可识别单臂 7D / 10D、双臂 14D / 20D 和其他自定义维度，并显示所有 <code>dtype: video</code> / <code>dtype: image</code> 相机。图片既可来自外部逐帧目录，也可直接读取 Parquet 内嵌 bytes。</div></div>
         <div class="card"><h2>已接收数据集</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div></div>
         <div class="card">

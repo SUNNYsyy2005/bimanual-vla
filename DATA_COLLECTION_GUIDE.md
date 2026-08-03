@@ -290,7 +290,22 @@ read -rsp "Dashboard token: " BIMANUAL_VLA_SERVER_TOKEN
 echo
 ```
 
-将新批次追加到服务器现有的 `my_dataset`：
+上传器支持两种输入方式。
+
+方式一，直接提交 GUI 采集的原始 NPZ 批次；脚本会自动校验并导出为 LeRobot：
+
+```bash
+python upload_dataset_4090.py \
+  "episodes_batches/$BATCH" \
+  --name my_dataset \
+  --server http://192.168.101.9:8090 \
+  --token "$BIMANUAL_VLA_SERVER_TOKEN" \
+  --workers 4 \
+  --fps 20 \
+  --merge
+```
+
+方式二，提交已经手动导出的 LeRobot 目录：
 
 ```bash
 python upload_dataset_4090.py \
@@ -301,6 +316,8 @@ python upload_dataset_4090.py \
   --workers 4 \
   --merge
 ```
+
+直接上传原始 NPZ 时，自动导出的 LeRobot 数据缓存在 `~/.cache/bimanual-vla/uploads/exports`。重复执行且源目录未变化时会复用导出结果和 tar；使用 `--rebuild` 可强制重建。一个原始目录中不要混合不同 arm mode 或 schema。
 
 完成后清除环境变量：
 
@@ -370,9 +387,9 @@ v4l2-ctl --list-devices
 
 在 GUI 中更新相机路径，并通过实时画面确认。
 
-### 上传时报 `dataset must be a LeRobot directory containing meta/info.json`
+### 上传时报输入目录既不是 LeRobot 也不是 GUI NPZ
 
-上传器不能直接上传 `episodes_batches/...` 中的 NPZ。先运行 `export_lerobot.py`，然后上传 `lerobot_batches/$BATCH`。
+输入目录必须满足其中一种格式：包含 `meta/info.json` 的 LeRobot 数据集，或顶层包含 `ep_*.npz` 的 GUI 采集目录。不要传入这两类目录的上一级目录。
 
 ### 上传时报 Token 长度不足
 
