@@ -31,10 +31,26 @@ from werkzeug.exceptions import HTTPException
 
 try:
     from .dataset_editor import DatasetEditor, DatasetValidationError
-    from .episode_split import EpisodeSplit, norm_split_matches, resolve_episode_split
+    from .episode_split import (
+        DEFAULT_SPLIT_SEED,
+        DEFAULT_TEST_RATIO,
+        NORM_CONFIG_FILENAME,
+        EpisodeSplit,
+        load_episode_split,
+        norm_split_matches,
+        resolve_episode_split,
+    )
 except ImportError:  # app.py is normally executed directly by start_server.sh
     from dataset_editor import DatasetEditor, DatasetValidationError
-    from episode_split import EpisodeSplit, norm_split_matches, resolve_episode_split
+    from episode_split import (
+        DEFAULT_SPLIT_SEED,
+        DEFAULT_TEST_RATIO,
+        NORM_CONFIG_FILENAME,
+        EpisodeSplit,
+        load_episode_split,
+        norm_split_matches,
+        resolve_episode_split,
+    )
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -612,6 +628,12 @@ class TaskManager:
 
         if dependency_state == "lost":
             task["dependency_recovered_from_artifact"] = True
+
+        norm_config = read_json(Path(str(artifact)).parent / NORM_CONFIG_FILENAME)
+        if isinstance(norm_config, dict):
+            metadata = task.setdefault("metadata", {})
+            metadata["norm_config"] = norm_config
+            metadata["norm_batch_size"] = norm_config.get("effective_batch_size")
 
         wait_reason = self._gpu_wait_reason(task)
         if wait_reason:
@@ -1535,6 +1557,7 @@ def create_app(config_path: Path) -> Flask:
             schema = describe_dataset_schema(info)
             split_info = read_json(directory / "meta" / "train_test_split.json")
             norm_ready_by_model: dict[str, bool] = {}
+            norm_config_by_model: dict[str, dict[str, Any] | None] = {}
             if schema["arm_mode"] in {"single", "bimanual"}:
                 for model_variant in sorted(MODEL_VARIANTS):
                     norm_dir = (
@@ -1543,6 +1566,8 @@ def create_app(config_path: Path) -> Flask:
                         / directory.name
                     )
                     norm_split = read_json(norm_dir / "episode_split.json")
+                    norm_config = read_json(norm_dir / NORM_CONFIG_FILENAME)
+                    norm_config_by_model[model_variant] = norm_config if isinstance(norm_config, dict) else None
                     norm_ready_by_model[model_variant] = bool(
                         (norm_dir / "norm_stats.json").is_file()
                         and isinstance(split_info, dict)
@@ -1563,6 +1588,7 @@ def create_app(config_path: Path) -> Flask:
                     "test_episodes": split_info.get("num_test_episodes") if isinstance(split_info, dict) else None,
                     "norm_stats_ready": norm_ready_by_model.get(default_model_variant, False),
                     "norm_stats_by_model": norm_ready_by_model,
+                    "norm_config_by_model": norm_config_by_model,
                     "norm_model_variants": [
                         variant for variant, ready in norm_ready_by_model.items() if ready
                     ],
@@ -1868,14 +1894,46 @@ def create_app(config_path: Path) -> Flask:
 
     def parse_episode_split(payload: dict[str, Any], dataset_id: str) -> EpisodeSplit:
         test_ratio = safe_float(
-            payload.get("test_ratio", 0.1),
+            payload.get("test_ratio", DEFAULT_TEST_RATIO),
             "test_ratio",
             0.0,
             1.0,
             maximum_inclusive=False,
         )
-        split_seed = safe_int(payload.get("split_seed", 42), "split_seed", 0, 2**31 - 1)
+        split_seed = safe_int(
+            payload.get("split_seed", DEFAULT_SPLIT_SEED),
+            "split_seed",
+            0,
+            2**31 - 1,
+        )
         return resolve_episode_split(dataset_root, dataset_id, test_ratio=test_ratio, seed=split_seed)
+
+    def training_episode_split(payload: dict[str, Any], dataset_id: str) -> tuple[EpisodeSplit, str]:
+        persisted = load_episode_split(dataset_root, dataset_id)
+        explicit_ratio = payload.get("test_ratio") not in (None, "")
+        explicit_seed = payload.get("split_seed") not in (None, "")
+        if not explicit_ratio and not explicit_seed and persisted is not None:
+            return persisted, "persisted"
+
+        test_ratio = safe_float(
+            payload.get("test_ratio")
+            if explicit_ratio
+            else persisted.test_ratio if persisted is not None else DEFAULT_TEST_RATIO,
+            "test_ratio",
+            0.0,
+            1.0,
+            maximum_inclusive=False,
+        )
+        split_seed = safe_int(
+            payload.get("split_seed")
+            if explicit_seed
+            else persisted.seed if persisted is not None else DEFAULT_SPLIT_SEED,
+            "split_seed",
+            0,
+            2**31 - 1,
+        )
+        split = resolve_episode_split(dataset_root, dataset_id, test_ratio=test_ratio, seed=split_seed)
+        return split, "request" if explicit_ratio or explicit_seed else "default"
 
     def build_norm_command(
         dataset_id: str,
@@ -1948,6 +2006,7 @@ def create_app(config_path: Path) -> Flask:
                 "max_frames": parsed_max_frames,
                 "test_ratio": split.test_ratio,
                 "split_seed": split.seed,
+                "split_source": "request",
                 "train_episodes": len(split.train_episodes),
                 "test_episodes": len(split.test_episodes),
                 "test_episode_indexes": list(split.test_episodes),
@@ -1962,9 +2021,10 @@ def create_app(config_path: Path) -> Flask:
         payload = request.get_json(force=True)
         dataset_id, arm_mode, arm_side, schema = parse_dataset(payload)
         base_checkpoint, model_variant = resolve_base_model(payload)
-        split = parse_episode_split(payload, dataset_id)
+        split, split_source = training_episode_split(payload, dataset_id)
         norm_path = norm_stats_path(dataset_id, arm_mode, model_variant)
         norm_ready = norm_split_matches(norm_path.parent, split)
+        saved_norm_config = read_json(norm_path.parent / NORM_CONFIG_FILENAME) if norm_ready else None
         gpu_ids = parse_gpus(payload, check_busy=norm_ready)
         exp_name = safe_name(payload.get("exp_name"), "experiment name")
         batch_size = safe_int(payload.get("batch_size", 8), "batch_size", 1, 1024)
@@ -2025,16 +2085,26 @@ def create_app(config_path: Path) -> Flask:
             "base_checkpoint": str(base_checkpoint),
             "exp_name": exp_name,
             "gpu_ids": gpu_ids,
+            "batch_size": batch_size,
+            "num_workers": num_workers,
             "steps": steps,
+            "save_interval": save_interval,
             "fsdp_devices": fsdp_devices,
             "mode": mode,
             "effective_mode": effective_mode,
             "checkpoint_dir": str(checkpoint_dir),
             "test_ratio": split.test_ratio,
             "split_seed": split.seed,
+            "split_source": split_source,
             "train_episodes": len(split.train_episodes),
             "test_episodes": len(split.test_episodes),
             "test_episode_indexes": list(split.test_episodes),
+            "norm_config": saved_norm_config if isinstance(saved_norm_config, dict) else None,
+            "norm_batch_size": (
+                saved_norm_config.get("effective_batch_size")
+                if isinstance(saved_norm_config, dict)
+                else None
+            ),
         }
         with tasks.lock:
             # Re-check while holding the task lock so simultaneous submissions
@@ -2096,6 +2166,7 @@ def create_app(config_path: Path) -> Flask:
                         "max_frames": None,
                         "test_ratio": split.test_ratio,
                         "split_seed": split.seed,
+                        "split_source": split_source,
                         "train_episodes": len(split.train_episodes),
                         "test_episodes": len(split.test_episodes),
                         "test_episode_indexes": list(split.test_episodes),

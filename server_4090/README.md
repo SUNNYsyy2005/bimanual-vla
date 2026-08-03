@@ -207,13 +207,16 @@ cd /home/sunny/bimanual-vla
 3. 选择模型系列、基础模型和 RTX 4090，提交 FSDP LoRA 微调：
    - 可选择 `π0.5` / `π0`，也可把已有完整 checkpoint 作为初始化权重；
    - 不同模型系列使用独立 config、norm stats 和 checkpoint 目录，避免互相覆盖；
+   - norm 时确定的测试集比例、划分种子和 episode 清单持久化到数据集 `meta/train_test_split.json`，训练自动加载，不需要重复填写；
+   - 每次成功 norm 还会保存 `episode_split.json` 和 `norm_config.json`，记录模型系列、基础权重、norm batch size、workers、帧数限制和实际处理规模；
+   - norm batch size 只影响统计阶段的吞吐与资源占用，不需要和训练 batch size 一致；
    - `norm_stats.json` 已存在且 episode 划分一致时直接启动训练；
    - 缺失时自动启动完整 norm 任务，训练进入持久化 `waiting_norm`；
    - norm 成功后自动启动训练；GPU 暂忙时进入 `waiting_gpu` 并自动重试；
    - norm 失败、丢失或未生成统计文件时，训练任务标记失败并显示依赖原因；
    - 同一数据集、模型系列、基础权重和划分参数已有运行中的 norm 时复用该任务，Dashboard 重启后依赖仍可恢复；
    - 启动方式默认使用 `auto`：实验目录存在时等价于 `--resume`，不存在时创建新训练；只有明确选择 `overwrite` 才会删除原 checkpoint。
-4. “计算归一化统计”表单保留为手动重算或限制帧数调试入口，正常训练无需预先手动点击。
+4. “计算归一化统计”表单用于首次确定或主动修改 episode 划分，也可手动重算或限制帧数调试；训练提交时会复用已保存划分，缺少 norm 时自动补算。
 5. 训练模块集中展示 Norm / Train 进程管理、任务日志和指标曲线；从日志提取 `Step N: key=value`，绘制 `loss`、`loss_physical_14d`、`loss_padding_18d` 等曲线，并显示 step 进度、latest/min/max；图例按钮可切换 `grad_norm`、`param_norm` 等其他指标。
 6. 页面按模型系列和数据集臂模式扫描 `pi05_piper_*_lora/<experiment>/<step>` 与 `pi0_piper_*_lora/<experiment>/<step>`，过滤完整 checkpoint，并在训练模块列出 checkpoint 表。
 7. 在“新建 / 切换 Policy 进程”中选择 GPU、端口和 checkpoint：
