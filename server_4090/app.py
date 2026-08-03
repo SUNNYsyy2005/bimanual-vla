@@ -31,8 +31,10 @@ from werkzeug.exceptions import HTTPException
 
 try:
     from .dataset_editor import DatasetEditor, DatasetValidationError
+    from .episode_split import EpisodeSplit, norm_split_matches, resolve_episode_split
 except ImportError:  # app.py is normally executed directly by start_server.sh
     from dataset_editor import DatasetEditor, DatasetValidationError
+    from episode_split import EpisodeSplit, norm_split_matches, resolve_episode_split
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -127,12 +129,57 @@ def safe_int(value: Any, label: str, minimum: int, maximum: int) -> int:
     return parsed
 
 
-def policy_config_name(arm_mode: str) -> str:
-    if arm_mode == "single":
-        return "pi05_piper_single_arm_lora"
-    if arm_mode == "bimanual":
-        return "pi05_piper_bimanual_lora"
-    raise ValueError(f"unsupported arm_mode: {arm_mode!r}")
+def safe_float(value: Any, label: str, minimum: float, maximum: float, *, maximum_inclusive: bool = True) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a number") from exc
+    upper_ok = parsed <= maximum if maximum_inclusive else parsed < maximum
+    if not math.isfinite(parsed) or parsed < minimum or not upper_ok:
+        bracket = "]" if maximum_inclusive else ")"
+        raise ValueError(f"{label} must be in [{minimum}, {maximum}{bracket}")
+    return parsed
+
+
+MODEL_VARIANTS = {"pi05", "pi0"}
+
+
+def infer_model_variant(path: Path) -> str | None:
+    path = Path(path)
+
+    def from_name(value: str) -> str | None:
+        name = value.lower()
+        if re.match(r"^pi(?:05|0\.5)(?:_|-|$)", name):
+            return "pi05"
+        if re.match(r"^pi0(?:_|-|$)", name):
+            return "pi0"
+        return None
+
+    # A complete checkpoint is normally ``<config>/<experiment>/<step>``.
+    # Inspect the config directory first so an experiment name such as
+    # ``from_pi05_transfer`` cannot override the actual model family.
+    if path.name.isdigit() and len(path.parents) >= 2:
+        configured = from_name(path.parent.parent.name)
+        if configured is not None:
+            return configured
+
+    # Then inspect from the checkpoint itself towards its parents.  The OpenPI
+    # checkout currently lives below a directory named ``pi05`` on 4x4090, so
+    # nearest recognized names must win over distant repository directories.
+    for part in reversed(path.parts):
+        inferred = from_name(part)
+        if inferred is not None:
+            return inferred
+    return None
+
+
+def policy_config_name(arm_mode: str, model_variant: str = "pi05") -> str:
+    if model_variant not in MODEL_VARIANTS:
+        raise ValueError(f"unsupported model_variant: {model_variant!r}")
+    if arm_mode not in {"single", "bimanual"}:
+        raise ValueError(f"unsupported arm_mode: {arm_mode!r}")
+    suffix = "single_arm" if arm_mode == "single" else "bimanual"
+    return f"{model_variant}_piper_{suffix}_lora"
 
 
 def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
@@ -1298,6 +1345,7 @@ def discover_external_policy_candidates(
                 "port": command_port or port,
                 "gpu_ids": sorted(gpu_by_pid.get(pid, [])),
                 "schema": _cmd_arg(command, "--schema") or "external",
+                "model_variant": _cmd_arg(command, "--model-variant") or "pi05",
                 "dataset_id": _cmd_arg(command, "--dataset-id") or "external",
                 "arm_side": _cmd_arg(command, "--arm-side"),
                 "checkpoint": _cmd_arg(command, "--checkpoint") or _cmd_arg(command, "--policy.dir"),
@@ -1463,6 +1511,22 @@ def create_app(config_path: Path) -> Flask:
             if not isinstance(info, dict):
                 continue
             schema = describe_dataset_schema(info)
+            split_info = read_json(directory / "meta" / "train_test_split.json")
+            norm_ready_by_model: dict[str, bool] = {}
+            if schema["arm_mode"] in {"single", "bimanual"}:
+                for model_variant in sorted(MODEL_VARIANTS):
+                    norm_dir = (
+                        Path(config["assets_base_dir"])
+                        / policy_config_name(schema["arm_mode"], model_variant)
+                        / directory.name
+                    )
+                    norm_split = read_json(norm_dir / "episode_split.json")
+                    norm_ready_by_model[model_variant] = bool(
+                        (norm_dir / "norm_stats.json").is_file()
+                        and isinstance(split_info, dict)
+                        and norm_split == split_info
+                    )
+            default_model_variant = infer_model_variant(Path(config["base_checkpoint"])) or "pi05"
             datasets.append(
                 {
                     "id": directory.name,
@@ -1472,58 +1536,107 @@ def create_app(config_path: Path) -> Flask:
                     "fps": info.get("fps"),
                     "robot_type": info.get("robot_type"),
                     **schema,
-                    "norm_stats_ready": (
-                        Path(config["assets_base_dir"])
-                        / policy_config_name(schema["arm_mode"])
-                        / directory.name
-                        / "norm_stats.json"
-                    ).is_file() if schema["arm_mode"] in {"single", "bimanual"} else False,
+                    "episode_split": split_info if isinstance(split_info, dict) else None,
+                    "train_episodes": split_info.get("num_train_episodes") if isinstance(split_info, dict) else None,
+                    "test_episodes": split_info.get("num_test_episodes") if isinstance(split_info, dict) else None,
+                    "norm_stats_ready": norm_ready_by_model.get(default_model_variant, False),
+                    "norm_stats_by_model": norm_ready_by_model,
+                    "norm_model_variants": [
+                        variant for variant, ready in norm_ready_by_model.items() if ready
+                    ],
                     "mtime": directory.stat().st_mtime,
                 }
             )
         return datasets
 
+    def list_base_models() -> list[dict[str, Any]]:
+        candidates: set[Path] = {Path(config["base_checkpoint"]).resolve()}
+        for root in checkpoint_roots:
+            if not root.exists():
+                continue
+            for params_dir in root.rglob("params"):
+                if params_dir.is_dir() and any(
+                    (params_dir / marker).exists()
+                    for marker in ("manifest.ocdbt", "_METADATA", "_CHECKPOINT_METADATA")
+                ):
+                    candidates.add(params_dir.parent.resolve())
+        default_path = Path(config["base_checkpoint"]).resolve()
+        models = []
+        for path in sorted(candidates, key=str):
+            if not (path / "params").is_dir():
+                continue
+            model_variant = infer_model_variant(path)
+            if model_variant is None:
+                continue
+            models.append(
+                {
+                    "path": str(path),
+                    "name": path.name,
+                    "model_variant": model_variant,
+                    "default": path == default_path,
+                    "source": "pretrained" if path.is_relative_to(Path.home() / ".cache/openpi") else "checkpoint",
+                }
+            )
+        return sorted(models, key=lambda item: (not item["default"], item["model_variant"], item["path"]))
+
+    def resolve_base_model(payload: dict[str, Any]) -> tuple[Path, str]:
+        requested_path = payload.get("base_checkpoint") or config["base_checkpoint"]
+        path = resolve_under(requested_path, checkpoint_roots)
+        if not (path / "params").is_dir():
+            raise ValueError(f"base checkpoint has no params directory: {path}")
+        inferred = infer_model_variant(path)
+        model_variant = str(payload.get("model_variant") or inferred or "pi05")
+        if model_variant not in MODEL_VARIANTS:
+            raise ValueError(f"model_variant must be one of {sorted(MODEL_VARIANTS)}")
+        if inferred is not None and inferred != model_variant:
+            raise ValueError(
+                f"base checkpoint {path} appears to be {inferred}, but model_variant={model_variant}"
+            )
+        return path, model_variant
+
     def list_checkpoints() -> list[dict[str, Any]]:
         checkpoints = []
-        for arm_mode in ("single", "bimanual"):
-            config_name = policy_config_name(arm_mode)
-            config_root = Path(config["checkpoint_base_dir"]) / config_name
-            if not config_root.exists():
-                continue
-            for exp_dir in config_root.iterdir():
-                if not exp_dir.is_dir() or exp_dir.name.startswith("."):
+        for model_variant in ("pi05", "pi0"):
+            for arm_mode in ("single", "bimanual"):
+                config_name = policy_config_name(arm_mode, model_variant)
+                config_root = Path(config["checkpoint_base_dir"]) / config_name
+                if not config_root.exists():
                     continue
-                for step_dir in exp_dir.iterdir():
-                    if not step_dir.is_dir() or not step_dir.name.isdigit():
+                for exp_dir in config_root.iterdir():
+                    if not exp_dir.is_dir() or exp_dir.name.startswith("."):
                         continue
-                    if not (step_dir / "params").is_dir() or not (step_dir / "_CHECKPOINT_METADATA").is_file():
-                        continue
-                    dataset_ids = sorted(
-                        path.parent.name
-                        for path in (step_dir / "assets").glob("*/norm_stats.json")
-                        if path.is_file()
-                    )
-                    mtime = step_dir.stat().st_mtime
-                    cache_key = str(step_dir.resolve())
-                    cached = checkpoint_size_cache.get(cache_key)
-                    if cached is None or cached[0] != mtime:
-                        size_bytes = sum(path.stat().st_size for path in step_dir.rglob("*") if path.is_file())
-                        checkpoint_size_cache[cache_key] = (mtime, size_bytes)
-                    else:
-                        size_bytes = cached[1]
-                    checkpoints.append(
-                        {
-                            "path": cache_key,
-                            "config_name": config_name,
-                            "arm_mode": arm_mode,
-                            "experiment": exp_dir.name,
-                            "step": int(step_dir.name),
-                            "dataset_ids": dataset_ids,
-                            "mtime": mtime,
-                            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)),
-                            "size_gib": round(size_bytes / (1024**3), 3),
-                        }
-                    )
+                    for step_dir in exp_dir.iterdir():
+                        if not step_dir.is_dir() or not step_dir.name.isdigit():
+                            continue
+                        if not (step_dir / "params").is_dir() or not (step_dir / "_CHECKPOINT_METADATA").is_file():
+                            continue
+                        dataset_ids = sorted(
+                            path.parent.name
+                            for path in (step_dir / "assets").glob("*/norm_stats.json")
+                            if path.is_file()
+                        )
+                        mtime = step_dir.stat().st_mtime
+                        cache_key = str(step_dir.resolve())
+                        cached = checkpoint_size_cache.get(cache_key)
+                        if cached is None or cached[0] != mtime:
+                            size_bytes = sum(path.stat().st_size for path in step_dir.rglob("*") if path.is_file())
+                            checkpoint_size_cache[cache_key] = (mtime, size_bytes)
+                        else:
+                            size_bytes = cached[1]
+                        checkpoints.append(
+                            {
+                                "path": cache_key,
+                                "config_name": config_name,
+                                "model_variant": model_variant,
+                                "arm_mode": arm_mode,
+                                "experiment": exp_dir.name,
+                                "step": int(step_dir.name),
+                                "dataset_ids": dataset_ids,
+                                "mtime": mtime,
+                                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)),
+                                "size_gib": round(size_bytes / (1024**3), 3),
+                            }
+                        )
         return sorted(checkpoints, key=lambda item: (item["mtime"], item["step"]), reverse=True)
 
 
@@ -1534,6 +1647,13 @@ def create_app(config_path: Path) -> Flask:
         for task in task_list:
             if task["type"] != "policy":
                 continue
+            metadata = task.setdefault("metadata", {})
+            if not metadata.get("model_variant"):
+                metadata["model_variant"] = (
+                    _cmd_arg(task.get("command", []), "--model-variant")
+                    or infer_model_variant(Path(str(metadata.get("checkpoint", ""))))
+                    or "pi05"
+                )
             task["telemetry"] = observations.summary_for_task(task)
             task["policy_healthy"] = False
             if task["state"] == "running":
@@ -1548,6 +1668,7 @@ def create_app(config_path: Path) -> Flask:
             {
                 "datasets": list_datasets(),
                 "checkpoints": list_checkpoints(),
+                "base_models": list_base_models(),
                 "robot_observation": latest_observation,
                 "tasks": task_list,
                 "gpus": gpu_inventory(),
@@ -1715,8 +1836,24 @@ def create_app(config_path: Path) -> Flask:
             raise ValueError(f"refusing busy GPU(s): {busy}")
         return gpu_ids
 
-    def norm_stats_path(dataset_id: str, arm_mode: str) -> Path:
-        return Path(config["assets_base_dir"]) / policy_config_name(arm_mode) / dataset_id / "norm_stats.json"
+    def norm_stats_path(dataset_id: str, arm_mode: str, model_variant: str) -> Path:
+        return (
+            Path(config["assets_base_dir"])
+            / policy_config_name(arm_mode, model_variant)
+            / dataset_id
+            / "norm_stats.json"
+        )
+
+    def parse_episode_split(payload: dict[str, Any], dataset_id: str) -> EpisodeSplit:
+        test_ratio = safe_float(
+            payload.get("test_ratio", 0.1),
+            "test_ratio",
+            0.0,
+            1.0,
+            maximum_inclusive=False,
+        )
+        split_seed = safe_int(payload.get("split_seed", 42), "split_seed", 0, 2**31 - 1)
+        return resolve_episode_split(dataset_root, dataset_id, test_ratio=test_ratio, seed=split_seed)
 
     def build_norm_command(
         dataset_id: str,
@@ -1724,8 +1861,11 @@ def create_app(config_path: Path) -> Flask:
         arm_side: str,
         schema: str,
         *,
+        base_checkpoint: Path,
+        model_variant: str,
         batch_size: int,
         num_workers: int,
+        split: EpisodeSplit,
         max_frames: int | None = None,
     ) -> list[str]:
         command = [
@@ -1734,11 +1874,14 @@ def create_app(config_path: Path) -> Flask:
             "--arm-mode", arm_mode,
             "--arm-side", arm_side,
             "--schema", schema,
+            "--model-variant", model_variant,
             "--assets-base-dir", config["assets_base_dir"],
             "--checkpoint-base-dir", config["checkpoint_base_dir"],
-            "--base-checkpoint", config["base_checkpoint"],
+            "--base-checkpoint", str(base_checkpoint),
             "--batch-size", str(batch_size),
             "--num-workers", str(num_workers),
+            "--test-ratio", str(split.test_ratio),
+            "--split-seed", str(split.seed),
         ]
         if max_frames is not None:
             command += ["--max-frames", str(max_frames)]
@@ -1748,6 +1891,8 @@ def create_app(config_path: Path) -> Flask:
     def start_norm():
         payload = request.get_json(force=True)
         dataset_id, arm_mode, arm_side, schema = parse_dataset(payload)
+        base_checkpoint, model_variant = resolve_base_model(payload)
+        split = parse_episode_split(payload, dataset_id)
         batch_size = safe_int(payload.get("batch_size", 16), "batch_size", 1, 1024)
         num_workers = safe_int(payload.get("num_workers", 2), "num_workers", 1, 64)
         max_frames = payload.get("max_frames")
@@ -1759,8 +1904,11 @@ def create_app(config_path: Path) -> Flask:
             arm_mode,
             arm_side,
             schema,
+            base_checkpoint=base_checkpoint,
+            model_variant=model_variant,
             batch_size=batch_size,
             num_workers=num_workers,
+            split=split,
             max_frames=parsed_max_frames,
         )
         task = tasks.start(
@@ -1771,10 +1919,17 @@ def create_app(config_path: Path) -> Flask:
                 "arm_mode": arm_mode,
                 "arm_side": arm_side,
                 "schema": schema,
+                "model_variant": model_variant,
+                "base_checkpoint": str(base_checkpoint),
                 "batch_size": batch_size,
                 "num_workers": num_workers,
                 "max_frames": parsed_max_frames,
-                "norm_path": str(norm_stats_path(dataset_id, arm_mode)),
+                "test_ratio": split.test_ratio,
+                "split_seed": split.seed,
+                "train_episodes": len(split.train_episodes),
+                "test_episodes": len(split.test_episodes),
+                "test_episode_indexes": list(split.test_episodes),
+                "norm_path": str(norm_stats_path(dataset_id, arm_mode, model_variant)),
                 "automatic": False,
             },
         )
@@ -1784,8 +1939,11 @@ def create_app(config_path: Path) -> Flask:
     def start_train():
         payload = request.get_json(force=True)
         dataset_id, arm_mode, arm_side, schema = parse_dataset(payload)
-        norm_path = norm_stats_path(dataset_id, arm_mode)
-        gpu_ids = parse_gpus(payload, check_busy=norm_path.is_file())
+        base_checkpoint, model_variant = resolve_base_model(payload)
+        split = parse_episode_split(payload, dataset_id)
+        norm_path = norm_stats_path(dataset_id, arm_mode, model_variant)
+        norm_ready = norm_split_matches(norm_path.parent, split)
+        gpu_ids = parse_gpus(payload, check_busy=norm_ready)
         exp_name = safe_name(payload.get("exp_name"), "experiment name")
         batch_size = safe_int(payload.get("batch_size", 8), "batch_size", 1, 1024)
         if batch_size % len(gpu_ids):
@@ -1801,7 +1959,7 @@ def create_app(config_path: Path) -> Flask:
             raise ValueError("mode must be auto, new, resume, or overwrite")
         checkpoint_dir = (
             Path(config["checkpoint_base_dir"])
-            / policy_config_name(arm_mode)
+            / policy_config_name(arm_mode, model_variant)
             / exp_name
         )
         if mode == "new" and checkpoint_dir.exists():
@@ -1819,15 +1977,18 @@ def create_app(config_path: Path) -> Flask:
             "--arm-mode", arm_mode,
             "--arm-side", arm_side,
             "--schema", schema,
+            "--model-variant", model_variant,
             "--exp-name", exp_name,
             "--assets-base-dir", config["assets_base_dir"],
             "--checkpoint-base-dir", config["checkpoint_base_dir"],
-            "--base-checkpoint", config["base_checkpoint"],
+            "--base-checkpoint", str(base_checkpoint),
             "--batch-size", str(batch_size),
             "--num-workers", str(num_workers),
             "--num-train-steps", str(steps),
             "--save-interval", str(save_interval),
             "--fsdp-devices", str(fsdp_devices),
+            "--test-ratio", str(split.test_ratio),
+            "--split-seed", str(split.seed),
         ]
         if effective_mode != "new":
             command.append(f"--{effective_mode}")
@@ -1838,6 +1999,8 @@ def create_app(config_path: Path) -> Flask:
             "arm_mode": arm_mode,
             "arm_side": arm_side,
             "schema": schema,
+            "model_variant": model_variant,
+            "base_checkpoint": str(base_checkpoint),
             "exp_name": exp_name,
             "gpu_ids": gpu_ids,
             "steps": steps,
@@ -1845,11 +2008,16 @@ def create_app(config_path: Path) -> Flask:
             "mode": mode,
             "effective_mode": effective_mode,
             "checkpoint_dir": str(checkpoint_dir),
+            "test_ratio": split.test_ratio,
+            "split_seed": split.seed,
+            "train_episodes": len(split.train_episodes),
+            "test_episodes": len(split.test_episodes),
+            "test_episode_indexes": list(split.test_episodes),
         }
         with tasks.lock:
             # Re-check while holding the task lock so simultaneous submissions
-            # cannot create duplicate automatic norm jobs for the same dataset.
-            if norm_path.is_file():
+            # cannot create duplicate automatic norm jobs for the same model and dataset.
+            if norm_ready:
                 gpu_ids = parse_gpus(payload)
                 metadata["gpu_ids"] = gpu_ids
                 task = tasks.start(
@@ -1870,6 +2038,10 @@ def create_app(config_path: Path) -> Flask:
                     and item.get("metadata", {}).get("arm_mode") == arm_mode
                     and item.get("metadata", {}).get("arm_side") == arm_side
                     and item.get("metadata", {}).get("schema") == schema
+                    and item.get("metadata", {}).get("model_variant") == model_variant
+                    and item.get("metadata", {}).get("base_checkpoint") == str(base_checkpoint)
+                    and float(item.get("metadata", {}).get("test_ratio", -1)) == split.test_ratio
+                    and int(item.get("metadata", {}).get("split_seed", -1)) == split.seed
                 ),
                 None,
             )
@@ -1883,8 +2055,11 @@ def create_app(config_path: Path) -> Flask:
                         arm_mode,
                         arm_side,
                         schema,
+                        base_checkpoint=base_checkpoint,
+                        model_variant=model_variant,
                         batch_size=norm_batch_size,
                         num_workers=norm_num_workers,
+                        split=split,
                     ),
                     env=build_environment(config, None),
                     metadata={
@@ -1892,9 +2067,16 @@ def create_app(config_path: Path) -> Flask:
                         "arm_mode": arm_mode,
                         "arm_side": arm_side,
                         "schema": schema,
+                        "model_variant": model_variant,
+                        "base_checkpoint": str(base_checkpoint),
                         "batch_size": norm_batch_size,
                         "num_workers": norm_num_workers,
                         "max_frames": None,
+                        "test_ratio": split.test_ratio,
+                        "split_seed": split.seed,
+                        "train_episodes": len(split.train_episodes),
+                        "test_episodes": len(split.test_episodes),
+                        "test_episode_indexes": list(split.test_episodes),
                         "norm_path": str(norm_path),
                         "automatic": True,
                     },
@@ -1916,6 +2098,22 @@ def create_app(config_path: Path) -> Flask:
         checkpoint = resolve_under(payload.get("checkpoint", ""), checkpoint_roots)
         if not (checkpoint / "params").exists():
             raise ValueError(f"checkpoint has no params directory: {checkpoint}")
+        inferred_variant = infer_model_variant(checkpoint)
+        requested_variant = str(payload.get("model_variant") or inferred_variant or "pi05")
+        if requested_variant not in MODEL_VARIANTS:
+            raise ValueError(f"model_variant must be one of {sorted(MODEL_VARIANTS)}")
+        if inferred_variant is not None and inferred_variant != requested_variant:
+            raise ValueError(
+                f"checkpoint {checkpoint} appears to be {inferred_variant}, "
+                f"but model_variant={requested_variant}"
+            )
+        model_variant = requested_variant
+        expected_config = policy_config_name(arm_mode, model_variant)
+        if expected_config not in checkpoint.parts:
+            raise ValueError(
+                f"checkpoint is not a {model_variant}/{arm_mode} checkpoint: "
+                f"expected path component {expected_config!r}"
+            )
         checkpoint_norm = checkpoint / "assets" / dataset_id / "norm_stats.json"
         if not checkpoint_norm.exists():
             raise ValueError(
@@ -1960,10 +2158,18 @@ def create_app(config_path: Path) -> Flask:
                 else:
                     raise RuntimeError(f"timed out force-stopping policy {old_task['id']}")
 
-        # Recheck after shutdown to avoid a race with another process taking the port.
-        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-            if sock.connect_ex(("127.0.0.1", port)) == 0:
-                raise ValueError(f"port {port} is already in use")
+        # Recheck after shutdown. The process state can become terminal slightly
+        # before the kernel releases its listening socket, so wait briefly for
+        # the exact port instead of failing a valid model switch.
+        port_deadline = time.monotonic() + 5.0
+        while True:
+            with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+                if sock.connect_ex(("127.0.0.1", port)) != 0:
+                    break
+            if time.monotonic() >= port_deadline:
+                raise ValueError(f"port {port} is still in use after stopping the previous policy")
+            time.sleep(0.1)
+
         telemetry_session, telemetry_dir = observations.create_session()
         command = [
             config["openpi_python"], openpi_helper, "serve",
@@ -1971,6 +2177,7 @@ def create_app(config_path: Path) -> Flask:
             "--arm-mode", arm_mode,
             "--arm-side", arm_side,
             "--schema", schema,
+            "--model-variant", model_variant,
             "--assets-base-dir", config["assets_base_dir"],
             "--checkpoint-base-dir", config["checkpoint_base_dir"],
             "--base-checkpoint", config["base_checkpoint"],
@@ -1987,11 +2194,17 @@ def create_app(config_path: Path) -> Flask:
             "policy", command,
             env=build_environment(config, gpu_ids),
             metadata={
-                "dataset_id": dataset_id, "arm_mode": arm_mode,
-                "arm_side": arm_side, "schema": schema,
-                "checkpoint": str(checkpoint), "gpu_ids": gpu_ids, "port": port,
+                "dataset_id": dataset_id,
+                "arm_mode": arm_mode,
+                "arm_side": arm_side,
+                "schema": schema,
+                "model_variant": model_variant,
+                "checkpoint": str(checkpoint),
+                "gpu_ids": gpu_ids,
+                "port": port,
                 "ws_url": f"ws://{request.host.split(':')[0]}:{port}",
-                "telemetry_session": telemetry_session, "telemetry_dir": str(telemetry_dir),
+                "telemetry_session": telemetry_session,
+                "telemetry_dir": str(telemetry_dir),
                 "replaced_task_id": replace_task_id or None,
             },
         )

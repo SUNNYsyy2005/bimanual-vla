@@ -181,9 +181,9 @@ GET    /api/datasets/<dataset_id>/episodes/<episode_index>/image/<image_key>/<fr
 
 LeRobot 数据集的 `meta/info.json` 中 `total_videos: 0` 只表示没有编码后的 MP4，**不代表没有摄像头画面**。例如 `my_dataset` 的 `image` 和 `wrist_image` feature 均为 `dtype: image`，画面可以位于 `images/<camera>/episode_x/frame_x.png`，也可以内嵌在 Parquet image bytes 中；Dashboard 会通过上述 image API 逐帧读取，不需要破坏性地转换原数据集。
 
-## 下载训练基座权重
+## 下载和选择训练基座权重
 
-单臂和双臂 Piper LoRA 微调都使用 `pi05_base`，不是 DROID 8D 的 `pi05_droid`：
+Dashboard 训练表单支持动态选择 `π0.5` 或 `π0` 模型系列，并会扫描 `checkpoint_allowed_roots` 下所有包含完整 `params/` 的预训练权重和训练 checkpoint。首次使用时至少准备一个与所选模型系列匹配的基座；例如下载 `pi05_base`：
 
 ```bash
 cd /home/sunny/bimanual-vla
@@ -204,16 +204,18 @@ cd /home/sunny/bimanual-vla
 
 1. 输入 Dashboard Token，或在页面顶部用 Dashboard 账号密码获取 Token。
 2. 通过顶部导航进入各模块，查看数据集结构、GPU 占用和活动任务。
-3. 选择 RTX 4090，提交 FSDP LoRA 微调：
-   - `norm_stats.json` 已存在时直接启动训练；
+3. 选择模型系列、基础模型和 RTX 4090，提交 FSDP LoRA 微调：
+   - 可选择 `π0.5` / `π0`，也可把已有完整 checkpoint 作为初始化权重；
+   - 不同模型系列使用独立 config、norm stats 和 checkpoint 目录，避免互相覆盖；
+   - `norm_stats.json` 已存在且 episode 划分一致时直接启动训练；
    - 缺失时自动启动完整 norm 任务，训练进入持久化 `waiting_norm`；
    - norm 成功后自动启动训练；GPU 暂忙时进入 `waiting_gpu` 并自动重试；
    - norm 失败、丢失或未生成统计文件时，训练任务标记失败并显示依赖原因；
-   - 同一数据集已有运行中的 norm 时复用该任务，Dashboard 重启后依赖仍可恢复；
+   - 同一数据集、模型系列、基础权重和划分参数已有运行中的 norm 时复用该任务，Dashboard 重启后依赖仍可恢复；
    - 启动方式默认使用 `auto`：实验目录存在时等价于 `--resume`，不存在时创建新训练；只有明确选择 `overwrite` 才会删除原 checkpoint。
 4. “计算归一化统计”表单保留为手动重算或限制帧数调试入口，正常训练无需预先手动点击。
 5. 训练模块集中展示 Norm / Train 进程管理、任务日志和指标曲线；从日志提取 `Step N: key=value`，绘制 `loss`、`loss_physical_14d`、`loss_padding_18d` 等曲线，并显示 step 进度、latest/min/max；图例按钮可切换 `grad_norm`、`param_norm` 等其他指标。
-6. 页面按数据集臂模式扫描 `pi05_piper_single_arm_lora/<experiment>/<step>` 或 `pi05_piper_bimanual_lora/<experiment>/<step>`，过滤完整 checkpoint，并在训练模块列出 checkpoint 表。
+6. 页面按模型系列和数据集臂模式扫描 `pi05_piper_*_lora/<experiment>/<step>` 与 `pi0_piper_*_lora/<experiment>/<step>`，过滤完整 checkpoint，并在训练模块列出 checkpoint 表。
 7. 在“新建 / 切换 Policy 进程”中选择 GPU、端口和 checkpoint：
    - 留空“操作对象”：新建独立 Policy；
    - 选择运行中的 Policy：先停止旧进程，再从新 checkpoint 启动替代进程。

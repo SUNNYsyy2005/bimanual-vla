@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-arm and bimanual Piper π0.5 training, norm-stat, and serving entrypoint.
+"""Single-arm and bimanual Piper π0/π0.5 training, norm-stat, and serving entrypoint.
 
 Run this file with the Python environment of an OpenPI checkout and use the
 checkout as the current working directory. It intentionally builds the config
@@ -34,6 +34,11 @@ from openpi.training import config as training_config
 from openpi.training import data_loader
 from openpi.training import weight_loaders
 
+try:
+    from .episode_split import EpisodeSplit, resolve_episode_split, write_norm_split
+except ImportError:  # openpi_single_arm.py is normally executed directly
+    from episode_split import EpisodeSplit, resolve_episode_split, write_norm_split
+
 
 class _ExpectedWebsocketProbeFilter(logging.Filter):
     """Drop expected health-check and bare-TCP probe noise from websockets."""
@@ -66,16 +71,20 @@ def _install_websocket_probe_filter() -> None:
 
 
 CONFIG_NAMES = {
-    "single": "pi05_piper_single_arm_lora",
-    "bimanual": "pi05_piper_bimanual_lora",
+    ("pi05", "single"): "pi05_piper_single_arm_lora",
+    ("pi05", "bimanual"): "pi05_piper_bimanual_lora",
+    ("pi0", "single"): "pi0_piper_single_arm_lora",
+    ("pi0", "bimanual"): "pi0_piper_bimanual_lora",
 }
 
 
-def config_name(arm_mode: str) -> str:
+def config_name(model_variant: str, arm_mode: str) -> str:
     try:
-        return CONFIG_NAMES[arm_mode]
+        return CONFIG_NAMES[(model_variant, arm_mode)]
     except KeyError as exc:
-        raise ValueError(f"unsupported arm_mode: {arm_mode!r}") from exc
+        raise ValueError(
+            f"unsupported model/arm combination: model_variant={model_variant!r}, arm_mode={arm_mode!r}"
+        ) from exc
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,9 +101,12 @@ class DatasetContract:
     action_alignment: str
 
 
+def _dataset_root() -> Path:
+    return Path(os.environ.get("HF_LEROBOT_HOME", Path.home() / ".cache/huggingface/lerobot"))
+
+
 def _dataset_info(dataset_id: str) -> dict[str, Any]:
-    root = Path(os.environ.get("HF_LEROBOT_HOME", Path.home() / ".cache/huggingface/lerobot"))
-    path = root / dataset_id / "meta" / "info.json"
+    path = _dataset_root() / dataset_id / "meta" / "info.json"
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -349,8 +361,9 @@ class PiperDataConfig(training_config.DataConfigFactory):
 
 def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
     contract = resolve_dataset_contract(args)
+    model_variant = str(getattr(args, "model_variant", "pi05"))
     model = pi0_config.Pi0Config(
-        pi05=True,
+        pi05=model_variant == "pi05",
         paligemma_variant="gemma_2b_lora",
         action_expert_variant="gemma_300m_lora",
     )
@@ -359,7 +372,7 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
     if args.command == "train" and not params_path.exists():
         raise FileNotFoundError(
             f"base checkpoint params not found: {params_path}. "
-            "Download gs://openpi-assets/checkpoints/pi05_base first."
+            f"Install a compatible {model_variant} checkpoint or choose another base model."
         )
     data_factory = PiperDataConfig(
         repo_id=args.dataset_id,
@@ -367,7 +380,7 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
         base_config=training_config.DataConfig(prompt_from_task=True),
     )
     return training_config.TrainConfig(
-        name=config_name(contract.arm_mode),
+        name=config_name(model_variant, contract.arm_mode),
         exp_name=getattr(args, "exp_name", "runtime"),
         model=model,
         data=data_factory,
@@ -386,6 +399,8 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
         wandb_enabled=getattr(args, "wandb_enabled", False),
         policy_metadata={
             "robot_type": "piper_bimanual" if contract.arm_mode == "bimanual" else "piper_single_arm",
+            "model_variant": model_variant,
+            "base_checkpoint": str(base_checkpoint),
             "arm_mode": contract.arm_mode,
             "arm_side": contract.arm_side,
             "schema": contract.schema,
@@ -399,6 +414,77 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
             "transport": "openpi_websocket_v1",
         },
     )
+
+
+def _resolve_training_split(args: argparse.Namespace) -> EpisodeSplit:
+    split = resolve_episode_split(
+        _dataset_root(),
+        args.dataset_id,
+        test_ratio=float(getattr(args, "test_ratio", 0.1)),
+        seed=int(getattr(args, "split_seed", 42)),
+    )
+    print(
+        "Episode split: "
+        f"train={len(split.train_episodes)} test={len(split.test_episodes)} "
+        f"ratio={split.test_ratio:g} seed={split.seed} "
+        f"test_episodes={list(split.test_episodes)}",
+        flush=True,
+    )
+    if not split.test_episodes:
+        logging.warning("dataset has fewer than two episodes or test_ratio=0; no held-out test episodes")
+    return split
+
+
+def _create_torch_dataset_for_episodes(
+    data_config: training_config.DataConfig,
+    action_horizon: int,
+    model_config: Any,
+    episodes: tuple[int, ...],
+):
+    repo_id = data_config.repo_id
+    if repo_id is None:
+        raise ValueError("Repo ID is not set. Cannot create dataset.")
+    if repo_id == "fake":
+        return data_loader.FakeDataset(model_config, num_samples=1024)
+    dataset_meta = data_loader.lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset = data_loader.lerobot_dataset.LeRobotDataset(
+        repo_id,
+        delta_timestamps={
+            key: [step / dataset_meta.fps for step in range(action_horizon)]
+            for key in data_config.action_sequence_keys
+        },
+    )
+    # This pinned LeRobot version accepts non-contiguous episode lists but its
+    # delta-query indexing still assumes contiguous episode ids. Keep the full
+    # dataset's boundary table and select frame indices at the PyTorch layer.
+    selected_episodes = set(episodes)
+    sample_indices = [
+        index
+        for index, episode_index in enumerate(dataset.hf_dataset["episode_index"])
+        if int(episode_index) in selected_episodes
+    ]
+    if not sample_indices:
+        raise ValueError(f"episode subset for {repo_id!r} contains no frames")
+    dataset = data_loader.torch.utils.data.Subset(dataset, sample_indices)
+    if data_config.prompt_from_task:
+        dataset = data_loader.TransformedDataset(
+            dataset,
+            [transforms.PromptFromLeRobotTask(dataset_meta.tasks)],
+        )
+    return dataset
+
+
+def _install_training_episode_subset(dataset_id: str, episodes: tuple[int, ...]) -> None:
+    """Make upstream OpenPI's training loader consume only selected episodes."""
+    original = data_loader.create_torch_dataset
+
+    @functools.wraps(original)
+    def create_subset(data_config, action_horizon, model_config):
+        if data_config.repo_id != dataset_id:
+            return original(data_config, action_horizon, model_config)
+        return _create_torch_dataset_for_episodes(data_config, action_horizon, model_config, episodes)
+
+    data_loader.create_torch_dataset = create_subset
 
 
 def _load_upstream_train_main(openpi_root: Path):
@@ -415,15 +501,23 @@ def _load_upstream_train_main(openpi_root: Path):
 
 
 def run_train(args: argparse.Namespace) -> None:
+    split = _resolve_training_split(args)
+    _install_training_episode_subset(args.dataset_id, split.train_episodes)
     config = build_config(args)
     train_main = _load_upstream_train_main(Path.cwd())
     train_main(config)
 
 
 def run_norm(args: argparse.Namespace) -> None:
+    split = _resolve_training_split(args)
     config = build_config(args)
     concrete = config.data.create(config.assets_dirs, config.model)
-    dataset = data_loader.create_torch_dataset(concrete, config.model.action_horizon, config.model)
+    dataset = _create_torch_dataset_for_episodes(
+        concrete,
+        config.model.action_horizon,
+        config.model,
+        split.train_episodes,
+    )
 
     dataset = data_loader.TransformedDataset(
         dataset,
@@ -445,6 +539,7 @@ def run_norm(args: argparse.Namespace) -> None:
         num_workers=args.num_workers,
         shuffle=shuffle,
         num_batches=num_batches,
+        framework="pytorch",
     )
     stats = {key: normalize.RunningStats() for key in ("state", "actions")}
     for index, batch in enumerate(loader, start=1):
@@ -456,6 +551,8 @@ def run_norm(args: argparse.Namespace) -> None:
     output_path = config.assets_dirs / args.dataset_id
     print(f"Writing stats to: {output_path}", flush=True)
     normalize.save(output_path, output)
+    split_path = write_norm_split(output_path, split)
+    print(f"Writing episode split manifest to: {split_path}", flush=True)
 
 
 class PolicyTelemetry:
@@ -674,6 +771,7 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--arm-side", choices=("left", "right", "both"), default="right")
     parser.add_argument("--schema", choices=("auto", "delivery", "joint"), default="auto")
     parser.add_argument("--dataset-layout", choices=("auto", "legacy", "canonical"), default="auto")
+    parser.add_argument("--model-variant", choices=("pi05", "pi0"), default="pi05")
     parser.add_argument("--assets-base-dir", default="./assets")
     parser.add_argument("--checkpoint-base-dir", default="./checkpoints")
     parser.add_argument(
@@ -691,6 +789,8 @@ def parse_args() -> argparse.Namespace:
     norm.add_argument("--batch-size", type=int, default=16)
     norm.add_argument("--num-workers", type=int, default=2)
     norm.add_argument("--max-frames", type=int, default=None)
+    norm.add_argument("--test-ratio", type=float, default=0.1)
+    norm.add_argument("--split-seed", type=int, default=42)
 
     train = subparsers.add_parser("train")
     add_common(train)
@@ -701,6 +801,8 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--save-interval", type=int, default=1_000)
     train.add_argument("--log-interval", type=int, default=100)
     train.add_argument("--fsdp-devices", type=int, default=1)
+    train.add_argument("--test-ratio", type=float, default=0.1)
+    train.add_argument("--split-seed", type=int, default=42)
     mode = train.add_mutually_exclusive_group()
     mode.add_argument("--resume", action="store_true")
     mode.add_argument("--overwrite", action="store_true")
@@ -719,6 +821,8 @@ def parse_args() -> argparse.Namespace:
     for name in ("batch_size", "num_workers", "num_train_steps", "save_interval", "log_interval", "fsdp_devices"):
         if hasattr(args, name) and getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if hasattr(args, "test_ratio") and not 0.0 <= args.test_ratio < 1.0:
+        parser.error("--test-ratio must be in [0, 1)")
     return args
 
 

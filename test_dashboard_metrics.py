@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
 import unittest
 
-from server_4090.app import describe_dataset_schema, parse_training_metrics
+from server_4090.app import (
+    describe_dataset_schema,
+    infer_model_variant,
+    parse_training_metrics,
+    policy_config_name,
+)
 
 
 class TrainingMetricsParserTest(unittest.TestCase):
@@ -34,6 +40,28 @@ class TrainingMetricsParserTest(unittest.TestCase):
         self.assertEqual(result["points"][0]["step"], 0)
         self.assertEqual(result["points"][-1]["step"], 99)
         self.assertEqual(result["summary"]["loss"]["max"], 9.5)
+
+
+class ModelVariantTest(unittest.TestCase):
+    def test_infers_nearest_checkpoint_variant(self):
+        # The checkout itself may be below a parent directory named ``pi05``;
+        # the nearer checkpoint config must win.
+        nested_pi0 = Path(
+            "/srv/policy/pi05/checkpoints/pi0_piper_single_arm_lora/from_pi05_transfer/1000"
+        )
+        self.assertEqual(infer_model_variant(nested_pi0), "pi0")
+        self.assertEqual(
+            infer_model_variant(Path("/models/pi05_piper_bimanual_lora/demo/1000")),
+            "pi05",
+        )
+        self.assertEqual(infer_model_variant(Path("/models/pi0.5_base")), "pi05")
+        self.assertIsNone(infer_model_variant(Path("/models/custom_checkpoint")))
+
+    def test_config_names_are_separated_by_model_and_arm_mode(self):
+        self.assertEqual(policy_config_name("single", "pi05"), "pi05_piper_single_arm_lora")
+        self.assertEqual(policy_config_name("bimanual", "pi0"), "pi0_piper_bimanual_lora")
+        with self.assertRaisesRegex(ValueError, "unsupported model_variant"):
+            policy_config_name("single", "pi0_fast")
 
 
 class DatasetSchemaDescriptionTest(unittest.TestCase):
