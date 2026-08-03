@@ -1,9 +1,9 @@
 """Small LeRobot v2.1 dataset writer used by the Piper collectors.
 
 The writer stores camera streams as MP4 files and numeric observations/actions
-in one parquet file per episode.  Parquet timestamps are generated from the
-configured FPS, as required by LeRobot; original host timestamps are retained
-only in the optional raw NPZ copy.
+in one parquet file per episode. ``timestamp`` is the canonical LeRobot frame
+time; state, action, and per-camera device timestamps are retained as explicit
+parquet columns and in the optional raw NPZ copy.
 """
 
 from __future__ import annotations
@@ -27,6 +27,58 @@ from piper_data_contract import (
 LEROBOT_CODEBASE_VERSION = "v2.1"
 DEFAULT_CHUNK_SIZE = 1000
 DEFAULT_VIDEO_CODEC = "mp4v"
+DEFAULT_ACTION_HORIZON = 50
+
+LEGACY_V2 = "legacy_v2"
+CANONICAL_CONTRACT_FORMAT = "canonical"
+DELIVERY_ABSOLUTE_ACTION_FORMAT = "absolute_eef_target"
+DELIVERY_LEGACY_ACTION_FORMAT = "step_delta"
+DELIVERY_ABSOLUTE_ACTION_SEMANTICS = "absolute_eef_target"
+DELIVERY_LEGACY_ACTION_SEMANTICS = (
+    "eef_delta_base_xyz_left_rotvec_gripper_target"
+)
+GRIPPER_OPENING_FRACTION = "absolute_opening_fraction_0_closed_1_open"
+GRIPPER_CLOSED_FRACTION_LEGACY = "absolute_closed_fraction_0_open_1_closed"
+ROTATION6D_SEMANTICS = (
+    "state_and_raw_action_rotation6d_first_two_columns_model_action_left_rotvec"
+)
+LEGACY_ROTATION_SEMANTICS = "state_rotation6d_action_left_rotvec_base_frame"
+COORDINATE_FRAME = "slave_base"
+
+EEF_STATE_NAMES = [
+    "eef_x_base_m",
+    "eef_y_base_m",
+    "eef_z_base_m",
+    "rotation6d_col0_x",
+    "rotation6d_col0_y",
+    "rotation6d_col0_z",
+    "rotation6d_col1_x",
+    "rotation6d_col1_y",
+    "rotation6d_col1_z",
+    "gripper_opening_fraction",
+]
+EEF_ABSOLUTE_ACTION_NAMES = [
+    "target_eef_x_base_m",
+    "target_eef_y_base_m",
+    "target_eef_z_base_m",
+    "target_rotation6d_col0_x",
+    "target_rotation6d_col0_y",
+    "target_rotation6d_col0_z",
+    "target_rotation6d_col1_x",
+    "target_rotation6d_col1_y",
+    "target_rotation6d_col1_z",
+    "target_gripper_opening_fraction",
+]
+EEF_LEGACY_STATE_NAMES = [*EEF_STATE_NAMES[:-1], "gripper_closed_fraction"]
+EEF_LEGACY_ACTION_NAMES = [
+    "delta_x_base_m",
+    "delta_y_base_m",
+    "delta_z_base_m",
+    "delta_rx_base_rad",
+    "delta_ry_base_rad",
+    "delta_rz_base_rad",
+    "gripper_target_closed_fraction",
+]
 
 BIMANUAL_JOINT_NAMES = [
     "left_joint_1", "left_joint_2", "left_joint_3", "left_joint_4", "left_joint_5", "left_joint_6", "left_gripper",
@@ -42,6 +94,103 @@ def single_arm_joint_names(side: str = "right") -> list[str]:
         f"{side}_joint_1", f"{side}_joint_2", f"{side}_joint_3", f"{side}_joint_4",
         f"{side}_joint_5", f"{side}_joint_6", f"{side}_gripper",
     ]
+
+
+def _per_arm_names(names: list[str], *, arm_mode: str, arm_side: str) -> list[str]:
+    if arm_mode == "bimanual":
+        return [f"left_{name}" for name in names] + [f"right_{name}" for name in names]
+    side = arm_side if arm_side in {"left", "right"} else "right"
+    return [f"{side}_{name}" for name in names]
+
+
+def default_eef_names(
+    *, arm_mode: str, arm_side: str, legacy: bool = False
+) -> tuple[list[str], list[str]]:
+    """Return design-document names for canonical or legacy delivery data."""
+    state = EEF_LEGACY_STATE_NAMES if legacy else EEF_STATE_NAMES
+    action = EEF_LEGACY_ACTION_NAMES if legacy else EEF_ABSOLUTE_ACTION_NAMES
+    return (
+        _per_arm_names(state, arm_mode=arm_mode, arm_side=arm_side),
+        _per_arm_names(action, arm_mode=arm_mode, arm_side=arm_side),
+    )
+
+
+def classify_contract_dimensions(
+    state_dim: int,
+    raw_action_dim: int,
+    *,
+    schema: str | None = None,
+    legacy_format: str | bool | None = None,
+) -> dict[str, Any]:
+    """Classify supported Piper layouts without relying on contract-class dimensions.
+
+    Delivery ``10D state + 7D action`` (or ``20D + 14D``) is always the
+    measured-step-delta ``legacy_v2`` layout. Canonical delivery is
+    ``10D + 10D`` per arm and stores absolute EEF targets.
+    """
+    state_dim = int(state_dim)
+    raw_action_dim = int(raw_action_dim)
+    schema_text = str(schema or "").strip().lower()
+    if schema_text in {"eef", "cartesian"}:
+        schema_text = "delivery"
+    legacy_requested = legacy_format is True or str(legacy_format or "").strip().lower() == LEGACY_V2
+
+    if schema_text not in {"", "joint", "delivery"}:
+        raise ValueError(f"unsupported schema {schema!r}")
+    inferred_schema = schema_text
+    if not inferred_schema:
+        if (state_dim, raw_action_dim) in {(10, 7), (20, 14), (10, 10), (20, 20)}:
+            inferred_schema = "delivery"
+        elif (state_dim, raw_action_dim) in {(7, 7), (14, 14)}:
+            inferred_schema = "joint"
+        else:
+            raise ValueError(
+                f"unsupported Piper state/action dimensions {state_dim}/{raw_action_dim}"
+            )
+
+    if inferred_schema == "joint":
+        if (state_dim, raw_action_dim) not in {(7, 7), (14, 14)}:
+            raise ValueError(
+                f"joint schema requires 7D/7D or 14D/14D, got {state_dim}/{raw_action_dim}"
+            )
+        if legacy_requested:
+            raise ValueError("legacy_v2 is reserved for delivery step-delta datasets")
+        arm_count = state_dim // 7
+        legacy = False
+        action_format = "absolute_joint_target"
+    else:
+        if state_dim not in {10, 20}:
+            raise ValueError(f"delivery schema requires 10D or 20D state, got {state_dim}")
+        arm_count = state_dim // 10
+        if raw_action_dim == state_dim:
+            if legacy_requested:
+                raise ValueError(
+                    "legacy_v2 delivery must be 10D+7D or 20D+14D; "
+                    f"got {state_dim}/{raw_action_dim}"
+                )
+            legacy = False
+            action_format = DELIVERY_ABSOLUTE_ACTION_FORMAT
+        elif raw_action_dim == arm_count * 7:
+            legacy = True
+            action_format = DELIVERY_LEGACY_ACTION_FORMAT
+        else:
+            raise ValueError(
+                "delivery schema requires canonical 10D absolute action per arm or "
+                f"legacy 7D step-delta per arm, got {state_dim}/{raw_action_dim}"
+            )
+
+    return {
+        "schema": inferred_schema,
+        "arm_count": arm_count,
+        "arm_mode": "single" if arm_count == 1 else "bimanual",
+        "state_dim": state_dim,
+        "raw_action_dim": raw_action_dim,
+        "model_action_dim": arm_count * 7,
+        "legacy": legacy,
+        "legacy_format": LEGACY_V2 if legacy else None,
+        "contract_format": LEGACY_V2 if legacy else CANONICAL_CONTRACT_FORMAT,
+        "delivery_action_format": action_format if inferred_schema == "delivery" else None,
+    }
 
 
 def derive_absolute_actions(qpos: np.ndarray, action_offset: int = 1) -> np.ndarray:
@@ -85,17 +234,38 @@ class Pi0LeRobotDatasetWriter:
         action_source: str = "master_joint_feedback",
         action_alignment: str = "same_step_command",
         action_offset: int | None = None,
+        action_horizon: int = DEFAULT_ACTION_HORIZON,
+        raw_action_dim: int | None = None,
+        model_action_dim: int | None = None,
+        gripper_semantics: str | None = None,
+        rotation_semantics: str | None = None,
+        coordinate_frame: str = COORDINATE_FRAME,
+        legacy_format: str | bool | None = None,
+        source_frame: str = "",
     ):
         self.root = Path(root).expanduser()
         self.fps = int(fps)
         self.robot_type = str(robot_type)
         self.state_names = list(state_names)
-        self.action_names = list(action_names or state_names)
+        if action_names is None and str(schema).lower() == "delivery":
+            inferred_mode_for_names = arm_mode or (
+                "single" if len(self.state_names) == 10 else "bimanual"
+            )
+            inferred_side_for_names = "both" if inferred_mode_for_names == "bimanual" else arm_side
+            _default_state_names, _default_action_names = default_eef_names(
+                arm_mode=inferred_mode_for_names,
+                arm_side=inferred_side_for_names,
+                legacy=False,
+            )
+            self.action_names = list(_default_action_names)
+        else:
+            self.action_names = list(action_names or state_names)
         self.camera_keys = list(camera_keys)
         self.image_hw = tuple(int(x) for x in image_hw)
         self.chunk_size = int(chunk_size)
         self.save_raw_npz = bool(save_raw_npz)
         self.val_ratio = float(val_ratio)
+        self.action_horizon = int(action_horizon)
         inferred_arm_mode = arm_mode
         if inferred_arm_mode is None:
             per_arm_state_dim = 10 if str(schema).lower() == "delivery" else 7
@@ -108,21 +278,107 @@ class Pi0LeRobotDatasetWriter:
                     f"cannot infer arm_mode from schema={schema!r} and "
                     f"state_dim={len(self.state_names)}"
                 )
-        self.contract = EpisodeContract(
+        dimensions = classify_contract_dimensions(
+            len(self.state_names),
+            len(self.action_names) if raw_action_dim is None else int(raw_action_dim),
             schema=schema,
-            arm_mode=inferred_arm_mode,
-            arm_side=arm_side,
-            camera_keys=tuple(self.camera_keys),
-            action_source=action_source,
-            action_alignment=action_alignment,
+            legacy_format=legacy_format,
         )
+        contract_kwargs: dict[str, Any] = {
+            "schema": schema,
+            "arm_mode": inferred_arm_mode,
+            "arm_side": arm_side,
+            "camera_keys": tuple(self.camera_keys),
+            "action_source": action_source,
+            "action_alignment": action_alignment,
+        }
+        contract_fields = getattr(EpisodeContract, "__dataclass_fields__", {})
+        optional_contract_values = {
+            "action_offset": action_offset,
+            "fps": self.fps,
+            "action_horizon": self.action_horizon,
+            "coordinate_frame": coordinate_frame,
+            "source_frame": source_frame,
+            "version": 2 if dimensions["legacy"] else CONTRACT_VERSION,
+            "legacy_delivery_v2": bool(dimensions["legacy"]),
+        }
+        for key, value in optional_contract_values.items():
+            if key in contract_fields:
+                contract_kwargs[key] = value
+        self.contract = EpisodeContract(**contract_kwargs)
         self.schema = self.contract.schema
         self.arm_mode = self.contract.arm_mode
         self.arm_side = self.contract.arm_side
         self.action_source = self.contract.action_source
         self.action_alignment = self.contract.action_alignment
-        self.action_semantics = str(action_semantics or self.contract.action_semantics)
         self.action_offset = self.contract.action_offset if action_offset is None else int(action_offset)
+
+        if dimensions["arm_mode"] != self.arm_mode:
+            raise ValueError(
+                f"dimensions imply arm_mode={dimensions['arm_mode']!r}, got {self.arm_mode!r}"
+            )
+        if len(self.action_names) != dimensions["raw_action_dim"]:
+            raise ValueError(
+                f"action_names dim {len(self.action_names)} != raw_action_dim "
+                f"{dimensions['raw_action_dim']}"
+            )
+        self.raw_action_dim = int(dimensions["raw_action_dim"])
+        self.model_action_dim = int(
+            dimensions["model_action_dim"] if model_action_dim is None else model_action_dim
+        )
+        if self.model_action_dim != int(dimensions["model_action_dim"]):
+            raise ValueError(
+                f"model_action_dim={self.model_action_dim} != expected "
+                f"{dimensions['model_action_dim']}"
+            )
+        contract_model_names = list(getattr(self.contract, "model_action_names", ()))
+        self.model_action_names = (
+            contract_model_names
+            if len(contract_model_names) == self.model_action_dim
+            else [f"model_action_{index}" for index in range(self.model_action_dim)]
+        )
+        self.legacy = bool(dimensions["legacy"])
+        self.legacy_format = dimensions["legacy_format"]
+        self.contract_format = str(dimensions["contract_format"])
+        self.delivery_action_format = dimensions["delivery_action_format"]
+        self.contract_version = 2 if self.legacy else CONTRACT_VERSION
+        self.source_frame = str(source_frame).strip()
+        default_action_semantics = self.contract.action_semantics
+        if self.schema == "delivery" and self.legacy:
+            default_action_semantics = DELIVERY_LEGACY_ACTION_SEMANTICS
+        self.action_semantics = str(action_semantics or default_action_semantics)
+        self.model_action_semantics = str(
+            getattr(self.contract, "model_action_semantics", self.action_semantics)
+        )
+        if self.schema == "delivery":
+            looks_delta = "delta" in self.action_semantics.lower()
+            if self.legacy and not looks_delta:
+                raise ValueError("legacy_v2 delivery action_semantics must describe step deltas")
+            if not self.legacy and looks_delta:
+                raise ValueError(
+                    "canonical delivery stores 10D absolute EEF targets; delta semantics are invalid"
+                )
+        if gripper_semantics is None:
+            if self.schema == "delivery" and self.legacy:
+                gripper_semantics = GRIPPER_CLOSED_FRACTION_LEGACY
+            elif hasattr(self.contract, "gripper_semantics"):
+                gripper_semantics = self.contract.gripper_semantics
+            elif any("opening_m" in name for name in [*self.state_names, *self.action_names]):
+                gripper_semantics = "absolute_opening_m"
+            else:
+                gripper_semantics = GRIPPER_OPENING_FRACTION
+        self.gripper_semantics = str(gripper_semantics)
+        if rotation_semantics is None:
+            if self.schema != "delivery":
+                rotation_semantics = "not_applicable"
+            elif self.legacy:
+                rotation_semantics = LEGACY_ROTATION_SEMANTICS
+            elif hasattr(self.contract, "rotation_semantics"):
+                rotation_semantics = self.contract.rotation_semantics
+            else:
+                rotation_semantics = ROTATION6D_SEMANTICS
+        self.rotation_semantics = str(rotation_semantics)
+        self.coordinate_frame = str(coordinate_frame).strip()
 
         if self.fps <= 0:
             raise ValueError("fps must be positive")
@@ -134,6 +390,10 @@ class Pi0LeRobotDatasetWriter:
             raise ValueError("image_hw must be (height, width)")
         if self.chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
+        if self.action_horizon <= 0:
+            raise ValueError("action_horizon must be positive")
+        if not self.coordinate_frame:
+            raise ValueError("coordinate_frame must not be empty")
         if not 0.0 <= self.val_ratio < 1.0:
             raise ValueError("val_ratio must be in [0, 1)")
         if self.action_offset < 0:
@@ -141,15 +401,6 @@ class Pi0LeRobotDatasetWriter:
         if len(self.state_names) != self.contract.state_dim:
             raise ValueError(
                 f"state_names dim {len(self.state_names)} != contract state_dim {self.contract.state_dim}"
-            )
-        if len(self.action_names) != self.contract.action_dim:
-            raise ValueError(
-                f"action_names dim {len(self.action_names)} != contract action_dim {self.contract.action_dim}"
-            )
-        if self.action_semantics != self.contract.action_semantics:
-            raise ValueError(
-                f"action_semantics={self.action_semantics!r} is incompatible with "
-                f"schema={self.schema!r}; expected {self.contract.action_semantics!r}"
             )
         if self.action_offset != self.contract.action_offset:
             raise ValueError(
@@ -190,11 +441,39 @@ class Pi0LeRobotDatasetWriter:
         instruction: str,
         success: bool = True,
         metadata: dict[str, Any] | None = None,
+        state_timestamps: np.ndarray | None = None,
+        action_timestamps: np.ndarray | None = None,
+        image_timestamps: dict[str, np.ndarray] | None = None,
     ) -> int:
         states = np.asarray(states, dtype=np.float32)
         actions = np.asarray(actions, dtype=np.float32)
         capture_timestamps = np.asarray(timestamps, dtype=np.float64)
-        self._validate_episode(states, actions, capture_timestamps, images)
+        state_timestamps = np.asarray(
+            capture_timestamps if state_timestamps is None else state_timestamps,
+            dtype=np.float64,
+        )
+        action_timestamps = np.asarray(
+            state_timestamps if action_timestamps is None else action_timestamps,
+            dtype=np.float64,
+        )
+        image_timestamps = {
+            key: np.asarray(
+                state_timestamps
+                if image_timestamps is None or key not in image_timestamps
+                else image_timestamps[key],
+                dtype=np.float64,
+            )
+            for key in self.camera_keys
+        }
+        self._validate_episode(
+            states,
+            actions,
+            capture_timestamps,
+            images,
+            state_timestamps=state_timestamps,
+            action_timestamps=action_timestamps,
+            image_timestamps=image_timestamps,
+        )
 
         frame_count = len(states)
         canonical_timestamps = np.arange(frame_count, dtype=np.float32) / self.fps
@@ -223,27 +502,49 @@ class Pi0LeRobotDatasetWriter:
                 "action": actions,
                 "timestamp": canonical_timestamps,
                 "capture_timestamps": capture_timestamps,
+                "state_timestamp": state_timestamps,
+                "action_timestamp": action_timestamps,
                 "episode_index": np.full(frame_count, episode_index, dtype=np.int64),
                 "frame_index": np.arange(frame_count, dtype=np.int64),
                 "index": np.arange(global_offset, global_offset + frame_count, dtype=np.int64),
                 "task_name": np.asarray(task_name),
                 "instruction": np.asarray(instruction),
                 "success": np.asarray(bool(success), dtype=np.bool_),
-                "contract_version": np.asarray(CONTRACT_VERSION, dtype=np.int64),
+                "contract_version": np.asarray(self.contract_version, dtype=np.int64),
                 "schema": np.asarray(self.schema),
                 "arm_mode": np.asarray(self.arm_mode),
                 "arm_side": np.asarray(self.arm_side),
                 "robot_type": np.asarray(self.robot_type),
-                "state_dim": np.asarray(self.contract.state_dim, dtype=np.int64),
-                "action_dim": np.asarray(self.contract.action_dim, dtype=np.int64),
+                "state_dim": np.asarray(len(self.state_names), dtype=np.int64),
+                "action_dim": np.asarray(self.raw_action_dim, dtype=np.int64),
+                "raw_action_dim": np.asarray(self.raw_action_dim, dtype=np.int64),
+                "model_action_dim": np.asarray(self.model_action_dim, dtype=np.int64),
                 "camera_keys": np.asarray(self.camera_keys),
+                "state_names": np.asarray(self.state_names),
+                "action_names": np.asarray(self.action_names),
+                "model_action_names": np.asarray(self.model_action_names),
                 "action_semantics": np.asarray(self.action_semantics),
+                "model_action_semantics": np.asarray(self.model_action_semantics),
                 "action_source": np.asarray(self.action_source),
                 "action_alignment": np.asarray(self.action_alignment),
                 "action_offset": np.asarray(self.action_offset, dtype=np.int64),
+                "action_horizon": np.asarray(self.action_horizon, dtype=np.int64),
+                "contract_format": np.asarray(self.contract_format),
+                "legacy": np.asarray(self.legacy, dtype=np.bool_),
+                "gripper_semantics": np.asarray(self.gripper_semantics),
+                "rotation_semantics": np.asarray(self.rotation_semantics),
+                "coordinate_frame": np.asarray(self.coordinate_frame),
+                "source_frame": np.asarray(self.source_frame),
+                "fps": np.asarray(self.fps, dtype=np.int64),
+                "legacy_delivery_v2": np.asarray(self.legacy, dtype=np.bool_),
             }
+            if self.legacy_format:
+                raw_payload["legacy_format"] = np.asarray(self.legacy_format)
+            if self.delivery_action_format:
+                raw_payload["delivery_action_format"] = np.asarray(self.delivery_action_format)
             for key, value in normalized_images.items():
                 raw_payload[f"observation.images.{key}"] = value
+                raw_payload[f"image_timestamps_{key}"] = image_timestamps[key]
             if metadata:
                 for key, value in metadata.items():
                     raw_payload[f"meta.{key}"] = np.asarray(value)
@@ -258,6 +559,9 @@ class Pi0LeRobotDatasetWriter:
             states=states,
             actions=actions,
             timestamps=canonical_timestamps,
+            state_timestamps=state_timestamps,
+            action_timestamps=action_timestamps,
+            image_timestamps=image_timestamps,
         )
 
         self._append_jsonl(
@@ -280,6 +584,12 @@ class Pi0LeRobotDatasetWriter:
                     "observation.state": self._stat_dict(states),
                     "action": self._stat_dict(actions),
                     "timestamp": self._stat_dict(canonical_timestamps[:, None]),
+                    "state_timestamp": self._stat_dict(state_timestamps[:, None]),
+                    "action_timestamp": self._stat_dict(action_timestamps[:, None]),
+                    **{
+                        f"image_timestamp.{key}": self._stat_dict(values[:, None])
+                        for key, values in image_timestamps.items()
+                    },
                 },
             },
         )
@@ -300,6 +610,10 @@ class Pi0LeRobotDatasetWriter:
         actions: np.ndarray,
         timestamps: np.ndarray,
         images: dict[str, np.ndarray],
+        *,
+        state_timestamps: np.ndarray,
+        action_timestamps: np.ndarray,
+        image_timestamps: dict[str, np.ndarray],
     ) -> None:
         if states.ndim != 2 or actions.ndim != 2:
             raise ValueError("states/actions must be rank-2 arrays")
@@ -319,6 +633,17 @@ class Pi0LeRobotDatasetWriter:
             raise ValueError("timestamps contain NaN or Inf")
         if len(timestamps) > 1 and np.any(np.diff(timestamps) <= 0):
             raise ValueError("capture timestamps must be strictly increasing")
+        for name, values in {
+            "state_timestamp": state_timestamps,
+            "action_timestamp": action_timestamps,
+            **{f"image_timestamp.{key}": value for key, value in image_timestamps.items()},
+        }.items():
+            if values.ndim != 1 or len(values) != len(states):
+                raise ValueError(f"{name} must be rank 1 and match the number of frames")
+            if not np.isfinite(values).all():
+                raise ValueError(f"{name} contains NaN or Inf")
+            if len(values) > 1 and np.any(np.diff(values) <= 0):
+                raise ValueError(f"{name} must be strictly increasing")
         for key in self.camera_keys:
             if key not in images:
                 raise ValueError(f"missing camera stream: {key}")
@@ -331,6 +656,8 @@ class Pi0LeRobotDatasetWriter:
         features: dict[str, Any] = {
             "observation.state": self._vector_feature(len(self.state_names), self.state_names),
             "action": self._vector_feature(len(self.action_names), self.action_names),
+            "state_timestamp": {"dtype": "float64", "shape": [1], "names": None},
+            "action_timestamp": {"dtype": "float64", "shape": [1], "names": None},
         }
         for key in self.camera_keys:
             features[f"observation.images.{key}"] = {
@@ -338,6 +665,11 @@ class Pi0LeRobotDatasetWriter:
                 "shape": [3, h, w],
                 "names": ["channels", "height", "width"],
                 "info": None,
+            }
+            features[f"image_timestamp.{key}"] = {
+                "dtype": "float64",
+                "shape": [1],
+                "names": None,
             }
         features.update(
             {
@@ -361,6 +693,12 @@ class Pi0LeRobotDatasetWriter:
             "splits": {},
             "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
             "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+            "timestamp_fields": {
+                "canonical": "timestamp",
+                "state": "state_timestamp",
+                "action": "action_timestamp",
+                "images": {key: f"image_timestamp.{key}" for key in self.camera_keys},
+            },
             "features": features,
             **self._contract_dict(),
         }
@@ -391,6 +729,17 @@ class Pi0LeRobotDatasetWriter:
         features = self.info.get("features", {})
         self._validate_vector_feature(features, "observation.state", self.state_names)
         self._validate_vector_feature(features, "action", self.action_names)
+        expected_timestamp_fields = {
+            "canonical": "timestamp",
+            "state": "state_timestamp",
+            "action": "action_timestamp",
+            "images": {key: f"image_timestamp.{key}" for key in self.camera_keys},
+        }
+        if self.info.get("timestamp_fields") != expected_timestamp_fields:
+            raise ValueError(
+                f"existing timestamp_fields={self.info.get('timestamp_fields')!r} "
+                f"!= requested {expected_timestamp_fields!r}"
+            )
         actual_cameras = {
             key.removeprefix("observation.images.")
             for key, value in features.items()
@@ -408,22 +757,38 @@ class Pi0LeRobotDatasetWriter:
 
     def _contract_dict(self) -> dict[str, Any]:
         return {
-            "contract_version": CONTRACT_VERSION,
+            "contract_version": self.contract_version,
             "schema": self.schema,
             "arm_mode": self.arm_mode,
             "arm_side": self.arm_side,
-            "state_dim": self.contract.state_dim,
-            "action_dim": self.contract.action_dim,
+            "state_dim": len(self.state_names),
+            "action_dim": self.raw_action_dim,
+            "raw_action_dim": self.raw_action_dim,
+            "model_action_dim": self.model_action_dim,
+            "state_names": list(self.state_names),
+            "action_names": list(self.action_names),
+            "model_action_names": list(self.model_action_names),
             "camera_keys": list(self.camera_keys),
             "action_semantics": self.action_semantics,
+            "model_action_semantics": self.model_action_semantics,
             "action_source": self.action_source,
             "action_alignment": self.action_alignment,
             "action_offset": self.action_offset,
+            "action_horizon": self.action_horizon,
+            "contract_format": self.contract_format,
+            "legacy": self.legacy,
+            "legacy_format": self.legacy_format,
+            "delivery_action_format": self.delivery_action_format,
+            "gripper_semantics": self.gripper_semantics,
+            "rotation_semantics": self.rotation_semantics,
+            "coordinate_frame": self.coordinate_frame,
+            "source_frame": self.source_frame,
+            "legacy_delivery_v2": self.legacy,
         }
 
     def _write_policy_contract(self) -> None:
         payload = {
-            "version": CONTRACT_VERSION,
+            "version": self.contract_version,
             "robot_type": self.robot_type,
             **{key: value for key, value in self._contract_dict().items() if key != "contract_version"},
         }
@@ -495,20 +860,26 @@ class Pi0LeRobotDatasetWriter:
         states: np.ndarray,
         actions: np.ndarray,
         timestamps: np.ndarray,
+        state_timestamps: np.ndarray,
+        action_timestamps: np.ndarray,
+        image_timestamps: dict[str, np.ndarray],
     ) -> None:
         frame_count, state_dim = states.shape
         action_dim = actions.shape[1]
-        table = pa.table(
-            {
+        columns: dict[str, Any] = {
                 "observation.state": pa.array(states.tolist(), type=pa.list_(pa.float32(), state_dim)),
                 "action": pa.array(actions.tolist(), type=pa.list_(pa.float32(), action_dim)),
                 "timestamp": pa.array(timestamps, type=pa.float32()),
+                "state_timestamp": pa.array(state_timestamps, type=pa.float64()),
+                "action_timestamp": pa.array(action_timestamps, type=pa.float64()),
                 "frame_index": pa.array(np.arange(frame_count, dtype=np.int64)),
                 "episode_index": pa.array(np.full(frame_count, episode_index, dtype=np.int64)),
                 "index": pa.array(np.arange(global_offset, global_offset + frame_count, dtype=np.int64)),
                 "task_index": pa.array(np.full(frame_count, task_index, dtype=np.int64)),
-            }
-        )
+        }
+        for key, values in image_timestamps.items():
+            columns[f"image_timestamp.{key}"] = pa.array(values, type=pa.float64())
+        table = pa.table(columns)
         pq.write_table(table, parquet_path)
 
     def _recompute_openpi_norm_stats(self) -> None:
@@ -525,7 +896,14 @@ class Pi0LeRobotDatasetWriter:
                 "state": self._stat_dict(np.concatenate(state_batches, axis=0), include_count=False),
                 "actions": self._stat_dict(np.concatenate(action_batches, axis=0), include_count=False),
             },
-            "note": "Raw absolute-action statistics. Run OpenPI compute_norm_stats.py for the final transformed training statistics.",
+            "raw_action_dim": self.raw_action_dim,
+            "model_action_dim": self.model_action_dim,
+            "contract_format": self.contract_format,
+            "note": (
+                "Raw LeRobot action statistics. Canonical delivery stores absolute 10D EEF "
+                "targets per arm; legacy_v2 stores 7D measured step deltas per arm. Run "
+                "OpenPI compute_norm_stats.py for transformed model-action statistics."
+            ),
         }
         self.norm_stats_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 

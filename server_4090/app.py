@@ -19,6 +19,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -29,15 +30,74 @@ import uuid
 from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.exceptions import HTTPException
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+try:
+    import piper_action_conventions as _piper_action_conventions
+except ImportError:
+    _piper_action_conventions = None
+
+
+def _action_constant(name: str, default: str) -> str:
+    return str(getattr(_piper_action_conventions, name, default))
+
+
+DELIVERY_STEP_ACTION_CONVENTION = _action_constant(
+    "DELIVERY_STEP_ACTION_CONVENTION", "step"
+)
+DELIVERY_CHUNK_ORIGIN_ACTION_CONVENTION = _action_constant(
+    "DELIVERY_CHUNK_ORIGIN_ACTION_CONVENTION", "chunk_origin"
+)
+DELIVERY_ABSOLUTE_EEF_ACTION_CONVENTION = "absolute_eef_target"
+DELIVERY_LEGACY_STEP_ACTION_SEMANTICS = _action_constant(
+    "DELIVERY_STEP_ACTION_SEMANTICS",
+    "eef_delta_base_xyz_left_rotvec_gripper_target",
+)
+DELIVERY_LEGACY_CHUNK_ACTION_SEMANTICS = _action_constant(
+    "DELIVERY_CHUNK_ORIGIN_ACTION_SEMANTICS",
+    "eef_delta_chunk_origin_base_xyz_left_rotvec_gripper_target",
+)
+DELIVERY_RAW_ACTION_SEMANTICS = _action_constant(
+    "DELIVERY_RAW_ACTION_SEMANTICS", "absolute_eef_target"
+)
+DELIVERY_MODEL_ACTION_SEMANTICS = _action_constant(
+    "DELIVERY_MODEL_ACTION_SEMANTICS",
+    "eef_delta_chunk_origin_base_xyz_left_rotvec_gripper_opening_target",
+)
+JOINT_RAW_ACTION_SEMANTICS = _action_constant(
+    "JOINT_ACTION_SEMANTICS", "absolute_joint_position_opening_fraction"
+)
+JOINT_MODEL_ACTION_SEMANTICS = _action_constant(
+    "JOINT_MODEL_ACTION_SEMANTICS",
+    "joint_delta_chunk_origin_first_6_absolute_gripper_target",
+)
+NEW_GRIPPER_SEMANTICS = _action_constant(
+    "NEW_GRIPPER_SEMANTICS", "absolute_opening_fraction_0_closed_1_open"
+)
+LEGACY_DELIVERY_GRIPPER_SEMANTICS = _action_constant(
+    "LEGACY_GRIPPER_SEMANTICS", "absolute_closed_fraction_0_open_1_closed"
+)
+LEGACY_JOINT_GRIPPER_SEMANTICS = "absolute_opening_metres"
+JOINT_RAW_ACTION_CONVENTION = "absolute_joint_target"
+CURRENT_CONTRACT_VERSION = 3
+LEGACY_CONTRACT_VERSION = 2
+MIN_POLICY_ACTION_HORIZON = 16
+MODEL_ACTION_START_OFFSET_STEPS = 1
+ACTION_CONTRACT_MARKER_VERSION = 3
+
 try:
     from .dataset_editor import DatasetEditor, DatasetValidationError
     from .episode_split import (
         DEFAULT_SPLIT_SEED,
         DEFAULT_TEST_RATIO,
         NORM_CONFIG_FILENAME,
+        NORM_CONFIG_VERSION,
         EpisodeSplit,
         load_episode_split,
         norm_split_matches,
+        normalize_contract_fingerprint,
         resolve_episode_split,
     )
 except ImportError:  # app.py is normally executed directly by start_server.sh
@@ -46,9 +106,11 @@ except ImportError:  # app.py is normally executed directly by start_server.sh
         DEFAULT_SPLIT_SEED,
         DEFAULT_TEST_RATIO,
         NORM_CONFIG_FILENAME,
+        NORM_CONFIG_VERSION,
         EpisodeSplit,
         load_episode_split,
         norm_split_matches,
+        normalize_contract_fingerprint,
         resolve_episode_split,
     )
 
@@ -145,6 +207,215 @@ def safe_int(value: Any, label: str, minimum: int, maximum: int) -> int:
     return parsed
 
 
+def _positive_int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def resolve_temporal_action_contract(
+    metadata: dict[str, Any],
+    *,
+    legacy_delivery: bool,
+) -> tuple[int, int]:
+    alignment = str(metadata.get("action_alignment") or "").strip().lower()
+    source = str(metadata.get("action_source") or "").strip().lower()
+    expected: int | None = None
+    if alignment.startswith("same_step_command"):
+        expected = 0
+    elif alignment in {"next_observation", "next_measured", "next_measured_fallback"}:
+        expected = 1
+    elif "next_measured" in source:
+        expected = 1
+
+    raw = metadata.get("action_offset")
+    if raw is None:
+        action_offset = expected if expected is not None else 1 if legacy_delivery else 0
+    else:
+        try:
+            action_offset = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("action_offset must be integer 0 or 1") from exc
+    if action_offset not in {0, 1}:
+        raise ValueError("action_offset must be 0 or 1")
+    if expected is not None and action_offset != expected:
+        raise ValueError(
+            f"action_offset={action_offset} conflicts with action_alignment={alignment!r}; expected {expected}"
+        )
+
+    raw_model = metadata.get(
+        "model_action_start_offset",
+        metadata.get("model_action_start_offset_steps", MODEL_ACTION_START_OFFSET_STEPS),
+    )
+    try:
+        model_start = int(raw_model)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("model_action_start_offset must be integer 1") from exc
+    if model_start != MODEL_ACTION_START_OFFSET_STEPS:
+        raise ValueError(
+            f"model_action_start_offset must be {MODEL_ACTION_START_OFFSET_STEPS}, got {model_start}"
+        )
+    return action_offset, model_start
+
+
+def complete_action_contract_fingerprint(contract: dict[str, Any]) -> dict[str, int | str]:
+    fingerprint = normalize_contract_fingerprint(contract)
+    try:
+        action_offset = int(contract.get("action_offset"))
+        model_start = int(
+            contract.get("model_action_start_offset", contract.get("model_action_start_offset_steps"))
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "action contract requires action_offset and model_action_start_offset"
+        ) from exc
+    if action_offset not in {0, 1}:
+        raise ValueError("action_offset must be 0 or 1")
+    if model_start != MODEL_ACTION_START_OFFSET_STEPS:
+        raise ValueError(
+            f"model_action_start_offset must be {MODEL_ACTION_START_OFFSET_STEPS}"
+        )
+    return {
+        **fingerprint,
+        "action_offset": action_offset,
+        "model_action_start_offset": model_start,
+    }
+
+
+def norm_extended_contract_matches(
+    norm_config: Any, contract: dict[str, int | str]
+) -> bool:
+    return bool(
+        isinstance(norm_config, dict)
+        and norm_config.get("version") == NORM_CONFIG_VERSION
+        and all(norm_config.get(key) == value for key, value in contract.items())
+    )
+
+
+def policy_horizon_status(
+    telemetry: dict[str, Any] | None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve the fail-closed async execution-horizon contract."""
+    telemetry = telemetry if isinstance(telemetry, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    action_horizon = _positive_int_or_none(
+        telemetry.get("action_horizon", metadata.get("action_horizon"))
+    )
+    client_horizon = _positive_int_or_none(telemetry.get("client_action_horizon"))
+    advertised_minimum = _positive_int_or_none(
+        telemetry.get("client_minimum_horizon", telemetry.get("minimum_horizon"))
+    )
+    minimum_horizon = max(MIN_POLICY_ACTION_HORIZON, advertised_minimum or 0)
+    client_matches = (
+        None
+        if client_horizon is None or action_horizon is None
+        else client_horizon == action_horizon
+    )
+    ready = bool(
+        action_horizon is not None
+        and action_horizon >= minimum_horizon
+        and client_matches is not False
+    )
+    if action_horizon is None:
+        error = "policy metadata is missing a valid action_horizon"
+    elif action_horizon < minimum_horizon:
+        error = (
+            f"action_horizon={action_horizon} is below the execution minimum "
+            f"{minimum_horizon}"
+        )
+    elif client_matches is False:
+        error = (
+            f"client action_horizon={client_horizon} does not match policy "
+            f"action_horizon={action_horizon}"
+        )
+    else:
+        error = None
+    return {
+        "action_horizon": action_horizon,
+        "minimum_horizon": minimum_horizon,
+        "client_action_horizon": client_horizon,
+        "horizon_contract_match": client_matches,
+        "horizon_execution_ready": ready,
+        "horizon_error": error,
+    }
+
+
+def policy_time_contract_status(
+    telemetry: dict[str, Any] | None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    telemetry = telemetry if isinstance(telemetry, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+
+    def value(key: str) -> Any:
+        return telemetry.get(key, metadata.get(key))
+
+    try:
+        action_offset = int(value("action_offset"))
+    except (TypeError, ValueError):
+        action_offset = None
+    try:
+        model_start = int(value("model_action_start_offset"))
+    except (TypeError, ValueError):
+        model_start = None
+    try:
+        wire_start = int(value("action_start_offset_steps"))
+    except (TypeError, ValueError):
+        wire_start = None
+    try:
+        action_hz = float(value("action_hz"))
+    except (TypeError, ValueError):
+        action_hz = None
+    try:
+        time_step = float(value("action_time_step_s"))
+    except (TypeError, ValueError):
+        time_step = None
+
+    errors = []
+    if action_offset not in {0, 1}:
+        errors.append("action_offset must be 0 or 1")
+    if model_start != MODEL_ACTION_START_OFFSET_STEPS:
+        errors.append("model_action_start_offset must be 1")
+    if wire_start != MODEL_ACTION_START_OFFSET_STEPS:
+        errors.append("action_start_offset_steps must be 1")
+    if action_hz is None or not math.isfinite(action_hz) or action_hz <= 0:
+        errors.append("action_hz must be positive")
+    if time_step is None or not math.isfinite(time_step) or time_step <= 0:
+        errors.append("action_time_step_s must be positive")
+    elif action_hz is not None and math.isfinite(action_hz) and action_hz > 0 and not math.isclose(
+        time_step, 1.0 / action_hz, rel_tol=1e-6, abs_tol=1e-9
+    ):
+        errors.append("action_time_step_s does not equal 1/action_hz")
+    return {
+        "action_offset": action_offset,
+        "model_action_start_offset": model_start,
+        "action_start_offset_steps": wire_start,
+        "action_time_step_s": time_step,
+        "time_contract_ready": not errors,
+        "time_contract_error": "; ".join(errors) if errors else None,
+    }
+
+
+def require_policy_execution_time_contract(telemetry: dict[str, Any] | None) -> None:
+    status = policy_time_contract_status(telemetry)
+    if not status["time_contract_ready"]:
+        raise ValueError(
+            "execution requires model/wire actions to start at t_obs + 1/fps: "
+            + str(status["time_contract_error"])
+        )
+
+
+def require_policy_execution_horizon(telemetry: dict[str, Any] | None) -> None:
+    status = policy_horizon_status(telemetry)
+    if not status["horizon_execution_ready"]:
+        raise ValueError(f"execution requires action_horizon >= {MIN_POLICY_ACTION_HORIZON}: {status['horizon_error']}")
+
+
 def safe_float(value: Any, label: str, minimum: float, maximum: float, *, maximum_inclusive: bool = True) -> float:
     try:
         parsed = float(value)
@@ -199,10 +470,16 @@ def policy_config_name(arm_mode: str, model_variant: str = "pi05") -> str:
 
 
 def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
-    """Describe supported single-arm/bimanual LeRobot contracts for the UI."""
+    """Describe and validate raw/model Piper action contracts for the UI."""
     features = info.get("features", {})
     if not isinstance(features, dict):
         features = {}
+    metadata: dict[str, Any] = {}
+    for key in ("data_contract", "contract", "piper_contract"):
+        value = info.get(key)
+        if isinstance(value, dict):
+            metadata.update(value)
+    metadata.update(info)
 
     def feature_for(*keys: str) -> tuple[str | None, dict[str, Any]]:
         for key in keys:
@@ -211,25 +488,44 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
                 return key, value
         return None, {}
 
+    def last_dim(feature: dict[str, Any]) -> int | None:
+        shape = feature.get("shape")
+        try:
+            return int(shape[-1]) if isinstance(shape, (list, tuple)) and shape else None
+        except (TypeError, ValueError):
+            return None
+
     state_key, state_feature = feature_for("observation.state", "state")
     action_key, action_feature = feature_for("action", "actions")
     state_shape = state_feature.get("shape")
     action_shape = action_feature.get("shape")
-    state_dim = state_shape[-1] if isinstance(state_shape, list) and state_shape else None
-    action_dim = action_shape[-1] if isinstance(action_shape, list) and action_shape else None
+    state_dim = last_dim(state_feature)
+    raw_action_dim = last_dim(action_feature)
+    dataset_layout = (
+        "canonical"
+        if state_key == "observation.state" and action_key == "action"
+        else "legacy"
+        if state_key == "state" and action_key == "actions"
+        else "unknown"
+    )
+
     layouts = {
-        (7, 7): ("joint", "single", "单臂 Joint 7D/7D"),
-        (10, 7): ("delivery", "single", "单臂 Delivery 10D/7D"),
-        (14, 14): ("joint", "bimanual", "双臂 Joint 14D/14D"),
-        (20, 14): ("delivery", "bimanual", "双臂 Delivery 20D/14D"),
+        (7, 7): ("joint", "single", False),
+        (14, 14): ("joint", "bimanual", False),
+        (10, 7): ("delivery", "single", True),
+        (20, 14): ("delivery", "bimanual", True),
+        (10, 10): ("delivery", "single", False),
+        (20, 20): ("delivery", "bimanual", False),
     }
-    inferred = layouts.get((state_dim, action_dim))
+    inferred = layouts.get((state_dim, raw_action_dim))
     inferred_schema = inferred[0] if inferred else "custom"
     inferred_arm_mode = inferred[1] if inferred else "unknown"
-    schema = str(info.get("schema") or inferred_schema).lower()
-    arm_mode = str(info.get("arm_mode") or inferred_arm_mode).lower()
-    schema_label = inferred[2] if inferred else f"通用格式 {state_dim or '?'}D/{action_dim or '?'}D"
-    arm_side = "both" if arm_mode == "bimanual" else str(info.get("arm_side") or "right").lower()
+    legacy_delivery = bool(inferred and inferred[2])
+    schema = str(metadata.get("schema") or inferred_schema).lower()
+    arm_mode = str(metadata.get("arm_mode") or inferred_arm_mode).lower()
+    arm_side = "both" if arm_mode == "bimanual" else str(metadata.get("arm_side") or "right").lower()
+    arm_count = 2 if arm_mode == "bimanual" else 1
+    model_action_dim = 7 * arm_count if arm_mode in {"single", "bimanual"} else None
 
     media = sorted(
         (
@@ -240,11 +536,6 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
         key=lambda item: (str(item["type"]), str(item["key"])),
     )
     media_keys = {str(item["key"]) for item in media}
-    dataset_layout = (
-        "canonical"
-        if state_key == "observation.state" and action_key == "action"
-        else "legacy" if state_key == "state" and action_key == "actions" else "unknown"
-    )
     if dataset_layout == "legacy":
         required_media = {"image", "wrist_image"}
     elif arm_mode == "bimanual":
@@ -262,30 +553,200 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
         if not (media_keys & wrist_candidates):
             required_media.add(f"observation.images.cam_{arm_side}_wrist")
 
-    expected_dims = {
-        ("joint", "single"): (7, 7),
-        ("delivery", "single"): (10, 7),
-        ("joint", "bimanual"): (14, 14),
-        ("delivery", "bimanual"): (20, 14),
-    }.get((schema, arm_mode))
-    layout_supported = dataset_layout == "canonical" or (
-        dataset_layout == "legacy" and schema == "delivery" and arm_mode == "single"
-    )
-    training_supported = bool(
-        expected_dims == (state_dim, action_dim)
-        and layout_supported
-        and required_media.issubset(media_keys)
-        and (arm_side in {"left", "right"} if arm_mode == "single" else arm_side == "both")
-    )
-    default_semantics = (
-        "eef_delta_base_xyz_left_rotvec_gripper_target"
-        if schema == "delivery"
-        else "absolute_joint_position" if schema == "joint" else None
-    )
+    errors: list[str] = []
+    if inferred is None:
+        errors.append("unsupported state/raw-action dimensions")
+    elif schema != inferred_schema or arm_mode != inferred_arm_mode:
+        errors.append(
+            f"schema/arm metadata {schema}/{arm_mode} conflicts with dimensions"
+        )
+    if dataset_layout == "legacy" and not (
+        legacy_delivery and arm_mode == "single"
+    ):
+        errors.append("legacy state/actions layout only supports single-arm delivery v2")
+    if legacy_delivery and dataset_layout == "canonical" and not (
+        str(metadata.get("legacy_format") or "").lower() == "legacy_v2"
+        or str(metadata.get("raw_action_convention") or metadata.get("action_convention") or "").lower()
+        in {"step", "one_step", "one_step_delta", "step_delta"}
+    ):
+        errors.append("canonical 10D/7D delivery requires explicit legacy_v2/step metadata")
+    if not required_media.issubset(media_keys):
+        errors.append("missing required camera media")
+    if arm_mode == "single" and arm_side not in {"left", "right"}:
+        errors.append("single-arm arm_side must be left/right")
+    if arm_mode == "bimanual" and arm_side != "both":
+        errors.append("bimanual arm_side must be both")
+
+    raw_action_semantics: str | None = None
+    model_action_semantics: str | None = None
+    raw_action_convention: str | None = None
+    model_action_convention: str | None = None
+    raw_gripper_semantics: str | None = None
+    model_gripper_semantics: str | None = None
+    contract_version: int | None = None
+    if inferred is not None:
+        try:
+            declared_version = int(metadata["contract_version"]) if metadata.get("contract_version") is not None else None
+        except (TypeError, ValueError):
+            declared_version = None
+            errors.append("contract_version must be an integer")
+        declared_raw_dim = metadata.get("raw_action_dim")
+        declared_model_dim = metadata.get("model_action_dim")
+        try:
+            if declared_raw_dim is not None and int(declared_raw_dim) != raw_action_dim:
+                errors.append("raw_action_dim metadata conflicts with feature")
+            if declared_model_dim is not None and int(declared_model_dim) != model_action_dim:
+                errors.append("model_action_dim metadata conflicts with model contract")
+        except (TypeError, ValueError):
+            errors.append("raw/model action dimensions must be integers")
+
+        if schema == "delivery":
+            if legacy_delivery:
+                contract_version = LEGACY_CONTRACT_VERSION
+                raw_action_semantics = str(
+                    metadata.get("raw_action_semantics")
+                    or metadata.get("action_semantics")
+                    or DELIVERY_LEGACY_STEP_ACTION_SEMANTICS
+                )
+                raw_action_convention = DELIVERY_STEP_ACTION_CONVENTION
+                model_action_semantics = DELIVERY_LEGACY_CHUNK_ACTION_SEMANTICS
+                raw_gripper_semantics = LEGACY_DELIVERY_GRIPPER_SEMANTICS
+                model_gripper_semantics = raw_gripper_semantics
+            else:
+                contract_version = declared_version or CURRENT_CONTRACT_VERSION
+                if contract_version < CURRENT_CONTRACT_VERSION:
+                    errors.append("absolute-EEF raw delivery requires contract_version>=3")
+                raw_action_semantics = str(
+                    metadata.get("raw_action_semantics")
+                    or metadata.get("action_semantics")
+                    or DELIVERY_RAW_ACTION_SEMANTICS
+                )
+                raw_action_convention = DELIVERY_ABSOLUTE_EEF_ACTION_CONVENTION
+                model_action_semantics = DELIVERY_MODEL_ACTION_SEMANTICS
+                raw_gripper_semantics = NEW_GRIPPER_SEMANTICS
+                model_gripper_semantics = NEW_GRIPPER_SEMANTICS
+            model_action_convention = DELIVERY_CHUNK_ORIGIN_ACTION_CONVENTION
+        elif schema == "joint":
+            declared_gripper = str(
+                metadata.get("raw_gripper_semantics")
+                or metadata.get("gripper_semantics")
+                or ""
+            )
+            names = " ".join(
+                map(
+                    str,
+                    [
+                        *(state_feature.get("names") or []),
+                        *(action_feature.get("names") or []),
+                    ],
+                )
+            ).lower()
+            meter_aliases = {
+                LEGACY_JOINT_GRIPPER_SEMANTICS,
+                "absolute_opening_m",
+                "opening_m",
+            }
+            fraction_aliases = {
+                NEW_GRIPPER_SEMANTICS,
+                "absolute_opening_fraction",
+                "opening_fraction",
+            }
+            if declared_gripper in meter_aliases or "gripper_opening_m" in names:
+                contract_version = LEGACY_CONTRACT_VERSION
+                raw_gripper_semantics = LEGACY_JOINT_GRIPPER_SEMANTICS
+                raw_action_semantics = str(
+                    metadata.get("raw_action_semantics")
+                    or metadata.get("action_semantics")
+                    or "absolute_joint_position"
+                )
+            elif declared_gripper in fraction_aliases or "gripper_opening_fraction" in names:
+                contract_version = max(declared_version or CURRENT_CONTRACT_VERSION, CURRENT_CONTRACT_VERSION)
+                raw_gripper_semantics = NEW_GRIPPER_SEMANTICS
+                raw_action_semantics = str(
+                    metadata.get("raw_action_semantics")
+                    or metadata.get("action_semantics")
+                    or JOINT_RAW_ACTION_SEMANTICS
+                )
+            elif declared_version is not None:
+                contract_version = (
+                    LEGACY_CONTRACT_VERSION
+                    if declared_version <= LEGACY_CONTRACT_VERSION
+                    else declared_version
+                )
+                raw_gripper_semantics = (
+                    LEGACY_JOINT_GRIPPER_SEMANTICS
+                    if contract_version == LEGACY_CONTRACT_VERSION
+                    else NEW_GRIPPER_SEMANTICS
+                )
+                raw_action_semantics = str(
+                    metadata.get("raw_action_semantics")
+                    or metadata.get("action_semantics")
+                    or (
+                        "absolute_joint_position"
+                        if contract_version == LEGACY_CONTRACT_VERSION
+                        else JOINT_RAW_ACTION_SEMANTICS
+                    )
+                )
+            else:
+                errors.append(
+                    "joint 7D/14D requires contract_version or gripper semantics to distinguish v2 metres from v3 fraction"
+                )
+            raw_action_convention = JOINT_RAW_ACTION_CONVENTION
+            model_action_convention = DELIVERY_CHUNK_ORIGIN_ACTION_CONVENTION
+            model_action_semantics = JOINT_MODEL_ACTION_SEMANTICS
+            # New training converts legacy joint metres to fractions before norm.
+            model_gripper_semantics = NEW_GRIPPER_SEMANTICS
+
+    action_offset: int | None = None
+    model_action_start_offset: int | None = None
+    try:
+        action_offset, model_action_start_offset = resolve_temporal_action_contract(
+            metadata, legacy_delivery=legacy_delivery
+        )
+    except ValueError as exc:
+        errors.append(str(exc))
+
+    contract_fingerprint: dict[str, int | str] | None = None
+    if not errors and contract_version is not None:
+        contract_fingerprint = complete_action_contract_fingerprint(
+            {
+                "contract_version": contract_version,
+                "raw_action_dim": raw_action_dim,
+                "model_action_dim": model_action_dim,
+                "raw_action_semantics": raw_action_semantics,
+                "model_action_semantics": model_action_semantics,
+                "raw_action_convention": raw_action_convention,
+                "model_action_convention": model_action_convention,
+                "gripper_semantics": model_gripper_semantics,
+                "raw_gripper_semantics": raw_gripper_semantics,
+                "wire_gripper_semantics": model_gripper_semantics,
+                "action_offset": action_offset,
+                "model_action_start_offset": model_action_start_offset,
+            }
+        )
+
+    if inferred is None:
+        schema_label = f"通用格式 {state_dim or '?'}D/{raw_action_dim or '?'}D"
+    else:
+        arm_label = "单臂" if arm_mode == "single" else "双臂"
+        if schema == "delivery" and legacy_delivery:
+            schema_label = f"{arm_label} Delivery legacy v2 · raw {raw_action_dim}D step → model {model_action_dim}D"
+        elif schema == "delivery":
+            schema_label = f"{arm_label} Delivery v3 · raw {raw_action_dim}D absolute EEF → model {model_action_dim}D"
+        else:
+            version_label = "legacy v2" if contract_version == LEGACY_CONTRACT_VERSION else "v3"
+            schema_label = f"{arm_label} Joint {version_label} · raw {raw_action_dim}D → model {model_action_dim}D"
+
     camera_keys = [
-        key.removeprefix("observation.images.")
-        for key in sorted(media_keys)
+        key.removeprefix("observation.images.") for key in sorted(media_keys)
     ]
+    model_contract_supported = not errors and contract_fingerprint is not None
+    training_supported = model_contract_supported and not legacy_delivery
+    training_error = (
+        "旧版 Delivery v2 仅保留预览/迁移兼容；请迁移为 canonical v3 后再训练"
+        if legacy_delivery and model_contract_supported
+        else None
+    )
     return {
         "schema": schema,
         "schema_label": schema_label,
@@ -293,22 +754,134 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
         "arm_layout": "bimanual" if arm_mode == "bimanual" else "single_arm" if arm_mode == "single" else "unknown",
         "arm_side": arm_side,
         "dataset_layout": dataset_layout,
+        "contract_version": contract_version,
+        "contract_error": "; ".join(errors) if errors else None,
+        "contract_fingerprint": contract_fingerprint,
+        "legacy_delivery_v2": legacy_delivery,
+        "legacy_joint_v2": schema == "joint" and contract_version == LEGACY_CONTRACT_VERSION,
         "state_key": state_key,
         "action_key": action_key,
         "state_shape": state_shape,
         "action_shape": action_shape,
         "state_dim": state_dim,
-        "action_dim": action_dim,
+        "action_dim": raw_action_dim,
+        "raw_action_dim": raw_action_dim,
+        "model_action_dim": model_action_dim,
         "camera_keys": camera_keys,
         "cameras": [str(item["key"]) for item in media],
         "media": media,
         "training_schema": schema if training_supported else None,
+        "model_contract_supported": model_contract_supported,
         "training_supported": training_supported,
-        "action_semantics": info.get("action_semantics") or default_semantics,
+        "training_error": training_error,
+        "action_semantics": raw_action_semantics,
+        "raw_action_semantics": raw_action_semantics,
+        "model_action_semantics": model_action_semantics,
+        "wire_action_semantics": (
+            JOINT_RAW_ACTION_SEMANTICS if schema == "joint" else model_action_semantics
+        ),
+        "raw_action_convention": raw_action_convention,
+        "model_action_convention": model_action_convention,
+        "wire_action_convention": (
+            JOINT_RAW_ACTION_CONVENTION if schema == "joint" else model_action_convention
+        ),
+        "gripper_semantics": model_gripper_semantics,
+        "raw_gripper_semantics": raw_gripper_semantics,
+        "model_gripper_semantics": model_gripper_semantics,
+        "wire_gripper_semantics": model_gripper_semantics,
         "action_source": info.get("action_source"),
         "action_alignment": info.get("action_alignment"),
-        "action_offset": info.get("action_offset"),
+        "action_offset": action_offset,
+        "model_action_start_offset": model_action_start_offset,
+        "model_action_start_offset_steps": model_action_start_offset,
     }
+
+def action_contract_for_model(
+    dataset_contract: dict[str, Any],
+    *,
+    delivery_action_convention: str | None = None,
+    model_gripper_semantics: str | None = None,
+) -> dict[str, Any]:
+    """Return a complete norm/train/serve contract derived from dataset raw data."""
+    if not dataset_contract.get(
+        "model_contract_supported", dataset_contract.get("training_supported")
+    ):
+        raise ValueError(dataset_contract.get("contract_error") or "unsupported dataset contract")
+    contract = dict(dataset_contract)
+    schema = str(contract["schema"])
+    if schema == "delivery":
+        convention = delivery_action_convention or DELIVERY_CHUNK_ORIGIN_ACTION_CONVENTION
+        if convention == DELIVERY_STEP_ACTION_CONVENTION:
+            if not contract.get("legacy_delivery_v2"):
+                raise ValueError("step convention is only valid for legacy delivery v2")
+            model_semantics = contract["raw_action_semantics"]
+        elif convention == DELIVERY_CHUNK_ORIGIN_ACTION_CONVENTION:
+            model_semantics = (
+                DELIVERY_LEGACY_CHUNK_ACTION_SEMANTICS
+                if contract.get("legacy_delivery_v2")
+                else DELIVERY_MODEL_ACTION_SEMANTICS
+            )
+        else:
+            raise ValueError(f"unsupported delivery action convention: {convention!r}")
+        contract["model_action_convention"] = convention
+        contract["model_action_semantics"] = model_semantics
+        contract["wire_action_convention"] = convention
+        contract["wire_action_semantics"] = model_semantics
+    else:
+        gripper = model_gripper_semantics or NEW_GRIPPER_SEMANTICS
+        if gripper not in {NEW_GRIPPER_SEMANTICS, LEGACY_JOINT_GRIPPER_SEMANTICS}:
+            raise ValueError(f"unsupported joint model gripper semantics: {gripper!r}")
+        if not contract.get("legacy_joint_v2") and gripper != NEW_GRIPPER_SEMANTICS:
+            raise ValueError("joint v3 checkpoints must use opening-fraction grippers")
+        contract["model_gripper_semantics"] = gripper
+        contract["wire_gripper_semantics"] = gripper
+        contract["gripper_semantics"] = gripper
+        contract["wire_action_semantics"] = (
+            JOINT_RAW_ACTION_SEMANTICS
+            if gripper == NEW_GRIPPER_SEMANTICS
+            else contract["raw_action_semantics"]
+        )
+    contract["gripper_semantics"] = contract["model_gripper_semantics"]
+    contract["contract_fingerprint"] = complete_action_contract_fingerprint(contract)
+    return contract
+
+
+def action_contract_command_args(contract: dict[str, Any]) -> list[str]:
+    args = [
+        "--contract-version", str(contract["contract_version"]),
+        "--raw-action-dim", str(contract["raw_action_dim"]),
+        "--model-action-dim", str(contract["model_action_dim"]),
+        "--raw-action-semantics", str(contract["raw_action_semantics"]),
+        "--model-action-semantics", str(contract["model_action_semantics"]),
+        "--raw-action-convention", str(contract["raw_action_convention"]),
+        "--model-action-convention", str(contract["model_action_convention"]),
+        "--raw-gripper-semantics", str(contract["raw_gripper_semantics"]),
+        "--gripper-semantics", str(contract["model_gripper_semantics"]),
+        "--model-gripper-semantics", str(contract["model_gripper_semantics"]),
+        "--action-offset", str(contract["action_offset"]),
+        "--model-action-start-offset", str(contract["model_action_start_offset"]),
+    ]
+    if contract["schema"] == "delivery":
+        args += [
+            "--delivery-action-convention",
+            str(contract["model_action_convention"]),
+        ]
+    return args
+
+
+def checkpoint_action_contract_marker(path: Path) -> Path:
+    path = Path(path)
+    experiment_dir = path.parent if path.name.isdigit() else path
+    return (
+        experiment_dir.parent
+        / ".policy_action_conventions"
+        / f"{experiment_dir.name}.json"
+    )
+
+
+def checkpoint_action_contract(path: Path) -> dict[str, Any] | None:
+    value = read_json(checkpoint_action_contract_marker(path))
+    return value if isinstance(value, dict) else None
 
 
 def resolve_under(value: str | Path, roots: list[Path], *, must_exist: bool = True) -> Path:
@@ -643,8 +1216,31 @@ class TaskManager:
             task["dependency_recovered_from_artifact"] = True
 
         norm_config = read_json(Path(str(artifact)).parent / NORM_CONFIG_FILENAME)
+        metadata = task.setdefault("metadata", {})
+        try:
+            expected_contract = complete_action_contract_fingerprint(metadata)
+        except ValueError:
+            expected_contract = {}
+        if expected_contract and (
+            not isinstance(norm_config, dict)
+            or norm_config.get("version") != NORM_CONFIG_VERSION
+            or any(norm_config.get(key) != value for key, value in expected_contract.items())
+        ):
+            return self._fail_dependency(
+                task,
+                "normalization dependency raw/model action contract does not match training",
+            )
+        expected_convention = metadata.get("delivery_action_convention")
+        if not expected_contract and expected_convention is not None and (
+            not isinstance(norm_config, dict)
+            or norm_config.get("delivery_action_convention") != expected_convention
+        ):
+            return self._fail_dependency(
+                task,
+                "normalization dependency action convention does not match training: "
+                f"expected {expected_convention!r}",
+            )
         if isinstance(norm_config, dict):
-            metadata = task.setdefault("metadata", {})
             metadata["norm_config"] = norm_config
             metadata["norm_batch_size"] = norm_config.get("effective_batch_size")
 
@@ -1231,8 +1827,10 @@ class PolicyTelemetryStore:
         session_dir = self._session_dir(str(session))
         payload = read_json(session_dir / "latest.json")
         connections = read_json(session_dir / "connections.json")
+        runtime = read_json(session_dir / "runtime.json")
         payload = payload if isinstance(payload, dict) else {}
         connections = connections if isinstance(connections, dict) else {}
+        runtime = runtime if isinstance(runtime, dict) else {}
         control = self.control_for_task(task)
         received_at = payload.get("received_at")
         age_s = max(0.0, time.time() - float(received_at)) if received_at is not None else None
@@ -1240,6 +1838,15 @@ class PolicyTelemetryStore:
         client_connected = process_active and bool(connections.get("client_connected", False))
         client_allow = bool(payload.get("client_allow_execution", False))
         client_state = str(payload.get("client_execution_state", "unknown"))
+        runtime_in_flight = bool(runtime.get("in_flight", False))
+        reported_in_flight = payload.get("client_in_flight")
+        client_in_flight = (
+            runtime_in_flight
+            if reported_in_flight is None
+            else bool(reported_in_flight) or runtime_in_flight
+        )
+        horizon_status = policy_horizon_status(payload, metadata)
+        time_contract_status = policy_time_contract_status(payload, metadata)
         dual_gate_open = bool(
             process_active
             and client_connected
@@ -1247,6 +1854,8 @@ class PolicyTelemetryStore:
             and age_s <= self.max_age_s
             and control["mode"] == "execute"
             and client_allow
+            and horizon_status["horizon_execution_ready"]
+            and time_contract_status["time_contract_ready"]
         )
         return {
             **payload,
@@ -1264,6 +1873,13 @@ class PolicyTelemetryStore:
             "execution_control": control,
             "client_allow_execution": client_allow,
             "client_execution_state": client_state,
+            "client_in_flight": client_in_flight,
+            "policy_in_flight": runtime_in_flight,
+            "policy_active_inferences": _positive_int_or_none(runtime.get("active_inferences")) or 0,
+            "policy_inference_started_at": runtime.get("last_inference_started_at"),
+            "policy_inference_finished_at": runtime.get("last_inference_finished_at"),
+            **horizon_status,
+            **time_contract_status,
             "dual_gate_open": dual_gate_open,
         }
 
@@ -1636,10 +2252,27 @@ def create_app(config_path: Path) -> Flask:
                     norm_split = read_json(norm_dir / "episode_split.json")
                     norm_config = read_json(norm_dir / NORM_CONFIG_FILENAME)
                     norm_config_by_model[model_variant] = norm_config if isinstance(norm_config, dict) else None
+                    default_contract = (
+                        action_contract_for_model(schema)
+                        if schema.get("training_supported")
+                        else None
+                    )
+                    expected_contract = (
+                        default_contract["contract_fingerprint"]
+                        if default_contract is not None
+                        else {}
+                    )
                     norm_ready_by_model[model_variant] = bool(
                         (norm_dir / "norm_stats.json").is_file()
                         and isinstance(split_info, dict)
                         and norm_split == split_info
+                        and isinstance(norm_config, dict)
+                        and norm_config.get("version") == NORM_CONFIG_VERSION
+                        and expected_contract
+                        and all(
+                            norm_config.get(key) == value
+                            for key, value in expected_contract.items()
+                        )
                     )
             default_model_variant = infer_model_variant(Path(config["base_checkpoint"])) or "pi05"
             datasets.append(
@@ -1739,9 +2372,20 @@ def create_app(config_path: Path) -> Flask:
                             checkpoint_size_cache[cache_key] = (mtime, size_bytes)
                         else:
                             size_bytes = cached[1]
+                        action_contract = checkpoint_action_contract(step_dir)
                         checkpoints.append(
                             {
                                 "path": cache_key,
+                                "action_contract": action_contract,
+                                "contract_version": action_contract.get("contract_version") if action_contract else None,
+                                "raw_action_dim": action_contract.get("raw_action_dim") if action_contract else None,
+                                "model_action_dim": action_contract.get("model_action_dim") if action_contract else None,
+                                "model_action_convention": (
+                                    action_contract.get("model_action_convention")
+                                    if action_contract
+                                    else None
+                                ),
+                                "gripper_semantics": action_contract.get("gripper_semantics") if action_contract else None,
                                 "config_name": config_name,
                                 "model_variant": model_variant,
                                 "arm_mode": arm_mode,
@@ -1890,7 +2534,7 @@ def create_app(config_path: Path) -> Flask:
         source_id = safe_name(payload.get("source_dataset_id") if isinstance(payload, dict) else None, "source dataset id")
         return jsonify(dataset_editor.merge_existing(dataset_id, source_id))
 
-    def parse_dataset(payload: dict[str, Any]) -> tuple[str, str, str, str]:
+    def parse_dataset(payload: dict[str, Any]) -> tuple[str, str, str, str, dict[str, Any]]:
         dataset_id = safe_name(payload.get("dataset_id"), "dataset id")
         dataset_path = dataset_root / dataset_id
         info = read_json(dataset_path / "meta" / "info.json")
@@ -1902,7 +2546,7 @@ def create_app(config_path: Path) -> Flask:
                 "unsupported dataset contract: "
                 f"layout={contract['dataset_layout']} schema={contract['schema']} "
                 f"arm_mode={contract['arm_mode']} dims={contract['state_shape']}/{contract['action_shape']} "
-                f"cameras={contract['cameras']}"
+                f"cameras={contract['cameras']} error={contract.get('contract_error') or '-'}"
             )
         arm_mode = str(contract["arm_mode"])
         schema = str(contract["schema"])
@@ -1917,7 +2561,7 @@ def create_app(config_path: Path) -> Flask:
                 )
             if arm_side not in {"left", "right"}:
                 raise ValueError("single-arm dataset arm_side must be left or right")
-        return dataset_id, arm_mode, arm_side, schema
+        return dataset_id, arm_mode, arm_side, schema, contract
 
 
     def parse_gpus(
@@ -1974,7 +2618,9 @@ def create_app(config_path: Path) -> Flask:
             / "norm_stats.json"
         )
 
-    def parse_episode_split(payload: dict[str, Any], dataset_id: str) -> EpisodeSplit:
+    def parse_episode_split(
+        payload: dict[str, Any], dataset_id: str, dataset_contract: dict[str, Any]
+    ) -> EpisodeSplit:
         test_ratio = safe_float(
             payload.get("test_ratio", DEFAULT_TEST_RATIO),
             "test_ratio",
@@ -1988,10 +2634,27 @@ def create_app(config_path: Path) -> Flask:
             0,
             2**31 - 1,
         )
-        return resolve_episode_split(dataset_root, dataset_id, test_ratio=test_ratio, seed=split_seed)
+        contract = action_contract_for_model(dataset_contract)
+        return resolve_episode_split(
+            dataset_root,
+            dataset_id,
+            test_ratio=test_ratio,
+            seed=split_seed,
+            contract=contract["contract_fingerprint"],
+        )
 
-    def training_episode_split(payload: dict[str, Any], dataset_id: str) -> tuple[EpisodeSplit, str]:
-        persisted = load_episode_split(dataset_root, dataset_id)
+    def training_episode_split(
+        payload: dict[str, Any],
+        dataset_id: str,
+        dataset_contract: dict[str, Any],
+        *,
+        model_contract: dict[str, Any] | None = None,
+    ) -> tuple[EpisodeSplit, str]:
+        contract = model_contract or action_contract_for_model(dataset_contract)
+        fingerprint = contract["contract_fingerprint"]
+        persisted = load_episode_split(
+            dataset_root, dataset_id, contract=fingerprint
+        )
         explicit_ratio = payload.get("test_ratio") not in (None, "")
         explicit_seed = payload.get("split_seed") not in (None, "")
         if not explicit_ratio and not explicit_seed and persisted is not None:
@@ -2014,8 +2677,15 @@ def create_app(config_path: Path) -> Flask:
             0,
             2**31 - 1,
         )
-        split = resolve_episode_split(dataset_root, dataset_id, test_ratio=test_ratio, seed=split_seed)
+        split = resolve_episode_split(
+            dataset_root,
+            dataset_id,
+            test_ratio=test_ratio,
+            seed=split_seed,
+            contract=fingerprint,
+        )
         return split, "request" if explicit_ratio or explicit_seed else "default"
+
 
     def build_norm_command(
         dataset_id: str,
@@ -2028,6 +2698,7 @@ def create_app(config_path: Path) -> Flask:
         batch_size: int,
         num_workers: int,
         split: EpisodeSplit,
+        model_contract: dict[str, Any],
         max_frames: int | None = None,
     ) -> list[str]:
         command = [
@@ -2045,6 +2716,7 @@ def create_app(config_path: Path) -> Flask:
             "--test-ratio", str(split.test_ratio),
             "--split-seed", str(split.seed),
         ]
+        command += action_contract_command_args(model_contract)
         if max_frames is not None:
             command += ["--max-frames", str(max_frames)]
         return command
@@ -2052,9 +2724,10 @@ def create_app(config_path: Path) -> Flask:
     @app.post("/api/tasks/norm")
     def start_norm():
         payload = request.get_json(force=True)
-        dataset_id, arm_mode, arm_side, schema = parse_dataset(payload)
+        dataset_id, arm_mode, arm_side, schema, dataset_contract = parse_dataset(payload)
+        model_contract = action_contract_for_model(dataset_contract)
         base_checkpoint, model_variant = resolve_base_model(payload)
-        split = parse_episode_split(payload, dataset_id)
+        split = parse_episode_split(payload, dataset_id, dataset_contract)
         batch_size = safe_int(payload.get("batch_size", 16), "batch_size", 1, 1024)
         num_workers = safe_int(payload.get("num_workers", 2), "num_workers", 1, 64)
         max_frames = payload.get("max_frames")
@@ -2071,6 +2744,7 @@ def create_app(config_path: Path) -> Flask:
             batch_size=batch_size,
             num_workers=num_workers,
             split=split,
+            model_contract=model_contract,
             max_frames=parsed_max_frames,
         )
         task = tasks.start(
@@ -2081,6 +2755,12 @@ def create_app(config_path: Path) -> Flask:
                 "arm_mode": arm_mode,
                 "arm_side": arm_side,
                 "schema": schema,
+                **model_contract["contract_fingerprint"],
+                "raw_gripper_semantics": model_contract["raw_gripper_semantics"],
+                "wire_gripper_semantics": model_contract["wire_gripper_semantics"],
+                "delivery_action_convention": (
+                    model_contract["model_action_convention"] if schema == "delivery" else None
+                ),
                 "model_variant": model_variant,
                 "base_checkpoint": str(base_checkpoint),
                 "batch_size": batch_size,
@@ -2101,19 +2781,120 @@ def create_app(config_path: Path) -> Flask:
     @app.post("/api/tasks/train")
     def start_train():
         payload = request.get_json(force=True)
-        dataset_id, arm_mode, arm_side, schema = parse_dataset(payload)
+        dataset_id, arm_mode, arm_side, schema, dataset_contract = parse_dataset(payload)
         base_checkpoint, model_variant = resolve_base_model(payload)
-        split, split_source = training_episode_split(payload, dataset_id)
+        exp_name = safe_name(payload.get("exp_name"), "experiment name")
+        mode = str(payload.get("mode", "auto"))
+        if mode not in {"auto", "new", "resume", "overwrite"}:
+            raise ValueError("mode must be auto, new, resume, or overwrite")
+        checkpoint_dir = (
+            Path(config["checkpoint_base_dir"])
+            / policy_config_name(arm_mode, model_variant)
+            / exp_name
+        )
+        if mode == "new" and checkpoint_dir.exists():
+            raise FileExistsError(
+                f"checkpoint directory already exists: {checkpoint_dir}; "
+                "choose auto/resume to continue it, or overwrite to replace it"
+            )
+        effective_mode = "resume" if mode == "auto" else mode
+        saved_steps = any(
+            child.is_dir() and child.name.isdigit() and (child / "params").is_dir()
+            for child in checkpoint_dir.iterdir()
+        ) if checkpoint_dir.is_dir() else False
+
+        # Auto-resume is allowed to recover old checkpoints only through an
+        # explicit compatibility choice. The generated command still carries
+        # the resolved convention/semantics, so it is never silent at runtime.
+        model_convention = (
+            DELIVERY_CHUNK_ORIGIN_ACTION_CONVENTION
+            if schema == "delivery"
+            else None
+        )
+        model_gripper = (
+            dataset_contract.get("model_gripper_semantics")
+            if schema == "joint"
+            else None
+        )
+        marker = checkpoint_action_contract(checkpoint_dir) if saved_steps else None
+        if effective_mode == "resume" and saved_steps:
+            if marker is not None:
+                if schema == "delivery":
+                    model_convention = marker.get("model_action_convention") or marker.get(
+                        "delivery_action_convention"
+                    )
+                else:
+                    model_gripper = marker.get("gripper_semantics") or marker.get(
+                        "model_gripper_semantics"
+                    )
+            elif schema == "delivery" and dataset_contract.get("legacy_delivery_v2"):
+                model_convention = DELIVERY_STEP_ACTION_CONVENTION
+            elif schema == "joint" and dataset_contract.get("legacy_joint_v2"):
+                model_gripper = LEGACY_JOINT_GRIPPER_SEMANTICS
+            else:
+                raise ValueError(
+                    "existing checkpoint has no action-contract marker; it cannot be resumed "
+                    "without a verified legacy dataset/convention"
+                )
+        model_contract = action_contract_for_model(
+            dataset_contract,
+            delivery_action_convention=model_convention,
+            model_gripper_semantics=model_gripper,
+        )
+        if effective_mode == "resume" and saved_steps and marker is not None:
+            marker_version = int(marker.get("version", 1))
+            legacy_temporal_compat = bool(
+                marker_version < ACTION_CONTRACT_MARKER_VERSION
+                and (
+                    dataset_contract.get("legacy_delivery_v2")
+                    or dataset_contract.get("legacy_joint_v2")
+                )
+            )
+            if marker_version < ACTION_CONTRACT_MARKER_VERSION and not legacy_temporal_compat:
+                raise ValueError(
+                    "checkpoint action marker predates action_offset/model_action_start_offset"
+                )
+            expected_items = (
+                normalize_contract_fingerprint(model_contract["contract_fingerprint"]).items()
+                if legacy_temporal_compat
+                else model_contract["contract_fingerprint"].items()
+            )
+            mismatches = {
+                key: {"checkpoint": marker.get(key), "training": value}
+                for key, value in expected_items
+                if marker.get(key) != value
+            }
+            if mismatches:
+                raise ValueError(
+                    "checkpoint action/time contract does not match requested training: "
+                    + json.dumps(mismatches, ensure_ascii=False, sort_keys=True)
+                )
+        split, split_source = training_episode_split(
+            payload,
+            dataset_id,
+            dataset_contract,
+            model_contract=model_contract,
+        )
         norm_path = norm_stats_path(dataset_id, arm_mode, model_variant)
-        norm_ready = norm_split_matches(norm_path.parent, split)
-        saved_norm_config = read_json(norm_path.parent / NORM_CONFIG_FILENAME) if norm_ready else None
+        norm_ready = norm_split_matches(
+            norm_path.parent,
+            split,
+            contract=model_contract["contract_fingerprint"],
+        )
+        saved_norm_config = (
+            read_json(norm_path.parent / NORM_CONFIG_FILENAME) if norm_ready else None
+        )
+        norm_ready = norm_ready and norm_extended_contract_matches(
+            saved_norm_config, model_contract["contract_fingerprint"]
+        )
+        if not norm_ready:
+            saved_norm_config = None
         minimum_free_gpu_mib = int(config.get("training_min_free_gpu_mib", 23_000))
         gpu_ids = parse_gpus(
             payload,
             check_busy=norm_ready,
             minimum_free_mib=minimum_free_gpu_mib,
         )
-        exp_name = safe_name(payload.get("exp_name"), "experiment name")
         batch_size = safe_int(payload.get("batch_size", 2), "batch_size", 1, 1024)
         if batch_size % len(gpu_ids):
             raise ValueError("batch_size must be divisible by the number of selected GPUs")
@@ -2129,23 +2910,6 @@ def create_app(config_path: Path) -> Flask:
         )
         steps = safe_int(payload.get("num_train_steps", 30_000), "num_train_steps", 1, 10_000_000)
         save_interval = safe_int(payload.get("save_interval", 1_000), "save_interval", 1, steps)
-        mode = str(payload.get("mode", "auto"))
-        if mode not in {"auto", "new", "resume", "overwrite"}:
-            raise ValueError("mode must be auto, new, resume, or overwrite")
-        checkpoint_dir = (
-            Path(config["checkpoint_base_dir"])
-            / policy_config_name(arm_mode, model_variant)
-            / exp_name
-        )
-        if mode == "new" and checkpoint_dir.exists():
-            raise FileExistsError(
-                f"checkpoint directory already exists: {checkpoint_dir}; "
-                "choose auto/resume to continue it, or overwrite to replace it"
-            )
-        # Upstream --resume is safe for both cases: it resumes the latest
-        # checkpoint when the directory exists, and starts a fresh run when it
-        # does not. Use it as the non-destructive Dashboard default.
-        effective_mode = "resume" if mode == "auto" else mode
         command = [
             config["openpi_python"], openpi_helper, "train",
             "--dataset-id", dataset_id,
@@ -2164,7 +2928,7 @@ def create_app(config_path: Path) -> Flask:
             "--fsdp-devices", str(fsdp_devices),
             "--test-ratio", str(split.test_ratio),
             "--split-seed", str(split.seed),
-        ]
+        ] + action_contract_command_args(model_contract)
         if effective_mode != "new":
             command.append(f"--{effective_mode}")
         if bool(payload.get("wandb_enabled", False)):
@@ -2174,6 +2938,12 @@ def create_app(config_path: Path) -> Flask:
             "arm_mode": arm_mode,
             "arm_side": arm_side,
             "schema": schema,
+            **model_contract["contract_fingerprint"],
+            "raw_gripper_semantics": model_contract["raw_gripper_semantics"],
+            "wire_gripper_semantics": model_contract["wire_gripper_semantics"],
+            "delivery_action_convention": (
+                model_contract["model_action_convention"] if schema == "delivery" else None
+            ),
             "model_variant": model_variant,
             "base_checkpoint": str(base_checkpoint),
             "exp_name": exp_name,
@@ -2202,8 +2972,6 @@ def create_app(config_path: Path) -> Flask:
             ),
         }
         with tasks.lock:
-            # Re-check while holding the task lock so simultaneous submissions
-            # cannot create duplicate automatic norm jobs for the same model and dataset.
             if norm_ready:
                 gpu_ids = parse_gpus(payload, minimum_free_mib=minimum_free_gpu_mib)
                 metadata["gpu_ids"] = gpu_ids
@@ -2229,6 +2997,16 @@ def create_app(config_path: Path) -> Flask:
                     and item.get("metadata", {}).get("arm_mode") == arm_mode
                     and item.get("metadata", {}).get("arm_side") == arm_side
                     and item.get("metadata", {}).get("schema") == schema
+                    and item.get("metadata", {}).get("contract_version")
+                    == model_contract["contract_version"]
+                    and item.get("metadata", {}).get("raw_action_dim")
+                    == model_contract["raw_action_dim"]
+                    and item.get("metadata", {}).get("model_action_dim")
+                    == model_contract["model_action_dim"]
+                    and item.get("metadata", {}).get("model_action_convention")
+                    == model_contract["model_action_convention"]
+                    and item.get("metadata", {}).get("gripper_semantics")
+                    == model_contract["model_gripper_semantics"]
                     and item.get("metadata", {}).get("model_variant") == model_variant
                     and item.get("metadata", {}).get("base_checkpoint") == str(base_checkpoint)
                     and float(item.get("metadata", {}).get("test_ratio", -1)) == split.test_ratio
@@ -2251,6 +3029,7 @@ def create_app(config_path: Path) -> Flask:
                         batch_size=norm_batch_size,
                         num_workers=norm_num_workers,
                         split=split,
+                        model_contract=model_contract,
                     ),
                     env=build_environment(config, None),
                     metadata={
@@ -2258,6 +3037,12 @@ def create_app(config_path: Path) -> Flask:
                         "arm_mode": arm_mode,
                         "arm_side": arm_side,
                         "schema": schema,
+                        **model_contract["contract_fingerprint"],
+                        "raw_gripper_semantics": model_contract["raw_gripper_semantics"],
+                        "wire_gripper_semantics": model_contract["wire_gripper_semantics"],
+                        "delivery_action_convention": (
+                            model_contract["model_action_convention"] if schema == "delivery" else None
+                        ),
                         "model_variant": model_variant,
                         "base_checkpoint": str(base_checkpoint),
                         "batch_size": norm_batch_size,
@@ -2281,11 +3066,10 @@ def create_app(config_path: Path) -> Flask:
                 norm_path=norm_path,
             )
             return jsonify(task), 202
-
     @app.post("/api/tasks/policy")
     def start_policy():
         payload = request.get_json(force=True)
-        dataset_id, arm_mode, arm_side, schema = parse_dataset(payload)
+        dataset_id, arm_mode, arm_side, schema, dataset_contract = parse_dataset(payload)
         port = safe_int(payload.get("port", 8000), "port", config["policy_port_min"], config["policy_port_max"])
         checkpoint = resolve_under(payload.get("checkpoint", ""), checkpoint_roots)
         if not (checkpoint / "params").exists():
@@ -2311,6 +3095,72 @@ def create_app(config_path: Path) -> Flask:
             raise ValueError(
                 f"checkpoint is not associated with dataset {dataset_id}: missing {checkpoint_norm}"
             )
+        marker = checkpoint_action_contract(checkpoint)
+        if marker is not None:
+            model_convention = marker.get("model_action_convention") or marker.get(
+                "delivery_action_convention"
+            )
+            model_gripper = marker.get("gripper_semantics") or marker.get(
+                "model_gripper_semantics"
+            )
+        elif schema == "delivery" and dataset_contract.get("legacy_delivery_v2"):
+            model_convention = DELIVERY_STEP_ACTION_CONVENTION
+            model_gripper = None
+        elif schema == "joint" and dataset_contract.get("legacy_joint_v2"):
+            model_convention = None
+            model_gripper = LEGACY_JOINT_GRIPPER_SEMANTICS
+        else:
+            raise ValueError(
+                "checkpoint has no complete action-contract marker and is not a verified "
+                "legacy-v2 checkpoint"
+            )
+        model_contract = action_contract_for_model(
+            dataset_contract,
+            delivery_action_convention=model_convention,
+            model_gripper_semantics=model_gripper,
+        )
+        if marker is not None:
+            marker_version = int(marker.get("version", 1))
+            legacy_temporal_compat = bool(
+                marker_version < ACTION_CONTRACT_MARKER_VERSION
+                and (
+                    (
+                        dataset_contract.get("legacy_delivery_v2")
+                        and marker.get("model_action_convention", marker.get("delivery_action_convention"))
+                        == model_contract.get("model_action_convention")
+                    )
+                    or (
+                        dataset_contract.get("legacy_joint_v2")
+                        and (marker.get("gripper_semantics") or marker.get("model_gripper_semantics"))
+                        == model_contract.get("model_gripper_semantics")
+                    )
+                )
+            )
+            if marker_version < ACTION_CONTRACT_MARKER_VERSION and not legacy_temporal_compat:
+                raise ValueError(
+                    "checkpoint action marker predates action_offset/model_action_start_offset; "
+                    "retrain or explicitly migrate the verified checkpoint contract"
+                )
+            fingerprint_items = (
+                normalize_contract_fingerprint(model_contract["contract_fingerprint"]).items()
+                if legacy_temporal_compat
+                else model_contract["contract_fingerprint"].items()
+            )
+            mismatches = {
+                key: {"checkpoint": marker.get(key), "dataset": value}
+                for key, value in fingerprint_items
+                if marker.get(key) != value
+            }
+            if marker.get("dataset_id") not in (None, dataset_id):
+                mismatches["dataset_id"] = {
+                    "checkpoint": marker.get("dataset_id"),
+                    "dataset": dataset_id,
+                }
+            if mismatches:
+                raise ValueError(
+                    "checkpoint action contract does not match selected dataset: "
+                    + json.dumps(mismatches, ensure_ascii=False, sort_keys=True)
+                )
         replace_task_id = str(payload.get("replace_task_id", "")).strip()
         old_task: dict[str, Any] | None = None
         old_active = False
@@ -2376,7 +3226,7 @@ def create_app(config_path: Path) -> Flask:
             "--checkpoint", str(checkpoint),
             "--port", str(port),
             "--telemetry-dir", str(telemetry_dir),
-        ]
+        ] + action_contract_command_args(model_contract)
         default_prompt = str(payload.get("default_prompt", "")).strip()
         if default_prompt:
             if len(default_prompt) > 500:
@@ -2390,6 +3240,12 @@ def create_app(config_path: Path) -> Flask:
                 "arm_mode": arm_mode,
                 "arm_side": arm_side,
                 "schema": schema,
+                **model_contract["contract_fingerprint"],
+                "raw_gripper_semantics": model_contract["raw_gripper_semantics"],
+                "wire_gripper_semantics": model_contract["wire_gripper_semantics"],
+                "delivery_action_convention": (
+                    model_contract["model_action_convention"] if schema == "delivery" else None
+                ),
                 "model_variant": model_variant,
                 "checkpoint": str(checkpoint),
                 "gpu_ids": gpu_ids,
@@ -2423,6 +3279,8 @@ def create_app(config_path: Path) -> Flask:
                 raise ValueError("execution requires fresh robot telemetry")
             if not telemetry.get("client_allow_execution"):
                 raise ValueError("robot client was not started with --allow-execution")
+            require_policy_execution_horizon(telemetry)
+            require_policy_execution_time_contract(telemetry)
         control = observations.set_control(
             task,
             mode=mode,

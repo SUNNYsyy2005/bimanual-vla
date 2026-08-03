@@ -19,7 +19,7 @@
 - 页面顶部按“总览 / 数据集 / 训练 / Policy / 实时遥测”分模块导航；总览集中显示 GPU、数据量和活动任务。
 - Dashboard 可以新建、健康检测、停止、强制结束 Policy，并用新 checkpoint 替换运行中的 Policy。
 - 已完成、失败、丢失或停止的训练 / Policy 历史任务可从对应模块删除任务记录和日志；checkpoint、模型与训练输出不会被删除。
-- 机械臂客户端默认是 shadow-only；只有显式添加 `--allow-execution`、Dashboard 对同一 Policy 给出未过期的 EXECUTE 授权、telemetry 新鲜且本地安全检查全部通过时，才会发布按模型频率合成后的短 chunk 命令。
+- 机械臂客户端默认是 shadow-only；只有显式添加 `--allow-execution`、Dashboard 对同一 Policy 给出未过期的 EXECUTE 授权、telemetry 新鲜、`action_horizon >= 16` 且本地安全检查全部通过时，才会发布异步 chunk 命令。
 
 ## 部署并启动 Dashboard
 
@@ -129,14 +129,19 @@ python upload_dataset_4090.py /path/to/pi0_dataset_single \
 - 新 episodes 会重新生成连续的 `episode_index`、全局 `index` 和 `task_index`；视频只复制/硬链接，不重新编码。
 - 合并在隐藏临时目录执行，最终数据集通过结构和实际 loader 校验后才原子替换旧目录。
 
-支持四种 canonical Piper 数据合同，双臂向量顺序固定为 `left + right`：
+Piper 合同区分 **raw action（数据集存储）**、**model action（norm/训练）** 和 **wire action（Policy 输出）**，双臂向量顺序固定为 `left + right`：
 
-| 模式 | schema | state | action | 相机 |
-|---|---|---:|---:|---|
-| 单臂 | joint | 7D 关节角 + 夹爪开度 | 7D 绝对关节/夹爪目标 | `cam_high` + 单腕部 |
-| 单臂 | delivery | 10D EEF xyz + rotation6d + 夹爪闭合比例 | 7D Δxyz + Δrotvec + 夹爪目标 | `cam_high` + 单腕部 |
-| 双臂 | joint | 14D = left 7D + right 7D | 14D = left 7D + right 7D | `cam_high` + 左右腕部 |
-| 双臂 | delivery | 20D = left 10D + right 10D | 14D = left 7D + right 7D | `cam_high` + 左右腕部 |
+| 模式 | schema / 版本 | state | raw action | model / wire action |
+|---|---|---:|---:|---:|
+| 单臂 | joint v3 | 7D 关节 + opening fraction | 7D 绝对关节目标 + opening fraction | 训练为前 6D current-anchored delta；wire 经 `AbsoluteActions` 恢复 7D 绝对目标 |
+| 双臂 | joint v3 | 14D | 14D | 14D，逐臂前 6D delta，夹爪保持绝对 opening fraction |
+| 单/双臂 | delivery v3 | 每臂 10D EEF xyz + rotation6d + opening fraction | 每臂 10D 绝对 EEF target | 每臂 7D `[delta_xyz, log(Rt*Rs.T), absolute opening fraction]`，chunk 所有行共用同一当前 state |
+| 单臂 | delivery legacy v2（如 `8_3_64eps`） | legacy `state` 10D + closed fraction | legacy `actions` 7D one-step delta + closed fraction | 仅通过显式 `step` 或转换后的 `chunk_origin` convention 使用 |
+| 单/双臂 | joint legacy v2 | 每臂 7D，夹爪为 opening metres | 每臂 7D 绝对目标，夹爪为 metres | 新训练默认先把 metres 转为 fraction 再 norm；旧 checkpoint 必须显式保留 metres wire 语义 |
+
+新 delivery 必须是 canonical `observation.state/action` 的 `(10,10)` 或 `(20,20)`；`(10,7)` / `(20,14)` 一律识别为 legacy delivery step-delta，不能仅依赖 `schema=delivery` 混用。
+
+所有 model/wire 行采用统一目标时间：第 `i` 行对应 `t_obs + (i + 1) / fps`。LeRobot raw action 的 delta timestamp 从 `(step + 1 - action_offset) / fps` 查询：`same_step_command` 的 `action_offset=0` 从下一帧 action 开始，`next_measured_*_fallback` 的 `action_offset=1` 从当前 action 行开始；两种 raw 对齐最终都转换成从 `+1 step` 开始的 model/wire chunk。`action_offset` 只能是 0/1，`model_action_start_offset=1` 固定且不可由 CLI 改成其他值。
 
 canonical LeRobot 相机字段为：
 
@@ -151,7 +156,7 @@ bimanual: observation.images.cam_high + observation.images.cam_left_wrist + obse
 
 Dashboard 的“Episode 级数据集编辑”区域支持：
 
-1. 识别并显示单臂 Joint 7D/7D、单臂 Delivery 10D/7D、双臂 Joint 14D/14D、双臂 Delivery 20D/14D，以及其他自定义 state/action 维度；四种 canonical Piper 格式均可进入对应训练配置，自定义格式只开放管理和预览。
+1. 同时显示 `contract_version`、state/raw/model action 维度、raw/model convention、动作语义和 raw/wire 夹爪语义；明确区分 legacy delivery `(10,7)/(20,14)` 与 canonical absolute-EEF `(10,10)/(20,20)`，不完整或冲突的合同只开放管理和预览。
 2. 分页查看 episode 的帧数、instruction、可选 task name、可选 success 和附加 metadata；未设置的可选字段保持为空，不会被自动写成 `success=true`。
 3. 数据集级重命名和整库删除；重命名同步移动当前 dataset-level norm stats，删除整库不删除历史 checkpoint、模型或任务记录。
 4. 独立预览该 episode 的各路摄像头媒体：
@@ -211,7 +216,7 @@ cd /home/sunny/bimanual-vla
    - 可选择 `π0.5` / `π0`，也可把已有完整 checkpoint 作为初始化权重；
    - 不同模型系列使用独立 config、norm stats 和 checkpoint 目录，避免互相覆盖；
    - norm 时确定的测试集比例、划分种子和 episode 清单持久化到数据集 `meta/train_test_split.json`，训练自动加载，不需要重复填写；
-   - 每次成功 norm 还会保存 `episode_split.json` 和 `norm_config.json`，记录模型系列、基础权重、norm batch size、workers、帧数限制和实际处理规模；
+   - 每次成功 norm 还会保存 `episode_split.json` 和 `norm_config.json`，除模型/批量/处理规模外，强制记录并校验 `contract_version`、raw/model action 维度、raw/model semantics/convention、模型夹爪语义、`action_offset` 和 `model_action_start_offset=1`；任一字段变化都会使旧 norm 失效；
    - norm batch size 只影响统计阶段的吞吐与资源占用，不需要和训练 batch size 一致；
    - 2×24 GiB RTX 4090 的 π0.5 LoRA 已验证安全起点为全局 batch `2`、`fsdp_devices=2`、`xla_memory_fraction=0.90`；batch `4` 可能在首个训练步的 NCCL 通信阶段 OOM；
    - Dashboard 按 GPU UUID 设置 `CUDA_VISIBLE_DEVICES`，避免某张故障卡从 CUDA 枚举中消失后数字序号错位；`nvidia-smi` 出现 `[N/A]` compute context 的卡会标记为不可训练；
@@ -236,7 +241,7 @@ cd /home/sunny/bimanual-vla
    - 最近 telemetry / 客户端推理时间；
    - 独立 Policy 日志、正常停止、强制结束，以及终态历史记录删除。
 9. 在机械臂控制电脑启动官方 WebSocket 客户端。
-10. Dashboard 按 schema 显示 Policy 实际收到的单臂 7D/10D 或双臂 14D/20D state、Policy 要求的两路/三路图像、prompt、7D/14D 预测 action，以及服务端授权、客户端本地执行许可、双重门结果和实际执行/阻断原因。
+10. Dashboard 按 schema 显示 Policy 实际收到的单臂 7D/10D 或双臂 14D/20D state、Policy 要求的两路/三路图像、prompt、7D/14D 预测 action，以及 4 Hz inference launch、20 Hz action/control、horizon、每步目标时间、actuator delay、动态 expired prefix、active plan/hold/blend/gripper filter、queue generation/remaining、underrun/rejected/drop、最后 wire/decoded target 和实际执行/阻断原因。
 
 训练指标 API（Bearer Token 必需）：
 
@@ -262,7 +267,7 @@ python robot_observation_bridge.py \
   --cam-wrist-device /dev/video16 \
   --arm-side right \
   --instruction "pick up the cube" \
-  --hz 5
+  --hz 4
 ```
 
 双臂 shadow-only 示例使用两个 CAN 和三路相机：
@@ -279,7 +284,7 @@ python robot_observation_bridge.py \
   --cam-left-wrist-device /dev/video12 \
   --cam-right-wrist-device /dev/video16 \
   --instruction "pick up the cube" \
-  --hz 5
+  --hz 4
 ```
 
 单次验证可在任一示例末尾追加 `--once`。
@@ -290,17 +295,27 @@ python robot_observation_bridge.py \
 2. 单臂同时构造 10D delivery state 和 7D joint qpos；双臂同时构造 20D delivery state 和 14D joint qpos。
 3. 单臂并行读取顶部与单腕部两路相机，双臂并行读取顶部与左右腕部三路相机，并转换为 256×256 RGB。
 4. 使用 `openpi_client.websocket_client_policy.WebsocketClientPolicy` 直连所选 Policy 端口。
-5. 校验服务端 metadata：`transport`、`schema`、`arm_mode`、`state_dim`、`action_dim`、`arm_side`、`action_semantics`、`camera_keys` 和可选的 `action_hz`；不一致时 fail closed。
-6. 根据 metadata 自动发送匹配的 7D/10D/14D/20D state 和相机字段，并只接受匹配的 7D/14D action。
-7. 同时打印模型首步 action 和按命令周期合成后的 `command_action`；切换模型造成断线时自动重连并重新协商合同。
+5. 校验服务端 metadata：除 `transport/schema/arm/state/action/camera/action_hz/action_horizon` 外，还校验 `action_time_step_s=1/fps`、`action_start_offset_steps=1`、`action_offset`、`model_action_start_offset=1`、`contract_version`、raw/model action dim、raw/model/wire semantics/convention 及 state/wire gripper semantics；`action_horizon < 16` 或任一合同不一致时 fail closed。
+6. 根据 metadata 自动发送匹配的 state 和相机字段，并只接受 `model_action_dim` 指定的 7D/14D wire action；legacy joint checkpoint 继续使用 metres，新 checkpoint 使用 opening fraction。
+7. 每次推理把当前观测保存为唯一 anchor；Dashboard telemetry 同时显示 raw/model/wire 合同、chunk 生命周期和最后 wire/decoded target。切换模型造成断线时自动重连并重新协商合同。
 
-Policy 会从数据集 `meta/info.json` 的 `fps` 发布 `action_hz`。客户端默认按
-`round(action_hz / --hz)` 消费 action chunk：例如训练数据为 20 Hz、客户端为
-5 Hz 时，每个机器人命令消费 4 个模型步。`delivery` schema 对前 N 步 xyz
-增量求和、按顺序组合 rotvec，并使用第 N 步夹爪目标；`joint` schema 的 action
-是绝对关节目标，因此直接选择第 N 步，不能把关节值相加。旧 Policy 未发布
-`action_hz` 时默认按 20 Hz 处理，也可以用 `--action-hz` 覆盖；如需临时恢复旧版
-“只执行首步”的行为，可显式使用 `--action-chunk-steps 1`。
+Policy metadata 会继续发布：`action_hz` 等于数据集 `meta/info.json` 的 `fps`（实测通常为
+20 Hz），`action_horizon` 等于模型输出 horizon（通常为 50），`action_time_step_s=1/fps`，
+`action_start_offset_steps=1`。执行客户端和 Dashboard 都要求 `action_horizon >= 16`，
+并校验 raw `action_offset` 与固定的 model/wire 起点；缺失或不一致时保持 SHADOW / fail closed。
+
+异步执行采用长 chunk 流水切换：控制循环持续以 20 Hz 消费旧 chunk，
+而推理默认以 4 Hz 启动，推理与传输通常约 200 ms；旧 chunk 在 inference launch 到
+result arrival 期间继续执行。新 chunk 到达后，根据每行绝对目标时间、
+launch/capture/arrival、actuator delay 和当前 20 Hz control tick 动态计算已过期 prefix；
+过期行数不是固定常量。随后用 2~4 步做 old/new blend，融合完成后才切换到新的 queue
+`generation`。`chunk rows` 是返回 chunk 的实际行数，`active plan`、`hold`、`blend`、
+`gripper filter`、`old remaining` / `new remaining`、`underrun`、`rejected result` 和
+`drop reason` 必须在 telemetry 中保留。新 delivery current-anchored 行共享同一当前 state，客户端把每一行
+相对于该 immutable anchor 独立解码为 absolute EEF target。legacy delivery `step`
+checkpoint 只有在显式 metadata/convention 下才可累计到同一
+anchor，不能与 canonical absolute-EEF 静默混用。`joint` wire action 已是绝对关节目标，
+按 20 Hz 逐行执行。
 
 该脚本不需要 Dashboard URL 或 Token。上述默认命令不会调用动作控制 API。
 
@@ -310,7 +325,9 @@ Policy 会从数据集 `meta/info.json` 的 `fps` 发布 `action_hz`。客户端
   --allow-execution
 ```
 
-这只打开客户端本地安全门，并不立即执行。网页还必须为同一个运行中 Policy 输入 task id，授权最多 5 分钟的 EXECUTE；任一门关闭、授权过期、连接断开、telemetry 过期、合成后的 delivery 命令/工作空间超限、joint 目标/命令变化超限或 Piper 状态异常都会阻断下发。网页可随时点击“只推理 / SHADOW”立即撤销服务端授权。频率合成不会绕过、放大或 clamp 安全限制，所有限制都作用于最终实际命令。joint 默认限制为每关节 `0.3 rad/command`、夹爪 `0.02 m/command`，可分别用 `--max-joint-step-rad` 和 `--max-joint-gripper-step-m` 收紧。
+这只打开客户端本地安全门，并不立即执行。网页还必须为同一个运行中 Policy 输入 task id，授权最多 5 分钟的 EXECUTE；任一门关闭、授权过期、连接断开、telemetry 过期、`action_horizon < 16`、delivery 命令/工作空间超限、joint 目标/命令变化超限或 Piper 状态异常都会阻断下发。网页可随时点击“只推理 / SHADOW”立即撤销服务端授权。每一条实际的 20 Hz command 都独立执行安全检查，不会因为 chunk、skip 或 blend 而放宽限制。
+
+`8_3_64eps` 全量 20 Hz 统计对应的 delivery 默认阈值为：translation `0.05 m/step`、rotation `0.18 rad/step`、gripper `0.30 fraction/step`；workspace 为 x `[-0.05, 0.30] m`、y `[0.01, 0.50] m`、z `[0.14, 0.52] m`。这些是默认拒绝边界，CLI 参数只能进一步收紧；请在改变阈值前重新确认数据分布和机械臂工作空间。
 
 ## Policy 进程管理与模型切换
 
@@ -342,5 +359,5 @@ Policy 会从数据集 `meta/info.json` 的 `fps` 发布 `action_hz`。客户端
 - 真实观测不经过 Dashboard HTTP API。
 - Dashboard telemetry 是 Policy 收到数据后的只读镜像。
 - 服务端 EXECUTE 授权最长 1 小时，网页默认 5 分钟；Dashboard 重启、Policy 停止或模型切换都会回到 SHADOW。
-- 客户端没有 `--allow-execution` 时永远不会发布动作；即使双重门打开，动作新鲜度、合成命令的位移/旋转/夹爪变化、工作空间和 Piper 状态仍会在本地逐次检查。
+- 客户端没有 `--allow-execution` 时永远不会发布动作；即使双重门打开，动作新鲜度、每条 20 Hz command 的位移/旋转/夹爪变化、workspace、`action_horizon` 和 Piper 状态仍会在本地逐次检查。
 - 默认拒绝在已有计算进程的 GPU 上启动任务；如修改 `allow_busy_gpus`，应明确确认不会干扰其他任务。

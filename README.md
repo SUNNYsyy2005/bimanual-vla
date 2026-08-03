@@ -15,6 +15,7 @@
 - LeRobot v2.1 导出：`export_lerobot.py`
 - 数据验收：`validate_piper_data.py`、`check_pi05_dataset.py`
 - 旧关节空间 NPZ 转换：`convert_output_arm_npz.py`
+- Legacy Delivery 数据集升级到 v3：`migrate_legacy_delivery_dataset.py`
 - OpenPI 权重并行断点续传：`download_openpi_checkpoint.py`
 - 上传至 4×4090：`upload_dataset_4090.py`
 - 4×4090 数据 / 微调 / Policy / shadow inference 网页：`server_4090/`
@@ -51,25 +52,37 @@ schema 对应的 7D/10D/14D/20D state，以及相对 Home 的位姿误差。任�
 
 ### 单双臂 π0.5 数据合同
 
-| 模式 | schema | state/action | 相机 |
-|---|---|---:|---|
-| 单臂 | joint | 7D / 7D | `cam_high` + 单腕部 |
-| 双臂 | joint | 14D / 14D | `cam_high` + 左右腕部 |
-| 单臂 | delivery | 10D / 7D | `cam_high` + 单腕部 |
-| 双臂 | delivery | 20D / 14D | `cam_high` + 左右腕部 |
+| 模式 | schema | state | raw action | model/wire action | 相机 |
+|---|---|---:|---:|---:|---|
+| 单臂 | joint | 7D | 7D absolute joint target | 7D | `cam_high` + 单腕部 |
+| 双臂 | joint | 14D | 14D absolute joint target | 14D | `cam_high` + 左右腕部 |
+| 单臂 | delivery | 10D absolute EEF | 10D absolute EEF target | 7D current-anchored delta | `cam_high` + 单腕部 |
+| 双臂 | delivery | 20D absolute EEF | 20D absolute EEF target | 14D current-anchored delta | `cam_high` + 左右腕部 |
 
-双臂 state/action 永远按 `left + right` 拼接。`joint` 每臂为 6 个关节角
-加夹爪开度；`delivery` 每臂 state 为 base-frame xyz、rotation-6D 和夹爪
-闭合比例，action 为 base-frame EEF 增量和绝对夹爪目标。
+双臂向量永远按 `left + right` 拼接。v3 `joint` 每臂为 6 个关节角加
+`gripper_opening_fraction`；v3 `delivery` 每臂 state/raw action 均使用
+base-frame xyz、rotation-6D 和绝对夹爪开口比例。夹爪统一为 `0=闭合、1=张开`。
+训练边界才把 10D absolute EEF target 转为 7D current-anchored
+`Δxyz + Δrotvec + absolute gripper`，同一 action chunk 的所有行共享同一个当前观测 anchor。
 
 动作来源必须区分：
 
 - `collect_output_arm.py` / `collect_gui.py` 只读输出臂反馈，无法看到遥操命令；
-  joint action 标记为下一帧实测 qpos，delivery action 由相邻 EEF state 推导，
-  都是 `action_alignment=next_observation`、`action_offset=1`。
-- `teleop_single.py` / `teleop.py` 记录 `state=slave measured qpos`、
-  `action=master qpos command`，是更推荐的遥操 joint 数据，使用
-  `action_source=master_joint_feedback`、`same_step_command`、`action_offset=0`。
+  joint action 标记为下一帧实测绝对关节目标，delivery raw action 保存下一帧
+  实测 absolute EEF target；两者均明确标为 fallback，并使用
+  `action_alignment=next_observation`、`action_offset=1`。
+- `teleop_single.py` / `teleop.py` 的 Joint 模式仍记录主臂映射后的同周期
+  joint target；Delivery 模式不读取主臂 EEF pose，而是使用“下一帧从臂实测
+  EEF pose + 当前周期主臂 gripper opening fraction”。对应
+  `action_alignment=next_observation_pose_same_step_gripper`、`action_offset=1`，
+  因此不需要主从 EEF 空间标定。
+
+默认时序固定为：采集/模型动作/机器人控制 `20 Hz`，模型异步推理启动约
+`4 Hz`。每个预测目标的时间为 `t_obs + (i+1)×0.05 s`。推理和传输约
+200 ms 时，控制线程继续消费上一条 chunk；新结果到达后按当前时间和执行器
+延迟动态丢弃过时目标，再用默认 3 步位姿融合切入新 chunk。夹爪独立做低通、
+迟滞和连续预测确认，不参与 old/new 位姿线性融合。
+OpenPI 默认输出 50 步，执行客户端要求至少 16 步，推理期间不会停下控制等待结果。
 
 导出前验收：
 
@@ -91,7 +104,7 @@ python export_lerobot.py \
 ```
 
 导出使用 `instruction` 写入 LeRobot `meta/tasks.jsonl`。完整字段和动作语义见
-`PIPER_DATA_CONTRACT.md`。
+`PIPER_DATA_CONTRACT.md` 和 `PI05_PIPER_7D_10D_DATA_ACTION_DESIGN.md`。
 
 ### Collection UI backend
 

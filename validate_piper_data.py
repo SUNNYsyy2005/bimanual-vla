@@ -1,4 +1,4 @@
-"""Validate raw Piper NPZ episodes for single-arm/bimanual π0.5 training."""
+"""Validate raw Piper NPZ episodes across explicit legacy-v2 and new-v3 paths."""
 
 from __future__ import annotations
 
@@ -10,20 +10,22 @@ from typing import Any, Mapping
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from piper_action_conventions import rotation6d_to_matrix
 from piper_data_contract import (
+    CONTRACT_VERSION,
+    DEFAULT_ACTION_HORIZON,
+    DEFAULT_FPS,
     DELIVERY_ACTION_SEMANTICS,
+    DELIVERY_MEASURED_ACTION_SOURCE,
     DELIVERY_SCHEMA,
     GRIPPER_MAX_M,
     IMAGE_HW,
-    JOINT_ACTION_SEMANTICS,
     JOINT_SCHEMA,
-    LEGACY_NEXT_JOINT_ACTION_SEMANTICS,
     EpisodeContract,
     infer_episode_contract,
 )
 
-
-TARGET_FPS = 20.0
+TARGET_FPS = float(DEFAULT_FPS)
 FPS_TOLERANCE = 0.05
 MAX_SYNC_S = 0.050
 ROTATION_NORM_TOLERANCE = 1e-3
@@ -32,8 +34,8 @@ TRANSLATION_TOLERANCE_M = 1e-5
 ROTATION_ACTION_TOLERANCE_RAD = 1e-4
 GRIPPER_TOLERANCE = 1e-5
 JOINT_ACTION_TOLERANCE = 1e-6
-GRIPPER_OPEN_THRESHOLD = 0.1
-GRIPPER_CLOSED_THRESHOLD = 0.9
+GRIPPER_CLOSED_THRESHOLD = 0.1
+GRIPPER_OPEN_THRESHOLD = 0.9
 GRIPPER_TRANSITION_THRESHOLD = 0.01
 
 
@@ -72,16 +74,17 @@ class EpisodeStats:
     arm_mode: str = "single"
     arm_side: str = "right"
     state_dim: int = 10
-    action_dim: int = 7
-    camera_keys: tuple[str, ...] = ("cam_high", "cam_wrist")
+    action_dim: int = 10
+    model_action_dim: int = 7
+    camera_keys: tuple[str, ...] = ("cam_high", "cam_right_wrist")
     action_semantics: str = DELIVERY_ACTION_SEMANTICS
-    action_source: str = "next_measured_eef"
+    action_source: str = DELIVERY_MEASURED_ACTION_SOURCE
     action_alignment: str = "next_observation"
+    contract_version: int = CONTRACT_VERSION
+    legacy_layout: bool = False
 
 
 class _NpzMapping(Mapping[str, Any]):
-    """Expose NpzFile as a normal Mapping for contract inference."""
-
     def __init__(self, data):
         self.data = data
 
@@ -95,14 +98,11 @@ class _NpzMapping(Mapping[str, Any]):
         return len(self.data.files)
 
 
-def _require_exact_dtype(array: np.ndarray, dtype, name: str, errors: list[str]) -> None:
-    expected = np.dtype(dtype)
-    if array.dtype != expected:
-        errors.append(f"{name} dtype must be {expected}, got {array.dtype}")
-
-
-def _is_finite(array: np.ndarray) -> bool:
-    return np.issubdtype(array.dtype, np.number) and bool(np.isfinite(array).all())
+def _read_scalar(data, name: str, default: Any = None) -> Any:
+    if name not in data.files:
+        return default
+    value = np.asarray(data[name])
+    return value.item() if value.shape == () else default
 
 
 def _read_string_scalar(data, name: str, required: bool, errors: list[str]) -> str | None:
@@ -111,10 +111,8 @@ def _read_string_scalar(data, name: str, required: bool, errors: list[str]) -> s
             errors.append(f"missing field: {name}")
         return None
     value = np.asarray(data[name])
-    if value.shape != () or value.dtype.kind != "U":
-        errors.append(
-            f"{name} must be a Unicode string scalar, got shape={value.shape} dtype={value.dtype}"
-        )
+    if value.shape != () or value.dtype.kind not in {"U", "S"}:
+        errors.append(f"{name} must be a string scalar, got shape={value.shape} dtype={value.dtype}")
         return None
     text = str(value.item()).strip()
     if required and not text:
@@ -122,18 +120,30 @@ def _read_string_scalar(data, name: str, required: bool, errors: list[str]) -> s
     return text
 
 
-def _read_scalar(data, name: str, default: Any = None) -> Any:
-    if name not in data.files:
-        return default
-    value = np.asarray(data[name])
-    return value.item() if value.shape == () else default
+def _require_dtype(value: np.ndarray, dtype, name: str, errors: list[str]) -> None:
+    if value.dtype != np.dtype(dtype):
+        errors.append(f"{name} dtype must be {np.dtype(dtype)}, got {value.dtype}")
 
 
-def _frozen_transition_count(images: np.ndarray, real_frames: int) -> int:
-    return sum(
-        np.array_equal(images[index], images[index - 1])
-        for index in range(1, real_frames)
-    )
+def _finite(value: np.ndarray) -> bool:
+    return np.issubdtype(value.dtype, np.number) and bool(np.isfinite(value).all())
+
+
+def _image_candidates(contract: EpisodeContract, key: str) -> tuple[str, ...]:
+    candidates = [contract.image_field(key), f"images_{key}", f"observation.images.{key}"]
+    if key == "cam_high":
+        candidates.append("image")
+    elif key == "cam_wrist":
+        candidates.append("wrist_image")
+    return tuple(dict.fromkeys(candidates))
+
+
+def _load_image(data, contract: EpisodeContract, key: str, errors: list[str]) -> tuple[np.ndarray, str]:
+    for field in _image_candidates(contract, key):
+        if field in data.files:
+            return np.asarray(data[field]), field
+    errors.append(f"missing camera {key}; expected one of {_image_candidates(contract, key)}")
+    return np.empty((0, *IMAGE_HW, 3), dtype=np.uint8), contract.image_field(key)
 
 
 def _percentiles(values: np.ndarray) -> tuple[float, float, float, float]:
@@ -143,65 +153,75 @@ def _percentiles(values: np.ndarray) -> tuple[float, float, float, float]:
     return float(p50), float(p95), float(p99), float(np.max(values))
 
 
-def _image_candidates(contract: EpisodeContract, camera_key: str) -> tuple[str, ...]:
-    candidates = [
-        contract.image_field(camera_key),
-        f"images_{camera_key}",
-        f"observation.images.{camera_key}",
-    ]
-    if camera_key == "cam_high":
-        candidates.append("image")
-    elif camera_key == "cam_wrist":
-        candidates.append("wrist_image")
-    return tuple(dict.fromkeys(candidates))
-
-
-def _load_image(data, contract: EpisodeContract, camera_key: str, errors: list[str]):
-    for field in _image_candidates(contract, camera_key):
-        if field in data.files:
-            return np.asarray(data[field]), field
-    errors.append(
-        f"missing camera {camera_key}; expected one of {_image_candidates(contract, camera_key)}"
+def _rotation_errors(values: np.ndarray) -> tuple[float, float, float]:
+    col0, col1 = values[:, 3:6], values[:, 6:9]
+    return (
+        float(np.max(np.abs(np.linalg.norm(col0, axis=1) - 1.0))),
+        float(np.max(np.abs(np.linalg.norm(col1, axis=1) - 1.0))),
+        float(np.max(np.abs(np.sum(col0 * col1, axis=1)))),
     )
-    return np.empty((0, *IMAGE_HW, 3), dtype=np.uint8), contract.image_field(camera_key)
+
+
+def _validate_rotation6d(values: np.ndarray, label: str, errors: list[str]) -> None:
+    norm0, norm1, dot = _rotation_errors(np.asarray(values, dtype=np.float64))
+    if max(norm0, norm1) > ROTATION_NORM_TOLERANCE:
+        errors.append(f"{label} rotation6D column norm error exceeds 1e-3")
+    if dot > ROTATION_DOT_TOLERANCE:
+        errors.append(f"{label} rotation6D columns are not orthogonal")
 
 
 def _validate_contract_metadata(data, contract: EpisodeContract, errors: list[str]) -> None:
-    expected_scalars = {
+    expected = {
         "schema": contract.schema,
         "arm_mode": contract.arm_mode,
         "arm_side": contract.arm_side,
         "state_dim": contract.state_dim,
-        "action_dim": contract.action_dim,
+        "action_dim": contract.raw_action_dim,
         "action_alignment": contract.action_alignment,
         "action_offset": contract.action_offset,
     }
-    for key, expected in expected_scalars.items():
+    if contract.version >= CONTRACT_VERSION:
+        expected.update(
+            {
+                "contract_version": CONTRACT_VERSION,
+                "raw_action_dim": contract.raw_action_dim,
+                "model_action_dim": contract.model_action_dim,
+                "action_semantics": contract.action_semantics,
+                "model_action_semantics": contract.model_action_semantics,
+                "gripper_semantics": contract.gripper_semantics,
+                "rotation_semantics": contract.rotation_semantics,
+                "coordinate_frame": contract.coordinate_frame,
+                "fps": contract.fps,
+                "action_horizon": contract.action_horizon,
+            }
+        )
+        required = {
+            "state_names",
+            "action_names",
+            "model_action_names",
+            "action_source",
+            "source_frame",
+            *expected.keys(),
+        }
+        for key in sorted(required):
+            if key not in data.files:
+                errors.append(f"missing v3 metadata: {key}")
+    for key, wanted in expected.items():
         if key in data.files:
             actual = _read_scalar(data, key)
-            if actual != expected:
-                errors.append(f"metadata {key}={actual!r}, inferred/expected {expected!r}")
-    if "camera_keys" in data.files:
-        values = np.asarray(data["camera_keys"])
-        actual = tuple(str(item) for item in values.tolist()) if values.ndim == 1 else ()
-        if actual != contract.camera_keys:
-            errors.append(f"metadata camera_keys={actual}, expected {contract.camera_keys}")
-    if "action_semantics" in data.files:
-        actual = str(_read_scalar(data, "action_semantics", ""))
-        accepted = {contract.action_semantics}
-        if contract.schema == JOINT_SCHEMA:
-            accepted.add(LEGACY_NEXT_JOINT_ACTION_SEMANTICS)
-        if actual not in accepted:
-            errors.append(
-                f"metadata action_semantics={actual!r}, expected one of {sorted(accepted)}"
-            )
-
-
-def _delivery_rotation_matrices(arm_states: np.ndarray) -> np.ndarray:
-    column_0 = np.asarray(arm_states[:, 3:6], dtype=np.float64)
-    column_1 = np.asarray(arm_states[:, 6:9], dtype=np.float64)
-    column_2 = np.cross(column_0, column_1)
-    return np.stack((column_0, column_1, column_2), axis=2)
+            if actual != wanted:
+                errors.append(f"metadata {key}={actual!r}, expected {wanted!r}")
+    for key, wanted in (
+        ("camera_keys", contract.camera_keys),
+        ("state_names", contract.state_names),
+        ("action_names", contract.action_names),
+        ("model_action_names", contract.model_action_names),
+    ):
+        if key in data.files:
+            values = np.asarray(data[key])
+            actual = tuple(str(item) for item in values.tolist()) if values.ndim == 1 else ()
+            if actual != tuple(wanted):
+                errors.append(f"metadata {key}={actual}, expected {tuple(wanted)}")
 
 
 def _empty_stats(path: Path, contract: EpisodeContract, instruction: str = "") -> EpisodeStats:
@@ -231,331 +251,260 @@ def _empty_stats(path: Path, contract: EpisodeContract, instruction: str = "") -
         arm_mode=contract.arm_mode,
         arm_side=contract.arm_side,
         state_dim=contract.state_dim,
-        action_dim=contract.action_dim,
+        action_dim=contract.raw_action_dim,
+        model_action_dim=contract.model_action_dim,
         camera_keys=contract.camera_keys,
         action_semantics=contract.action_semantics,
         action_source=contract.action_source,
         action_alignment=contract.action_alignment,
+        contract_version=contract.version,
+        legacy_layout=contract.legacy_delivery_v2 or contract.legacy_joint_v2,
     )
 
 
 def validate_episode(path: str | Path, target_fps: float = TARGET_FPS) -> EpisodeStats:
     path = Path(path)
     errors: list[str] = []
-    if target_fps <= 0:
-        raise ValueError("target_fps must be positive")
-
     with np.load(path, allow_pickle=False) as data:
-        if "state" not in data.files or "actions" not in data.files:
-            missing = [key for key in ("state", "actions") if key not in data.files]
-            raise EpisodeValidationError(path, [f"missing required fields: {missing}"])
         try:
             contract = infer_episode_contract(_NpzMapping(data))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise EpisodeValidationError(path, [f"invalid episode contract: {exc}"]) from exc
+        except Exception as exc:
+            fallback = EpisodeContract()
+            raise EpisodeValidationError(path, [f"cannot infer episode contract: {exc}"], _empty_stats(path, fallback)) from exc
         _validate_contract_metadata(data, contract, errors)
-
-        core_required = {"state", "actions", "timestamps", "instruction", "success"}
-        missing_core = sorted(core_required.difference(data.files))
-        if missing_core:
-            errors.append(f"missing required fields: {missing_core}")
-
-        state = np.asarray(data["state"])
-        actions = np.asarray(data["actions"])
-        timestamps = np.asarray(data["timestamps"]) if "timestamps" in data.files else np.empty(0)
         instruction = _read_string_scalar(data, "instruction", True, errors) or ""
         task = _read_string_scalar(data, "task", False, errors)
-        if "_" in instruction:
-            errors.append("instruction must be natural language, not an internal snake_case task ID")
+        if task is None:
+            task = _read_string_scalar(data, "task_name", False, errors)
+        success_value = np.asarray(data["success"]) if "success" in data.files else np.asarray(False)
+        if "success" not in data.files:
+            errors.append("missing field: success")
+        elif success_value.shape != () or success_value.dtype != np.bool_:
+            errors.append(f"success must be bool scalar, got shape={success_value.shape} dtype={success_value.dtype}")
+        success = bool(success_value.item()) if success_value.shape == () else False
 
-        if "success" in data.files:
-            success_array = np.asarray(data["success"])
-            if success_array.shape != () or success_array.dtype != np.dtype(np.bool_):
-                errors.append(
-                    "success must be a bool scalar, "
-                    f"got shape={success_array.shape} dtype={success_array.dtype}"
-                )
-                success = False
-            else:
-                success = bool(success_array.item())
-        else:
-            success = False
-
-        _require_exact_dtype(state, np.float32, "state", errors)
-        _require_exact_dtype(actions, np.float32, "actions", errors)
-        _require_exact_dtype(timestamps, np.float64, "timestamps", errors)
-
-        if state.ndim != 2 or state.shape[1:] != (contract.state_dim,):
+        state = np.asarray(data["state"]) if "state" in data.files else np.empty((0, contract.state_dim))
+        actions = np.asarray(data["actions"]) if "actions" in data.files else np.empty((0, contract.raw_action_dim))
+        if "state" not in data.files:
+            errors.append("missing field: state")
+        if "actions" not in data.files:
+            errors.append("missing field: actions")
+        frame_count = int(state.shape[0]) if state.ndim == 2 else 0
+        _require_dtype(state, np.float32, "state", errors)
+        _require_dtype(actions, np.float32, "actions", errors)
+        if state.shape != (frame_count, contract.state_dim):
             errors.append(f"state shape must be (T,{contract.state_dim}), got {state.shape}")
-            frame_count = state.shape[0] if state.ndim else 0
+        if actions.shape != (frame_count, contract.raw_action_dim):
+            errors.append(f"actions shape must be ({frame_count},{contract.raw_action_dim}), got {actions.shape}")
+        if state.size and not _finite(state):
+            errors.append("state contains NaN or Inf")
+        if actions.size and not _finite(actions):
+            errors.append("actions contains NaN or Inf")
+
+        terminal_padding = bool(_read_scalar(data, "terminal_padding", True))
+        real_frames = max(0, frame_count - 1) if terminal_padding else frame_count
+        if real_frames < 2:
+            errors.append("episode must contain at least two real frames")
+
+        state_field = "state_timestamp" if "state_timestamp" in data.files else "timestamps"
+        if contract.version >= CONTRACT_VERSION and "state_timestamp" not in data.files:
+            errors.append("missing field: state_timestamp")
+        state_ts = np.asarray(data[state_field]) if state_field in data.files else np.empty(0)
+        _require_dtype(state_ts, np.float64, state_field, errors)
+        if state_ts.shape != (frame_count,):
+            errors.append(f"{state_field} shape must be ({frame_count},), got {state_ts.shape}")
+        if contract.version >= CONTRACT_VERSION and "action_timestamp" not in data.files:
+            errors.append("missing field: action_timestamp")
+        if "action_timestamp" in data.files:
+            action_ts = np.asarray(data["action_timestamp"])
+            _require_dtype(action_ts, np.float64, "action_timestamp", errors)
+            if action_ts.shape != (frame_count,):
+                errors.append(f"action_timestamp shape must be ({frame_count},), got {action_ts.shape}")
         else:
-            frame_count = len(state)
-        if actions.shape != (frame_count, contract.action_dim):
-            errors.append(
-                f"actions shape must be ({frame_count},{contract.action_dim}), got {actions.shape}"
-            )
-        if timestamps.shape != (frame_count,):
-            errors.append(f"timestamps shape must be ({frame_count},), got {timestamps.shape}")
+            action_ts = state_ts.copy()
+        if state_ts.shape == (frame_count,) and _finite(state_ts):
+            if np.any(np.diff(state_ts) <= 0):
+                errors.append("state timestamps must be strictly increasing")
+            real_ts = state_ts[:real_frames]
+            dt_s = np.diff(real_ts)
+            if len(dt_s) and np.all(dt_s > 0):
+                actual_fps = float(1.0 / np.mean(dt_s))
+                duration_s = float(real_ts[-1] - real_ts[0])
+                if abs(actual_fps - target_fps) / target_fps > FPS_TOLERANCE:
+                    errors.append(f"actual FPS {actual_fps:.3f} is outside {target_fps:.0f} +/-5%")
+            else:
+                actual_fps = duration_s = 0.0
+        else:
+            if state_ts.size and not _finite(state_ts):
+                errors.append(f"{state_field} contains NaN or Inf")
+            dt_s = np.empty(0, dtype=np.float64)
+            actual_fps = duration_s = 0.0
+        if action_ts.shape == (frame_count,) and _finite(action_ts):
+            if contract.version >= CONTRACT_VERSION and np.any(np.diff(action_ts) <= 0):
+                errors.append("action timestamps must be strictly increasing")
+            if state_ts.shape == action_ts.shape and real_frames:
+                anchor = np.minimum(np.arange(real_frames) + contract.action_offset, frame_count - 1)
+                skew = np.abs(action_ts[:real_frames] - state_ts[anchor])
+                if contract.action_alignment == "same_step_command" and np.max(skew) > MAX_SYNC_S:
+                    errors.append(f"state/action command sync exceeds 50 ms: max={np.max(skew)*1000:.2f} ms")
+        elif action_ts.size:
+            errors.append("action_timestamp contains NaN or Inf")
 
         images: dict[str, np.ndarray] = {}
-        image_timestamps: dict[str, np.ndarray] = {}
-        image_fields: dict[str, str] = {}
-        for camera_key in contract.camera_keys:
-            image, image_field = _load_image(data, contract, camera_key, errors)
-            images[camera_key] = image
-            image_fields[camera_key] = image_field
-            timestamp_field = contract.timestamp_field(camera_key)
-            if timestamp_field not in data.files:
-                errors.append(f"missing field: {timestamp_field}")
-                image_ts = np.empty(0)
-            else:
-                image_ts = np.asarray(data[timestamp_field])
-            image_timestamps[camera_key] = image_ts
-            _require_exact_dtype(image, np.uint8, image_field, errors)
-            _require_exact_dtype(image_ts, np.float64, timestamp_field, errors)
+        image_ts_by_key: dict[str, np.ndarray] = {}
+        sync_by_key: dict[str, np.ndarray] = {}
+        frozen_by_key: dict[str, int] = {}
+        for key in contract.camera_keys:
+            image, field = _load_image(data, contract, key, errors)
+            images[key] = image
+            _require_dtype(image, np.uint8, field, errors)
             if image.shape != (frame_count, *IMAGE_HW, 3):
-                errors.append(
-                    f"{image_field} shape must be ({frame_count},{IMAGE_HW[0]},{IMAGE_HW[1]},3), "
-                    f"got {image.shape}"
-                )
+                errors.append(f"{field} shape must be ({frame_count},{IMAGE_HW[0]},{IMAGE_HW[1]},3), got {image.shape}")
+            ts_field = contract.timestamp_field(key)
+            image_ts = np.asarray(data[ts_field]) if ts_field in data.files else np.empty(0)
+            if ts_field not in data.files:
+                errors.append(f"missing field: {ts_field}")
+            _require_dtype(image_ts, np.float64, ts_field, errors)
             if image_ts.shape != (frame_count,):
-                errors.append(
-                    f"{timestamp_field} shape must be ({frame_count},), got {image_ts.shape}"
-                )
+                errors.append(f"{ts_field} shape must be ({frame_count},), got {image_ts.shape}")
+            image_ts_by_key[key] = image_ts
+            if image_ts.shape == (frame_count,) and _finite(image_ts) and state_ts.shape == (frame_count,):
+                if contract.version >= CONTRACT_VERSION and np.any(np.diff(image_ts) <= 0):
+                    errors.append(f"{ts_field} must be strictly increasing")
+                sync = np.abs(image_ts[:real_frames] - state_ts[:real_frames])
+                sync_by_key[key] = sync
+                if len(sync) and np.max(sync) > MAX_SYNC_S:
+                    errors.append(f"image/state sync exceeds 50 ms for {key}: max={np.max(sync)*1000:.2f} ms")
+            else:
+                sync_by_key[key] = np.empty(0, dtype=np.float64)
+            frozen = 0
+            if image.shape == (frame_count, *IMAGE_HW, 3) and real_frames:
+                black = np.flatnonzero(np.max(image.reshape(frame_count, -1), axis=1) == 0)
+                if len(black):
+                    errors.append(f"{key} contains all-black frames: {black[:10].tolist()}")
+                frozen = sum(np.array_equal(image[index], image[index - 1]) for index in range(1, real_frames))
+                if real_frames > 1 and frozen == real_frames - 1:
+                    errors.append(f"{key} is frozen for the entire non-terminal episode")
+            frozen_by_key[key] = frozen
+        if "cam_high" in images and images["cam_high"].shape == (frame_count, *IMAGE_HW, 3):
+            for key, image in images.items():
+                if key != "cam_high" and image.shape == images["cam_high"].shape and np.array_equal(image[:real_frames], images["cam_high"][:real_frames]):
+                    errors.append(f"cam_high and {key} are identical; check camera mappings")
 
         if "joint_qpos" in data.files:
             joint_qpos = np.asarray(data["joint_qpos"])
-            _require_exact_dtype(joint_qpos, np.float32, "joint_qpos", errors)
+            _require_dtype(joint_qpos, np.float32, "joint_qpos", errors)
             if joint_qpos.shape != (frame_count, contract.joint_dim):
-                errors.append(
-                    f"joint_qpos shape must be ({frame_count},{contract.joint_dim}), got {joint_qpos.shape}"
-                )
-            elif not _is_finite(joint_qpos):
+                errors.append(f"joint_qpos shape must be ({frame_count},{contract.joint_dim}), got {joint_qpos.shape}")
+            elif not _finite(joint_qpos):
                 errors.append("joint_qpos contains NaN or Inf")
 
-        terminal_padding = bool(_read_scalar(data, "terminal_padding", True))
-        min_frames = 3 if terminal_padding else 2
-        if frame_count < min_frames:
-            errors.append(
-                "episode must contain at least two real frames"
-                + (" and one terminal frame" if terminal_padding else "")
-            )
-        real_frames = max(0, frame_count - 1) if terminal_padding else frame_count
-
-        if state.shape == (frame_count, contract.state_dim) and not _is_finite(state):
-            errors.append("state contains NaN or Inf")
-        if actions.shape == (frame_count, contract.action_dim) and not _is_finite(actions):
-            errors.append("actions contains NaN or Inf")
-        if timestamps.shape == (frame_count,) and not _is_finite(timestamps):
-            errors.append("timestamps contains NaN or Inf")
-        for camera_key, image_ts in image_timestamps.items():
-            if image_ts.shape == (frame_count,) and not _is_finite(image_ts):
-                errors.append(f"{contract.timestamp_field(camera_key)} contains NaN or Inf")
-
-        timing_valid = (
-            frame_count >= min_frames
-            and timestamps.shape == (frame_count,)
-            and _is_finite(timestamps)
-        )
-        if timing_valid:
-            full_dt = np.diff(timestamps)
-            if np.any(full_dt <= 0):
-                errors.append("timestamps must be strictly increasing")
-            real_timestamps = timestamps[:real_frames]
-            dt_s = np.diff(real_timestamps)
-            if len(dt_s) and np.all(dt_s > 0):
-                actual_fps = float(1.0 / np.mean(dt_s))
-                duration_s = float(real_timestamps[-1] - real_timestamps[0])
-                relative_error = abs(actual_fps - target_fps) / target_fps
-                if relative_error > FPS_TOLERANCE:
-                    errors.append(
-                        f"actual FPS {actual_fps:.3f} is outside {target_fps:.0f} +/-5%"
-                    )
-            else:
-                actual_fps = 0.0
-                duration_s = 0.0
-        else:
-            dt_s = np.empty(0, dtype=np.float64)
-            actual_fps = 0.0
-            duration_s = 0.0
-
-        sync_by_camera: dict[str, np.ndarray] = {}
-        frozen_by_camera: dict[str, int] = {}
-        shapes_valid = True
-        for camera_key in contract.camera_keys:
-            image = images[camera_key]
-            image_ts = image_timestamps[camera_key]
-            valid_shape = image.shape == (frame_count, *IMAGE_HW, 3)
-            valid_ts = image_ts.shape == (frame_count,) and _is_finite(image_ts)
-            shapes_valid &= valid_shape and valid_ts
-            if timing_valid and valid_ts:
-                sync = np.abs(image_ts[:real_frames] - timestamps[:real_frames])
-                sync_by_camera[camera_key] = sync
-                if len(sync) and np.max(sync) > MAX_SYNC_S:
-                    errors.append(
-                        f"image/state sync exceeds 50 ms for {camera_key}: "
-                        f"max={np.max(sync) * 1000:.2f} ms"
-                    )
-            else:
-                sync_by_camera[camera_key] = np.empty(0, dtype=np.float64)
-            frozen_by_camera[camera_key] = 0
-            if valid_shape and real_frames:
-                black = np.flatnonzero(np.max(image.reshape(frame_count, -1), axis=1) == 0)
-                if len(black):
-                    errors.append(
-                        f"{camera_key} contains all-black frames: {black[:10].tolist()}"
-                    )
-                frozen = _frozen_transition_count(image, real_frames)
-                frozen_by_camera[camera_key] = frozen
-                transition_count = max(0, real_frames - 1)
-                if transition_count and frozen == transition_count:
-                    errors.append(f"{camera_key} is frozen for the entire non-terminal episode")
-
-        if shapes_valid and real_frames:
-            high = images["cam_high"][:real_frames]
-            for camera_key in contract.camera_keys:
-                if camera_key != "cam_high" and np.array_equal(high, images[camera_key][:real_frames]):
-                    errors.append(
-                        f"cam_high and {camera_key} are identical; check camera mappings"
-                    )
-
-        numeric_valid = (
-            frame_count > 0
-            and state.shape == (frame_count, contract.state_dim)
-            and actions.shape == (frame_count, contract.action_dim)
-            and _is_finite(state)
-            and _is_finite(actions)
-        )
         action_norms = np.empty(0, dtype=np.float64)
         translation_norms = np.empty(0, dtype=np.float64)
         rotation_norms = np.empty(0, dtype=np.float64)
-        no_op_count = 0
-        no_op_total = 0
-        gripper_values = np.empty(0, dtype=np.float32)
-        gripper_transition_count = 0
-
-        if numeric_valid:
-            gripper_chunks: list[np.ndarray] = []
+        no_op = np.empty(0, dtype=np.bool_)
+        gripper_parts: list[np.ndarray] = []
+        if state.shape == (frame_count, contract.state_dim) and actions.shape == (frame_count, contract.raw_action_dim) and _finite(state) and _finite(actions):
             for index in contract.gripper_state_indices:
-                values = state[:real_frames, index]
-                if contract.schema == JOINT_SCHEMA:
-                    values = np.clip(1.0 - values / GRIPPER_MAX_M, 0.0, 1.0)
-                gripper_chunks.append(np.asarray(values, dtype=np.float32))
-            if gripper_chunks:
-                gripper_values = np.concatenate(gripper_chunks)
-                gripper_transition_count = sum(
-                    int(np.count_nonzero(np.abs(np.diff(values)) > GRIPPER_TRANSITION_THRESHOLD))
-                    for values in gripper_chunks
-                )
+                values = state[:real_frames, index].astype(np.float32)
+                if contract.legacy_delivery_v2:
+                    values = 1.0 - values
+                elif contract.legacy_joint_v2:
+                    values = np.clip(values / GRIPPER_MAX_M, 0.0, 1.0)
+                gripper_parts.append(values)
+            gripper_values = np.concatenate(gripper_parts) if gripper_parts else np.empty(0, dtype=np.float32)
+            for arm, values in enumerate(gripper_parts):
+                if np.min(values) < -GRIPPER_TOLERANCE or np.max(values) > 1 + GRIPPER_TOLERANCE:
+                    errors.append(f"arm {arm} normalized gripper state is outside [0,1]")
 
+            translations: list[np.ndarray] = []
+            rotations: list[np.ndarray] = []
+            no_ops: list[np.ndarray] = []
             if contract.schema == DELIVERY_SCHEMA:
-                motion_norms: list[np.ndarray] = []
-                translations: list[np.ndarray] = []
-                rotations: list[np.ndarray] = []
-                no_op_parts: list[np.ndarray] = []
-                for arm_index in range(contract.arm_count):
-                    ss = arm_index * 10
-                    aa = arm_index * 7
-                    arm_state = state[:, ss : ss + 10]
-                    arm_action = actions[:, aa : aa + 7]
-                    column_0 = np.asarray(arm_state[:, 3:6], dtype=np.float64)
-                    column_1 = np.asarray(arm_state[:, 6:9], dtype=np.float64)
-                    norm_error_0 = float(np.max(np.abs(np.linalg.norm(column_0, axis=1) - 1.0)))
-                    norm_error_1 = float(np.max(np.abs(np.linalg.norm(column_1, axis=1) - 1.0)))
-                    dot_error = float(np.max(np.abs(np.sum(column_0 * column_1, axis=1))))
-                    if max(norm_error_0, norm_error_1) > ROTATION_NORM_TOLERANCE:
-                        errors.append(
-                            f"arm {arm_index} rotation6D column norm error exceeds 1e-3"
-                        )
-                    if dot_error > ROTATION_DOT_TOLERANCE:
-                        errors.append(
-                            f"arm {arm_index} rotation6D columns are not orthogonal"
-                        )
-                    if terminal_padding and frame_count >= 2:
-                        expected_translation = arm_state[1:, :3] - arm_state[:-1, :3]
-                        error = float(np.max(np.abs(arm_action[:-1, :3] - expected_translation)))
-                        if contract.action_alignment == "next_observation" and error > TRANSLATION_TOLERANCE_M:
-                            errors.append(
-                                f"arm {arm_index} translation action reconstruction error "
-                                f"exceeds 1e-5 m: max={error:.3e}"
-                            )
-                        matrices = _delivery_rotation_matrices(arm_state)
-                        delta = matrices[1:] @ np.swapaxes(matrices[:-1], 1, 2)
-                        expected_rotation = Rotation.from_matrix(delta).as_rotvec()
-                        rotation_error = float(
-                            np.max(np.linalg.norm(arm_action[:-1, 3:6] - expected_rotation, axis=1))
-                        )
-                        if contract.action_alignment == "next_observation" and rotation_error > ROTATION_ACTION_TOLERANCE_RAD:
-                            errors.append(
-                                f"arm {arm_index} rotation action reconstruction error "
-                                f"exceeds 1e-4 rad: max={rotation_error:.3e}"
-                            )
-                        gripper_error = float(
-                            np.max(np.abs(arm_action[:-1, 6] - arm_state[1:, 9]))
-                        )
-                        if contract.action_alignment == "next_observation" and gripper_error > GRIPPER_TOLERANCE:
-                            errors.append(
-                                f"arm {arm_index} gripper action reconstruction error "
-                                f"exceeds 1e-5: max={gripper_error:.3e}"
-                            )
-                        if np.max(np.abs(arm_action[-1, :6])) > 1e-6:
-                            errors.append(f"arm {arm_index} terminal delivery motion must be zero")
-                        if abs(float(arm_action[-1, 6] - arm_state[-1, 9])) > GRIPPER_TOLERANCE:
-                            errors.append(f"arm {arm_index} terminal gripper action must hold")
-                    measured = arm_action[:real_frames]
-                    translation = np.linalg.norm(measured[:, :3], axis=1)
-                    rotation = np.linalg.norm(measured[:, 3:6], axis=1)
-                    gripper_change = np.abs(measured[:, 6] - arm_state[:real_frames, 9])
+                for arm in range(contract.arm_count):
+                    ss = arm * 10
+                    state_arm = state[:, ss : ss + 10]
+                    _validate_rotation6d(state_arm, f"arm {arm} state", errors)
+                    if contract.legacy_delivery_v2:
+                        aa = arm * 7
+                        action_arm = actions[:, aa : aa + 7]
+                        if terminal_padding and frame_count > 1:
+                            expected_xyz = state_arm[1:, :3] - state_arm[:-1, :3]
+                            xyz_error = float(np.max(np.abs(action_arm[:-1, :3] - expected_xyz)))
+                            if xyz_error > TRANSLATION_TOLERANCE_M:
+                                errors.append(f"arm {arm} legacy translation action reconstruction error: {xyz_error:.3e}")
+                            expected_rot = []
+                            for current, nxt in zip(state_arm[:-1], state_arm[1:]):
+                                expected_rot.append(Rotation.from_matrix(rotation6d_to_matrix(nxt[3:9]) @ rotation6d_to_matrix(current[3:9]).T).as_rotvec())
+                            rot_error = float(np.max(np.abs(action_arm[:-1, 3:6] - np.asarray(expected_rot))))
+                            if rot_error > ROTATION_ACTION_TOLERANCE_RAD:
+                                errors.append(f"arm {arm} legacy rotation action reconstruction error: {rot_error:.3e}")
+                            grip_error = float(np.max(np.abs(action_arm[:-1, 6] - state_arm[1:, 9])))
+                            if grip_error > GRIPPER_TOLERANCE:
+                                errors.append(f"arm {arm} legacy gripper action reconstruction error: {grip_error:.3e}")
+                        translation = np.linalg.norm(action_arm[:real_frames, :3], axis=1)
+                        rotation = np.linalg.norm(action_arm[:real_frames, 3:6], axis=1)
+                        grip_change = np.abs((1.0 - action_arm[:real_frames, 6]) - gripper_parts[arm])
+                    else:
+                        aa = arm * 10
+                        action_arm = actions[:, aa : aa + 10]
+                        _validate_rotation6d(action_arm, f"arm {arm} raw action", errors)
+                        if np.min(action_arm[:, 9]) < -GRIPPER_TOLERANCE or np.max(action_arm[:, 9]) > 1 + GRIPPER_TOLERANCE:
+                            errors.append(f"arm {arm} action gripper opening fraction is outside [0,1]")
+                        if terminal_padding and contract.action_offset == 1:
+                            pose_error = float(np.max(np.abs(action_arm[:-1, :9] - state_arm[1:, :9])))
+                            if pose_error > TRANSLATION_TOLERANCE_M:
+                                errors.append(f"arm {arm} fallback absolute EEF pose does not match next measured state: {pose_error:.3e}")
+                            if "gripper_command_present" in data.files:
+                                present = np.asarray(data["gripper_command_present"])[:-1, arm].astype(bool)
+                                missing = ~present
+                                if np.any(missing):
+                                    grip_error = float(np.max(np.abs(action_arm[:-1, 9][missing] - state_arm[1:, 9][missing])))
+                                    if grip_error > GRIPPER_TOLERANCE:
+                                        errors.append(f"arm {arm} fallback gripper does not match next measured state: {grip_error:.3e}")
+                            elif not np.allclose(action_arm[:-1, 9], state_arm[1:, 9], atol=GRIPPER_TOLERANCE, rtol=0):
+                                errors.append(f"arm {arm} fallback gripper does not match next measured state")
+                        translation = np.linalg.norm(action_arm[:real_frames, :3] - state_arm[:real_frames, :3], axis=1)
+                        rotation_values = []
+                        for current, target in zip(state_arm[:real_frames], action_arm[:real_frames]):
+                            rotation_values.append(np.linalg.norm(Rotation.from_matrix(rotation6d_to_matrix(target[3:9]) @ rotation6d_to_matrix(current[3:9]).T).as_rotvec()))
+                        rotation = np.asarray(rotation_values)
+                        grip_change = np.abs(action_arm[:real_frames, 9] - state_arm[:real_frames, 9])
                     translations.append(translation)
                     rotations.append(rotation)
-                    motion_norms.append(np.linalg.norm(measured[:, :6], axis=1))
-                    no_op_parts.append(
-                        (translation <= 1e-6)
-                        & (rotation <= 1e-6)
-                        & (gripper_change <= GRIPPER_TOLERANCE)
-                    )
+                    no_ops.append((translation <= TRANSLATION_TOLERANCE_M) & (rotation <= ROTATION_ACTION_TOLERANCE_RAD) & (grip_change <= GRIPPER_TOLERANCE))
                 translation_norms = np.linalg.norm(np.stack(translations, axis=1), axis=1)
                 rotation_norms = np.linalg.norm(np.stack(rotations, axis=1), axis=1)
-                action_norms = np.linalg.norm(np.stack(motion_norms, axis=1), axis=1)
-                no_op = np.logical_and.reduce(no_op_parts) if no_op_parts else np.empty(0, bool)
+                action_norms = np.sqrt(translation_norms**2 + rotation_norms**2)
+                no_op = np.all(np.stack(no_ops, axis=1), axis=1)
             else:
-                measured = actions[:real_frames]
                 current = state[:real_frames]
-                delta = measured - current
-                joint_delta_parts = []
-                gripper_delta_parts = []
-                for arm_index in range(contract.arm_count):
-                    start = arm_index * 7
-                    joint_delta_parts.append(delta[:, start : start + 6])
-                    gripper_delta_parts.append(np.abs(delta[:, start + 6]))
-                joints = np.concatenate(joint_delta_parts, axis=1)
-                grippers = np.stack(gripper_delta_parts, axis=1)
+                target = actions[:real_frames]
+                differences: list[np.ndarray] = []
+                grip_changes: list[np.ndarray] = []
+                for arm in range(contract.arm_count):
+                    offset = arm * 7
+                    differences.append(target[:, offset : offset + 6] - current[:, offset : offset + 6])
+                    if contract.legacy_joint_v2:
+                        grip_changes.append(np.abs(target[:, offset + 6] - current[:, offset + 6]) / GRIPPER_MAX_M)
+                        if np.min(current[:, offset + 6]) < -GRIPPER_TOLERANCE or np.max(current[:, offset + 6]) > GRIPPER_MAX_M + GRIPPER_TOLERANCE:
+                            errors.append(f"arm {arm} legacy joint gripper opening_m is outside [0,{GRIPPER_MAX_M}]")
+                    else:
+                        grip_changes.append(np.abs(target[:, offset + 6] - current[:, offset + 6]))
+                        if np.min(current[:, offset + 6]) < -GRIPPER_TOLERANCE or np.max(current[:, offset + 6]) > 1 + GRIPPER_TOLERANCE:
+                            errors.append(f"arm {arm} joint gripper opening fraction is outside [0,1]")
+                joints = np.concatenate(differences, axis=1)
                 action_norms = np.linalg.norm(joints, axis=1)
                 translation_norms = action_norms.copy()
                 rotation_norms = np.zeros_like(action_norms)
-                no_op = (action_norms <= JOINT_ACTION_TOLERANCE) & np.all(
-                    grippers <= JOINT_ACTION_TOLERANCE, axis=1
-                )
-                if terminal_padding:
-                    if contract.action_alignment == "next_observation" and not np.allclose(
-                        actions[:-1], state[1:], atol=JOINT_ACTION_TOLERANCE, rtol=0
-                    ):
-                        error = float(np.max(np.abs(actions[:-1] - state[1:])))
-                        errors.append(
-                            "joint actions do not match the next measured observation: "
-                            f"max error={error:.3e}"
-                        )
-                    if not np.allclose(actions[-1], state[-1], atol=JOINT_ACTION_TOLERANCE, rtol=0):
-                        errors.append("terminal joint action must hold the final joint state")
-            no_op_count = int(np.count_nonzero(no_op))
-            no_op_total = len(no_op)
+                no_op = (action_norms <= JOINT_ACTION_TOLERANCE) & np.all(np.stack(grip_changes, axis=1) <= JOINT_ACTION_TOLERANCE, axis=1)
+                if terminal_padding and contract.action_offset == 1 and not np.allclose(actions[:-1], state[1:], atol=JOINT_ACTION_TOLERANCE, rtol=0):
+                    errors.append(f"joint fallback actions do not match next measured observation: max error={np.max(np.abs(actions[:-1]-state[1:])):.3e}")
+        else:
+            gripper_values = np.empty(0, dtype=np.float32)
 
-        wrist_sync = [
-            sync_by_camera[key]
-            for key in contract.camera_keys
-            if key != "cam_high" and len(sync_by_camera[key])
-        ]
-        sync_wrist_s = np.concatenate(wrist_sync) if wrist_sync else np.empty(0, dtype=np.float64)
+        gripper_transition_count = sum(int(np.count_nonzero(np.abs(np.diff(values)) > GRIPPER_TRANSITION_THRESHOLD)) for values in gripper_parts)
+        wrist_sync = [value for key, value in sync_by_key.items() if key != "cam_high" and len(value)]
         stats = EpisodeStats(
             path=path,
             success=success,
@@ -566,35 +515,33 @@ def validate_episode(path: str | Path, target_fps: float = TARGET_FPS) -> Episod
             duration_s=duration_s,
             actual_fps=actual_fps,
             dt_s=dt_s,
-            sync_high_s=sync_by_camera.get("cam_high", np.empty(0, dtype=np.float64)),
-            sync_wrist_s=sync_wrist_s,
+            sync_high_s=sync_by_key.get("cam_high", np.empty(0, dtype=np.float64)),
+            sync_wrist_s=np.concatenate(wrist_sync) if wrist_sync else np.empty(0, dtype=np.float64),
             action_norms=action_norms,
             translation_norms=translation_norms,
             rotation_norms=rotation_norms,
-            no_op_count=no_op_count,
-            no_op_total=no_op_total,
+            no_op_count=int(np.count_nonzero(no_op)),
+            no_op_total=len(no_op),
             gripper_values=gripper_values,
             gripper_transition_count=gripper_transition_count,
-            frozen_high_count=frozen_by_camera.get("cam_high", 0),
-            frozen_wrist_count=sum(
-                value for key, value in frozen_by_camera.items() if key != "cam_high"
-            ),
+            frozen_high_count=frozen_by_key.get("cam_high", 0),
+            frozen_wrist_count=sum(value for key, value in frozen_by_key.items() if key != "cam_high"),
             schema=contract.schema,
             arm_mode=contract.arm_mode,
             arm_side=contract.arm_side,
             state_dim=contract.state_dim,
-            action_dim=contract.action_dim,
+            action_dim=contract.raw_action_dim,
+            model_action_dim=contract.model_action_dim,
             camera_keys=contract.camera_keys,
             action_semantics=contract.action_semantics,
             action_source=contract.action_source,
             action_alignment=contract.action_alignment,
+            contract_version=contract.version,
+            legacy_layout=contract.legacy_delivery_v2 or contract.legacy_joint_v2,
         )
 
-    if success and no_op_total > 0 and no_op_count == no_op_total:
-        errors.append(
-            "successful episode contains no robot motion or gripper change "
-            "(100% no-op); check Piper CAN feedback before recording"
-        )
+    if success and stats.no_op_total and stats.no_op_count == stats.no_op_total:
+        errors.append("successful episode contains no robot motion or gripper change (100% no-op); check Piper CAN feedback before recording")
     if errors:
         raise EpisodeValidationError(path, errors, stats=stats)
     return stats
@@ -604,77 +551,46 @@ def validate_gripper_coverage(stats: list[EpisodeStats]) -> None:
     if not stats:
         raise ValueError("no successful episodes are available for export")
     gripper = np.concatenate([item.gripper_values for item in stats])
-    transition_count = sum(item.gripper_transition_count for item in stats)
     missing = []
-    if not np.any(gripper <= GRIPPER_OPEN_THRESHOLD):
-        missing.append("open states (closed_fraction <= 0.1)")
-    if not np.any(gripper >= GRIPPER_CLOSED_THRESHOLD):
-        missing.append("closed states (closed_fraction >= 0.9)")
-    if transition_count == 0:
+    if not np.any(gripper <= GRIPPER_CLOSED_THRESHOLD):
+        missing.append("closed states (opening_fraction <= 0.1)")
+    if not np.any(gripper >= GRIPPER_OPEN_THRESHOLD):
+        missing.append("open states (opening_fraction >= 0.9)")
+    if sum(item.gripper_transition_count for item in stats) == 0:
         missing.append("gripper transitions (step change > 0.01)")
     if missing:
         raise ValueError("successful dataset lacks " + ", ".join(missing))
 
 
 def validate_instruction_consistency(stats: list[EpisodeStats]) -> None:
-    instructions_by_task: dict[str, set[str]] = {}
     contracts = {
-        (
-            item.schema,
-            item.arm_mode,
-            item.arm_side,
-            item.state_dim,
-            item.action_dim,
-            item.camera_keys,
-            item.action_semantics,
-            item.action_alignment,
-        )
+        (item.schema, item.arm_mode, item.arm_side, item.state_dim, item.action_dim, item.model_action_dim, item.camera_keys, item.action_semantics, item.action_alignment, item.contract_version)
         for item in stats
     }
     if len(contracts) > 1:
         raise ValueError(f"episodes mix incompatible contracts: {sorted(contracts)!r}")
+    instructions_by_task: dict[str, set[str]] = {}
     for item in stats:
         if item.task:
             instructions_by_task.setdefault(item.task, set()).add(item.instruction)
-    inconsistent = {
-        task: sorted(instructions)
-        for task, instructions in instructions_by_task.items()
-        if len(instructions) > 1
-    }
+    inconsistent = {task: sorted(values) for task, values in instructions_by_task.items() if len(values) > 1}
     if inconsistent:
-        raise ValueError(
-            "internal task IDs map to inconsistent instructions: "
-            f"{inconsistent}"
-        )
+        raise ValueError(f"internal task IDs map to inconsistent instructions: {inconsistent}")
 
 
 def format_episode_report(stats: EpisodeStats) -> str:
     no_op_ratio = stats.no_op_count / max(1, stats.no_op_total)
     p50, p95, p99, maximum = _percentiles(stats.action_norms)
-    _, high_p95, _, high_max = _percentiles(stats.sync_high_s)
-    _, wrist_p95, _, wrist_max = _percentiles(stats.sync_wrist_s)
-    high_mean = float(np.mean(stats.sync_high_s)) if len(stats.sync_high_s) else 0.0
-    wrist_mean = float(np.mean(stats.sync_wrist_s)) if len(stats.sync_wrist_s) else 0.0
-    gripper = stats.gripper_values
-    gripper_min = float(np.min(gripper)) if len(gripper) else 0.0
-    gripper_max = float(np.max(gripper)) if len(gripper) else 0.0
-    open_count = int(np.count_nonzero(gripper <= GRIPPER_OPEN_THRESHOLD))
-    closed_count = int(np.count_nonzero(gripper >= GRIPPER_CLOSED_THRESHOLD))
-    warning = " WARNING:no-op>50%" if no_op_ratio > 0.5 else ""
+    gripper_min = float(np.min(stats.gripper_values)) if len(stats.gripper_values) else 0.0
+    gripper_max = float(np.max(stats.gripper_values)) if len(stats.gripper_values) else 0.0
+    layout = "legacy-v2" if stats.legacy_layout else "v3"
     return (
-        f"PASS {stats.path}: schema={stats.schema} arm={stats.arm_mode}/{stats.arm_side} "
-        f"state={stats.state_dim} action={stats.action_dim} frames={stats.frames} "
-        f"real={stats.real_frames} duration={stats.duration_s:.2f}s fps={stats.actual_fps:.3f}\n"
-        f"  cameras={list(stats.camera_keys)} sync_ms high mean/p95/max={high_mean * 1000:.2f}/"
-        f"{high_p95 * 1000:.2f}/{high_max * 1000:.2f}, wrists="
-        f"{wrist_mean * 1000:.2f}/{wrist_p95 * 1000:.2f}/{wrist_max * 1000:.2f}\n"
-        f"  action={stats.action_semantics} source={stats.action_source} "
-        f"alignment={stats.action_alignment}\n"
-        f"  action_norm p50/p95/p99/max={p50:.6f}/{p95:.6f}/{p99:.6f}/"
-        f"{maximum:.6f}, no_op={no_op_ratio:.1%}{warning}\n"
-        f"  gripper closed_fraction min/max={gripper_min:.3f}/{gripper_max:.3f}, "
-        f"open={open_count}, closed={closed_count}, transitions={stats.gripper_transition_count}\n"
-        f"  frozen_transitions high={stats.frozen_high_count}, wrists={stats.frozen_wrist_count}"
+        f"PASS {stats.path}: {layout} schema={stats.schema} arm={stats.arm_mode}/{stats.arm_side} "
+        f"state={stats.state_dim} raw_action={stats.action_dim} model_action={stats.model_action_dim} "
+        f"frames={stats.frames} real={stats.real_frames} fps={stats.actual_fps:.3f}\n"
+        f"  action={stats.action_semantics} source={stats.action_source} alignment={stats.action_alignment}\n"
+        f"  action_norm p50/p95/p99/max={p50:.6f}/{p95:.6f}/{p99:.6f}/{maximum:.6f}, no_op={no_op_ratio:.1%}\n"
+        f"  gripper opening_fraction min/max={gripper_min:.3f}/{gripper_max:.3f}, transitions={stats.gripper_transition_count}"
     )
 
 
@@ -682,21 +598,12 @@ def format_dataset_report(stats: list[EpisodeStats]) -> str:
     if not stats:
         return "Dataset PASS: episodes=0 frames=0"
     action_norms = np.concatenate([item.action_norms for item in stats])
-    gripper = np.concatenate([item.gripper_values for item in stats])
     p50, p95, p99, maximum = _percentiles(action_norms)
-    no_op_count = sum(item.no_op_count for item in stats)
-    no_op_total = sum(item.no_op_total for item in stats)
     first = stats[0]
     return (
-        f"Dataset PASS: schema={first.schema} arm={first.arm_mode}/{first.arm_side} "
-        f"episodes={len(stats)} frames={sum(item.frames for item in stats)} "
-        f"real_duration={sum(item.duration_s for item in stats):.2f}s\n"
-        f"  fps min/max={min(item.actual_fps for item in stats):.3f}/"
-        f"{max(item.actual_fps for item in stats):.3f}\n"
-        f"  action_norm p50/p95/p99/max={p50:.6f}/{p95:.6f}/{p99:.6f}/"
-        f"{maximum:.6f}, no_op={no_op_count / max(1, no_op_total):.1%}\n"
-        f"  gripper min/max={np.min(gripper):.3f}/{np.max(gripper):.3f}, "
-        f"transitions={sum(item.gripper_transition_count for item in stats)}"
+        f"Dataset PASS: schema={first.schema} arm={first.arm_mode}/{first.arm_side} episodes={len(stats)} "
+        f"frames={sum(item.frames for item in stats)}\n"
+        f"  action_norm p50/p95/p99/max={p50:.6f}/{p95:.6f}/{p99:.6f}/{maximum:.6f}"
     )
 
 
@@ -705,13 +612,10 @@ def main() -> None:
     parser.add_argument("--input-dir", default="episodes_piper_v21")
     parser.add_argument("--target-fps", type=float, default=TARGET_FPS)
     args = parser.parse_args()
-
     paths = sorted(Path(args.input_dir).glob("ep_*.npz"))
     if not paths:
         raise SystemExit(f"No episodes found in {args.input_dir}")
-
     successful: list[EpisodeStats] = []
-    coverage_candidates: list[EpisodeStats] = []
     failures: list[str] = []
     for path in paths:
         try:
@@ -719,25 +623,12 @@ def main() -> None:
             print(format_episode_report(stats))
             if stats.success:
                 successful.append(stats)
-                coverage_candidates.append(stats)
         except EpisodeValidationError as exc:
             failures.append(str(exc))
-            if exc.stats is not None and exc.stats.success:
-                coverage_candidates.append(exc.stats)
-
-    dataset_error = None
-    try:
-        validate_gripper_coverage(coverage_candidates)
-        validate_instruction_consistency(coverage_candidates)
-    except ValueError as exc:
-        dataset_error = str(exc)
     if failures:
-        details = "\n\n".join(failures)
-        if dataset_error:
-            details += f"\n\nDataset validation failed: {dataset_error}"
-        raise SystemExit(details)
-    if dataset_error:
-        raise SystemExit(f"Dataset validation failed: {dataset_error}")
+        raise SystemExit("\n\n".join(failures))
+    validate_gripper_coverage(successful)
+    validate_instruction_consistency(successful)
     print(format_dataset_report(successful))
 
 

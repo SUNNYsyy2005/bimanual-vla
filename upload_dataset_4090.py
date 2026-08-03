@@ -20,6 +20,7 @@ import sys
 import tarfile
 import threading
 import time
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -94,6 +95,7 @@ def build_archive(dataset_root: Path, dataset_name: str, cache_dir: Path, rebuil
 
 
 RAW_EXPORT_CACHE_VERSION = 2
+LEROBOT_NORMALIZATION_VERSION = 2
 
 
 def classify_dataset_source(source: Path) -> str:
@@ -102,7 +104,7 @@ def classify_dataset_source(source: Path) -> str:
         raise ValueError(f"dataset directory does not exist: {source}")
     if (source / "meta" / "info.json").is_file():
         return "lerobot"
-    if any(source.glob("ep_*.npz")):
+    if any(source.glob("ep_*.npz")) or any(source.glob("episode_*.npz")):
         return "raw_npz"
     raise ValueError(
         "dataset must be either a LeRobot directory containing meta/info.json "
@@ -204,6 +206,331 @@ def prepare_raw_npz_dataset(
     return output_root
 
 
+def _feature_dim(info: dict[str, Any], key: str) -> int | None:
+    feature = info.get("features", {}).get(key, {})
+    shape = feature.get("shape") if isinstance(feature, dict) else None
+    if isinstance(shape, (list, tuple)) and len(shape) == 1:
+        try:
+            return int(shape[0])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def classify_lerobot_contract(info: dict[str, Any]) -> dict[str, Any]:
+    """Classify a LeRobot info.json, including metadata-free 8_3_64eps."""
+    from pi0_dataset import classify_contract_dimensions
+
+    features = info.get("features", {})
+    if "observation.state" in features and "action" in features:
+        state_key, action_key, layout = "observation.state", "action", "canonical_columns"
+    elif "state" in features and "actions" in features:
+        state_key, action_key, layout = "state", "actions", "legacy_columns"
+    else:
+        raise ValueError("cannot locate LeRobot state/action features")
+    state_dim = _feature_dim(info, state_key)
+    action_dim = _feature_dim(info, action_key)
+    if state_dim is None or action_dim is None:
+        raise ValueError("state/action features must have one-dimensional shapes")
+    dimensions = classify_contract_dimensions(
+        state_dim,
+        action_dim,
+        schema=info.get("schema"),
+        legacy_format=info.get("legacy_format") or info.get("contract_format"),
+    )
+    return {
+        **dimensions,
+        "state_key": state_key,
+        "action_key": action_key,
+        "column_layout": layout,
+    }
+
+
+def _legacy_next_measured_matches(root: Path, contract: dict[str, Any]) -> bool:
+    """Verify the observed 8_3_64eps step-delta construction when possible."""
+    try:
+        import numpy as np
+        import pyarrow.parquet as pq
+        import piper_data_contract as contract_module
+
+        paths = sorted((root / "data").glob("chunk-*/episode_*.parquet"))
+        if not paths:
+            return False
+        for path in paths:
+            table = pq.read_table(path, columns=[contract["state_key"], contract["action_key"]])
+            states = np.asarray(table[contract["state_key"]].to_pylist(), dtype=np.float32)
+            actions = np.asarray(table[contract["action_key"]].to_pylist(), dtype=np.float32)
+            builder = getattr(
+                contract_module,
+                "build_legacy_delivery_step_actions",
+                contract_module.build_delivery_actions,
+            )
+            expected = builder(states, arm_count=contract["arm_count"])
+            if actions.shape != expected.shape or not np.allclose(actions, expected, atol=1e-5, rtol=1e-5):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _legacy_camera_keys(info: dict[str, Any], arm_mode: str) -> list[str]:
+    features = info.get("features", {})
+    if arm_mode == "bimanual":
+        return ["cam_high", "cam_left_wrist", "cam_right_wrist"]
+    if "image" in features or "wrist_image" in features:
+        return ["cam_high", "cam_wrist"]
+    keys = [
+        key.removeprefix("observation.images.")
+        for key, value in features.items()
+        if key.startswith("observation.images.")
+        and isinstance(value, dict)
+        and value.get("dtype") in {"image", "video"}
+    ]
+    return sorted(keys)
+
+
+def _legacy_stats_current(root: Path, contract: dict[str, Any]) -> bool:
+    """Return whether numeric episode stats already match parquet payloads."""
+    try:
+        import numpy as np
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        stats_rows = {}
+        stats_path = root / "meta" / "episodes_stats.jsonl"
+        if stats_path.is_file():
+            for line in stats_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    row = json.loads(line)
+                    stats_rows[int(row["episode_index"])] = row.get("stats", {})
+        parquets = sorted((root / "data").glob("chunk-*/episode_*.parquet"))
+        if len(stats_rows) != len(parquets):
+            return False
+        for path in parquets:
+            episode_index = int(path.stem.removeprefix("episode_"))
+            table = pq.read_table(path)
+            row_stats = stats_rows.get(episode_index, {})
+            for name in table.column_names:
+                if name not in row_stats:
+                    continue
+                field_type = table.schema.field(name).type
+                if pa.types.is_list(field_type) or pa.types.is_fixed_size_list(field_type):
+                    values = np.asarray(table[name].to_pylist(), dtype=np.float64)
+                elif pa.types.is_integer(field_type) or pa.types.is_floating(field_type) or pa.types.is_boolean(field_type):
+                    values = np.asarray(table[name].to_numpy(zero_copy_only=False), dtype=np.float64)
+                else:
+                    continue
+                if values.ndim == 1:
+                    values = values[:, None]
+                actual = row_stats[name]
+                checks = {
+                    "min": np.min(values, axis=0),
+                    "max": np.max(values, axis=0),
+                    "mean": np.mean(values, axis=0),
+                    "std": np.std(values, axis=0),
+                }
+                for stat_name, expected in checks.items():
+                    if stat_name in actual and not np.allclose(
+                        np.asarray(actual[stat_name], dtype=np.float64), expected, atol=1e-5, rtol=1e-5
+                    ):
+                        return False
+                if "count" in actual and int(np.asarray(actual["count"]).reshape(-1)[0]) != len(values):
+                    return False
+        return True
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return False
+
+
+def _repair_legacy_statistics(root: Path) -> None:
+    """Rebuild numeric episodes_stats while retaining image statistics."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    old_rows: dict[int, dict[str, Any]] = {}
+    stats_path = root / "meta" / "episodes_stats.jsonl"
+    if stats_path.is_file():
+        for line in stats_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                row = json.loads(line)
+                old_rows[int(row["episode_index"])] = row
+    new_rows: list[dict[str, Any]] = []
+    for path in sorted((root / "data").glob("chunk-*/episode_*.parquet")):
+        index = int(path.stem.removeprefix("episode_"))
+        table = pq.read_table(path)
+        stats = dict(old_rows.get(index, {}).get("stats", {}))
+        for name in table.column_names:
+            field_type = table.schema.field(name).type
+            try:
+                if pa.types.is_list(field_type) or pa.types.is_fixed_size_list(field_type):
+                    values = np.asarray(table[name].to_pylist(), dtype=np.float64)
+                elif pa.types.is_integer(field_type) or pa.types.is_floating(field_type) or pa.types.is_boolean(field_type):
+                    values = np.asarray(table[name].to_numpy(zero_copy_only=False), dtype=np.float64)
+                else:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if values.ndim == 1:
+                values = values[:, None]
+            if values.ndim != 2 or not len(values) or not np.isfinite(values).all():
+                continue
+            stats[name] = {
+                "min": np.min(values, axis=0).tolist(),
+                "max": np.max(values, axis=0).tolist(),
+                "mean": np.mean(values, axis=0).tolist(),
+                "std": np.std(values, axis=0).tolist(),
+                "count": [len(values)],
+            }
+        new_rows.append({"episode_index": index, "stats": stats})
+    if stats_path.exists():
+        stats_path.unlink()
+    stats_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in new_rows),
+        encoding="utf-8",
+    )
+
+
+def _normalized_legacy_metadata(root: Path, info: dict[str, Any], contract: dict[str, Any]) -> dict[str, Any]:
+    from pi0_dataset import (
+        DEFAULT_ACTION_HORIZON,
+        DELIVERY_LEGACY_ACTION_FORMAT,
+        DELIVERY_LEGACY_ACTION_SEMANTICS,
+        GRIPPER_CLOSED_FRACTION_LEGACY,
+        LEGACY_ROTATION_SEMANTICS,
+        LEGACY_V2,
+        default_eef_names,
+    )
+
+    arm_mode = contract["arm_mode"]
+    arm_side = str(info.get("arm_side") or ("both" if arm_mode == "bimanual" else "right"))
+    if arm_mode == "bimanual":
+        arm_side = "both"
+    fallback_state, fallback_action = default_eef_names(
+        arm_mode=arm_mode, arm_side=arm_side, legacy=True
+    )
+    state_feature = info["features"][contract["state_key"]]
+    action_feature = info["features"][contract["action_key"]]
+    state_names = state_feature.get("names") or fallback_state
+    action_names = action_feature.get("names") or fallback_action
+    measured_verified = _legacy_next_measured_matches(root, contract)
+    return {
+        "contract_version": 2,
+        "schema": "delivery",
+        "arm_mode": arm_mode,
+        "arm_side": arm_side,
+        "state_dim": contract["state_dim"],
+        "action_dim": contract["raw_action_dim"],
+        "raw_action_dim": contract["raw_action_dim"],
+        "model_action_dim": contract["model_action_dim"],
+        "state_names": list(state_names),
+        "action_names": list(action_names),
+        "camera_keys": _legacy_camera_keys(info, arm_mode),
+        "contract_format": LEGACY_V2,
+        "legacy": True,
+        "legacy_format": LEGACY_V2,
+        "legacy_delivery_v2": True,
+        "delivery_action_format": DELIVERY_LEGACY_ACTION_FORMAT,
+        "action_semantics": DELIVERY_LEGACY_ACTION_SEMANTICS,
+        "action_source": "next_measured_eef" if measured_verified else "legacy_recorded_eef_delta",
+        "action_alignment": "next_observation",
+        "action_offset": 1,
+        "action_horizon": int(info.get("action_horizon", DEFAULT_ACTION_HORIZON)),
+        "gripper_semantics": GRIPPER_CLOSED_FRACTION_LEGACY,
+        "rotation_semantics": LEGACY_ROTATION_SEMANTICS,
+        "coordinate_frame": "slave_base",
+        "legacy_next_measured_verified": measured_verified,
+    }
+
+
+def _link_copy(src: str, dst: str) -> str:
+    try:
+        os.link(src, dst)
+        return dst
+    except OSError:
+        return shutil.copy2(src, dst)
+
+
+def prepare_lerobot_dataset(
+    source: Path,
+    dataset_name: str,
+    cache_dir: Path,
+    *,
+    rebuild: bool,
+) -> Path:
+    """Annotate metadata-free 10D+7D/20D+14D delivery as legacy_v2."""
+    info_path = source / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    try:
+        contract = classify_lerobot_contract(info)
+    except ValueError:
+        # Keep generic LeRobot passthrough behavior; server validation will
+        # report unsupported datasets with its normal diagnostics.
+        return source
+    if not contract["legacy"]:
+        return source
+
+    metadata = _normalized_legacy_metadata(source, info, contract)
+    if all(info.get(key) == value for key, value in metadata.items()) and _legacy_stats_current(source, contract):
+        print(f"Detected explicitly marked {metadata['legacy_format']} LeRobot dataset: {source}")
+        return source
+
+    signature = source_signature(source)
+    key = hashlib.sha256(
+        f"normalize={LEROBOT_NORMALIZATION_VERSION}\nsource={signature}\n".encode()
+    ).hexdigest()
+    normalized = cache_dir / "normalized" / f"{dataset_name}-{key[:16]}"
+    marker = normalized.with_name(normalized.name + ".json")
+    if normalized.is_dir() and marker.is_file() and not rebuild:
+        cached = json.loads(marker.read_text(encoding="utf-8"))
+        if cached.get("source_signature") == signature:
+            print(f"Reusing legacy_v2 metadata-normalized dataset: {normalized}")
+            return normalized
+
+    temporary = normalized.with_name(normalized.name + ".building")
+    shutil.rmtree(temporary, ignore_errors=True)
+    normalized.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, temporary, copy_function=_link_copy)
+    normalized_info_path = temporary / "meta" / "info.json"
+    normalized_info = json.loads(normalized_info_path.read_text(encoding="utf-8"))
+    normalized_info.update(metadata)
+    normalized_info["features"][contract["state_key"]]["names"] = metadata["state_names"]
+    normalized_info["features"][contract["action_key"]]["names"] = metadata["action_names"]
+    # copytree may have hard-linked metadata; unlink before writing so the
+    # source dataset is never modified by normalization.
+    normalized_info_path.unlink()
+    normalized_info_path.write_text(
+        json.dumps(normalized_info, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    policy_contract = {
+        "version": normalized_info.get("contract_version", 2),
+        "robot_type": normalized_info.get("robot_type", "piper"),
+        **metadata,
+    }
+    policy_path = temporary / "meta" / "policy_contract.json"
+    policy_path.unlink(missing_ok=True)
+    policy_path.write_text(
+        json.dumps(policy_contract, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    _repair_legacy_statistics(temporary)
+    shutil.rmtree(normalized, ignore_errors=True)
+    os.replace(temporary, normalized)
+    marker.write_text(
+        json.dumps(
+            {
+                "normalization_version": LEROBOT_NORMALIZATION_VERSION,
+                "source": str(source),
+                "source_signature": signature,
+                "contract_format": metadata["contract_format"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(f"Marked metadata-free delivery dataset as legacy_v2: {normalized}")
+    return normalized
+
+
 def prepare_dataset_directory(
     source: Path,
     dataset_name: str,
@@ -216,19 +543,22 @@ def prepare_dataset_directory(
     """Resolve a LeRobot input directly or auto-export a GUI NPZ directory."""
     kind = classify_dataset_source(source)
     if kind == "lerobot":
+        prepared = prepare_lerobot_dataset(
+            source, dataset_name, cache_dir, rebuild=rebuild
+        )
         print(f"Detected LeRobot dataset directory: {source}")
-        return source, kind
-    return (
-        prepare_raw_npz_dataset(
+        return prepared, kind
+    exported = prepare_raw_npz_dataset(
             source,
             dataset_name,
             cache_dir,
             fps=fps,
             allow_incomplete_gripper_coverage=allow_incomplete_gripper_coverage,
             rebuild=rebuild,
-        ),
-        kind,
     )
+    return prepare_lerobot_dataset(
+        exported, dataset_name, cache_dir, rebuild=rebuild
+    ), kind
 
 
 def sha256_file(path: Path) -> str:
