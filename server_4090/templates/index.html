@@ -152,8 +152,30 @@
     <section id="module-training" class="dashboard-module" data-module="training" hidden>
       <div class="module-heading"><div><h2>训练中心</h2><p>归一化、LoRA 微调、训练进度和 loss 曲线。</p></div></div>
       <div class="grid">
-        <div class="card third"><h2>1. 归一化统计</h2><p class="muted">训练提交时若缺失 norm stats 会自动串联执行。</p><form id="normForm"><label>数据集</label><select name="dataset_id" class="dataset-select"></select><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select><div class="row"><div><label>Batch size</label><input name="batch_size" type="number" value="16" min="1"></div><div><label>Workers</label><input name="num_workers" type="number" value="2" min="1"></div></div><label>最多帧数（留空=全部）</label><input name="max_frames" type="number" min="1"><p><button type="submit">提交 norm stats</button></p></form></div>
-        <div class="card two-third"><h2>2. 提交 LoRA 微调</h2><form id="trainForm"><div class="row"><div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div><div><label>实验名</label><input name="exp_name" required placeholder="pick_cube_r1"></div></div><div class="row3"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU IDs</label><input name="gpu_ids" value="0,1" placeholder="0,1"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div><div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>Batch</label><input name="batch_size" type="number" value="8"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div><div class="row"><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div><div><label>启动方式</label><select name="mode"><option value="auto">auto（推荐）</option><option value="new">new</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select></div></div><p class="muted">缺少 norm stats 时自动执行 norm→train；任务持久化并支持续训。</p><p><button type="submit">提交训练</button></p></form></div>
+        <div class="card third">
+          <h2>1. 归一化统计</h2><p class="muted">训练提交时若缺失或数据划分不匹配会自动串联执行。</p>
+          <form id="normForm">
+            <label>数据集</label><select name="dataset_id" class="dataset-select"></select>
+            <div class="row"><div><label>模型系列</label><select name="model_variant" class="model-variant-select"><option value="pi05">π0.5</option><option value="pi0">π0</option></select></div><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div></div>
+            <label>基础模型 / 初始化 checkpoint</label><select name="base_checkpoint" class="base-model-select" required></select><p class="muted base-model-info">从允许目录自动扫描可用权重。</p>
+            <div class="row"><div><label>Batch size</label><input name="batch_size" type="number" value="16" min="1"></div><div><label>Workers</label><input name="num_workers" type="number" value="2" min="1"></div></div>
+            <div class="row"><div><label>测试集比例</label><input name="test_ratio" type="number" value="0.1" min="0" max="0.9" step="0.01"></div><div><label>划分种子</label><input name="split_seed" type="number" value="42" min="0"></div></div>
+            <label>最多帧数（留空=全部训练集帧）</label><input name="max_frames" type="number" min="1"><p><button type="submit">提交 norm stats</button></p>
+          </form>
+        </div>
+        <div class="card two-third">
+          <h2>2. 提交 LoRA 微调</h2>
+          <form id="trainForm">
+            <div class="row"><div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div><div><label>实验名</label><input name="exp_name" required placeholder="pick_cube_r1"></div></div>
+            <div class="row"><div><label>模型系列</label><select name="model_variant" class="model-variant-select"><option value="pi05">π0.5</option><option value="pi0">π0</option></select></div><div><label>基础模型 / 初始化 checkpoint</label><select name="base_checkpoint" class="base-model-select" required></select></div></div>
+            <p class="muted base-model-info">可选择预训练权重，也可从已有完整 checkpoint 继续微调。</p>
+            <div class="row3"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU IDs</label><input name="gpu_ids" value="0,1" placeholder="0,1"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div>
+            <div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>Batch</label><input name="batch_size" type="number" value="8"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div>
+            <div class="row3"><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div><div><label>测试集比例</label><input name="test_ratio" type="number" value="0.1" min="0" max="0.9" step="0.01"></div><div><label>划分种子</label><input name="split_seed" type="number" value="42" min="0"></div></div>
+            <label>启动方式</label><select name="mode"><option value="auto">auto（推荐）</option><option value="new">new</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select>
+            <p class="muted">按 episode 固定划分训练/测试集；norm 只统计训练集，并按 π0.5 / π0 分目录保存。缺少或划分不匹配时自动执行 norm→train。</p><p><button type="submit">提交训练</button></p>
+          </form>
+        </div>
         <div class="card two-third">
           <h2>训练进程管理</h2>
           <p class="muted">查看 Norm / Train 任务状态、PID、依赖关系；已结束任务可删除记录和日志，不会删除 checkpoint 或训练输出。</p>
@@ -177,7 +199,7 @@
     <section id="module-policy" class="dashboard-module" data-module="policy" hidden>
       <div class="module-heading"><div><h2>Policy 管理</h2><p>从 checkpoint 启动、切换、健康检测和实机执行授权。</p></div></div>
       <div class="grid">
-        <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div><div><label>默认 prompt</label><input name="default_prompt"></div></div><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
+        <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><input type="hidden" name="model_variant" id="policyModelVariant" value="pi05"><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div><div><label>默认 prompt</label><input name="default_prompt"></div></div><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
         <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code> 和本地安全检查。已结束的历史进程可删除记录和日志。</p><div class="table-wrap"><table><thead><tr><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端 / telemetry</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div></div>
         <div class="card" id="policyTaskLogCard"><h2>Policy 进程日志</h2><p class="muted">从 Policy 进程表点击“日志”查看最近输出。</p><pre id="policyTaskLog">尚未选择 Policy 进程。</pre></div>
         <div class="card"><h2>机械臂客户端命令</h2><pre id="policyClientCommand">python robot_observation_bridge.py --host 192.168.101.9 --port 8000 --arm-mode single --arm-side right --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16 --instruction "pick up the cube"</pre></div>
@@ -319,7 +341,7 @@ function fillDatasets(items) {
   document.getElementById('datasets').innerHTML = items.map(d => `
     <tr>
       <td><code>${esc(d.id)}</code><br><span class="muted">${esc(d.robot_type)}</span></td>
-      <td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps<br>${d.norm_stats_ready ? '<span class="ok">norm ready</span>' : '<span class="warn">norm 需计算</span>'}</td>
+      <td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps<br>${d.train_episodes == null ? '<span class="muted">尚未生成 train/test 划分</span>' : `<span class="pill">${esc(d.train_episodes)} train</span> <span class="pill">${esc(d.test_episodes)} test</span>`}<br>${(d.norm_model_variants || []).length ? `<span class="ok">norm ready: ${esc((d.norm_model_variants || []).map(modelVariantLabel).join(', '))}</span>` : '<span class="warn">norm 需计算或划分已变化</span>'}</td>
       <td><span class="pill">${esc(d.schema_label || d.schema)}</span> <span class="pill">${esc(d.arm_mode || '-')}</span> <span class="pill">${esc(d.dataset_layout || '-')}</span> ${d.training_supported ? '<span class="ok">训练兼容</span>' : '<span class="muted">仅管理 / 预览</span>'}<br><code>${esc(d.state_key || 'state?')}</code> ${esc(JSON.stringify(d.state_shape))} → <code>${esc(d.action_key || 'action?')}</code> ${esc(JSON.stringify(d.action_shape))}<br>state/action=${esc(d.state_dim || '?')}D/${esc(d.action_dim || '?')}D · arm=${esc(d.arm_side || '-')}<br>${(d.media || []).map(m => `<span class="pill">${esc(m.type)} · ${esc(String(m.key).replace('observation.images.', ''))}</span>`).join('') || '<span class="muted">无相机媒体</span>'}</td>
       <td>${esc(d.action_semantics || '-')}<br>offset=${d.action_offset == null ? '-' : esc(d.action_offset)}</td>
       <td><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button><button class="inline secondary" onclick="renameDataset('${esc(d.id)}')">重命名</button><button class="inline danger" onclick="deleteDataset('${esc(d.id)}')">删除数据集</button></td>
@@ -647,14 +669,48 @@ async function mergeDatasetEpisodes() {
   }
 }
 
+function modelVariantLabel(variant) {
+  return variant === 'pi0' ? 'π0' : variant === 'pi05' ? 'π0.5' : (variant || '-');
+}
+
+function baseModelLabel(model) {
+  const source = model.source === 'pretrained' ? '预训练' : 'checkpoint';
+  return `${source} · ${modelVariantLabel(model.model_variant)} · ${model.name} · ${shortPath(model.path)}`;
+}
+
+function fillBaseModels(items) {
+  document.querySelectorAll('.base-model-select').forEach(select => {
+    const form = select.closest('form');
+    const variantSelect = form && form.querySelector('.model-variant-select');
+    const variant = variantSelect ? variantSelect.value : 'pi05';
+    const old = select.value;
+    const matches = items.filter(model => model.model_variant === variant);
+    select.innerHTML = matches.length
+      ? matches.map(model => `<option value="${esc(model.path)}">${esc(baseModelLabel(model))}${model.default ? '（默认）' : ''}</option>`).join('')
+      : `<option value="" disabled>未发现 ${esc(modelVariantLabel(variant))} 可用权重</option>`;
+    if (matches.some(model => model.path === old)) select.value = old;
+    else {
+      const preferred = matches.find(model => model.default) || matches[0];
+      if (preferred) select.value = preferred.path;
+    }
+    const selected = matches.find(model => model.path === select.value);
+    const info = form && form.querySelector('.base-model-info');
+    if (info) info.textContent = selected
+      ? `当前：${selected.path}`
+      : `允许目录中没有 ${modelVariantLabel(variant)} 权重；安装后刷新页面即可选择。`;
+    const submit = form && form.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = !selected;
+  });
+}
+
 function checkpointLabel(c) {
   const size = c.size_gib == null ? '' : ` · ${Number(c.size_gib).toFixed(1)} GiB`;
-  return `${c.experiment} / step ${c.step} · ${c.arm_mode || '-'} · ${c.updated_at}${size}`;
+  return `${c.experiment} / step ${c.step} · ${modelVariantLabel(c.model_variant)} · ${c.arm_mode || '-'} · ${c.updated_at}${size}`;
 }
 
 function fillCheckpoints(items) {
   document.getElementById('checkpoints').innerHTML = items.map(c => `
-    <tr><td><strong>${esc(c.experiment)}</strong><br>step ${esc(c.step)} · <span class="pill">${esc(c.arm_mode || '-')}</span></td>
+    <tr><td><strong>${esc(c.experiment)}</strong><br>step ${esc(c.step)} · <span class="pill">${esc(modelVariantLabel(c.model_variant))}</span> <span class="pill">${esc(c.arm_mode || '-')}</span></td>
     <td>${(c.dataset_ids || []).map(id => `<span class="pill">${esc(id)}</span>`).join('') || '<span class="muted">-</span>'}<br><span class="muted">${esc(c.config_name || '-')}</span></td>
     <td>${c.size_gib == null ? '-' : `${Number(c.size_gib).toFixed(1)} GiB`}<br><span class="muted">${esc(c.updated_at || '-')}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">暂无完整 checkpoint</td></tr>';
 
@@ -668,10 +724,15 @@ function fillCheckpoints(items) {
   select.innerHTML = matches.map(c => `<option value="${esc(c.path)}">${esc(checkpointLabel(c))}</option>`).join('');
   if (matches.some(c => c.path === old)) select.value = old;
   const selected = matches.find(c => c.path === select.value);
+  document.getElementById('policyModelVariant').value = selected ? selected.model_variant : 'pi05';
   document.getElementById('checkpointInfo').textContent = selected
-    ? `完整 checkpoint；当前：${selected.path}`
+    ? `${modelVariantLabel(selected.model_variant)} 完整 checkpoint；当前：${selected.path}`
     : `数据集 ${dataset || '-'} 暂无完整 checkpoint，请先完成训练。`;
   document.getElementById('policySubmit').disabled = !selected;
+}
+
+function syncPolicyCheckpointVariant() {
+  fillCheckpoints((latestStatus && latestStatus.checkpoints) || []);
 }
 
 function fillGpus(items) {
@@ -911,14 +972,16 @@ function fillTasks(items) {
     const health = t.policy_healthy === true ? '<span class="ok">/healthz OK</span>' : t.state === 'running' ? '<span class="bad">/healthz FAIL</span>' : '<span class="muted">未运行</span>';
     const badge = m.external ? '<br><span class="pill warn">外部进程已接管</span>' : '';
     const deletable = TERMINAL_STATES.has(t.state);
-    return `<tr><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid || '-')}${badge}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal ? `<br>${esc(t.stop_signal)}` : ''}</td><td>GPU ${esc((m.gpu_ids || []).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.arm_mode || '-')}</span> <span class="pill">${esc(m.schema || '-')}</span></td><td>dataset=${esc(m.dataset_id)}<br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}','policy')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','policy')">删除记录</button>` : ''}</td></tr>`;
+    return `<tr><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid || '-')}${badge}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal ? `<br>${esc(t.stop_signal)}` : ''}</td><td>GPU ${esc((m.gpu_ids || []).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.arm_mode || '-')}</span> <span class="pill">${esc(m.schema || '-')}</span></td><td>dataset=${esc(m.dataset_id)} · <span class="pill">${esc(modelVariantLabel(m.model_variant))}</span><br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}','policy')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','policy')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="6" class="muted">暂无 Policy 进程；可在上方创建。</td></tr>';
 
   const jobs = items.filter(t => t.type !== 'policy');
   document.getElementById('jobs').innerHTML = jobs.map(t => {
     const m = t.metadata || {};
     const active = ACTIVE_STATES.has(t.state);
-    const params = `dataset=${esc(m.dataset_id || '-')} · arm=${esc(m.arm_mode || '-')} · schema=${esc(m.schema || '-')}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}` : `<br>batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}`;
+    const split = m.train_episodes !== undefined ? `<br>split=${esc(m.train_episodes)} train / ${esc(m.test_episodes)} test · seed ${esc(m.split_seed)}` : '';
+    const model = `<br>model=${esc(modelVariantLabel(m.model_variant))}${m.base_checkpoint ? ` · base=<code class="path" title="${esc(m.base_checkpoint)}">${esc(shortPath(m.base_checkpoint))}</code>` : ''}`;
+    const params = `dataset=${esc(m.dataset_id || '-')} · arm=${esc(m.arm_mode || '-')} · schema=${esc(m.schema || '-')}${model}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}` : `<br>batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}${split}`;
     const deletable = TERMINAL_STATES.has(t.state);
     return `<tr><td><code>${esc(t.id)}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${jobDependencySummary(t)}${t.start_error ? `<br><span class="bad">${esc(t.start_error)}</span>` : ''}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}','training')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','training')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="4" class="muted">暂无 Norm / Train 任务</td></tr>';
@@ -1089,13 +1152,14 @@ async function refreshAll() {
     const data = await api('/api/status');
     latestStatus = data;
     fillDatasets(data.datasets || []);
+    fillBaseModels(data.base_models || []);
     fillCheckpoints(data.checkpoints || []);
     fillGpus(data.gpus || []);
     fillTasks(data.tasks || []);
     fillTrainingTasks(data.tasks || []);
     fillObservation(data.robot_observation);
     updateSummaries(data);
-    document.getElementById('serverInfo').innerHTML = `管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>Base: <code>${esc(data.config.base_checkpoint)}</code>`;
+    document.getElementById('serverInfo').innerHTML = `管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>默认基础模型: <code>${esc(data.config.base_checkpoint)}</code><br>可选基础权重: ${esc((data.base_models || []).length)}`;
     if (!episodeDatasetData && document.getElementById('editorDataset').value) loadDatasetEpisodes(0);
     const trainingVisible = !document.getElementById('module-training').hidden;
     if (trainingVisible && document.getElementById('trainMetricsTask').value) loadTrainingMetrics({quiet: true});
@@ -1203,7 +1267,11 @@ document.querySelectorAll('.dataset-select').forEach(select => select.addEventLi
   if (select.id === 'policyDataset') fillCheckpoints((latestStatus && latestStatus.checkpoints) || []);
   updateClientCommand();
 }));
+document.querySelectorAll('.model-variant-select').forEach(select => select.addEventListener('change', () => {
+  fillBaseModels((latestStatus && latestStatus.base_models) || []);
+}));
 document.getElementById('replacePolicy').addEventListener('change', () => updatePolicyOperation(true));
+document.getElementById('checkpointSelect').addEventListener('change', syncPolicyCheckpointVariant);
 document.getElementById('policyPort').addEventListener('input', updateClientCommand);
 document.getElementById('editorDataset').addEventListener('change', () => {
   episodeDatasetData = null;
