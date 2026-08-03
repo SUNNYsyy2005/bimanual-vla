@@ -29,11 +29,10 @@
 bash deploy_4090_server.sh
 ```
 
-脚本只同步本服务需要的文件到 `4x4090-wg:/home/sunny/bimanual-vla`。它会重启 Dashboard 本身，但不会停止页面管理的 Policy、训练任务或服务器上已有的其他 GPU 进程。首次启动会生成随机 Token，并打印：
+脚本只同步本服务需要的文件到 `4x4090:/home/sunny/bimanual-vla`，安装并启用用户级 systemd 服务 `bimanual-vla-dashboard.service`。Dashboard 会随 4×4090 开机自动启动，并在异常退出后自动重启；重启 Dashboard 本身不会停止页面管理的 Policy、训练任务或服务器上已有的其他 GPU 进程。首次启动会生成随机 Token，Dashboard 地址为：
 
 ```text
-URL: http://192.168.101.9:8090
-Token: ...
+http://192.168.101.9:8090
 ```
 
 Token 保存在服务器：
@@ -45,13 +44,13 @@ Token 保存在服务器：
 随时读取现有 Token：
 
 ```bash
-ssh 4x4090-wg 'source ~/.config/bimanual-vla/server.env && printf "%s\n" "$BIMANUAL_VLA_SERVER_TOKEN"'
+ssh 4x4090 'source ~/.config/bimanual-vla/server.env && printf "%s\n" "$BIMANUAL_VLA_SERVER_TOKEN"'
 ```
 
-Dashboard 也支持用账号密码换取 Token。`start_server.sh` 会在首次启动时生成一组独立的 Dashboard 登录凭据，并与 Token 一起保存在权限为 `0600` 的 `server.env` 中：
+Dashboard 也支持用账号密码换取 Token。启动脚本会在首次启动时生成一组独立的 Dashboard 登录凭据，并与 Token 一起保存在权限为 `0600` 的 `server.env` 中：
 
 ```bash
-ssh 4x4090-wg 'source ~/.config/bimanual-vla/server.env && printf "user=%s\npassword=%s\n" "$BIMANUAL_VLA_LOGIN_USER" "$BIMANUAL_VLA_LOGIN_PASSWORD"'
+ssh 4x4090 'source ~/.config/bimanual-vla/server.env && printf "user=%s\npassword=%s\n" "$BIMANUAL_VLA_LOGIN_USER" "$BIMANUAL_VLA_LOGIN_PASSWORD"'
 ```
 
 网页顶部的“账号密码获取 Token”按钮会调用 `POST /api/auth/token`，验证成功后自动把返回的 Bearer Token 保存到当前浏览器。命令行也可以这样获取（不要把密码放在 URL 中）：
@@ -64,7 +63,7 @@ curl -sS -X POST http://192.168.101.9:8090/api/auth/token \
 
 验证流程：
 
-1. `start_server.sh` 首次启动时用 `secrets.token_urlsafe(36)` 生成随机 Token，文件权限为 `0600`。
+1. Dashboard 启动脚本首次运行时用 `secrets.token_urlsafe(36)` 生成随机 Token，文件权限为 `0600`。
 2. 浏览器将 Token 保存在当前浏览器的 `localStorage`，并在每个管理请求中发送 `Authorization: Bearer <token>`。
 3. 上传脚本使用同一个 Bearer Token。
 4. 服务端用恒定时间比较验证 Token；除 `/` 和 `/healthz` 外，所有 Dashboard API 都必须验证。
@@ -72,7 +71,7 @@ curl -sS -X POST http://192.168.101.9:8090/api/auth/token \
 Token 只用于 Dashboard 管理 API；OpenPI Policy WebSocket 使用官方通信协议，机械臂客户端不需要这个 Token。不要把 Token 提交到 Git、放进 URL，或保存在不可信浏览器。需要轮换时：
 
 ```bash
-ssh 4x4090-wg 'bash /home/sunny/bimanual-vla/server_4090/stop_server.sh && rm -f ~/.config/bimanual-vla/server.env && bash /home/sunny/bimanual-vla/server_4090/start_server.sh'
+ssh 4x4090 'systemctl --user stop bimanual-vla-dashboard.service && rm -f ~/.config/bimanual-vla/server.env && systemctl --user start bimanual-vla-dashboard.service'
 ```
 
 自定义路径、端口或 JAX 显存比例时修改服务器上的：
@@ -81,12 +80,16 @@ ssh 4x4090-wg 'bash /home/sunny/bimanual-vla/server_4090/stop_server.sh && rm -f
 /home/sunny/bimanual-vla/server_4090/config.json
 ```
 
-重启 Dashboard：
+管理 Dashboard 自启动服务：
 
 ```bash
-ssh 4x4090-wg 'bash /home/sunny/bimanual-vla/server_4090/stop_server.sh'
-ssh 4x4090-wg 'bash /home/sunny/bimanual-vla/server_4090/start_server.sh'
+ssh 4x4090 'systemctl --user status bimanual-vla-dashboard.service'
+ssh 4x4090 'systemctl --user restart bimanual-vla-dashboard.service'
+ssh 4x4090 'journalctl --user -u bimanual-vla-dashboard.service -n 100 --no-pager'
+ssh 4x4090 'tail -n 100 ~/.local/share/bimanual-vla-server/dashboard.log'
 ```
+
+部署脚本会尝试为当前用户开启 systemd linger，使用户尚未登录时服务也能随系统启动。可用 `loginctl show-user sunny -p Linger` 验证；如果服务器策略拒绝无管理员授权开启 linger，用户服务仍会在 `sunny` 登录后自动启动，但需要管理员执行 `loginctl enable-linger sunny` 才能实现完全无人登录的开机自启动。
 
 ## 上传数据集
 
