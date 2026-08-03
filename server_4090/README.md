@@ -210,6 +210,9 @@ cd /home/sunny/bimanual-vla
    - norm 时确定的测试集比例、划分种子和 episode 清单持久化到数据集 `meta/train_test_split.json`，训练自动加载，不需要重复填写；
    - 每次成功 norm 还会保存 `episode_split.json` 和 `norm_config.json`，记录模型系列、基础权重、norm batch size、workers、帧数限制和实际处理规模；
    - norm batch size 只影响统计阶段的吞吐与资源占用，不需要和训练 batch size 一致；
+   - 2×24 GiB RTX 4090 的 π0.5 LoRA 已验证安全起点为全局 batch `2`、`fsdp_devices=2`、`xla_memory_fraction=0.90`；batch `4` 可能在首个训练步的 NCCL 通信阶段 OOM；
+   - Dashboard 按 GPU UUID 设置 `CUDA_VISIBLE_DEVICES`，避免某张故障卡从 CUDA 枚举中消失后数字序号错位；`nvidia-smi` 出现 `[N/A]` compute context 的卡会标记为不可训练；
+   - 正式训练启动前要求每张 4090 至少有 23000 MiB 空闲显存，避免数据采集、仿真或其他进程与 JAX 预分配/NCCL 抢占显存；
    - `norm_stats.json` 已存在且 episode 划分一致时直接启动训练；
    - 缺失时自动启动完整 norm 任务，训练进入持久化 `waiting_norm`；
    - norm 成功后自动启动训练；GPU 暂忙时进入 `waiting_gpu` 并自动重试；

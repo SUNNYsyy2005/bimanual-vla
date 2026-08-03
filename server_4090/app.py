@@ -404,6 +404,8 @@ def load_config(path: Path) -> dict[str, Any]:
         "port": 8090,
         "allowed_gpu_ids": [0, 1, 2, 3],
         "allow_busy_gpus": False,
+        "xla_memory_fraction": 0.90,
+        "training_min_free_gpu_mib": 23_000,
         "max_upload_gib": 500,
         "max_chunk_mib": 64,
         "policy_port_min": 8000,
@@ -575,6 +577,13 @@ class TaskManager:
         if managed_busy:
             return f"waiting for managed task(s) on GPU(s): {managed_busy}"
         inventory = {gpu["index"]: gpu for gpu in gpu_inventory()}
+        unavailable = {
+            gpu_id: inventory.get(gpu_id, {}).get("health_issue") or "GPU compute unavailable"
+            for gpu_id in gpu_ids
+            if inventory.get(gpu_id, {}).get("compute_available") is False
+        }
+        if unavailable:
+            return f"waiting for unavailable GPU(s): {unavailable}"
         external_busy = {
             gpu_id: inventory.get(gpu_id, {}).get("processes", [])
             for gpu_id in gpu_ids
@@ -582,6 +591,10 @@ class TaskManager:
         }
         if external_busy:
             return f"waiting for busy GPU(s): {external_busy}"
+        minimum_free_mib = int(self.config.get("training_min_free_gpu_mib", 23_000))
+        low_memory = gpu_memory_shortfalls(inventory, gpu_ids, minimum_free_mib)
+        if low_memory:
+            return f"waiting for GPU free memory: {low_memory}"
         return None
 
     def _refresh_waiting(self, task: dict[str, Any]) -> dict[str, Any]:
@@ -651,7 +664,11 @@ class TaskManager:
         )
         return self._launch(
             task,
-            env=build_environment(self.config, task.get("metadata", {}).get("gpu_ids", [])),
+            env=build_environment(
+                self.config,
+                task.get("metadata", {}).get("gpu_ids", []),
+                xla_memory_fraction=task.get("metadata", {}).get("xla_memory_fraction"),
+            ),
             raise_on_error=False,
         )
 
@@ -1279,6 +1296,28 @@ def _nvidia_int(value: str) -> int | None:
         return None
 
 
+def gpu_memory_shortfalls(
+    inventory: dict[int, dict[str, Any]],
+    gpu_ids: list[int],
+    minimum_free_mib: int,
+) -> dict[int, dict[str, int]]:
+    if minimum_free_mib <= 0:
+        return {}
+    shortfalls: dict[int, dict[str, int]] = {}
+    for gpu_id in gpu_ids:
+        gpu = inventory.get(gpu_id, {})
+        free_mib = max(
+            0,
+            int(gpu.get("memory_total_mib", 0)) - int(gpu.get("memory_used_mib", 0)),
+        )
+        if free_mib < minimum_free_mib:
+            shortfalls[gpu_id] = {
+                "free_mib": free_mib,
+                "required_mib": minimum_free_mib,
+            }
+    return shortfalls
+
+
 def gpu_inventory() -> list[dict[str, Any]]:
     gpu_cmd = [
         "nvidia-smi",
@@ -1296,6 +1335,7 @@ def gpu_inventory() -> list[dict[str, Any]]:
     except (FileNotFoundError, subprocess.SubprocessError):
         return []
     processes: dict[str, list[dict[str, Any]]] = {}
+    unavailable_uuids: set[str] = set()
     for line in process_lines:
         parts = [part.strip() for part in line.split(",", 3)]
         if len(parts) != 4:
@@ -1303,8 +1343,9 @@ def gpu_inventory() -> list[dict[str, Any]]:
         pid = _nvidia_int(parts[1])
         if pid is None:
             # NVIDIA occasionally reports stale/driver-only compute contexts as
-            # ``uuid, [N/A], [N/A], [N/A]``. They have no actionable process
-            # identity and must not make the entire status endpoint fail.
+            # ``uuid, [N/A], [N/A], [N/A]``. In practice CUDA no longer exposes
+            # that physical GPU, so keep the Dashboard alive but mark it unsafe.
+            unavailable_uuids.add(parts[0])
             continue
         processes.setdefault(parts[0], []).append(
             {
@@ -1329,9 +1370,25 @@ def gpu_inventory() -> list[dict[str, Any]]:
                 "memory_total_mib": _nvidia_int(parts[3]) or 0,
                 "memory_used_mib": _nvidia_int(parts[4]) or 0,
                 "processes": processes.get(parts[1], []),
+                "compute_available": parts[1] not in unavailable_uuids,
+                "health_issue": (
+                    None
+                    if parts[1] not in unavailable_uuids
+                    else "nvidia-smi reports an unavailable compute context ([N/A])"
+                ),
             }
         )
     return gpus
+
+
+def cuda_visible_devices(gpu_ids: list[int], inventory: list[dict[str, Any]] | None = None) -> str:
+    """Address physical GPUs by UUID so broken/missing ordinals cannot remap ids."""
+    inventory = gpu_inventory() if inventory is None else inventory
+    by_index = {int(gpu["index"]): gpu for gpu in inventory}
+    uuids = [str(by_index.get(gpu_id, {}).get("uuid", "")) for gpu_id in gpu_ids]
+    if uuids and all(uuids):
+        return ",".join(uuids)
+    return ",".join(map(str, gpu_ids))
 
 
 def listening_processes_by_port(port_min: int, port_max: int) -> dict[int, set[int]]:
@@ -1404,7 +1461,12 @@ def discover_external_policy_candidates(
     return candidates
 
 
-def build_environment(config: dict[str, Any], gpu_ids: list[int] | None) -> dict[str, str]:
+def build_environment(
+    config: dict[str, Any],
+    gpu_ids: list[int] | None,
+    *,
+    xla_memory_fraction: float | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
     openpi_env_lib = str(Path(config["openpi_python"]).resolve().parent.parent / "lib")
     inherited_ld = env.get("LD_LIBRARY_PATH", "")
@@ -1416,9 +1478,15 @@ def build_environment(config: dict[str, Any], gpu_ids: list[int] | None) -> dict
             "LD_LIBRARY_PATH": openpi_env_lib + ((":" + inherited_ld) if inherited_ld else ""),
             "PYTHONUNBUFFERED": "1",
             "TOKENIZERS_PARALLELISM": "false",
-            # JAX defaults to a 75% preallocation pool, which is too tight for
-            # π0.5 LoRA initialization on a 24 GiB RTX 4090.
-            "XLA_PYTHON_CLIENT_MEM_FRACTION": str(config.get("xla_memory_fraction", 0.95)),
+            # UUID-based visibility below keeps Dashboard physical ids stable
+            # even when a failed GPU disappears from CUDA ordinal enumeration.
+            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+            # 0.95 leaves too little non-XLA memory for NCCL on 24 GiB 4090s.
+            "XLA_PYTHON_CLIENT_MEM_FRACTION": str(
+                xla_memory_fraction
+                if xla_memory_fraction is not None
+                else config.get("xla_memory_fraction", 0.90)
+            ),
         }
     )
     if gpu_ids is None:
@@ -1426,7 +1494,7 @@ def build_environment(config: dict[str, Any], gpu_ids: list[int] | None) -> dict
         env["CUDA_VISIBLE_DEVICES"] = ""
     else:
         env.pop("JAX_PLATFORMS", None)
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
+        env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices(gpu_ids)
     return env
 
 
@@ -1726,6 +1794,8 @@ def create_app(config_path: Path) -> Flask:
                     "base_checkpoint": config["base_checkpoint"],
                     "allowed_gpu_ids": sorted(allowed_gpus),
                     "allow_busy_gpus": config["allow_busy_gpus"],
+                    "xla_memory_fraction": config.get("xla_memory_fraction", 0.90),
+                    "training_min_free_gpu_mib": config.get("training_min_free_gpu_mib", 23_000),
                     "policy_port_range": [config["policy_port_min"], config["policy_port_max"]],
                     "robot_observation_max_age_s": observations.max_age_s,
                 },
@@ -1856,6 +1926,7 @@ def create_app(config_path: Path) -> Flask:
         one_only: bool = False,
         ignored_pids: set[int] | None = None,
         check_busy: bool = True,
+        minimum_free_mib: int = 0,
     ) -> list[int]:
         raw = payload.get("gpu_ids", [0])
         if isinstance(raw, str):
@@ -1871,6 +1942,13 @@ def create_app(config_path: Path) -> Flask:
             return gpu_ids
         ignored_pids = ignored_pids or set()
         inventory = {gpu["index"]: gpu for gpu in gpu_inventory()}
+        unavailable = {
+            gpu_id: inventory.get(gpu_id, {}).get("health_issue") or "GPU compute unavailable"
+            for gpu_id in gpu_ids
+            if inventory.get(gpu_id, {}).get("compute_available") is False
+        }
+        if unavailable:
+            raise ValueError(f"GPU(s) are unavailable for CUDA compute: {unavailable}")
         busy = {
             gpu_id: [
                 process
@@ -1882,6 +1960,10 @@ def create_app(config_path: Path) -> Flask:
         busy = {gpu_id: procs for gpu_id, procs in busy.items() if procs}
         if busy and not config["allow_busy_gpus"]:
             raise ValueError(f"refusing busy GPU(s): {busy}")
+        if minimum_free_mib > 0 and not config["allow_busy_gpus"]:
+            low_memory = gpu_memory_shortfalls(inventory, gpu_ids, minimum_free_mib)
+            if low_memory:
+                raise ValueError(f"GPU(s) do not have enough free memory: {low_memory}")
         return gpu_ids
 
     def norm_stats_path(dataset_id: str, arm_mode: str, model_variant: str) -> Path:
@@ -2025,15 +2107,26 @@ def create_app(config_path: Path) -> Flask:
         norm_path = norm_stats_path(dataset_id, arm_mode, model_variant)
         norm_ready = norm_split_matches(norm_path.parent, split)
         saved_norm_config = read_json(norm_path.parent / NORM_CONFIG_FILENAME) if norm_ready else None
-        gpu_ids = parse_gpus(payload, check_busy=norm_ready)
+        minimum_free_gpu_mib = int(config.get("training_min_free_gpu_mib", 23_000))
+        gpu_ids = parse_gpus(
+            payload,
+            check_busy=norm_ready,
+            minimum_free_mib=minimum_free_gpu_mib,
+        )
         exp_name = safe_name(payload.get("exp_name"), "experiment name")
-        batch_size = safe_int(payload.get("batch_size", 8), "batch_size", 1, 1024)
+        batch_size = safe_int(payload.get("batch_size", 2), "batch_size", 1, 1024)
         if batch_size % len(gpu_ids):
             raise ValueError("batch_size must be divisible by the number of selected GPUs")
         fsdp_devices = safe_int(payload.get("fsdp_devices", 1), "fsdp_devices", 1, len(gpu_ids))
         if len(gpu_ids) % fsdp_devices:
             raise ValueError("selected GPU count must be divisible by fsdp_devices")
         num_workers = safe_int(payload.get("num_workers", 2), "num_workers", 1, 64)
+        xla_memory_fraction = safe_float(
+            payload.get("xla_memory_fraction", config.get("xla_memory_fraction", 0.90)),
+            "xla_memory_fraction",
+            0.50,
+            0.95,
+        )
         steps = safe_int(payload.get("num_train_steps", 30_000), "num_train_steps", 1, 10_000_000)
         save_interval = safe_int(payload.get("save_interval", 1_000), "save_interval", 1, steps)
         mode = str(payload.get("mode", "auto"))
@@ -2090,6 +2183,8 @@ def create_app(config_path: Path) -> Flask:
             "steps": steps,
             "save_interval": save_interval,
             "fsdp_devices": fsdp_devices,
+            "xla_memory_fraction": xla_memory_fraction,
+            "minimum_free_gpu_mib": minimum_free_gpu_mib,
             "mode": mode,
             "effective_mode": effective_mode,
             "checkpoint_dir": str(checkpoint_dir),
@@ -2110,12 +2205,16 @@ def create_app(config_path: Path) -> Flask:
             # Re-check while holding the task lock so simultaneous submissions
             # cannot create duplicate automatic norm jobs for the same model and dataset.
             if norm_ready:
-                gpu_ids = parse_gpus(payload)
+                gpu_ids = parse_gpus(payload, minimum_free_mib=minimum_free_gpu_mib)
                 metadata["gpu_ids"] = gpu_ids
                 task = tasks.start(
                     "train",
                     command,
-                    env=build_environment(config, gpu_ids),
+                    env=build_environment(
+                        config,
+                        gpu_ids,
+                        xla_memory_fraction=xla_memory_fraction,
+                    ),
                     metadata=metadata,
                 )
                 return jsonify(task), 201

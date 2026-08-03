@@ -737,7 +737,8 @@ function syncPolicyCheckpointVariant() {
 
 function fillGpus(items) {
   document.getElementById('gpuList').innerHTML = items.map(g => `
-    <div><span class="pill">GPU ${g.index}</span> ${esc(g.name)} · ${g.memory_used_mib}/${g.memory_total_mib} MiB · ${g.processes.length ? '<span class="warn">busy</span>' : '<span class="ok">free</span>'}
+    <div><span class="pill">GPU ${g.index}</span> ${esc(g.name)} · ${g.memory_used_mib}/${g.memory_total_mib} MiB · ${g.compute_available === false ? '<span class="bad">CUDA unavailable</span>' : g.processes.length ? '<span class="warn">busy</span>' : '<span class="ok">free</span>'}
+    ${g.health_issue ? `<div class="bad">${esc(g.health_issue)}</div>` : ''}
     ${g.processes.map(p => `<div class="muted">PID ${p.pid} ${esc(p.name)} ${p.memory_mib} MiB</div>`).join('')}</div>`).join('') || '<div class="bad">nvidia-smi 不可用</div>';
 }
 
@@ -999,8 +1000,8 @@ function updateSummaries(data) {
   const gpus = data.gpus || [];
   const datasets = data.datasets || [];
   const tasks = data.tasks || [];
-  const freeGpus = gpus.filter(gpu => !(gpu.processes || []).length).length;
-  const freeMemory = gpus.reduce((sum, gpu) => sum + Math.max(0, Number(gpu.memory_total_mib || 0) - Number(gpu.memory_used_mib || 0)), 0);
+  const freeGpus = gpus.filter(gpu => gpu.compute_available !== false && !(gpu.processes || []).length).length;
+  const freeMemory = gpus.reduce((sum, gpu) => sum + (gpu.compute_available === false ? 0 : Math.max(0, Number(gpu.memory_total_mib || 0) - Number(gpu.memory_used_mib || 0))), 0);
   const frames = datasets.reduce((sum, dataset) => sum + Number(dataset.frames || 0), 0);
   const trainTasks = tasks.filter(task => task.type === 'train');
   const normTasks = tasks.filter(task => task.type === 'norm');
