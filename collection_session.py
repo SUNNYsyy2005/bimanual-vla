@@ -120,6 +120,10 @@ class CollectionSession:
         try:
             cameras.open()
             checks = self._camera_verifier(cameras, self.config.camera_fps)
+            # Verify live Piper feedback before reporting the session as ready.
+            # The production reader rejects stale SDK cache values by checking
+            # the underlying SocketCAN receive timestamps.
+            self._state_reader(piper)
         except Exception:
             cameras.close()
             piper.DisconnectPort()

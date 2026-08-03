@@ -397,6 +397,11 @@ def validate_episode(path: str | Path, target_fps: float = TARGET_FPS) -> Episod
         frozen_high_count=frozen_high_count,
         frozen_wrist_count=frozen_wrist_count,
     )
+    if success and no_op_total > 0 and no_op_count == no_op_total:
+        errors.append(
+            "successful episode contains no robot motion or gripper change "
+            "(100% no-op); check Piper CAN feedback before recording"
+        )
     if errors:
         raise EpisodeValidationError(path, errors, stats=stats)
     return stats
