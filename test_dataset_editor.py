@@ -191,6 +191,59 @@ class DatasetEditorTest(unittest.TestCase):
                 "target", target, overwrite=True, merge=True
             )
 
+    def test_image_media_details_and_frame_lookup(self):
+        target = make_dataset(self.datasets, "target", [3])
+        info_path = target / "meta" / "info.json"
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        info["features"]["image"] = {
+            "dtype": "image",
+            "shape": [256, 256, 3],
+            "names": ["height", "width", "channel"],
+        }
+        info_path.write_text(json.dumps(info), encoding="utf-8")
+
+        parquet_path = target / DATA_PATH.format(episode_chunk=0, episode_index=0)
+        table = pq.read_table(parquet_path)
+        image_values = pa.array(
+            [
+                {
+                    "bytes": None,
+                    "path": "custom/frame-one.jpg" if frame_index == 1 else f"frame_{frame_index:06d}.png",
+                }
+                for frame_index in range(table.num_rows)
+            ],
+            type=pa.struct([("bytes", pa.binary()), ("path", pa.string())]),
+        )
+        pq.write_table(table.append_column("image", image_values), parquet_path)
+
+        for frame_index in range(table.num_rows):
+            if frame_index == 1:
+                continue
+            frame_path = target / "images" / "image" / "episode_000000" / f"frame_{frame_index:06d}.png"
+            frame_path.parent.mkdir(parents=True, exist_ok=True)
+            frame_path.write_bytes(b"synthetic-png")
+        custom_frame = target / "images" / "custom" / "frame-one.jpg"
+        custom_frame.parent.mkdir(parents=True, exist_ok=True)
+        custom_frame.write_bytes(b"synthetic-jpeg")
+
+        editor = self.editor()
+        details = editor.details("target")
+        episode = details["episodes"][0]
+        self.assertEqual(episode["image_keys"], ["image"])
+        self.assertEqual(episode["video_keys"], [])
+        self.assertEqual(
+            episode["media"],
+            [{"key": "image", "type": "image", "frames": 3, "fps": 20}],
+        )
+        self.assertEqual(
+            editor.image_path("target", 0, "image", 1),
+            custom_frame,
+        )
+        with self.assertRaisesRegex(ValueError, "unknown image key"):
+            editor.image_path("target", 0, "wrist_image", 0)
+        with self.assertRaisesRegex(ValueError, "frame index"):
+            editor.image_path("target", 0, "image", 3)
+
     def test_episode_metadata_supports_nested_json_and_invalidates_norm(self):
         target = make_dataset(self.datasets, "target", [2])
         norm = self.assets / "pi05_piper_single_arm_lora" / "target" / "norm_stats.json"

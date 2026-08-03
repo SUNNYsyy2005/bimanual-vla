@@ -16,6 +16,7 @@
 - 真实 `state + cam_high + cam_wrist + prompt` 由机械臂电脑直接发送到 Policy WebSocket 端口。
 - Dashboard 不接收机械臂观测上传，也不代发 inference。
 - Dashboard 负责数据集、norm、训练、GPU、checkpoint 和 Policy 进程管理。
+- 页面顶部按“总览 / 数据集 / 训练 / Policy / 实时遥测”分模块导航；总览集中显示 GPU、数据量和活动任务。
 - Dashboard 可以新建、健康检测、停止、强制结束 Policy，并用新 checkpoint 替换运行中的 Policy。
 - 机械臂客户端默认是 shadow-only；只有显式添加 `--allow-execution`、Dashboard 对同一 Policy 给出未过期的 EXECUTE 授权、telemetry 新鲜且本地安全检查全部通过时，才会发布第一步 action。
 
@@ -140,7 +141,9 @@ observation.images.cam_<side>_wrist RGB
 Dashboard 的“Episode 级数据集编辑”区域支持：
 
 1. 分页查看 episode 的帧数、instruction、task name、success 和附加 metadata。
-2. 播放该 episode 的各路摄像头视频。
+2. 独立预览该 episode 的各路摄像头媒体：
+   - `dtype: video` 直接播放 MP4；
+   - `dtype: image` 按数据集 FPS 播放逐帧 PNG，并支持暂停和拖动帧索引。
 3. 修改 instruction、task name、success 和 JSON metadata。
 4. 批量删除错误 episode；剩余 episode、parquet、video、可选 raw NPZ 和 metadata 会连续重新编号。
 5. 把服务器另一个兼容数据集的全部 episodes 合并到当前目标数据集；源数据集保持不变。
@@ -161,7 +164,10 @@ PATCH /api/datasets/<dataset_id>/episodes/<episode_index>
 POST  /api/datasets/<dataset_id>/episodes/delete
 POST  /api/datasets/<dataset_id>/merge
 GET   /api/datasets/<dataset_id>/episodes/<episode_index>/video/<video_key>
+GET   /api/datasets/<dataset_id>/episodes/<episode_index>/image/<image_key>/<frame_index>
 ```
+
+LeRobot 数据集的 `meta/info.json` 中 `total_videos: 0` 只表示没有编码后的 MP4，**不代表没有摄像头画面**。例如 `my_dataset` 的 `image` 和 `wrist_image` feature 均为 `dtype: image`，实际帧位于 `images/<camera>/episode_x/frame_x.png`；Dashboard 会通过上述 image API 逐帧读取，不需要破坏性地转换原数据集。
 
 ## 下载训练基座权重
 
@@ -185,7 +191,7 @@ cd /home/sunny/bimanual-vla
 ## 页面工作流
 
 1. 输入 Dashboard Token，或在页面顶部用 Dashboard 账号密码获取 Token。
-2. 查看数据集结构及 GPU 占用。
+2. 通过顶部导航进入各模块，查看数据集结构、GPU 占用和活动任务。
 3. 选择 RTX 4090，提交 FSDP LoRA 微调：
    - `norm_stats.json` 已存在时直接启动训练；
    - 缺失时自动启动完整 norm 任务，训练进入持久化 `waiting_norm`；
@@ -194,19 +200,28 @@ cd /home/sunny/bimanual-vla
    - 同一数据集已有运行中的 norm 时复用该任务，Dashboard 重启后依赖仍可恢复；
    - 启动方式默认使用 `auto`：实验目录存在时等价于 `--resume`，不存在时创建新训练；只有明确选择 `overwrite` 才会删除原 checkpoint。
 4. “计算归一化统计”表单保留为手动重算或限制帧数调试入口，正常训练无需预先手动点击。
-5. 页面扫描 `pi05_piper_single_arm_lora/<experiment>/<step>`，按数据集过滤完整 checkpoint。
-6. 在“新建 / 切换 Policy 进程”中选择 GPU、端口和 checkpoint：
+5. 训练模块从任务日志提取 `Step N: key=value`，绘制 `loss`、`loss_physical_14d`、`loss_padding_18d` 等曲线，并显示 step 进度、latest/min/max；图例按钮可切换 `grad_norm`、`param_norm` 等其他指标。
+6. 页面扫描 `pi05_piper_single_arm_lora/<experiment>/<step>`，按数据集过滤完整 checkpoint，并在训练模块列出 checkpoint 表。
+7. 在“新建 / 切换 Policy 进程”中选择 GPU、端口和 checkpoint：
    - 留空“操作对象”：新建独立 Policy；
    - 选择运行中的 Policy：先停止旧进程，再从新 checkpoint 启动替代进程。
-7. 在“Policy 进程管理”中查看：
+8. 在“Policy 进程管理”中查看：
    - PID 和进程状态；
    - WebSocket `/healthz`；
    - GPU、端口和 schema；
    - dataset 和 checkpoint；
    - 最近 telemetry / 客户端推理时间；
    - 日志、正常停止和强制结束。
-8. 在机械臂控制电脑启动官方 WebSocket 客户端。
-9. Dashboard 按 schema 显示 Policy 实际收到的 10D delivery state 或 7D joint state、两路图像、prompt、预测 action，以及服务端授权、客户端本地执行许可、双重门结果和实际执行/阻断原因。
+9. 在机械臂控制电脑启动官方 WebSocket 客户端。
+10. Dashboard 按 schema 显示 Policy 实际收到的 10D delivery state 或 7D joint state、两路图像、prompt、预测 action，以及服务端授权、客户端本地执行许可、双重门结果和实际执行/阻断原因。
+
+训练指标 API（Bearer Token 必需）：
+
+```text
+GET /api/tasks/<train_task_id>/metrics?max_points=1200
+```
+
+接口最多读取任务日志尾部 16 MiB，同一步的后出现记录覆盖前记录，并对返回曲线降采样；latest/min/max 汇总仍基于读取到的全部指标点。
 
 服务端只列出同时包含 `params/` 和 `_CHECKPOINT_METADATA` 的完整 checkpoint，并通过 `assets/<dataset_id>/norm_stats.json` 判断 checkpoint 所属数据集。启动 Policy 时会再次校验，防止 checkpoint 与数据集错配。
 

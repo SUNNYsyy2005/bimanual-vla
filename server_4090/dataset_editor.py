@@ -125,6 +125,16 @@ def _video_keys(info: dict[str, Any]) -> list[str]:
     )
 
 
+def _image_keys(info: dict[str, Any]) -> list[str]:
+    features = info.get("features", {})
+    if not isinstance(features, dict):
+        return []
+    return sorted(
+        key for key, feature in features.items()
+        if isinstance(feature, dict) and feature.get("dtype") == "image"
+    )
+
+
 def _format_episode_path(root: Path, info: dict[str, Any], key: str, episode_index: int, **extra: Any) -> Path:
     template = info.get(key)
     if not isinstance(template, str) or not template:
@@ -272,6 +282,8 @@ class DatasetEditor:
         indexes = sorted(parquet)
         selected = indexes[offset:offset + limit]
         rows = []
+        video_keys = _video_keys(info)
+        image_keys = _image_keys(info)
         for index in selected:
             row = dict(episodes.get(index, {}))
             task_values = row.get("tasks")
@@ -297,7 +309,18 @@ class DatasetEditor:
                     "task_name": row.get("task_name", ""),
                     "success": row.get("success"),
                     "parameters": parameters,
-                    "video_keys": _video_keys(info),
+                    "video_keys": video_keys,
+                    "image_keys": image_keys,
+                    "media": [
+                        *(
+                            {"key": key, "type": "video", "frames": int(length), "fps": info.get("fps")}
+                            for key in video_keys
+                        ),
+                        *(
+                            {"key": key, "type": "image", "frames": int(length), "fps": info.get("fps")}
+                            for key in image_keys
+                        ),
+                    ],
                 }
             )
         return {
@@ -321,6 +344,67 @@ class DatasetEditor:
         if not path.is_file():
             raise FileNotFoundError(path)
         return path
+
+    def image_path(self, dataset_id: str, episode_index: int, image_key: str, frame_index: int) -> Path:
+        root = self._dataset_path(dataset_id)
+        info = _read_json(root / "meta" / "info.json")
+        if not isinstance(info, dict):
+            raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
+        if image_key not in _image_keys(info):
+            raise ValueError(f"unknown image key: {image_key}")
+        parquet = _parquet_paths(root)
+        parquet_path = parquet.get(episode_index)
+        if parquet_path is None:
+            raise FileNotFoundError(f"episode does not exist: {episode_index}")
+        frame_count = pq.read_metadata(parquet_path).num_rows
+        if not 0 <= frame_index < frame_count:
+            raise ValueError(f"frame index must be in [0, {max(0, frame_count - 1)}]")
+
+        chunk = episode_index // int(info.get("chunks_size", 1000))
+        episode_name = f"episode_{episode_index:06d}"
+        root_resolved = root.resolve()
+
+        def existing_candidate(candidates: list[Path]) -> Path | None:
+            for candidate in candidates:
+                try:
+                    resolved = candidate.resolve()
+                except OSError:
+                    continue
+                if resolved.is_relative_to(root_resolved) and resolved.is_file():
+                    return resolved
+            return None
+
+        default_name = f"frame_{frame_index:06d}.png"
+        result = existing_candidate(
+            [
+                root / "images" / image_key / episode_name / default_name,
+                root / "images" / f"chunk-{chunk:03d}" / image_key / episode_name / default_name,
+            ]
+        )
+        if result is not None:
+            return result
+
+        stored_path = ""
+        try:
+            paths = pq.read_table(parquet_path, columns=[f"{image_key}.path"]).column(0)
+            stored_path = str(paths[frame_index].as_py() or "")
+        except (KeyError, IndexError, OSError, TypeError, ValueError, pa.ArrowInvalid):
+            pass
+        frame_name = Path(stored_path).name if stored_path else default_name
+        result = existing_candidate(
+            [
+                root / stored_path,
+                root / "images" / stored_path,
+                root / "images" / image_key / episode_name / frame_name,
+                root / "images" / f"chunk-{chunk:03d}" / image_key / episode_name / frame_name,
+            ]
+        )
+        if result is not None:
+            return result
+        raise FileNotFoundError(
+            f"image frame not found: dataset={dataset_id} episode={episode_index} "
+            f"key={image_key} frame={frame_index}"
+        )
 
     def install_upload(self, dataset_id: str, extracted: Path, *, overwrite: bool, merge: bool) -> dict[str, Any]:
         if overwrite and merge:
