@@ -1840,6 +1840,47 @@ def _telemetry_json_value(value: Any, *, action_dim: int, max_chars: int = 16_00
         return None
 
 
+def _normalize_queue_drop_kind(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "unsafe": "unsafe",
+        "safety": "unsafe",
+        "safety_rejection": "unsafe",
+        "expired": "expired",
+        "expiry": "expired",
+        "stale_target": "expired",
+        "other": "other",
+    }
+    return aliases.get(normalized)
+
+
+def _infer_queue_drop_kind(reason: Any) -> str | None:
+    reason_lower = " ".join(str(reason or "").strip().lower().split())
+    if not reason_lower:
+        return None
+    if any(token in reason_lower for token in (
+        "unsafe",
+        "safety",
+        "translation step",
+        "rotation step",
+        "gripper step",
+        "workspace",
+    )):
+        return "unsafe"
+    if any(token in reason_lower for token in (
+        "targets older than execution_time",
+        "target older than execution_time",
+        "older than execution time",
+        "active timed plan exhausted",
+        "timed plan exhausted",
+        "expired prefix",
+        "expired target",
+        "target expired",
+    )):
+        return "expired"
+    return "other"
+
+
 def sanitize_async_client_telemetry(
     client: dict[str, Any],
     *,
@@ -2124,12 +2165,97 @@ def sanitize_async_client_telemetry(
         if rejected_count is not None and result.get("client_rejected_result_count") is None:
             result["client_rejected_result_count"] = rejected_count
 
-    drop_reason = _first_client_value(
-        client, "drop_reason", "queue_drop_reason", "last_queue_drop_reason", "client_drop_reason"
+    # New clients report category counters explicitly. Keep the legacy total
+    # separate: it includes expiry, queue replacement, stale generations and
+    # safety rejection, so it is never a safety-violation rate.
+    result["client_dropped_action_count"] = _telemetry_nonnegative_int(
+        _first_client_value(
+            client,
+            "dropped_action_count",
+            "client_dropped_action_count",
+            "dropped_actions",
+        )
     )
-    if not drop_reason and isinstance(rejected_json, dict):
-        drop_reason = rejected_json.get("reason")
+    for output, keys in {
+        "client_unsafe_drop_count": (
+            "unsafe_drop_count",
+            "client_unsafe_drop_count",
+            "safety_drop_count",
+        ),
+        "client_expired_drop_count": (
+            "expired_drop_count",
+            "client_expired_drop_count",
+            "expiry_drop_count",
+        ),
+        "client_other_drop_count": (
+            "other_drop_count",
+            "client_other_drop_count",
+        ),
+    }.items():
+        result[output] = _telemetry_nonnegative_int(_first_client_value(client, *keys))
+
+    explicit_reason = _first_client_value(
+        client,
+        "last_queue_drop_reason",
+        "queue_drop_reason",
+        "drop_reason",
+        "client_drop_reason",
+    )
+    if not explicit_reason and isinstance(rejected_json, dict):
+        explicit_reason = rejected_json.get("reason")
+
+    blocked_reason = str(client.get("blocked_reason") or "")[:500]
+    blocked_drop_kind = _infer_queue_drop_kind(blocked_reason)
+    blocked_looks_like_drop = bool(blocked_reason) and (
+        blocked_drop_kind in {"unsafe", "expired"}
+        or any(token in blocked_reason.lower() for token in ("dropped", "drop "))
+    )
+    drop_reason = explicit_reason or (blocked_reason if blocked_looks_like_drop else "")
     result["client_drop_reason"] = str(drop_reason or "")[:500]
+
+    explicit_drop_kind = _first_client_value(
+        client,
+        "last_queue_drop_kind",
+        "client_last_queue_drop_kind",
+        "drop_kind",
+        "queue_drop_kind",
+        "client_last_drop_kind",
+    )
+    drop_kind = _normalize_queue_drop_kind(explicit_drop_kind)
+    if drop_kind is None:
+        drop_kind = _infer_queue_drop_kind(result["client_drop_reason"])
+    result["client_last_drop_kind"] = drop_kind
+    result["client_last_drop_was_unsafe"] = (
+        drop_kind == "unsafe" if drop_kind is not None else None
+    )
+    result["client_last_drop_was_expired"] = (
+        drop_kind == "expired" if drop_kind is not None else None
+    )
+
+    # Prefer the client's explicit current-state flag. For legacy clients only,
+    # infer current unsafe state from execution_state + blocked_reason; never
+    # infer it from cumulative counters or a historical queue-drop reason.
+    explicit_unsafe = _first_client_value(
+        client,
+        "unsafe_active",
+        "client_unsafe_active",
+        "safety_violation_active",
+        "unsafe_action_active",
+    )
+    unsafe_flag, _ = _telemetry_bool_or_count(explicit_unsafe)
+    unsafe_source = "client" if unsafe_flag is not None else None
+    if unsafe_flag is None:
+        execution_state = str(client.get("execution_state") or "").strip().lower()
+        healthy_execution = execution_state in {"ready", "executing", "holding"}
+        if healthy_execution:
+            unsafe_flag = False
+            unsafe_source = "legacy_execution_state"
+        elif blocked_drop_kind == "unsafe" and execution_state:
+            unsafe_flag = True
+            unsafe_source = "legacy_blocked_reason"
+    result["client_unsafe_active"] = unsafe_flag
+    result["client_unsafe_active_source"] = unsafe_source
+
     result["client_last_wire_action"] = _telemetry_json_value(
         _first_client_value(client, "last_wire_action", "wire_action", "client_last_wire_action"),
         action_dim=action_dim,
@@ -2421,15 +2547,14 @@ class PolicyTelemetry:
                     "client_last_decoded_target"
                 ],
                 "client_last_feedback_at": self._finite_float(client.get("last_feedback_at")),
-                "client_dropped_action_count": self._nonnegative_int(
-                    client.get("dropped_action_count")
-                ),
                 "client_unqueued_action_count": self._nonnegative_int(
                     client.get("unqueued_action_count")
                 ),
                 "client_last_queue_drop_reason": async_client["client_drop_reason"],
                 **async_client,
                 "robot_arm_status": client.get("robot_arm_status"),
+                "client_robot_enabled_sides": client.get("robot_enabled_sides"),
+                "client_robot_enable_hold": client.get("robot_enable_hold"),
                 "schema": self.metadata["schema"],
                 "arm_mode": self.metadata["arm_mode"],
                 "arm_side": self.metadata["arm_side"],

@@ -97,6 +97,7 @@
     .telemetry-item-label { display:block; color:var(--muted); font-size:11px; }
     .telemetry-item-value { display:block; overflow:hidden; color:#eaf4ff; font-size:12px; font-weight:700; text-overflow:ellipsis; white-space:nowrap; }
     .telemetry-alert { margin-top:7px; padding:6px 8px; border-left:3px solid var(--yellow); border-radius:5px; background:#241d13; color:#ffd98a; font-size:12px; line-height:1.4; }
+    .telemetry-note { margin-top:7px; padding:6px 8px; border-left:3px solid var(--blue); border-radius:5px; background:#102233; color:#b9dcff; font-size:12px; line-height:1.4; }
     .telemetry-details { margin-top:7px; }
     .telemetry-details summary { cursor:pointer; color:#9fdcff; font-size:11px; }
     .telemetry-detail-list { display:grid; gap:4px; margin-top:6px; color:#adc0d6; font-size:11px; line-height:1.4; }
@@ -1090,6 +1091,85 @@ function actionTargetAt(t) {
   ]);
 }
 
+function normalizeQueueDropKind(value) {
+  const normalized = String(value || '').trim().toLowerCase().replace(/-/g, '_');
+  if (['unsafe', 'safety', 'safety_rejection'].includes(normalized)) return 'unsafe';
+  if (['expired', 'expiry', 'stale_target'].includes(normalized)) return 'expired';
+  if (normalized === 'other') return 'other';
+  return null;
+}
+
+function inferQueueDropKind(reason) {
+  const normalized = String(reason || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!normalized) return null;
+  if (['unsafe', 'safety', 'translation step', 'rotation step', 'gripper step', 'workspace'].some(token => normalized.includes(token))) {
+    return 'unsafe';
+  }
+  if ([
+    'targets older than execution_time',
+    'target older than execution_time',
+    'older than execution time',
+    'active timed plan exhausted',
+    'timed plan exhausted',
+    'expired prefix',
+    'expired target',
+    'target expired',
+  ].some(token => normalized.includes(token))) {
+    return 'expired';
+  }
+  return 'other';
+}
+
+function queueDropInfo(t) {
+  const executionState = String(t.client_execution_state || '').trim().toLowerCase();
+  const healthyExecution = ['ready', 'executing', 'holding'].includes(executionState);
+  const blockedReason = String(t.client_blocked_reason || '');
+  const blockedKind = inferQueueDropKind(blockedReason);
+  const blockedLooksLikeDrop = ['unsafe', 'expired'].includes(blockedKind)
+    || /(?:^|\b)(dropped|drop)(?:\b| )/i.test(blockedReason);
+  const historicalBlockedDrop = healthyExecution && blockedLooksLikeDrop ? blockedReason : '';
+  const reason = String(t.client_drop_reason || t.client_last_queue_drop_reason || (blockedLooksLikeDrop ? blockedReason : ''));
+  const kind = normalizeQueueDropKind(t.client_last_drop_kind ?? t.client_last_queue_drop_kind ?? t.last_queue_drop_kind)
+    || inferQueueDropKind(reason);
+
+  let unsafeActive = typeof t.client_unsafe_active === 'boolean' ? t.client_unsafe_active : null;
+  let unsafeSource = t.client_unsafe_active_source || (unsafeActive == null ? null : 'client');
+  if (unsafeActive == null && healthyExecution) {
+    unsafeActive = false;
+    unsafeSource = 'legacy_execution_state';
+  } else if (unsafeActive == null && executionState && blockedKind === 'unsafe') {
+    unsafeActive = true;
+    unsafeSource = 'legacy_blocked_reason';
+  }
+
+  const counts = {
+    total: t.client_dropped_action_count ?? t.dropped_action_count ?? null,
+    unsafe: t.client_unsafe_drop_count ?? t.unsafe_drop_count ?? null,
+    expired: t.client_expired_drop_count ?? t.expired_drop_count ?? null,
+    other: t.client_other_drop_count ?? t.other_drop_count ?? null,
+  };
+  const count = value => value == null ? '-' : value;
+  const classified = counts.unsafe != null || counts.expired != null || counts.other != null;
+  const history = `总计 ${count(counts.total)}（非安全率）${classified ? ` · 安全 ${count(counts.unsafe)} / 过期 ${count(counts.expired)} / 其他 ${count(counts.other)}` : ' · 分类计数未上报'}`;
+  const kindLabel = {unsafe: '安全拒绝', expired: '过期', other: '其他'}[kind] || '未分类';
+  const unsafeLabel = unsafeActive === true ? '当前 UNSAFE' : unsafeActive === false ? '当前未阻断' : '当前状态未上报';
+
+  return {
+    executionState,
+    blockedReason,
+    currentReason: historicalBlockedDrop ? '' : blockedReason,
+    reason,
+    kind,
+    kindLabel,
+    unsafeActive,
+    unsafeSource,
+    unsafeLabel,
+    counts,
+    history,
+    unsafeReason: blockedKind === 'unsafe' ? blockedReason : '',
+  };
+}
+
 function telemetrySummary(t) {
   if (!t) return '<span class="muted">客户端未连接，尚无 telemetry</span>';
   const control = t.execution_control || {};
@@ -1134,7 +1214,13 @@ function telemetrySummary(t) {
   const dualGate = t.dual_gate_open
     ? '<span class="bad">双重门 OPEN</span>'
     : '<span class="ok">双重门 CLOSED</span>';
-  const reason = t.client_blocked_reason || t.client_drop_reason || t.horizon_error || '';
+  const drop = queueDropInfo(t);
+  const reason = drop.currentReason || t.horizon_error || t.time_contract_error || '';
+  const safetyBadge = drop.unsafeActive === true
+    ? '<span class="bad">当前安全阻断</span>'
+    : drop.unsafeActive === false
+      ? '<span class="ok">当前无安全阻断</span>'
+      : '<span class="muted">安全状态未上报</span>';
   const details = `
     <div>推理时序：launch/capture/arrival=${esc(fmtTime(t.client_launch_at))}/${esc(fmtTime(t.client_capture_at ?? t.captured_at))}/${esc(fmtTime(t.client_arrival_at))}</div>
     <div>异步延迟：capture→result=${esc(metricMs(t.client_latency_ms))} · 上传=${esc(uploadTiming)} · 模型=${esc(metricMs(t.server_model_inference_ms ?? t.client_model_inference_ms))} · 下行=${esc(downloadTiming)} · RTT=${esc(metricMs(t.client_round_trip_ms))}</div>
@@ -1148,11 +1234,13 @@ function telemetrySummary(t) {
     <div>rejected=${esc(rejected)} (${esc(t.client_rejected_result_count ?? 0)}) · underrun=${esc(t.client_underrun ?? false)} (${esc(t.client_underrun_count ?? 0)})</div>
     <div>actuator command/feedback sequence=${esc(t.client_actuator_command_sequence ?? '-')} / ${esc(t.client_feedback_command_sequence ?? '-')} · generation=${esc(t.client_actuator_command_generation ?? '-')} / ${esc(t.client_feedback_command_generation ?? '-')}</div>
     <div>next-cycle feedback=${esc(metricMs(t.client_command_to_feedback_ms))} · max joint=${esc(metricUnit(commandJointError, 'rad'))} · EEF xyz/rot=${esc(metricUnit(t.client_command_max_eef_translation_error_m, 'm'))}/${esc(metricUnit(t.client_command_max_eef_rotation_error_rad, 'rad'))}</div>
+    <div>丢弃计数：${esc(drop.history)} · expired prefix=${esc(t.client_expired_prefix ?? '-')}</div>
+    <div>最近丢弃：${esc(drop.kindLabel)} · ${esc(drop.reason || '-')} · 当前安全=${esc(drop.unsafeLabel)} (${esc(drop.unsafeSource || 'unreported')})</div>
     <div>contract=v${esc(t.contract_version || '?')} · raw/model=${esc(t.raw_action_dim || '?')}D/${esc(t.model_action_dim || '?')}D · ${esc(t.model_action_convention || '-')}</div>
     <div>gripper=${esc(t.raw_gripper_semantics || '-')} → ${esc(t.wire_gripper_semantics || '-')} · source=${esc(t.source_name || '-')} · action=${esc(JSON.stringify(t.actions_shape || []))}</div>
   `;
   return `<div class="policy-telemetry">
-    <div class="telemetry-badges">${connection}${freshness}${serverGate}${clientGate}${dualGate}</div>
+    <div class="telemetry-badges">${connection}${freshness}${serverGate}${clientGate}${dualGate}${safetyBadge}</div>
     <div class="telemetry-grid">
       ${item('实际状态', `<code>${esc(t.client_execution_state || 'unknown')}</code>`, t.client_execution_state === 'ready' || t.client_execution_state === 'executing' ? 'ok' : '')}
       ${item('推理 / 控制频率', `${esc(launchHz)} / ${esc(controlHz)} Hz`)}
@@ -1163,8 +1251,11 @@ function telemetrySummary(t) {
       ${item('模型推理（当前请求）', esc(metricMs(t.server_model_inference_ms ?? t.client_model_inference_ms)))}
       ${item('网络 / RTT', `${esc(metricMs(t.client_network_transport_total_ms))} / ${esc(metricMs(t.client_round_trip_ms))}`)}
       ${item('下一周期关节误差', esc(metricUnit(commandJointError, 'rad')), commandJointError != null && commandJointError > 0.05 ? 'warn' : '')}
+      ${item('当前安全状态', esc(drop.unsafeLabel), drop.unsafeActive === true ? 'bad' : drop.unsafeActive === false ? 'ok' : '')}
+      ${item('历史丢弃（非安全率）', `总 ${esc(drop.counts.total ?? '-')} · 安全 ${esc(drop.counts.unsafe ?? '-')}`)}
     </div>
-    ${reason ? `<div class="telemetry-alert"><strong>当前原因：</strong>${esc(reason)}</div>` : ''}
+    ${drop.unsafeActive === true ? `<div class="telemetry-alert"><strong>当前安全阻断：</strong>${esc(drop.unsafeReason || reason || drop.reason || '客户端报告 unsafe_active')}</div>` : reason ? `<div class="telemetry-alert"><strong>当前状态原因：</strong>${esc(reason)}</div>` : ''}
+    ${drop.reason ? `<div class="telemetry-note"><strong>最近丢弃（历史事件）：</strong>${esc(drop.kindLabel)} · ${esc(drop.reason)}<br>${esc(drop.history)}</div>` : ''}
     <details class="telemetry-details"><summary>展开详细遥测</summary><div class="telemetry-detail-list">${details}</div></details>
   </div>`;
 }
@@ -1374,6 +1465,7 @@ function fillObservation(obs) {
   const clientDownloadMs = obs.client_result_download_ms;
   const clientTransportMs = obs.client_network_transport_total_ms;
   const roundTripMs = obs.client_round_trip_ms;
+  const drop = queueDropInfo(obs);
   document.getElementById('telemetryUpload').textContent = metricMs(uploadMs);
   document.getElementById('telemetryUploadDetail').textContent = clientUploadMs != null
     ? '客户端汇报 · wall-clock 单向测量'
@@ -1391,7 +1483,7 @@ function fillObservation(obs) {
     : '尚无客户端总传输汇报 · RTT 为客户端 monotonic 实测';
   document.getElementById('telemetryFirstCommand').textContent = metricMs(obs.client_result_to_first_command_ms);
   document.getElementById('telemetryActionError').textContent = signedMetricMs(currentTargetErrorMs);
-  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · 服务端=${control.mode || 'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open ? 'OPEN' : 'CLOSED'} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · 上传=${clientTimingMetric(clientUploadMs, serverUploadMs)} · 推理实测=${metricMs(modelMs)} · 下行=${clientTimingMetric(clientDownloadMs, null)} · 当前动作时间误差=${signedMetricMs(currentTargetErrorMs)} · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
+  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · 服务端=${control.mode || 'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open ? 'OPEN' : 'CLOSED'} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · 上传=${clientTimingMetric(clientUploadMs, serverUploadMs)} · 推理实测=${metricMs(modelMs)} · 下行=${clientTimingMetric(clientDownloadMs, null)} · 当前动作时间误差=${signedMetricMs(currentTargetErrorMs)} · 安全=${drop.unsafeLabel} · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
   const joint = obs.schema === 'joint';
   const stateGripper = String(obs.state_gripper_semantics || obs.raw_gripper_semantics || '');
   const gripperLabel = stateGripper.includes('metre') || stateGripper.endsWith('_m')
@@ -1453,8 +1545,10 @@ hold: ${obs.client_hold_active ?? false} steps=${obs.client_hold_steps ?? 0} rea
 blend active/remaining: ${obs.client_blend_active ?? false} / ${obs.client_blend_remaining ?? '-'}
 gripper filter: ${obs.client_gripper_filter_active ?? false} · ${obs.client_gripper_filter ? JSON.stringify(obs.client_gripper_filter) : '-'}
 underrun: ${obs.client_underrun ?? false} (count=${obs.client_underrun_count ?? 0})
+drop counters (total is not a safety rate): ${drop.history}
 rejected result: ${rejectedResult} (count=${obs.client_rejected_result_count ?? 0})
-drop reason: ${obs.client_drop_reason || '-'}
+last queue drop: ${drop.kindLabel} · ${drop.reason || '-'}
+current unsafe: ${drop.unsafeLabel} · source=${drop.unsafeSource || 'unreported'}
 plan target times: ${targetTimes}
 current model action target: ${obs.client_timed_target ? JSON.stringify(obs.client_timed_target) : '-'}
 current action target timestamp: ${fmtTime(targetAt)} · time error (now-target, signed): ${signedMetricMs(currentTargetErrorMs)} · snapshot=${fmtTime(obs.client_timing_snapshot_at)}
@@ -1474,7 +1568,9 @@ policy elapsed: ${Number(obs.policy_elapsed_s || 0).toFixed(4)}s
 server gate: ${control.mode || 'shadow'} (revision ${control.revision || 0})
 client allow: ${Boolean(obs.client_allow_execution)}
 client state: ${obs.client_execution_state || 'unknown'}
-blocked reason: ${obs.client_blocked_reason || '-'}
+bridge reason (raw): ${obs.client_blocked_reason || '-'}
+robot enabled sides: ${Array.isArray(obs.client_robot_enabled_sides) ? obs.client_robot_enabled_sides.join(', ') || '-' : '-'}
+enable hold handshake: ${obs.client_robot_enable_hold ? JSON.stringify(obs.client_robot_enable_hold) : '-'}
 last command sent: ${fmtTime(obs.client_last_command_at)}
 safety @20Hz: translation<=0.05m, rotation<=0.18rad, gripper<=0.30 fraction; workspace x[-0.05,0.30] y[0.01,0.50] z[0.14,0.52]; CLI may tighten`;
   const key = `${obs.telemetry_session}:${obs.sequence}`;
