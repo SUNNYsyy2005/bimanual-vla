@@ -170,6 +170,7 @@ def inference_launch(
     generation: int = 1,
     latency_s: float = 0.0,
     captured_monotonic: float | None = None,
+    executed_plan_command_count: int = 0,
 ) -> tuple[InferenceLaunch, float]:
     arrived_at = time.time()
     captured_at = arrived_at - latency_s
@@ -185,6 +186,7 @@ def inference_launch(
             raw_delivery_state=np.asarray(raw_state, dtype=np.float64).copy(),
             qpos_m=np.asarray(qpos, dtype=np.float64).copy(),
             image_timestamps={"cam_high": captured_at, "cam_wrist": captured_at},
+            executed_plan_command_count=executed_plan_command_count,
         ),
         arrived_at,
     )
@@ -257,23 +259,50 @@ class FakeExecution:
 
 
 class FakePiper:
-    def __init__(self, *, arm_status=0, err_code=0):
+    def __init__(
+        self,
+        *,
+        arm_status=0,
+        err_code=0,
+        initial_ctrl_mode=1,
+        mode_feed=1,
+        ctrl_mode_ready_after_status_reads=0,
+        status_timestamp=None,
+    ):
         self.calls = []
         self.arm_status = arm_status
         self.err_code = err_code
+        self.current_ctrl_mode = initial_ctrl_mode
+        self.mode_feed = mode_feed
+        self.ctrl_mode_ready_after_status_reads = ctrl_mode_ready_after_status_reads
+        self.enable_requested = False
+        self.status_timestamp = status_timestamp
+        self.status_read_count = 0
+        self.status_ctrl_modes = []
+        self.joint_ctrl_modes = []
 
     def GetArmStatus(self):
+        if self.enable_requested:
+            self.status_read_count += 1
+            if self.status_read_count > self.ctrl_mode_ready_after_status_reads:
+                self.current_ctrl_mode = 1
+        self.status_ctrl_modes.append(self.current_ctrl_mode)
         status = SimpleNamespace(
-            ctrl_mode=1,
+            ctrl_mode=self.current_ctrl_mode,
             arm_status=self.arm_status,
-            mode_feed=1,
+            mode_feed=self.mode_feed,
             motion_status=0,
             err_code=self.err_code,
         )
-        return SimpleNamespace(arm_status=status)
+        message = SimpleNamespace(arm_status=status)
+        if self.status_timestamp is not None:
+            message.time_stamp = self.status_timestamp
+            message.Hz = 100.0
+        return message
 
     def EnablePiper(self):
         self.calls.append(("EnablePiper",))
+        self.enable_requested = True
         return True
 
     def ModeCtrl(self, *args):
@@ -281,6 +310,7 @@ class FakePiper:
 
     def JointCtrl(self, *args):
         self.calls.append(("JointCtrl", *args))
+        self.joint_ctrl_modes.append(self.current_ctrl_mode)
 
     def EndPoseCtrl(self, *args):
         self.calls.append(("EndPoseCtrl", *args))
@@ -449,6 +479,54 @@ class EnableHoldTest(unittest.TestCase):
             np.rint(measured[:6] * RAD_FACTOR).astype(np.int64),
         )
         np.testing.assert_allclose(execution.arm_hold_targets["right"], measured[:6])
+        self.assertAlmostEqual(
+            execution.arm_hold_gripper_targets["right"], measured[6]
+        )
+
+    def test_enable_waits_for_delayed_can_ctrl_and_retransmits_measured_hold(self):
+        piper = FakePiper(
+            initial_ctrl_mode=0,
+            ctrl_mode_ready_after_status_reads=3,
+        )
+        execution = ExecutionController(
+            piper, execution_args(enable_timeout_s=0.5)
+        )
+        measured = np.array([1.0, -0.0345, 0.0491, 0.1, 0.2, -0.3, 0.035])
+        with patch("robot_observation_bridge.time.sleep", return_value=None):
+            execution._enable_robot("right", piper, measured)
+
+        joint_calls = [call for call in piper.calls if call[0] == "JointCtrl"]
+        mode_calls = [call for call in piper.calls if call[0] == "ModeCtrl"]
+        gripper_calls = [call for call in piper.calls if call[0] == "GripperCtrl"]
+        expected = np.rint(measured[:6] * RAD_FACTOR).astype(np.int64)
+        self.assertGreaterEqual(len(joint_calls), 4)
+        self.assertGreaterEqual(len(mode_calls), 4)
+        self.assertGreaterEqual(len(gripper_calls), 4)
+        for call in joint_calls:
+            np.testing.assert_array_equal(np.asarray(call[1:]), expected)
+        self.assertIn(0, piper.status_ctrl_modes)
+        self.assertEqual(piper.status_ctrl_modes[-1], 1)
+        self.assertIn(0, piper.joint_ctrl_modes)
+        self.assertEqual(piper.joint_ctrl_modes[-1], 1)
+        self.assertEqual(execution.robot_enabled, {"right"})
+
+    def test_enable_rejects_stale_arm_status_feedback(self):
+        piper = FakePiper(status_timestamp=time.time() - 1.0)
+        execution = ExecutionController(piper, execution_args(enable_timeout_s=0.5))
+        measured = np.array([0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.035])
+        with self.assertRaisesRegex(ExecutionBlocked, "became unhealthy"):
+            execution._enable_robot("right", piper, measured)
+        self.assertNotIn("right", execution.robot_enabled)
+
+    def test_protocol_reconnect_preserves_active_enable_hold(self):
+        piper = FakePiper()
+        execution = ExecutionController(piper, execution_args())
+        measured = np.array([0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.035])
+        execution._enable_robot("right", piper, measured)
+        execution.waiting_fresh_after_enable = True
+        execution.configure_protocol(validate_policy_metadata(JOINT_METADATA, "right"))
+        self.assertIn("right", execution.arm_hold_targets)
+        self.assertTrue(execution.waiting_fresh_after_enable)
 
 
 class MetadataCompatibilityTest(unittest.TestCase):
@@ -919,6 +997,137 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         execution.robot_enabled = {"right"}
         return execution, piper
 
+    def test_enable_settle_freezes_pre_settle_plan_and_requires_post_settle_inference(self):
+        piper = FakePiper(initial_ctrl_mode=0, ctrl_mode_ready_after_status_reads=1)
+        execution = ExecutionController(
+            piper,
+            execution_args(arm_settle_s=0.25, enable_timeout_s=0.5),
+        )
+        execution.configure_protocol(self.joint_protocol)
+        base = time.monotonic()
+        initial = self.joint_chunk(20, 0.10)
+        launch, _ = inference_launch(
+            self.raw_state,
+            self.qpos,
+            generation=10,
+            captured_monotonic=base,
+        )
+        self.assertTrue(
+            execution.accept_inference_result(
+                execution_result(initial),
+                launch,
+                self.joint_protocol,
+                arrived_at=time.time(),
+                arrived_monotonic=base,
+            )
+        )
+
+        with patch("robot_observation_bridge.time.monotonic", return_value=base), patch(
+            "robot_observation_bridge.time.sleep", return_value=None
+        ):
+            self.assertFalse(
+                execution.execute_next(
+                    self.raw_state,
+                    self.qpos,
+                    self.joint_protocol,
+                    feedback_captured_at=time.time(),
+                )
+            )
+        self.assertEqual(execution.robot_enabled, {"right"})
+        self.assertEqual(execution.pending_action_count, 0)
+        self.assertTrue(execution.waiting_fresh_after_enable)
+        self.assertEqual(execution.expired_drop_count, 0)
+        enable_hold = execution.metadata()["robot_enable_hold"]
+        self.assertTrue(enable_hold["active"])
+        self.assertFalse(enable_hold["settled"])
+
+        pre_settle = self.joint_chunk(20, 0.20)
+        stale_launch, _ = inference_launch(
+            self.raw_state,
+            self.qpos,
+            generation=11,
+            captured_monotonic=base + 0.01,
+        )
+        self.assertFalse(
+            execution.accept_inference_result(
+                execution_result(pre_settle),
+                stale_launch,
+                self.joint_protocol,
+                arrived_at=time.time(),
+                arrived_monotonic=base + 0.10,
+            )
+        )
+        self.assertEqual(execution.pending_action_count, 0)
+
+        for tick in (base + 0.10, base + 0.20):
+            with patch("robot_observation_bridge.time.monotonic", return_value=tick):
+                self.assertFalse(
+                    execution.execute_next(
+                        self.raw_state,
+                        self.qpos,
+                        self.joint_protocol,
+                        feedback_captured_at=time.time(),
+                    )
+                )
+        with patch(
+            "robot_observation_bridge.time.monotonic", return_value=base + 0.26
+        ):
+            self.assertFalse(
+                execution.execute_next(
+                    self.raw_state,
+                    self.qpos,
+                    self.joint_protocol,
+                    feedback_captured_at=time.time(),
+                )
+            )
+        self.assertTrue(execution.waiting_fresh_after_enable)
+        self.assertEqual(execution.expired_drop_count, 0)
+        enable_hold = execution.metadata()["robot_enable_hold"]
+        self.assertTrue(enable_hold["active"])
+        self.assertTrue(enable_hold["settled"])
+        hold_calls = [call for call in piper.calls if call[0] == "JointCtrl"]
+        expected_hold = np.rint(self.qpos[:6] * RAD_FACTOR).astype(np.int64)
+        for call in hold_calls[2:]:
+            np.testing.assert_array_equal(np.asarray(call[1:]), expected_hold)
+        self.assertNotIn(
+            int(np.rint(0.20 * RAD_FACTOR)),
+            [call[1] for call in hold_calls],
+        )
+
+        fresh = self.joint_chunk(20, 0.02)
+        fresh_launch, _ = inference_launch(
+            self.raw_state,
+            self.qpos,
+            generation=12,
+            captured_monotonic=base + 0.27,
+        )
+        self.assertTrue(
+            execution.accept_inference_result(
+                execution_result(fresh),
+                fresh_launch,
+                self.joint_protocol,
+                arrived_at=time.time(),
+                arrived_monotonic=base + 0.27,
+            )
+        )
+        self.assertFalse(execution.waiting_fresh_after_enable)
+        self.assertFalse(execution.metadata()["robot_enable_hold"]["active"])
+        with patch(
+            "robot_observation_bridge.time.monotonic", return_value=base + 0.27
+        ):
+            self.assertTrue(
+                execution.execute_next(
+                    self.raw_state,
+                    self.qpos,
+                    self.joint_protocol,
+                    feedback_captured_at=time.time(),
+                )
+            )
+        last_joint_call = [
+            call for call in piper.calls if call[0] == "JointCtrl"
+        ][-1]
+        self.assertEqual(last_joint_call[1], int(np.rint(0.02 * RAD_FACTOR)))
+
     def test_slow_async_inference_does_not_stop_old_20hz_queue(self):
         class BlockingPolicy:
             def __init__(self):
@@ -1019,12 +1228,26 @@ class AsyncInferencePipelineTest(unittest.TestCase):
                 execution, _ = self.configured_execution(
                     control_hz=20.0, actuator_delay_s=actuator_delay_s
                 )
+                now = time.time()
+                execution.queue_result(
+                    execution_result(self.joint_chunk(8, 0.0)),
+                    self.raw_state,
+                    self.qpos,
+                    self.joint_protocol,
+                    {"cam_high": now, "cam_wrist": now},
+                    0.0,
+                )
+                execution.last_safe_target = execution.pending_actions[0]
                 launch, _ = inference_launch(
                     self.raw_state,
                     self.qpos,
                     generation=3,
                     captured_monotonic=100.0,
                 )
+                # Simulate the old plan continuing to send commands while the
+                # new inference is in flight.  The controller may only skip a
+                # prefix that actually progressed after capture.
+                execution.executed_plan_command_count = expected_source_index
                 self.assertTrue(
                     execution.accept_inference_result(
                         execution_result(actions),
@@ -1032,6 +1255,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
                         self.joint_protocol,
                         arrived_at=launch.captured_at + latency_s,
                         arrived_monotonic=100.0 + latency_s,
+                        blend_steps_override=0,
                     )
                 )
                 self.assertEqual(
@@ -1046,6 +1270,147 @@ class AsyncInferencePipelineTest(unittest.TestCase):
                 self.assertAlmostEqual(
                     selected.absolute_target[0], actions[expected_source_index, 0]
                 )
+
+
+    def test_cold_start_keeps_unexecuted_prefix_and_does_not_blend_pending_rows(self):
+        execution, _ = self.configured_execution(control_hz=20.0, blend_steps=4)
+        actions = self.joint_chunk(20, np.linspace(0.01, 0.20, 20))
+        launch, _ = inference_launch(
+            self.raw_state,
+            self.qpos,
+            generation=41,
+            captured_monotonic=100.0,
+        )
+
+        self.assertTrue(
+            execution.accept_inference_result(
+                execution_result(actions),
+                launch,
+                self.joint_protocol,
+                arrived_at=launch.captured_at + 0.24,
+                arrived_monotonic=100.24,
+            )
+        )
+        self.assertIsNone(execution.last_safe_target)
+        self.assertFalse(execution.hold_active)
+        self.assertEqual(execution.inference_old_remaining, 0)
+        self.assertEqual(execution.inference_skip_steps, 0)
+        self.assertEqual(execution.inference_blend_steps, 0)
+        self.assertEqual(execution.pending_actions[0].source_index, 0)
+
+        # A second result before the first command must replace the unexecuted
+        # plan, not blend against actions that never reached the robot.
+        second_launch, _ = inference_launch(
+            self.raw_state,
+            self.qpos,
+            generation=42,
+            captured_monotonic=101.0,
+        )
+        self.assertTrue(
+            execution.accept_inference_result(
+                execution_result(actions),
+                second_launch,
+                self.joint_protocol,
+                arrived_at=second_launch.captured_at + 0.24,
+                arrived_monotonic=101.24,
+            )
+        )
+        self.assertEqual(execution.inference_old_remaining, 20)
+        self.assertEqual(execution.inference_skip_steps, 0)
+        self.assertEqual(execution.inference_blend_steps, 0)
+        self.assertEqual(execution.pending_actions[0].source_index, 0)
+        self.assertEqual(execution.pending_actions[0].generation, 42)
+
+    def test_cold_start_retimes_chunk_and_executes_rows_sequentially(self):
+        execution, piper = self.configured_execution(control_hz=20.0)
+        actions = self.joint_chunk(20, np.linspace(0.01, 0.20, 20))
+        launch, _ = inference_launch(
+            self.raw_state,
+            self.qpos,
+            generation=43,
+            captured_monotonic=100.0,
+        )
+        self.assertTrue(
+            execution.accept_inference_result(
+                execution_result(actions),
+                launch,
+                self.joint_protocol,
+                arrived_at=launch.captured_at + 0.24,
+                arrived_monotonic=100.24,
+            )
+        )
+
+        self.assertTrue(execution.inference_timeline_resynced)
+        self.assertTrue(execution.timeline_resync_active)
+        np.testing.assert_allclose(
+            [item.target_monotonic for item in execution.pending_actions[:3]],
+            [100.29, 100.34, 100.39],
+            atol=1e-9,
+        )
+
+        for now_monotonic, row_index in ((100.24, 0), (100.29, 1), (100.34, 2)):
+            with self.subTest(now_monotonic=now_monotonic):
+                with patch(
+                    "robot_observation_bridge.time.monotonic",
+                    return_value=now_monotonic,
+                ):
+                    self.assertTrue(
+                        execution.execute_next(
+                            self.raw_state,
+                            self.qpos,
+                            self.joint_protocol,
+                            feedback_captured_at=time.time(),
+                        )
+                    )
+                self.assertEqual(execution.last_queued_action_index, row_index)
+
+        joint_call = [call for call in piper.calls if call[0] == "JointCtrl"][-1]
+        self.assertEqual(joint_call[1], int(np.rint(actions[2, 0] * RAD_FACTOR)))
+        self.assertIsNotNone(execution.last_safe_target)
+        self.assertFalse(execution.last_safe_target.hold)
+
+    def test_partial_old_plan_progress_limits_skip_and_retimes_remainder(self):
+        execution, _ = self.configured_execution(control_hz=20.0, blend_steps=3)
+        old = self.joint_chunk(12, np.linspace(0.0, 0.11, 12))
+        now = time.time()
+        execution.queue_result(
+            execution_result(old),
+            self.raw_state,
+            self.qpos,
+            self.joint_protocol,
+            {"cam_high": now, "cam_wrist": now},
+            0.0,
+        )
+        execution.last_safe_target = execution.pending_actions[0]
+        launch, _ = inference_launch(
+            self.raw_state,
+            self.qpos,
+            generation=44,
+            captured_monotonic=100.0,
+            executed_plan_command_count=10,
+        )
+        # Only two old-plan commands actually reached the robot while wall time
+        # advanced by roughly four action periods.
+        execution.executed_plan_command_count = 12
+        actions = self.joint_chunk(20, np.linspace(0.01, 0.20, 20))
+
+        self.assertTrue(
+            execution.accept_inference_result(
+                execution_result(actions),
+                launch,
+                self.joint_protocol,
+                arrived_at=launch.captured_at + 0.24,
+                arrived_monotonic=100.24,
+            )
+        )
+
+        self.assertEqual(execution.inference_elapsed_prefix_steps, 4)
+        self.assertEqual(execution.inference_progress_steps, 2)
+        self.assertEqual(execution.inference_skip_steps, 2)
+        self.assertTrue(execution.inference_timeline_resynced)
+        self.assertEqual(execution.pending_actions[0].source_index, 2)
+        self.assertAlmostEqual(execution.pending_actions[0].target_monotonic, 100.29)
+        self.assertAlmostEqual(execution.pending_actions[1].target_monotonic, 100.34)
 
     def test_control_tick_reselects_closest_future_target_as_time_advances(self):
         execution, piper = self.configured_execution(control_hz=20.0)
@@ -1067,6 +1432,17 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         )
         self.assertEqual(execution.pending_actions[0].source_index, 0)
 
+        with patch("robot_observation_bridge.time.monotonic", return_value=100.01):
+            self.assertTrue(
+                execution.execute_next(
+                    self.raw_state,
+                    self.qpos,
+                    self.joint_protocol,
+                    feedback_captured_at=time.time(),
+                )
+            )
+        self.assertEqual(execution.last_queued_action_index, 0)
+
         with patch("robot_observation_bridge.time.monotonic", return_value=100.18):
             self.assertTrue(
                 execution.execute_next(
@@ -1078,7 +1454,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
             )
         self.assertEqual(execution.last_queued_action_index, 3)
         self.assertEqual(execution.pending_actions[0].source_index, 4)
-        self.assertEqual(execution.dropped_action_count, 3)
+        self.assertEqual(execution.dropped_action_count, 2)
         joint_call = [call for call in piper.calls if call[0] == "JointCtrl"][-1]
         self.assertEqual(joint_call[1], int(np.rint(actions[3, 0] * RAD_FACTOR)))
 
@@ -1123,6 +1499,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
             {"cam_high": now, "cam_wrist": now},
             0.01,
         )
+        execution.last_safe_target = execution.pending_actions[0]
         new = self.joint_chunk(20, 0.20)
         launch, arrived_at = inference_launch(self.raw_state, self.qpos, generation=5)
         self.assertTrue(
@@ -1161,6 +1538,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
             {"cam_high": now, "cam_wrist": now},
             0.01,
         )
+        execution.last_safe_target = execution.pending_actions[0]
         new = self.joint_chunk(20, 0.2)
         new[:, 6] = 0.8
         launch, arrived_at = inference_launch(self.raw_state, self.qpos, generation=51)
@@ -1200,6 +1578,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
             {"cam_high": now, "cam_left_wrist": now, "cam_right_wrist": now},
             0.01,
         )
+        execution.last_safe_target = execution.pending_actions[0]
         new_left = old_arm.copy()
         new_right = old_arm.copy()
         new_left[0] = 0.3
@@ -1241,6 +1620,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
             {"cam_high": now, "cam_wrist": now},
             0.01,
         )
+        execution.last_safe_target = execution.pending_actions[0]
         new = np.zeros((20, 7), dtype=np.float64)
         new[:, 5] = np.pi / 2
         new[:, 6] = 0.5
@@ -1272,6 +1652,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
             {"cam_high": now, "cam_wrist": now},
             0.01,
         )
+        execution.last_safe_target = execution.pending_actions[0]
         old_targets = [item.absolute_target.copy() for item in execution.pending_actions]
         launch, arrived_at = inference_launch(
             self.raw_state, self.qpos, generation=7, latency_s=1.0
@@ -1687,7 +2068,7 @@ class ExecutionQueueTest(unittest.TestCase):
             "feedback_minus_command",
         )
 
-    def test_unreachable_delivery_row_is_dropped_without_destroying_chunk(self):
+    def test_unreachable_delivery_row_abandons_dependent_chunk_and_holds(self):
         protocol = validate_policy_metadata(DELIVERY_METADATA, "right")
         piper = FakePiper()
         execution = ExecutionController(piper, execution_args())
@@ -1711,15 +2092,20 @@ class ExecutionQueueTest(unittest.TestCase):
             )
         )
         self.assertEqual(execution.state, "ready")
-        self.assertEqual(execution.pending_action_count, 1)
+        self.assertEqual(execution.pending_action_count, 0)
+        self.assertEqual(execution.unsafe_drop_count, 1)
+        self.assertEqual(execution.other_drop_count, 1)
+        self.assertEqual(execution.dropped_action_count, 2)
+        self.assertTrue(execution.unsafe_active)
         self.assertIn("dropped unsafe queued target", execution.blocked_reason)
-        self.assertTrue(
+        # There is no last-safe target yet, so the controller must wait for a
+        # fresh inference instead of trying the unsafe suffix.
+        self.assertFalse(
             execution.execute_next(
                 self.raw_state, self.qpos, protocol, feedback_captured_at=time.time()
             )
         )
-        self.assertEqual(execution.pending_action_count, 0)
-        self.assertIn("JointCtrl", [call[0] for call in piper.calls])
+        self.assertNotIn("JointCtrl", [call[0] for call in piper.calls])
 
     def test_feedback_freshness_and_status_block_before_motion(self):
         protocol = validate_policy_metadata(JOINT_METADATA, "right")

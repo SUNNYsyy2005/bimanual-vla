@@ -133,6 +133,10 @@ DEFAULT_IK_POSITION_TOLERANCE_M = 0.0015
 DEFAULT_IK_ROTATION_TOLERANCE_RAD = 0.02
 DEFAULT_IK_MAX_NFEV = 100
 DEFAULT_MONITORING_DIR = "monitoring_data"
+PIPER_CTRL_MODE_CAN = 0x01
+PIPER_MOVE_MODE_J = 0x01
+PIPER_ENABLE_CONFIRM_CYCLES = 2
+PIPER_ENABLE_RETRY_S = 0.02
 
 
 class ExecutionBlocked(RuntimeError):
@@ -670,13 +674,31 @@ def policy_observation_state(
 
 
 def arm_status_dict(piper: Any) -> dict[str, Any]:
-    feedback = piper.GetArmStatus().arm_status
+    message = piper.GetArmStatus()
+    feedback = message.arm_status
+    has_timestamp = hasattr(message, "time_stamp")
+    timestamp = float(getattr(message, "time_stamp", 0.0) or 0.0)
+    hz = float(getattr(message, "Hz", 0.0) or 0.0)
+    feedback_age_s = time.time() - timestamp if timestamp > 0 else None
+    feedback_fresh = (
+        None
+        if not has_timestamp
+        else bool(
+            timestamp > 0
+            and feedback_age_s is not None
+            and -1.0 <= feedback_age_s <= PIPER_FEEDBACK_MAX_AGE_S
+        )
+    )
     return {
         "ctrl_mode": int(feedback.ctrl_mode),
         "arm_status": int(feedback.arm_status),
         "mode_feed": int(feedback.mode_feed),
         "motion_status": int(feedback.motion_status),
         "err_code": int(feedback.err_code),
+        "feedback_timestamp": timestamp if has_timestamp else None,
+        "feedback_age_s": feedback_age_s,
+        "feedback_hz": hz if has_timestamp else None,
+        "feedback_fresh": feedback_fresh,
     }
 
 
@@ -1294,6 +1316,10 @@ class InferenceLaunch:
     raw_delivery_state: np.ndarray
     qpos_m: np.ndarray
     image_timestamps: dict[str, float]
+    # Number of non-hold policy targets that had actually reached the robot at
+    # observation capture.  The completed inference may only skip a delayed
+    # prefix when the old plan really progressed while inference was running.
+    executed_plan_command_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -1712,6 +1738,8 @@ class ExecutionController:
         self.active_generation = 0
         self._next_inference_generation = 1
         self.waiting_fresh_after_enable = False
+        self.fresh_inference_required_after_monotonic: float | None = None
+        self.enable_hold_settled_at: float | None = None
 
         self.last_action_chunk_steps = 0
         self.last_composed_action: list[float] | None = None
@@ -1729,7 +1757,16 @@ class ExecutionController:
         self.last_decoded_absolute_target: dict[str, Any] | None = None
         self.last_feedback_at: float | None = None
         self.dropped_action_count = 0
+        self.unsafe_drop_count = 0
+        self.expired_drop_count = 0
+        self.other_drop_count = 0
         self.last_queue_drop_reason = ""
+        self.last_queue_drop_kind: str | None = None
+        self.unsafe_active = False
+        self.executed_plan_command_count = 0
+        self.inference_progress_steps = 0
+        self.inference_timeline_resynced = False
+        self.timeline_resync_active = False
 
         self.inference_launch_at: float | None = None
         self.inference_capture_at: float | None = None
@@ -1738,6 +1775,7 @@ class ExecutionController:
         self.inference_arrival_monotonic: float | None = None
         self.inference_latency_s: float | None = None
         self.inference_skip_steps = 0
+        self.inference_elapsed_prefix_steps = 0
         self.inference_blend_steps = 0
         self.inference_generation: int | None = None
         self.inference_old_remaining = 0
@@ -1761,6 +1799,7 @@ class ExecutionController:
         self.last_command_feedback: dict[str, Any] | None = None
         self._pending_feedback_command: dict[str, Any] | None = None
         self.arm_hold_targets: dict[str, np.ndarray] = {}
+        self.arm_hold_gripper_targets: dict[str, float] = {}
         self.arm_hold_started_at: dict[str, float] = {}
         self.ik_solver: PiperContinuousIK | None = None
 
@@ -1800,7 +1839,15 @@ class ExecutionController:
         )
         self.expected_action_horizon = int(protocol.action_horizon)
         self.pending_actions.clear()
-        self.waiting_fresh_after_enable = False
+        if self.arm_hold_targets:
+            # A policy reconnect must not cancel a physical measured-pose hold.
+            # Keep the enable barrier and require a fresh result on the new link.
+            self.waiting_fresh_after_enable = True
+        else:
+            self.waiting_fresh_after_enable = False
+            self.fresh_inference_required_after_monotonic = None
+            self.enable_hold_settled_at = None
+        self.timeline_resync_active = False
         self.queue_underrun = False
         logging.info(
             "Async action timing: control=%.3g Hz inference=%.3g Hz expected_chunk=%d "
@@ -1947,6 +1994,21 @@ class ExecutionController:
             "last_command_at": self.last_command_at,
             "control_revision": self.control_revision,
             "robot_arm_status": self.robot_status,
+            "robot_enabled_sides": sorted(self.robot_enabled),
+            "robot_enable_hold": {
+                "active": bool(self.arm_hold_targets),
+                "sides": sorted(self.arm_hold_targets),
+                "waiting_fresh_inference": self.waiting_fresh_after_enable,
+                "settled": self.fresh_inference_required_after_monotonic is not None,
+                "settled_at": self.enable_hold_settled_at,
+                "hold_age_s": {
+                    side: max(
+                        0.0, timing_snapshot_monotonic - self.arm_hold_started_at[side]
+                    )
+                    for side in self.arm_hold_targets
+                    if side in self.arm_hold_started_at
+                },
+            },
             "policy_action_hz": self.policy_action_hz,
             "command_hz": self.control_hz,
             "control_hz": self.control_hz,
@@ -1968,7 +2030,16 @@ class ExecutionController:
             "last_decoded_absolute_target": self.last_decoded_absolute_target,
             "last_feedback_at": self.last_feedback_at,
             "dropped_action_count": self.dropped_action_count,
+            "unsafe_drop_count": self.unsafe_drop_count,
+            "expired_drop_count": self.expired_drop_count,
+            "other_drop_count": self.other_drop_count,
             "last_queue_drop_reason": self.last_queue_drop_reason,
+            "last_queue_drop_kind": self.last_queue_drop_kind,
+            "unsafe_active": self.unsafe_active,
+            "executed_plan_command_count": self.executed_plan_command_count,
+            "inference_progress_steps": self.inference_progress_steps,
+            "inference_timeline_resynced": self.inference_timeline_resynced,
+            "timeline_resync_active": self.timeline_resync_active,
             "inference_launch_at": self.inference_launch_at,
             "inference_capture_at": self.inference_capture_at,
             "inference_capture_monotonic": self.inference_capture_monotonic,
@@ -1976,6 +2047,7 @@ class ExecutionController:
             "inference_arrival_monotonic": self.inference_arrival_monotonic,
             "inference_latency_s": self.inference_latency_s,
             "inference_skip_steps": self.inference_skip_steps,
+            "inference_elapsed_prefix_steps": self.inference_elapsed_prefix_steps,
             "inference_blend_steps": self.inference_blend_steps,
             "inference_generation": self.inference_generation,
             "action_generation": self.active_generation,
@@ -2094,8 +2166,61 @@ class ExecutionController:
         logging.warning("Rejected inference generation %d: %s", generation, reason)
         return False
 
+    @staticmethod
+    def _piper_can_joint_mode_ready(status: dict[str, Any]) -> bool:
+        return (
+            status.get("ctrl_mode") == PIPER_CTRL_MODE_CAN
+            and status.get("mode_feed") == PIPER_MOVE_MODE_J
+            and status.get("arm_status") == 0
+            and status.get("err_code") == 0
+            and status.get("feedback_fresh") is not False
+        )
+
+    def _send_enable_hold(
+        self,
+        side: str,
+        piper: Any,
+        hold_joints: np.ndarray,
+        hold_gripper_m: float,
+    ) -> None:
+        """Refresh CAN joint mode and the measured enable-time hold target."""
+        raw_joints = np.rint(hold_joints * RAD_FACTOR).astype(np.int64)
+        piper.ModeCtrl(
+            PIPER_CTRL_MODE_CAN,
+            PIPER_MOVE_MODE_J,
+            int(getattr(self.args, "speed_pct", 10)),
+            0x00,
+        )
+        piper.JointCtrl(*map(int, raw_joints))
+        piper.GripperCtrl(
+            round(float(hold_gripper_m) * GRIPPER_FACTOR),
+            int(getattr(self.args, "gripper_effort", 1000)),
+            0x01,
+            0,
+        )
+
+    def _refresh_known_enable_holds(self, *, exclude_side: str | None = None) -> None:
+        """Keep an already-enabled sibling arm held during a second arm handshake."""
+        for known_side, hold_joints in self.arm_hold_targets.items():
+            if known_side == exclude_side:
+                continue
+            piper = self.pipers.get(known_side)
+            hold_gripper_m = self.arm_hold_gripper_targets.get(known_side)
+            if piper is None or hold_gripper_m is None:
+                continue
+            self._send_enable_hold(
+                known_side, piper, hold_joints, hold_gripper_m
+            )
+
     def _enable_robot(self, side: str, piper: Any, hold_qpos: np.ndarray) -> None:
-        """Enable Piper and immediately hold its measured joint pose."""
+        """Enable Piper only after CAN joint mode accepts a repeated pose hold.
+
+        ``EnablePiper()`` reports the enable state sampled before its own enable
+        frame is sent.  A single subsequent ``JointCtrl`` can therefore arrive
+        while feedback still says STANDBY and be ignored exactly when the motor
+        brake is released.  Repeat enable, mode, and measured-pose hold commands
+        until feedback confirms CAN/MOVE_J for consecutive cycles.
+        """
         hold_qpos = np.asarray(hold_qpos, dtype=np.float64)
         if hold_qpos.shape != (7,) or not np.all(np.isfinite(hold_qpos)):
             raise ExecutionBlocked(f"{side} Piper hold qpos is not finite 7D")
@@ -2111,24 +2236,110 @@ class ExecutionController:
         # unsolicited enable-time motion.
         hold_joints = hold_qpos[:6].copy()
         hold_gripper_m = float(np.clip(hold_qpos[6], 0.0, GRIPPER_MAX_M))
-        deadline = time.monotonic() + self.args.enable_timeout_s
+        enable_timeout_s = float(getattr(self.args, "enable_timeout_s", 3.0))
+        deadline = time.monotonic() + enable_timeout_s
+        ready_cycles = 0
+        last_status: dict[str, Any] | None = None
         while time.monotonic() < deadline:
-            if piper.EnablePiper():
-                raw_joints = np.rint(hold_joints * RAD_FACTOR).astype(np.int64)
-                piper.ModeCtrl(0x01, 0x01, self.args.speed_pct, 0x00)
-                piper.JointCtrl(*map(int, raw_joints))
-                piper.GripperCtrl(
-                    round(hold_gripper_m * GRIPPER_FACTOR),
-                    self.args.gripper_effort,
-                    0x01,
-                    0,
+            enabled_feedback = bool(piper.EnablePiper())
+            self._send_enable_hold(side, piper, hold_joints, hold_gripper_m)
+            self._refresh_known_enable_holds(exclude_side=side)
+            last_status = arm_status_dict(piper)
+            if (
+                last_status["arm_status"] != 0
+                or last_status["err_code"] != 0
+                or last_status.get("feedback_fresh") is False
+            ):
+                raise ExecutionBlocked(
+                    f"{side} Piper became unhealthy during enable: {last_status}"
                 )
-                self.arm_hold_targets[side] = hold_joints.copy()
-                self.arm_hold_started_at[side] = time.monotonic()
-                self.robot_enabled.add(side)
-                return
-            time.sleep(0.02)
-        raise ExecutionBlocked(f"{side} Piper enable timed out after {self.args.enable_timeout_s:.1f}s")
+            if enabled_feedback and self._piper_can_joint_mode_ready(last_status):
+                ready_cycles += 1
+                if ready_cycles >= PIPER_ENABLE_CONFIRM_CYCLES:
+                    confirmed_at = time.monotonic()
+                    self.arm_hold_targets[side] = hold_joints.copy()
+                    self.arm_hold_gripper_targets[side] = hold_gripper_m
+                    self.arm_hold_started_at[side] = confirmed_at
+                    self.robot_enabled.add(side)
+                    return
+            else:
+                ready_cycles = 0
+            time.sleep(PIPER_ENABLE_RETRY_S)
+        raise ExecutionBlocked(
+            f"{side} Piper enable timed out after {enable_timeout_s:.1f}s; "
+            f"last_status={last_status}"
+        )
+
+    def _maintain_post_enable_hold(
+        self,
+        sides: tuple[str, ...],
+        qpos_m: np.ndarray,
+        statuses: dict[str, dict[str, Any]],
+        *,
+        now_monotonic: float,
+    ) -> bool:
+        """Refresh enable holds before timed-plan ageing and wait for fresh data."""
+        hold_sides = [side for side in sides if side in self.arm_hold_targets]
+        if not hold_sides:
+            return False
+
+        waiting_for_hold: list[str] = []
+        for index, side in enumerate(sides):
+            if side not in self.arm_hold_targets:
+                continue
+            status = statuses[side]
+            if (
+                status["arm_status"] != 0
+                or status["err_code"] != 0
+                or status.get("feedback_fresh") is False
+            ):
+                raise ExecutionBlocked(
+                    f"{side} Piper became unhealthy during enable hold: {status}"
+                )
+            hold_target = self.arm_hold_targets[side]
+            hold_gripper_m = self.arm_hold_gripper_targets[side]
+            self._send_enable_hold(
+                side, self.pipers[side], hold_target, hold_gripper_m
+            )
+            qpos_slice = np.asarray(qpos_m, dtype=np.float64)[
+                index * 7 : (index + 1) * 7
+            ]
+            hold_age = now_monotonic - self.arm_hold_started_at[side]
+            hold_error = float(np.max(np.abs(qpos_slice[:6] - hold_target)))
+            if (
+                not self._piper_can_joint_mode_ready(status)
+                or hold_age < float(getattr(self.args, "arm_settle_s", 0.0))
+                or hold_error
+                > float(getattr(self.args, "arm_hold_tolerance_rad", 0.02))
+            ):
+                waiting_for_hold.append(
+                    f"{side}: ctrl={status['ctrl_mode']} mode={status['mode_feed']} "
+                    f"age={hold_age:.2f}s joint_error={hold_error:.4f}rad"
+                )
+
+        if waiting_for_hold:
+            self.state = "armed"
+            self.blocked_reason = (
+                "waiting for enable hold to settle: " + "; ".join(waiting_for_hold)
+            )
+            return True
+
+        if self.fresh_inference_required_after_monotonic is None:
+            self.fresh_inference_required_after_monotonic = now_monotonic
+            self.enable_hold_settled_at = time.time()
+            # Any result captured before this barrier describes the robot before
+            # its controller was confirmed stable.  Keep holding and require a
+            # post-settle observation instead of activating that old timeline.
+            self.discard_pending_actions(
+                "post-enable hold settled; discarded pre-settle trajectory",
+                kind="other",
+            )
+        self.waiting_fresh_after_enable = True
+        self.state = "armed"
+        self.blocked_reason = (
+            "Piper enable hold is stable; waiting for inference captured after settle"
+        )
+        return True
 
     def _candidate_execution_control(
         self,
@@ -2248,6 +2459,41 @@ class ExecutionController:
             if target.target_monotonic + 1e-9 >= execution_time:
                 return index
         return None
+
+    def _retime_actions_from(
+        self,
+        actions: list[DecodedQueuedAction],
+        start_monotonic: float,
+    ) -> list[DecodedQueuedAction]:
+        """Place retained rows on a fresh action timeline.
+
+        If the old plan didn't actually progress during inference, retaining
+        observation-relative timestamps would make the control tick discard the
+        same prefix that result acceptance intentionally kept.
+        """
+        period_s = 1.0 / self.policy_action_hz
+        return [
+            replace(
+                action,
+                target_monotonic=float(start_monotonic) + (index + 1) * period_s,
+            )
+            for index, action in enumerate(actions)
+        ]
+
+    def _record_queue_drop(self, count: int, reason: str, *, kind: str) -> None:
+        if kind not in {"unsafe", "expired", "other"}:
+            raise ValueError(f"unsupported queue drop kind: {kind!r}")
+        count = max(0, int(count))
+        self.dropped_action_count += count
+        if kind == "unsafe":
+            self.unsafe_drop_count += count
+            self.unsafe_active = True
+        elif kind == "expired":
+            self.expired_drop_count += count
+        else:
+            self.other_drop_count += count
+        self.last_queue_drop_reason = str(reason)[:500]
+        self.last_queue_drop_kind = kind
 
     @staticmethod
     def _gripper_slot(protocol: PolicyProtocol, arm_index: int) -> int:
@@ -2632,7 +2878,14 @@ class ExecutionController:
         self._record_client_transport_timing(result, generation=launch.generation)
         self.inference_old_remaining = len(self.pending_actions)
         self.inference_skip_steps = 0
+        self.inference_elapsed_prefix_steps = 0
         self.inference_blend_steps = 0
+        self.inference_progress_steps = max(
+            0,
+            self.executed_plan_command_count
+            - int(getattr(launch, "executed_plan_command_count", 0)),
+        )
+        self.inference_timeline_resynced = False
         if not math.isfinite(latency_s) or latency_s < 0:
             return self._reject_result(
                 launch.generation, f"invalid capture-to-arrival latency {latency_s!r}", arrived_at
@@ -2646,11 +2899,26 @@ class ExecutionController:
                 control, arrived_monotonic=arrived_monotonic
             )
         except PermissionError as exc:
-            self.discard_pending_actions(str(exc))
+            self.discard_pending_actions(str(exc), kind="expired")
             state = "shadow" if "shadow" in str(exc) else "blocked"
             return self._block(state, str(exc))
         except ExecutionBlocked as exc:
             return self._reject_result(launch.generation, str(exc), arrived_at)
+
+        if self.waiting_fresh_after_enable:
+            barrier = self.fresh_inference_required_after_monotonic
+            if barrier is None:
+                return self._reject_result(
+                    launch.generation,
+                    "discarded inference captured before post-enable hold settled",
+                    arrived_at,
+                )
+            if float(launch.captured_monotonic) < barrier:
+                return self._reject_result(
+                    launch.generation,
+                    "discarded pre-settle inference; waiting for a post-enable observation",
+                    arrived_at,
+                )
 
         max_action_age_s = float(getattr(self.args, "max_action_age_s", 2.0))
         stale_images = {
@@ -2694,6 +2962,7 @@ class ExecutionController:
             )
         except ExecutionBlocked as exc:
             return self._reject_result(launch.generation, str(exc), arrived_at)
+        retime_from_arrival = False
         if skip_steps_override is not None:
             skip_steps = max(0, int(skip_steps_override))
             if skip_steps >= len(decoded):
@@ -2714,10 +2983,31 @@ class ExecutionController:
                     f"last_target={decoded[-1].target_monotonic:.6f}",
                     arrived_at,
                 )
-            skip_steps = future_index
+            self.inference_elapsed_prefix_steps = future_index
+            # Time passing alone isn't sufficient evidence that a delayed
+            # prefix was executed.  In cold start, hold, blocked, or underrun
+            # recovery, the robot may not have advanced at all.  Skip no more
+            # rows than the old plan actually sent after this observation was
+            # captured.  If execution lagged behind wall time, place the
+            # retained rows on a fresh timeline so execute_next won't discard
+            # them again on the following control tick.
+            skip_steps = min(future_index, self.inference_progress_steps)
+            retime_from_arrival = skip_steps < future_index
         self.inference_skip_steps = skip_steps
         fresh_actions = decoded[skip_steps:]
-        old_actions = list(self.pending_actions)
+        if retime_from_arrival:
+            fresh_actions = self._retime_actions_from(
+                fresh_actions, arrived_monotonic
+            )
+            self.inference_timeline_resynced = True
+            # Pending rows weren't consumed on schedule, so they aren't a valid
+            # trajectory to blend against.  The last command that really
+            # reached the robot is the only safe transition anchor.
+            old_actions = (
+                [self.last_safe_target] if self.last_safe_target is not None else []
+            )
+        else:
+            old_actions = list(self.pending_actions)
         if not old_actions and self.last_safe_target is not None and self.hold_active:
             old_actions = [self.last_safe_target]
         blend_steps = self.blend_steps if blend_steps_override is None else int(blend_steps_override)
@@ -2747,6 +3037,7 @@ class ExecutionController:
         # All decoding/blending/authorization checks finished. The control thread
         # performs one atomic list replacement; inference never mutates this queue.
         self.pending_actions = candidate
+        self.timeline_resync_active = retime_from_arrival
         self.active_generation = launch.generation
         self.control_revision = revision
         self.authorization_deadline_monotonic = authorization_deadline
@@ -2766,6 +3057,10 @@ class ExecutionController:
         self.queue_underrun = False
         self.hold_active = False
         self.hold_started_at = None
+        if self.waiting_fresh_after_enable:
+            self.arm_hold_targets.clear()
+            self.arm_hold_gripper_targets.clear()
+            self.arm_hold_started_at.clear()
         self.waiting_fresh_after_enable = False
         self.rejected_result = None
         if bool(getattr(self.args, "allow_execution", False)):
@@ -2825,12 +3120,16 @@ class ExecutionController:
         )
         return len(self.pending_actions) if accepted else 0
 
-    def discard_pending_actions(self, reason: str) -> None:
-        if self.pending_actions:
-            self.dropped_action_count += len(self.pending_actions)
+    def discard_pending_actions(self, reason: str, *, kind: str = "other") -> None:
+        count = len(self.pending_actions)
+        if count:
+            self._record_queue_drop(count, reason, kind=kind)
             self.pending_actions.clear()
+        else:
+            self.last_queue_drop_reason = str(reason)[:500]
+            self.last_queue_drop_kind = kind
         self.queued_action_index = None
-        self.last_queue_drop_reason = reason[:500]
+        self.timeline_resync_active = False
 
     def _mark_queue_underrun(self, *, holding: bool) -> bool:
         if not self.queue_underrun:
@@ -2880,7 +3179,9 @@ class ExecutionController:
             self.authorization_deadline_monotonic is None
             or now_monotonic >= self.authorization_deadline_monotonic
         ):
-            self.discard_pending_actions("execution authorization expired")
+            self.discard_pending_actions(
+                "execution authorization expired", kind="expired"
+            )
             return self._block("blocked", "execution authorization expired")
 
         feedback_age = time.time() - feedback_at
@@ -2900,23 +3201,102 @@ class ExecutionController:
                 f"connected Piper sides {sorted(self.pipers)} do not match policy sides {list(sides)}",
             )
 
+        # Enable and post-enable hold are handled before timed-plan selection.
+        # Otherwise the queue advances by wall time while the controller is still
+        # switching out of STANDBY, and the first real command can jump deep into
+        # a chunk even though no earlier target reached the robot.
+        try:
+            statuses = {side: arm_status_dict(self.pipers[side]) for side in sides}
+            self.robot_status = (
+                statuses if protocol.arm_mode == "bimanual" else statuses[sides[0]]
+            )
+            bad_status = {
+                side: status
+                for side, status in statuses.items()
+                if (
+                    status["arm_status"] != 0
+                    or status["err_code"] != 0
+                    or status.get("feedback_fresh") is False
+                )
+            }
+            if bad_status:
+                raise ExecutionBlocked(f"Piper status is not normal: {bad_status}")
+
+            lost_control_mode = [
+                side
+                for side in sides
+                if side in self.robot_enabled
+                and side not in self.arm_hold_targets
+                and not self._piper_can_joint_mode_ready(statuses[side])
+            ]
+            for side in lost_control_mode:
+                logging.warning(
+                    "%s Piper left CAN/MOVE_J mode; restarting measured-pose enable hold",
+                    side,
+                )
+                self.robot_enabled.discard(side)
+
+            missing_enabled = [side for side in sides if side not in self.robot_enabled]
+            if missing_enabled:
+                if not self.pending_actions:
+                    return self._mark_queue_underrun(holding=False)
+                for side in missing_enabled:
+                    side_index = sides.index(side)
+                    hold_qpos = np.asarray(qpos_m, dtype=np.float64)[
+                        side_index * 7 : (side_index + 1) * 7
+                    ]
+                    self._enable_robot(side, self.pipers[side], hold_qpos)
+                statuses = {side: arm_status_dict(self.pipers[side]) for side in sides}
+                self.robot_status = (
+                    statuses if protocol.arm_mode == "bimanual" else statuses[sides[0]]
+                )
+                self.discard_pending_actions(
+                    "Piper enabled; discarded pre-enable trajectory and waiting for stable hold",
+                    kind="other",
+                )
+                self.waiting_fresh_after_enable = True
+                self.fresh_inference_required_after_monotonic = None
+                self.enable_hold_settled_at = None
+                self.state = "armed"
+                self.blocked_reason = "Piper enabled; stabilizing measured-pose hold"
+                return False
+
+            if self._maintain_post_enable_hold(
+                sides, qpos_m, statuses, now_monotonic=now_monotonic
+            ):
+                return False
+        except ExecutionBlocked as exc:
+            self.discard_pending_actions(str(exc), kind="other")
+            return self._block("blocked", str(exc))
+        except Exception as exc:
+            logging.exception("Piper enable/hold handshake failed")
+            self.discard_pending_actions(
+                f"Piper enable/hold handshake failed: {exc}", kind="other"
+            )
+            return self._block(
+                "blocked", f"Piper enable/hold handshake failed: {exc}"
+            )
+
         execution_time = self._estimated_execution_time(now_monotonic)
         if self.pending_actions:
             future_index = self._first_future_target_index(
                 self.pending_actions, execution_time
             )
             if future_index is None:
-                self.dropped_action_count += len(self.pending_actions)
-                self.last_queue_drop_reason = (
+                reason = (
                     "active timed plan exhausted before the estimated actuator execution time"
+                )
+                self._record_queue_drop(
+                    len(self.pending_actions), reason, kind="expired"
                 )
                 self.pending_actions.clear()
                 self.queued_action_index = None
+                self.timeline_resync_active = False
             elif future_index:
-                self.dropped_action_count += future_index
-                self.last_queue_drop_reason = (
+                reason = (
                     f"dropped {future_index} targets older than execution_time={execution_time:.6f}"
                 )
+                self._record_queue_drop(future_index, reason, kind="expired")
                 del self.pending_actions[:future_index]
 
         holding = False
@@ -2941,40 +3321,6 @@ class ExecutionController:
         )
         target_prevalidation = False
         try:
-            statuses = {side: arm_status_dict(self.pipers[side]) for side in sides}
-            self.robot_status = statuses if protocol.arm_mode == "bimanual" else statuses[sides[0]]
-            bad_status = {
-                side: status
-                for side, status in statuses.items()
-                if status["arm_status"] != 0 or status["err_code"] != 0
-            }
-            if bad_status:
-                raise ExecutionBlocked(f"Piper status is not normal: {bad_status}")
-
-            waiting_for_hold = []
-            for index, side in enumerate(sides):
-                hold_target = self.arm_hold_targets.get(side)
-                if hold_target is None:
-                    continue
-                qpos_slice = np.asarray(qpos_m, dtype=np.float64)[index * 7 : (index + 1) * 7]
-                hold_age = time.monotonic() - self.arm_hold_started_at[side]
-                hold_error = float(np.max(np.abs(qpos_slice[:6] - hold_target)))
-                if (
-                    hold_age < float(getattr(self.args, "arm_settle_s", 0.0))
-                    or hold_error > float(getattr(self.args, "arm_hold_tolerance_rad", 0.02))
-                ):
-                    waiting_for_hold.append(
-                        f"{side}: age={hold_age:.2f}s joint_error={hold_error:.4f}rad"
-                    )
-                else:
-                    self.arm_hold_targets.pop(side, None)
-                    self.arm_hold_started_at.pop(side, None)
-            if waiting_for_hold:
-                return self._block(
-                    "armed",
-                    "waiting for enable hold to settle: " + "; ".join(waiting_for_hold),
-                )
-
             target_prevalidation = True
             queued = self._filter_gripper_target(queued, qpos_m, protocol)
             prepared: dict[str, tuple[Any, ...]] = {}
@@ -3110,26 +3456,6 @@ class ExecutionController:
                     raise ExecutionBlocked(f"unsupported execution schema: {protocol.schema}")
             target_prevalidation = False
 
-            missing_enabled = [side for side in sides if side not in self.robot_enabled]
-            if missing_enabled:
-                for side in missing_enabled:
-                    side_index = sides.index(side)
-                    hold_qpos = np.asarray(qpos_m, dtype=np.float64)[side_index * 7 : (side_index + 1) * 7]
-                    self._enable_robot(side, self.pipers[side], hold_qpos)
-                (
-                    self._filtered_gripper_opening,
-                    self._gripper_extreme_candidate,
-                    self._gripper_extreme_count,
-                    self._gripper_extreme_latch,
-                ) = filter_snapshot
-                self.discard_pending_actions(
-                    "Piper enabled; discarded pre-enable trajectory and waiting for fresh inference"
-                )
-                self.waiting_fresh_after_enable = True
-                self.state = "armed"
-                self.blocked_reason = "Piper enabled; waiting for a fresh inference result"
-                return False
-
             # Blend and hold never bypass safety: both arms are fully prevalidated
             # against the same fresh feedback before either arm receives a command.
             command_started_at = time.time()
@@ -3162,19 +3488,30 @@ class ExecutionController:
                 self._gripper_extreme_latch,
             ) = filter_snapshot
             if target_prevalidation and self.pending_actions:
-                # A bad/unreachable row must not destroy the whole action chunk.
-                # Drop only that timed target and let the next 20 Hz tick try the
-                # next row; a fresh inference can still blend with the remainder.
+                # Do not chase later cumulative targets after the robot failed
+                # to execute this row.  They assume this target was reached and
+                # can create a self-sustaining unsafe-drop loop.  Drop the bad
+                # row, abandon the dependent suffix, and hold the last safe
+                # command until a fresh observation produces a new plan.
                 self.pending_actions.pop(0)
-                self.dropped_action_count += 1
+                self._record_queue_drop(1, str(exc), kind="unsafe")
+                if self.pending_actions:
+                    suffix_count = len(self.pending_actions)
+                    self._record_queue_drop(
+                        suffix_count,
+                        f"abandoned {suffix_count} dependent targets after unsafe target: {exc}",
+                        kind="other",
+                    )
+                    self.pending_actions.clear()
+                # Preserve the unsafe event as the latest classification even
+                # though the dependent suffix was abandoned for another reason.
                 self.last_queue_drop_reason = str(exc)[:500]
-                self.queued_action_index = (
-                    self.pending_actions[0].queue_index
-                    if self.pending_actions
-                    else None
-                )
+                self.last_queue_drop_kind = "unsafe"
+                self.unsafe_active = True
+                self.queued_action_index = None
+                self.timeline_resync_active = False
                 return self._block("ready", f"dropped unsafe queued target: {exc}")
-            self.discard_pending_actions(str(exc))
+            self.discard_pending_actions(str(exc), kind="other")
             return self._block("blocked", str(exc))
         except Exception as exc:
             (
@@ -3184,12 +3521,15 @@ class ExecutionController:
                 self._gripper_extreme_latch,
             ) = filter_snapshot
             logging.exception("robot command failed")
-            self.discard_pending_actions(f"robot command failed: {exc}")
+            self.discard_pending_actions(f"robot command failed: {exc}", kind="other")
             return self._block("blocked", f"robot command failed: {exc}")
 
         if not holding:
             self.pending_actions.pop(0)
             self.last_safe_target = replace(queued, hold=False)
+            self.executed_plan_command_count += 1
+            if not self.pending_actions:
+                self.timeline_resync_active = False
         self.last_queued_action_index = queued.queue_index
         self.queued_action_index = self.pending_actions[0].queue_index if self.pending_actions else None
         self.last_wire_action = queued.wire_action.tolist()
@@ -3245,6 +3585,7 @@ class ExecutionController:
         self.last_actuator_command = command_trace
         self._pending_feedback_command = command_trace
         self.last_command_at = command_at
+        self.unsafe_active = False
         if (
             queued.generation == self.last_transport_generation
             and self.last_transport_first_command_generation != queued.generation
@@ -3873,6 +4214,9 @@ def run(args: argparse.Namespace) -> None:
                                 raw_delivery_state=delivery_anchor,
                                 qpos_m=qpos_anchor,
                                 image_timestamps={},
+                                executed_plan_command_count=(
+                                    execution.executed_plan_command_count
+                                ),
                             )
 
                             def capture_and_infer(

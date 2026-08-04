@@ -328,6 +328,102 @@ class AsyncTelemetrySanitizerTest(unittest.TestCase):
         )
         self.assertIsNone(invalid["client_one_way_timing_requires_clock_sync"])
 
+    def test_dropped_total_is_not_a_safety_counter(self):
+        telemetry = HELPER.sanitize_async_client_telemetry(
+            {
+                "dropped_action_count": 7,
+                "drop_reason": "stale generation",
+                "expired_prefix_steps": 4,
+            },
+            action_dim=7,
+            action_horizon=50,
+        )
+
+        self.assertEqual(telemetry["client_dropped_action_count"], 7)
+        self.assertIsNone(telemetry["client_unsafe_drop_count"])
+        self.assertIsNone(telemetry["client_expired_drop_count"])
+        self.assertIsNone(telemetry["client_other_drop_count"])
+        self.assertEqual(telemetry["client_last_drop_kind"], "other")
+        self.assertFalse(telemetry["client_last_drop_was_unsafe"])
+        self.assertFalse(telemetry["client_last_drop_was_expired"])
+        self.assertIsNone(telemetry["client_unsafe_active"])
+
+    def test_explicit_drop_fields_take_priority_and_remain_independent(self):
+        telemetry = HELPER.sanitize_async_client_telemetry(
+            {
+                "dropped_action_count": 21,
+                "unsafe_drop_count": 3,
+                "client_unsafe_drop_count": 99,
+                "expired_drop_count": 12,
+                "other_drop_count": 6,
+                "last_queue_drop_kind": "expired",
+                "drop_kind": "unsafe",
+                "last_queue_drop_reason": "active timed plan exhausted",
+                "drop_reason": "translation step exceeds limit",
+                "unsafe_active": False,
+                "safety_violation_active": True,
+            },
+            action_dim=7,
+            action_horizon=50,
+        )
+
+        self.assertEqual(telemetry["client_dropped_action_count"], 21)
+        self.assertEqual(telemetry["client_unsafe_drop_count"], 3)
+        self.assertEqual(telemetry["client_expired_drop_count"], 12)
+        self.assertEqual(telemetry["client_other_drop_count"], 6)
+        self.assertEqual(telemetry["client_drop_reason"], "active timed plan exhausted")
+        self.assertEqual(telemetry["client_last_drop_kind"], "expired")
+        self.assertFalse(telemetry["client_last_drop_was_unsafe"])
+        self.assertTrue(telemetry["client_last_drop_was_expired"])
+        self.assertFalse(telemetry["client_unsafe_active"])
+        self.assertEqual(telemetry["client_unsafe_active_source"], "client")
+
+    def test_legacy_expired_reasons_are_classified(self):
+        reasons = (
+            "dropped 1 targets older than execution_time",
+            "active timed plan exhausted",
+            "discarded expired prefix after inference",
+            "target expired before execution",
+        )
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                telemetry = HELPER.sanitize_async_client_telemetry(
+                    {"drop_reason": reason},
+                    action_dim=7,
+                    action_horizon=50,
+                )
+                self.assertEqual(telemetry["client_last_drop_kind"], "expired")
+                self.assertTrue(telemetry["client_last_drop_was_expired"])
+                self.assertFalse(telemetry["client_last_drop_was_unsafe"])
+
+    def test_legacy_blocked_reason_distinguishes_current_from_historical_unsafe(self):
+        reason = "dropped unsafe queued target: translation step exceeds limit"
+        ready = HELPER.sanitize_async_client_telemetry(
+            {"execution_state": "ready", "blocked_reason": reason},
+            action_dim=7,
+            action_horizon=50,
+        )
+        self.assertEqual(ready["client_drop_reason"], reason)
+        self.assertEqual(ready["client_last_drop_kind"], "unsafe")
+        self.assertFalse(ready["client_unsafe_active"])
+        self.assertEqual(ready["client_unsafe_active_source"], "legacy_execution_state")
+
+        blocked = HELPER.sanitize_async_client_telemetry(
+            {"execution_state": "blocked", "blocked_reason": reason},
+            action_dim=7,
+            action_horizon=50,
+        )
+        self.assertTrue(blocked["client_unsafe_active"])
+        self.assertEqual(blocked["client_unsafe_active_source"], "legacy_blocked_reason")
+
+        unknown = HELPER.sanitize_async_client_telemetry(
+            {"drop_reason": reason},
+            action_dim=7,
+            action_horizon=50,
+        )
+        self.assertIsNone(unknown["client_unsafe_active"])
+        self.assertIsNone(unknown["client_unsafe_active_source"])
+
     def test_current_bridge_queue_fields_map_without_semantic_regression(self):
         telemetry = HELPER.sanitize_async_client_telemetry(
             {
