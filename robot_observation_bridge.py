@@ -1545,6 +1545,9 @@ class ExecutionController:
         self.inference_launch_count = 0
         self.inference_launch_deferred_count = 0
         self.last_client_transport_timing: dict[str, Any] = {}
+        self.last_client_timing_source: str | None = None
+        self.last_client_one_way_clock: str | None = None
+        self.last_client_one_way_clock_sync_required: bool | None = None
         self.last_transport_generation: int | None = None
         self.last_transport_first_command_generation: int | None = None
         self.rejected_result: dict[str, Any] | None = None
@@ -1657,6 +1660,9 @@ class ExecutionController:
         raw = result.get("_client_transport_timing")
         if not isinstance(raw, dict):
             self.last_client_transport_timing = {}
+            self.last_client_timing_source = None
+            self.last_client_one_way_clock = None
+            self.last_client_one_way_clock_sync_required = None
             self.last_transport_generation = int(generation)
             self.last_transport_first_command_generation = None
             return
@@ -1674,6 +1680,10 @@ class ExecutionController:
             "response_received_at",
             "response_received_monotonic",
             "inference_generation",
+            "client_observation_upload_ms",
+            "client_result_download_ms",
+            "client_network_transport_total_ms",
+            "non_model_rtt_ms",
         }
         cleaned = {
             key: value
@@ -1682,11 +1692,20 @@ class ExecutionController:
         }
         if not cleaned:
             self.last_client_transport_timing = {}
+            self.last_client_timing_source = None
+            self.last_client_one_way_clock = None
+            self.last_client_one_way_clock_sync_required = None
             self.last_transport_generation = int(generation)
             self.last_transport_first_command_generation = None
             return
         cleaned["generation"] = int(generation)
         cleaned["timing_valid"] = True
+        self.last_client_timing_source = str(raw.get("timing_source") or "") or None
+        self.last_client_one_way_clock = str(raw.get("one_way_timing_clock") or "") or None
+        sync_required = raw.get("one_way_timing_requires_clock_sync")
+        self.last_client_one_way_clock_sync_required = (
+            bool(sync_required) if isinstance(sync_required, bool) else None
+        )
         self.last_client_transport_timing = cleaned
         self.last_transport_generation = int(generation)
         self.last_transport_first_command_generation = None
@@ -1779,11 +1798,18 @@ class ExecutionController:
             "timing_generation": self.last_transport_generation,
             "transport_timing_generation": self.last_transport_generation,
             "transport_timing_valid": bool(self.last_client_transport_timing.get("timing_valid", False)),
+            "client_timing_source": self.last_client_timing_source,
+            "one_way_timing_clock": self.last_client_one_way_clock,
+            "one_way_timing_requires_clock_sync": self.last_client_one_way_clock_sync_required,
             "camera_capture_ms": self.last_client_transport_timing.get("camera_capture_ms"),
             "observation_upload_ms": self.last_client_transport_timing.get("observation_upload_ms"),
+            "client_observation_upload_ms": self.last_client_transport_timing.get("client_observation_upload_ms"),
             "model_inference_ms": self.last_client_transport_timing.get("model_inference_ms"),
             "result_download_ms": self.last_client_transport_timing.get("result_download_ms"),
+            "client_result_download_ms": self.last_client_transport_timing.get("client_result_download_ms"),
             "network_transport_total_ms": self.last_client_transport_timing.get("network_transport_total_ms"),
+            "client_network_transport_total_ms": self.last_client_transport_timing.get("client_network_transport_total_ms"),
+            "non_model_rtt_ms": self.last_client_transport_timing.get("non_model_rtt_ms"),
             "round_trip_ms": self.last_client_transport_timing.get("round_trip_ms"),
             "request_sent_at": self.last_client_transport_timing.get("request_sent_at"),
             "server_request_received_at": self.last_client_transport_timing.get("server_request_received_at"),
@@ -2829,6 +2855,82 @@ def print_result(
     )
 
 
+def build_client_transport_timing(
+    *,
+    request_sent_at: float,
+    request_sent_monotonic: float,
+    response_received_at: float,
+    response_received_monotonic: float,
+    server_timing: dict[str, Any] | None,
+    camera_capture_ms: float | None,
+    inference_generation: int,
+) -> dict[str, Any]:
+    """Measure and report transport timing from the client side.
+
+    The client owns the send/receive boundaries and computes the two one-way
+    values from server timestamps echoed in the response. Those values are
+    still estimates when the two machines' wall clocks are not synchronized,
+    so the payload explicitly records that measurement contract. RTT and all
+    local intervals use monotonic clocks.
+    """
+    server_timing = server_timing if isinstance(server_timing, dict) else {}
+
+    def finite(value: Any) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) and number >= 0 else None
+
+    def interval(end: Any, start: Any) -> float | None:
+        end_value = finite(end)
+        start_value = finite(start)
+        if end_value is None or start_value is None or end_value < start_value:
+            return None
+        return (end_value - start_value) * 1000.0
+
+    server_request_received_at = finite(server_timing.get("server_request_received_at"))
+    server_response_ready_at = finite(server_timing.get("server_response_ready_at"))
+    model_inference_ms = finite(server_timing.get("model_inference_ms"))
+    upload_ms = interval(server_request_received_at, request_sent_at)
+    download_ms = interval(response_received_at, server_response_ready_at)
+    round_trip_ms = max(
+        0.0, (float(response_received_monotonic) - float(request_sent_monotonic)) * 1000.0
+    )
+    one_way_total_ms = (
+        upload_ms + download_ms
+        if upload_ms is not None and download_ms is not None
+        else None
+    )
+    non_model_rtt_ms = (
+        max(0.0, round_trip_ms - model_inference_ms)
+        if model_inference_ms is not None
+        else None
+    )
+    return {
+        "camera_capture_ms": finite(camera_capture_ms),
+        "observation_upload_ms": upload_ms,
+        "client_observation_upload_ms": upload_ms,
+        "model_inference_ms": model_inference_ms,
+        "result_download_ms": download_ms,
+        "client_result_download_ms": download_ms,
+        "network_transport_total_ms": one_way_total_ms,
+        "client_network_transport_total_ms": one_way_total_ms,
+        "non_model_rtt_ms": non_model_rtt_ms,
+        "round_trip_ms": round_trip_ms,
+        "request_sent_at": finite(request_sent_at),
+        "server_request_received_at": server_request_received_at,
+        "server_model_completed_at": finite(server_timing.get("server_model_completed_at")),
+        "server_response_ready_at": server_response_ready_at,
+        "response_received_at": finite(response_received_at),
+        "response_received_monotonic": finite(response_received_monotonic),
+        "inference_generation": int(inference_generation),
+        "timing_source": "client_wall_clock_echo",
+        "one_way_timing_clock": "wall_clock",
+        "one_way_timing_requires_clock_sync": True,
+    }
+
+
 def run(args: argparse.Namespace) -> None:
     for key in ("NO_PROXY", "no_proxy"):
         entries = [item.strip() for item in os.environ.get(key, "").split(",") if item.strip()]
@@ -3071,49 +3173,15 @@ def run(args: argparse.Namespace) -> None:
                                 server_timing = result.get("transport_timing")
                                 server_timing = server_timing if isinstance(server_timing, dict) else {}
 
-                                def interval_ms(end: Any, start: Any) -> float | None:
-                                    try:
-                                        value = (float(end) - float(start)) * 1000.0
-                                    except (TypeError, ValueError):
-                                        return None
-                                    return value if math.isfinite(value) and value >= 0 else None
-
-                                model_inference_ms = ExecutionController._finite_timing_value(
-                                    server_timing.get("model_inference_ms")
+                                client_timing = build_client_transport_timing(
+                                    request_sent_at=request_sent_at,
+                                    request_sent_monotonic=request_sent_monotonic,
+                                    response_received_at=response_received_at,
+                                    response_received_monotonic=response_received_monotonic,
+                                    server_timing=server_timing,
+                                    camera_capture_ms=(camera_finished_monotonic - camera_started_monotonic) * 1000.0,
+                                    inference_generation=launch_ref.generation,
                                 )
-                                round_trip_ms = max(
-                                    0.0,
-                                    (response_received_monotonic - request_sent_monotonic) * 1000.0,
-                                )
-                                observation_upload_ms = ExecutionController._finite_timing_value(
-                                    server_timing.get("observation_upload_ms")
-                                )
-                                result_download_ms = interval_ms(
-                                    response_received_at,
-                                    server_timing.get("server_response_ready_at"),
-                                )
-                                network_transport_total_ms = (
-                                    max(0.0, round_trip_ms - model_inference_ms)
-                                    if model_inference_ms is not None
-                                    else None
-                                )
-                                client_timing = {
-                                    "camera_capture_ms": max(
-                                        0.0, (camera_finished_monotonic - camera_started_monotonic) * 1000.0
-                                    ),
-                                    "observation_upload_ms": observation_upload_ms,
-                                    "model_inference_ms": model_inference_ms,
-                                    "result_download_ms": result_download_ms,
-                                    "network_transport_total_ms": network_transport_total_ms,
-                                    "round_trip_ms": round_trip_ms,
-                                    "request_sent_at": request_sent_at,
-                                    "server_request_received_at": server_timing.get("server_request_received_at"),
-                                    "server_model_completed_at": server_timing.get("server_model_completed_at"),
-                                    "server_response_ready_at": server_timing.get("server_response_ready_at"),
-                                    "response_received_at": response_received_at,
-                                    "response_received_monotonic": response_received_monotonic,
-                                    "inference_generation": launch_ref.generation,
-                                }
                                 return InferenceWorkerResult(
                                     result=result,
                                     image_timestamps=image_timestamps,

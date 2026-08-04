@@ -1888,10 +1888,10 @@ def sanitize_async_client_telemetry(
         "client_server_response_ready_at": ("server_response_ready_at", "client_server_response_ready_at"),
         "client_response_received_at": ("response_received_at", "client_response_received_at"),
         "client_camera_capture_ms": ("camera_capture_ms", "client_camera_capture_ms"),
-        "client_observation_upload_ms": ("observation_upload_ms", "client_observation_upload_ms"),
+        "client_observation_upload_ms": ("client_observation_upload_ms", "observation_upload_ms"),
         "client_model_inference_ms": ("model_inference_ms", "client_model_inference_ms"),
-        "client_result_download_ms": ("result_download_ms", "client_result_download_ms"),
-        "client_network_transport_total_ms": ("network_transport_total_ms", "client_network_transport_total_ms"),
+        "client_result_download_ms": ("client_result_download_ms", "result_download_ms"),
+        "client_network_transport_total_ms": ("client_network_transport_total_ms", "network_transport_total_ms"),
         "client_round_trip_ms": ("round_trip_ms", "client_round_trip_ms"),
         "client_result_to_first_command_ms": ("result_to_first_command_ms", "client_result_to_first_command_ms"),
         "client_observation_to_first_command_ms": ("observation_to_first_command_ms", "client_observation_to_first_command_ms"),
@@ -1990,12 +1990,32 @@ def sanitize_async_client_telemetry(
         result[output] = _telemetry_json_value(
             _first_client_value(client, *keys), action_dim=action_dim
         )
-    if result.get("client_timing_generation") is None:
-        timing_payload = result.get("client_transport_timing")
-        if isinstance(timing_payload, dict):
+    timing_payload = result.get("client_transport_timing")
+    if isinstance(timing_payload, dict):
+        if result.get("client_timing_generation") is None:
             result["client_timing_generation"] = _telemetry_nonnegative_int(
                 timing_payload.get("generation")
             )
+        for output, key in {
+            "client_observation_upload_ms": "client_observation_upload_ms",
+            "client_result_download_ms": "client_result_download_ms",
+            "client_network_transport_total_ms": "client_network_transport_total_ms",
+        }.items():
+            if result.get(output) is None:
+                result[output] = _telemetry_nonnegative_float(timing_payload.get(key))
+
+    result["client_timing_source"] = str(
+        _first_client_value(client, "client_timing_source", "timing_source") or ""
+    )[:128]
+    result["client_one_way_timing_clock"] = str(
+        _first_client_value(client, "client_one_way_timing_clock", "one_way_timing_clock") or ""
+    )[:64]
+    clock_sync = _first_client_value(
+        client, "client_one_way_timing_requires_clock_sync", "one_way_timing_requires_clock_sync"
+    )
+    result["client_one_way_timing_requires_clock_sync"] = (
+        clock_sync if isinstance(clock_sync, bool) else None
+    )
 
     timed_target = result.get("client_timed_target")
     if isinstance(timed_target, dict):
@@ -2290,7 +2310,10 @@ class PolicyTelemetry:
                 transport_timing.get("model_inference_ms")
             )
             server_observation_upload_ms = _telemetry_nonnegative_float(
-                transport_timing.get("observation_upload_ms")
+                transport_timing.get(
+                    "server_observation_upload_ms",
+                    transport_timing.get("observation_upload_ms"),
+                )
             )
             payload = {
                 "sequence": self.sequence,
@@ -2384,6 +2407,7 @@ class PolicyTelemetry:
                     transport_timing.get("inference_generation")
                 ),
                 "server_observation_upload_ms": server_observation_upload_ms,
+                "server_observation_upload_semantics": "client_request_to_policy_infer_entry",
                 "server_request_received_at": _telemetry_nonnegative_float(
                     transport_timing.get("server_request_received_at")
                 ),
@@ -2464,6 +2488,7 @@ class TelemetryPolicy:
                 "server_model_completed_at": server_model_completed_at,
                 "model_inference_ms": model_inference_s * 1000.0,
                 "observation_upload_ms": observation_upload_ms,
+                "server_observation_upload_ms": observation_upload_ms,
             }
             result["transport_timing"] = transport_timing
             result["execution_control"] = self.telemetry.execution_control()

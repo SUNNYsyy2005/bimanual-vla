@@ -585,7 +585,13 @@ class AsyncPolicyDashboardContractTest(unittest.TestCase):
             "client_observation_upload_ms",
             "client_model_inference_ms",
             "client_result_download_ms",
+            "client_network_transport_total_ms",
             "client_round_trip_ms",
+            "client_timing_source",
+            "client_one_way_timing_clock",
+            "one_way_timing_requires_clock_sync",
+            "客户端实测",
+            "服务端诊断",
             "client_current_target_time_error_ms",
             "result→first command",
         ):

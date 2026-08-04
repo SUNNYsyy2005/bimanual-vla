@@ -237,14 +237,14 @@
     <section id="module-telemetry" class="dashboard-module" data-module="telemetry" hidden>
       <div class="module-heading"><div><h2>实时遥测</h2><p>只读展示 Policy 实际收到的 state、相机、prompt、预测 action 和异步 chunk 生命周期。默认 delivery 安全阈值来自 <code>8_3_64eps</code> 全量 20 Hz 统计：translation 0.05 m/step、rotation 0.18 rad/step、gripper 0.30 fraction/step，workspace x[-0.05,0.30]、y[0.01,0.50]、z[0.14,0.52]；每条 20 Hz command 仍独立检查，CLI 可继续收紧。</p></div></div>
       <div class="stat-grid telemetry-latency-grid" aria-label="异步链路延迟">
-        <div class="stat-card"><div class="stat-label">客户端上传（估算）</div><div id="telemetryUpload" class="stat-value">-</div><div class="stat-detail">request sent → server received</div></div>
+        <div class="stat-card"><div class="stat-label">客户端测量：上传</div><div id="telemetryUpload" class="stat-value">-</div><div id="telemetryUploadDetail" class="stat-detail">client report · one-way wall-clock</div></div>
         <div class="stat-card"><div class="stat-label">模型推理（实测）</div><div id="telemetryModel" class="stat-value">-</div><div class="stat-detail">server model execution</div></div>
-        <div class="stat-card"><div class="stat-label">下行到客户端（估算）</div><div id="telemetryDownload" class="stat-value">-</div><div class="stat-detail">response ready → client received</div></div>
-        <div class="stat-card"><div class="stat-label">网络总传输 / RTT</div><div id="telemetryTransport" class="stat-value">-</div><div class="stat-detail">RTT - model（RTT 实测）</div></div>
+        <div class="stat-card"><div class="stat-label">客户端测量：下行</div><div id="telemetryDownload" class="stat-value">-</div><div id="telemetryDownloadDetail" class="stat-detail">client report · one-way wall-clock</div></div>
+        <div class="stat-card"><div class="stat-label">网络总传输 / RTT</div><div id="telemetryTransport" class="stat-value">-</div><div id="telemetryTransportDetail" class="stat-detail">client report · RTT monotonic measured</div></div>
         <div class="stat-card"><div class="stat-label">结果 → 首条命令</div><div id="telemetryFirstCommand" class="stat-value">-</div><div class="stat-detail">client response → 20 Hz command</div></div>
         <div class="stat-card"><div class="stat-label">当前动作时间误差</div><div id="telemetryActionError" class="stat-value">-</div><div class="stat-detail">now - target time（带符号）</div></div>
       </div>
-      <p class="muted">说明：上传/下行是基于客户端与 Policy 服务端 wall-clock 的单向延迟估算，需两端时钟基本同步；RTT、模型推理和“结果→首条命令”分别由单调时钟/服务端或客户端实际测量。</p>
+      <p class="muted">说明：上传/下行由客户端根据本次请求的服务端时间戳回显计算并汇报；单向值仍需两端 wall-clock 基本同步。RTT 和“结果→首条命令”由客户端 monotonic clock 实测，模型推理由服务端 monotonic clock 实测。</p>
       <div class="grid">
         <div class="card"><h2>Policy 实时观测</h2><div id="robotObservation" class="warn">尚未收到 telemetry。</div><div class="preview-grid"><div><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div><div><h3>Prompt / predicted action</h3><pre id="policyAction">action: -</pre></div></div><div id="robotImages" class="preview-grid"><figure><figcaption>顶部全局</figcaption><img id="previewHigh" alt="high camera"></figure><figure id="singleWristPreview"><figcaption>单臂腕部</figcaption><img id="previewWrist" alt="wrist camera"></figure><figure id="leftWristPreview" hidden><figcaption>左臂腕部</figcaption><img id="previewLeftWrist" alt="left wrist camera"></figure><figure id="rightWristPreview" hidden><figcaption>右臂腕部</figcaption><img id="previewRightWrist" alt="right wrist camera"></figure></div></div>
       </div>
@@ -1008,6 +1008,14 @@ function metricMs(value) {
   return number == null ? '-' : `${number.toFixed(1)} ms`;
 }
 
+function clientTimingMetric(clientValue, fallbackValue) {
+  const client = finiteMetric(clientValue);
+  if (client != null) return `${metricMs(client)} · 客户端实测`;
+  const fallback = finiteMetric(fallbackValue);
+  if (fallback != null) return `${metricMs(fallback)} · 服务端诊断`;
+  return '未上报';
+}
+
 function signedMetricMs(value) {
   const number = finiteMetric(value);
   return number == null ? '-' : `${number >= 0 ? '+' : ''}${number.toFixed(1)} ms`;
@@ -1058,6 +1066,9 @@ function telemetrySummary(t) {
   const targetAge = t.client_target_age_s ?? target.target_age_s ?? '-';
   const targetTimes = Array.isArray(t.client_plan_target_times) ? JSON.stringify(t.client_plan_target_times) : '-';
   const targetError = actionTimeErrorMs(t);
+  const uploadTiming = clientTimingMetric(t.client_observation_upload_ms, t.server_observation_upload_ms);
+  const downloadTiming = clientTimingMetric(t.client_result_download_ms, null);
+  const transportTiming = clientTimingMetric(t.client_network_transport_total_ms, null);
   const activeGeneration = t.client_active_plan_generation ?? t.client_queue_generation ?? '-';
   const activeIndex = t.client_active_plan_index ?? '-';
   const activeRemaining = t.client_active_plan_remaining ?? t.client_new_remaining ?? '-';
@@ -1085,9 +1096,10 @@ function telemetrySummary(t) {
   const reason = t.client_blocked_reason || t.client_drop_reason || t.horizon_error || '';
   const details = `
     <div>推理时序：launch/capture/arrival=${esc(fmtTime(t.client_launch_at))}/${esc(fmtTime(t.client_capture_at ?? t.captured_at))}/${esc(fmtTime(t.client_arrival_at))}</div>
-    <div>异步延迟：capture→result=${esc(metricMs(t.client_latency_ms))} · 上传≈${esc(metricMs(t.server_observation_upload_ms ?? t.client_observation_upload_ms))} · 模型=${esc(metricMs(t.server_model_inference_ms ?? t.client_model_inference_ms))} · 下行≈${esc(metricMs(t.client_result_download_ms))} · RTT=${esc(metricMs(t.client_round_trip_ms))}</div>
+    <div>异步延迟：capture→result=${esc(metricMs(t.client_latency_ms))} · 上传=${esc(uploadTiming)} · 模型=${esc(metricMs(t.server_model_inference_ms ?? t.client_model_inference_ms))} · 下行=${esc(downloadTiming)} · RTT=${esc(metricMs(t.client_round_trip_ms))}</div>
+    <div>客户端网络总传输=${esc(transportTiming)} · 单向测量来源=${esc(t.client_timing_source || '未上报')} · 时钟=${esc(t.client_one_way_timing_clock || '-')} · 需同步=${esc(t.client_one_way_timing_requires_clock_sync ?? '-')}</div>
     <div>result→first command=${esc(metricMs(t.client_result_to_first_command_ms))} · observation→first command=${esc(metricMs(t.client_observation_to_first_command_ms))} · actuator=${esc(metricMs(t.client_actuator_delay_ms))}</div>
-    <div>timing generation client/server=${esc(t.client_timing_generation ?? '-')} / ${esc(t.server_timing_generation ?? '-')} · upload/model 属于当前请求，download/RTT 属于最近完成结果</div>
+    <div>timing generation client/server=${esc(t.client_timing_generation ?? '-')} / ${esc(t.server_timing_generation ?? '-')} · upload/download source=${esc(t.client_timing_source || '-')} · clock=${esc(t.client_one_way_timing_clock || '-')} · sync_required=${esc(t.client_one_way_timing_requires_clock_sync ?? '-')}</div>
     <div>时间契约：dt=${esc(t.action_time_step_s ?? '-')}s · start=${esc(t.action_start_offset_steps ?? '-')} step · 当前动作误差=${esc(signedMetricMs(targetError))} · target_at=${esc(fmtTime(actionTargetAt(t)))}</div>
     <div>target monotonic/age=${esc(targetMonotonic)}/${esc(targetAge)}s · target times=${esc(targetTimes)}</div>
     <div>generation active/result=${esc(t.client_queue_generation ?? '-')} / ${esc(t.client_result_generation ?? '-')} · old/new remaining=${esc(t.client_old_remaining ?? '-')}/${esc(t.client_new_remaining ?? '-')}</div>
@@ -1300,26 +1312,41 @@ function fillObservation(obs) {
     document.getElementById('robotState').textContent = 'state: -';
     document.getElementById('policyAction').textContent = 'action: -';
     ['telemetryUpload', 'telemetryModel', 'telemetryDownload', 'telemetryTransport', 'telemetryFirstCommand', 'telemetryActionError'].forEach(id => { document.getElementById(id).textContent = '-'; });
+    ['telemetryUploadDetail', 'telemetryDownloadDetail', 'telemetryTransportDetail'].forEach(id => { document.getElementById(id).textContent = '尚无客户端汇报'; });
     return;
   }
   const control = obs.execution_control || {};
   status.className = obs.dual_gate_open ? 'bad' : obs.fresh ? 'ok' : 'warn';
   const captured = fmtTime(obs.client_capture_at ?? obs.captured_at);
   const currentTargetErrorMs = actionTimeErrorMs(obs);
-  // Server-side upload/model values belong to the current request; client-side
-  // download/RTT values arrive with the most recently completed result.
-  const uploadMs = obs.server_observation_upload_ms ?? obs.client_observation_upload_ms;
+  // Client upload/download/transport values are reported asynchronously with
+  // the next request. Keep the server-side upload boundary as an explicitly
+  // labelled diagnostic fallback instead of presenting it as a client measure.
+  const clientUploadMs = obs.client_observation_upload_ms;
+  const serverUploadMs = obs.server_observation_upload_ms;
+  const uploadMs = clientUploadMs ?? serverUploadMs;
   const modelMs = obs.server_model_inference_ms ?? obs.client_model_inference_ms;
-  const downloadMs = obs.client_result_download_ms;
-  const transportMs = obs.client_network_transport_total_ms;
+  const clientDownloadMs = obs.client_result_download_ms;
+  const clientTransportMs = obs.client_network_transport_total_ms;
   const roundTripMs = obs.client_round_trip_ms;
   document.getElementById('telemetryUpload').textContent = metricMs(uploadMs);
+  document.getElementById('telemetryUploadDetail').textContent = clientUploadMs != null
+    ? '客户端汇报 · wall-clock 单向测量'
+    : serverUploadMs != null
+      ? '无客户端汇报 · 服务端请求入口诊断'
+      : '尚无客户端汇报';
   document.getElementById('telemetryModel').textContent = metricMs(modelMs);
-  document.getElementById('telemetryDownload').textContent = metricMs(downloadMs);
-  document.getElementById('telemetryTransport').textContent = `${metricMs(transportMs)} / ${metricMs(roundTripMs)}`;
+  document.getElementById('telemetryDownload').textContent = metricMs(clientDownloadMs);
+  document.getElementById('telemetryDownloadDetail').textContent = clientDownloadMs != null
+    ? '客户端汇报 · wall-clock 单向测量'
+    : '尚无客户端汇报';
+  document.getElementById('telemetryTransport').textContent = `${metricMs(clientTransportMs)} / ${metricMs(roundTripMs)}`;
+  document.getElementById('telemetryTransportDetail').textContent = clientTransportMs != null
+    ? '总传输为客户端汇报 · RTT 为客户端 monotonic 实测'
+    : '尚无客户端总传输汇报 · RTT 为客户端 monotonic 实测';
   document.getElementById('telemetryFirstCommand').textContent = metricMs(obs.client_result_to_first_command_ms);
   document.getElementById('telemetryActionError').textContent = signedMetricMs(currentTargetErrorMs);
-  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · 服务端=${control.mode || 'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open ? 'OPEN' : 'CLOSED'} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · 上传估算=${metricMs(uploadMs)} · 推理实测=${metricMs(modelMs)} · 下行估算=${metricMs(downloadMs)} · 当前动作时间误差=${signedMetricMs(currentTargetErrorMs)} · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
+  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · 服务端=${control.mode || 'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open ? 'OPEN' : 'CLOSED'} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · 上传=${clientTimingMetric(clientUploadMs, serverUploadMs)} · 推理实测=${metricMs(modelMs)} · 下行=${clientTimingMetric(clientDownloadMs, null)} · 当前动作时间误差=${signedMetricMs(currentTargetErrorMs)} · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
   const joint = obs.schema === 'joint';
   const stateGripper = String(obs.state_gripper_semantics || obs.raw_gripper_semantics || '');
   const gripperLabel = stateGripper.includes('metre') || stateGripper.endsWith('_m')
@@ -1367,9 +1394,9 @@ time contract: offset=${obs.action_offset ?? '-'} · model/wire start=${obs.mode
 in-flight: ${obs.client_in_flight ?? '-'} · actuator delay=${obs.client_actuator_delay_ms ?? '-'} ms / ${obs.client_actuator_delay_steps ?? '-'} steps
 launch / capture / arrival: ${fmtTime(obs.client_launch_at)} / ${fmtTime(obs.client_capture_at ?? obs.captured_at)} / ${fmtTime(obs.client_arrival_at)}
 latency (capture→result): ${metricMs(obs.client_latency_ms)} / ${obs.client_latency_steps ?? '-'} steps
-async latency breakdown: camera=${metricMs(obs.client_camera_capture_ms)} · upload≈${metricMs(obs.server_observation_upload_ms ?? obs.client_observation_upload_ms)} · model=${metricMs(obs.server_model_inference_ms ?? obs.client_model_inference_ms)} · result→client≈${metricMs(obs.client_result_download_ms)} · transport total=${metricMs(obs.client_network_transport_total_ms)} · RTT=${metricMs(obs.client_round_trip_ms)}
+async latency breakdown: camera=${metricMs(obs.client_camera_capture_ms)} · upload=${clientTimingMetric(obs.client_observation_upload_ms, obs.server_observation_upload_ms)} · model=${metricMs(obs.server_model_inference_ms ?? obs.client_model_inference_ms)} · result→client=${clientTimingMetric(obs.client_result_download_ms, null)} · transport total=${clientTimingMetric(obs.client_network_transport_total_ms, null)} · RTT=${metricMs(obs.client_round_trip_ms)}
 result→first command: ${metricMs(obs.client_result_to_first_command_ms)} · observation→first command=${metricMs(obs.client_observation_to_first_command_ms)}
-server timing: request received=${fmtTime(obs.client_server_request_received_at ?? obs.server_request_received_at)} · model done=${fmtTime(obs.client_server_model_completed_at ?? obs.server_model_completed_at)} · response ready=${fmtTime(obs.client_server_response_ready_at)} · client received=${fmtTime(obs.client_response_received_at)}
+server timing: request received=${fmtTime(obs.client_server_request_received_at ?? obs.server_request_received_at)} · model done=${fmtTime(obs.client_server_model_completed_at ?? obs.server_model_completed_at)} · response ready=${fmtTime(obs.client_server_response_ready_at ?? obs.server_response_ready_at)} · client received=${fmtTime(obs.client_response_received_at)}
 expired prefix / skipped prefix / blend: ${obs.client_expired_prefix ?? '-'} / ${obs.client_skipped_prefix ?? '-'} / ${obs.client_blend_steps ?? '-'} steps
 active plan generation/index/remaining: ${obs.client_active_plan_generation ?? '-'} / ${obs.client_active_plan_index ?? '-'} / ${obs.client_active_plan_remaining ?? '-'}
 queue generation active/result: ${obs.client_queue_generation ?? '-'} / ${obs.client_result_generation ?? '-'} · old/new remaining: ${obs.client_old_remaining ?? '-'} / ${obs.client_new_remaining ?? '-'}

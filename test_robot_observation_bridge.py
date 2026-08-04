@@ -51,6 +51,7 @@ from robot_observation_bridge import (
     aggregate_action_chunk,
     build_checked_joint_target,
     build_checked_target,
+    build_client_transport_timing,
     build_observation,
     decode_action_queue,
     policy_observation_state,
@@ -781,6 +782,87 @@ class TargetSafetyTest(unittest.TestCase):
             gripper_semantics=GRIPPER_OPENING_METRES,
         )
         self.assertAlmostEqual(legacy_gripper_m, 0.042)
+
+
+class ClientTransportTimingTest(unittest.TestCase):
+    def test_build_client_transport_timing_uses_fixed_boundaries_and_generation(self):
+        timing = build_client_transport_timing(
+            request_sent_at=100.000,
+            request_sent_monotonic=10.000,
+            response_received_at=100.250,
+            response_received_monotonic=10.200,
+            server_timing={
+                "server_request_received_at": 100.050,
+                "server_model_completed_at": 100.190,
+                "server_response_ready_at": 100.210,
+                "model_inference_ms": 180.0,
+            },
+            camera_capture_ms=12.5,
+            inference_generation=42,
+        )
+
+        self.assertAlmostEqual(timing["camera_capture_ms"], 12.5)
+        self.assertAlmostEqual(timing["observation_upload_ms"], 50.0)
+        self.assertAlmostEqual(timing["client_observation_upload_ms"], 50.0)
+        self.assertAlmostEqual(timing["result_download_ms"], 40.0)
+        self.assertAlmostEqual(timing["client_result_download_ms"], 40.0)
+        self.assertAlmostEqual(timing["network_transport_total_ms"], 90.0)
+        self.assertAlmostEqual(timing["client_network_transport_total_ms"], 90.0)
+        self.assertAlmostEqual(timing["round_trip_ms"], 200.0)
+        self.assertAlmostEqual(timing["non_model_rtt_ms"], 20.0)
+        self.assertEqual(timing["inference_generation"], 42)
+        self.assertEqual(timing["timing_source"], "client_wall_clock_echo")
+        self.assertEqual(timing["one_way_timing_clock"], "wall_clock")
+        self.assertTrue(timing["one_way_timing_requires_clock_sync"])
+
+    def test_build_client_transport_timing_fails_closed_for_missing_or_reversed_wall_timestamps(self):
+        timing = build_client_transport_timing(
+            request_sent_at=100.100,
+            request_sent_monotonic=10.200,
+            response_received_at=100.200,
+            response_received_monotonic=10.100,
+            server_timing={
+                # Server clock is earlier than the client send timestamp.
+                "server_request_received_at": 100.000,
+                # Server response-ready time is after the client receive time.
+                "server_response_ready_at": 100.300,
+                "model_inference_ms": -1.0,
+            },
+            camera_capture_ms=float("nan"),
+            inference_generation=7,
+        )
+
+        self.assertIsNone(timing["camera_capture_ms"])
+        self.assertIsNone(timing["observation_upload_ms"])
+        self.assertIsNone(timing["client_observation_upload_ms"])
+        self.assertIsNone(timing["result_download_ms"])
+        self.assertIsNone(timing["client_result_download_ms"])
+        self.assertIsNone(timing["network_transport_total_ms"])
+        self.assertIsNone(timing["client_network_transport_total_ms"])
+        # A reversed local monotonic interval is clamped, never reported negative.
+        self.assertEqual(timing["round_trip_ms"], 0.0)
+        self.assertIsNone(timing["non_model_rtt_ms"])
+        self.assertEqual(timing["inference_generation"], 7)
+        self.assertEqual(timing["request_sent_at"], 100.1)
+        self.assertEqual(timing["response_received_at"], 100.2)
+
+    def test_build_client_transport_timing_accepts_missing_server_timing_without_throwing(self):
+        timing = build_client_transport_timing(
+            request_sent_at=200.0,
+            request_sent_monotonic=20.0,
+            response_received_at=200.3,
+            response_received_monotonic=20.3,
+            server_timing=None,
+            camera_capture_ms=5.0,
+            inference_generation=8,
+        )
+
+        self.assertAlmostEqual(timing["round_trip_ms"], 300.0)
+        self.assertIsNone(timing["observation_upload_ms"])
+        self.assertIsNone(timing["result_download_ms"])
+        self.assertIsNone(timing["model_inference_ms"])
+        self.assertIsNone(timing["network_transport_total_ms"])
+        self.assertEqual(timing["inference_generation"], 8)
 
 
 class AsyncInferencePipelineTest(unittest.TestCase):
