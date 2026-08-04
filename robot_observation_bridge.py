@@ -1108,10 +1108,11 @@ class InferenceCompletion:
 
 @dataclass(frozen=True)
 class InferenceWorkerResult:
-    """Inference result plus camera timestamps captured off the control thread."""
+    """Inference result plus camera/transport timing captured off the control thread."""
 
     result: dict[str, Any]
     image_timestamps: dict[str, float]
+    client_timing: dict[str, Any] | None = None
 
 
 class AsyncPolicyInference:
@@ -1169,7 +1170,10 @@ class AsyncPolicyInference:
                     for key, value in result.image_timestamps.items()
                 },
             )
-            result = result.result
+            payload = dict(result.result)
+            if isinstance(result.client_timing, dict):
+                payload["_client_transport_timing"] = dict(result.client_timing)
+            result = payload
         return InferenceCompletion(launch, result, arrived_at, arrived_monotonic, error=None)
 
     def shutdown(self) -> None:
@@ -1498,6 +1502,10 @@ class ExecutionController:
         self.hold_count = 0
         self.hold_started_at: float | None = None
         self.current_timed_target: dict[str, Any] | None = None
+        # Keep the decoded target object so telemetry can recompute its signed
+        # age against the current snapshot time instead of freezing the value at
+        # the last command tick.
+        self.current_timed_target_action: DecodedQueuedAction | None = None
         self._filtered_gripper_opening: dict[str, float] = {}
         self._gripper_extreme_candidate: dict[str, str | None] = {}
         self._gripper_extreme_count: dict[str, int] = {}
@@ -1536,6 +1544,9 @@ class ExecutionController:
         self.inference_old_remaining = 0
         self.inference_launch_count = 0
         self.inference_launch_deferred_count = 0
+        self.last_client_transport_timing: dict[str, Any] = {}
+        self.last_transport_generation: int | None = None
+        self.last_transport_first_command_generation: int | None = None
         self.rejected_result: dict[str, Any] | None = None
         self.rejected_result_count = 0
         self.queue_underrun = False
@@ -1628,8 +1639,86 @@ class ExecutionController:
         if overrun:
             self.control_overrun_count += 1
 
+    @staticmethod
+    def _finite_timing_value(value: Any, *, allow_negative: bool = False) -> float | None:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(result) or (result < 0 and not allow_negative):
+            return None
+        return result
+
+    def _record_client_transport_timing(
+        self, result: dict[str, Any], *, generation: int
+    ) -> None:
+        if not isinstance(result, dict):
+            return
+        raw = result.get("_client_transport_timing")
+        if not isinstance(raw, dict):
+            self.last_client_transport_timing = {}
+            self.last_transport_generation = int(generation)
+            self.last_transport_first_command_generation = None
+            return
+        allowed = {
+            "camera_capture_ms",
+            "observation_upload_ms",
+            "model_inference_ms",
+            "result_download_ms",
+            "network_transport_total_ms",
+            "round_trip_ms",
+            "request_sent_at",
+            "server_request_received_at",
+            "server_model_completed_at",
+            "server_response_ready_at",
+            "response_received_at",
+            "response_received_monotonic",
+            "inference_generation",
+        }
+        cleaned = {
+            key: value
+            for key in allowed
+            if (value := self._finite_timing_value(raw.get(key))) is not None
+        }
+        if not cleaned:
+            self.last_client_transport_timing = {}
+            self.last_transport_generation = int(generation)
+            self.last_transport_first_command_generation = None
+            return
+        cleaned["generation"] = int(generation)
+        cleaned["timing_valid"] = True
+        self.last_client_transport_timing = cleaned
+        self.last_transport_generation = int(generation)
+        self.last_transport_first_command_generation = None
+
     def metadata(self) -> dict[str, Any]:
+        timing_snapshot_at = time.time()
+        timing_snapshot_monotonic = time.monotonic()
+        # Prefer the target that was actually sent on the most recent 20 Hz
+        # control tick. ``last_safe_target`` is the fallback hold target and
+        # can legitimately have ``hold=False`` while the controller is already
+        # holding it after a queue underrun.
+        if self.current_timed_target_action is not None:
+            current_target = self._timed_target_telemetry(
+                self.current_timed_target_action,
+                now_monotonic=timing_snapshot_monotonic,
+                now_wall=timing_snapshot_at,
+            )
+        else:
+            current_target = self.current_timed_target
+            if current_target is None:
+                current_target = self._timed_target_telemetry(
+                    self.last_safe_target,
+                    now_monotonic=timing_snapshot_monotonic,
+                    now_wall=timing_snapshot_at,
+                )
+        plan_target_times = [
+            timing_snapshot_at
+            + (float(target.target_monotonic) - timing_snapshot_monotonic)
+            for target in self.pending_actions
+        ]
         return {
+            "timing_snapshot_at": timing_snapshot_at,
             "allow_execution": bool(getattr(self.args, "allow_execution", False)),
             "execution_state": self.state,
             "blocked_reason": self.blocked_reason,
@@ -1678,8 +1767,31 @@ class ExecutionController:
             "hold_active": self.hold_active,
             "hold_count": self.hold_count,
             "hold_started_at": self.hold_started_at,
-            "last_safe_target": self._timed_target_telemetry(self.last_safe_target),
-            "timed_target": self.current_timed_target,
+            "last_safe_target": self._timed_target_telemetry(
+                self.last_safe_target,
+                now_monotonic=timing_snapshot_monotonic,
+                now_wall=timing_snapshot_at,
+            ),
+            "timed_target": current_target,
+            "current_timed_target": current_target,
+            "plan_target_times": plan_target_times,
+            "client_transport_timing": dict(self.last_client_transport_timing),
+            "timing_generation": self.last_transport_generation,
+            "transport_timing_generation": self.last_transport_generation,
+            "transport_timing_valid": bool(self.last_client_transport_timing.get("timing_valid", False)),
+            "camera_capture_ms": self.last_client_transport_timing.get("camera_capture_ms"),
+            "observation_upload_ms": self.last_client_transport_timing.get("observation_upload_ms"),
+            "model_inference_ms": self.last_client_transport_timing.get("model_inference_ms"),
+            "result_download_ms": self.last_client_transport_timing.get("result_download_ms"),
+            "network_transport_total_ms": self.last_client_transport_timing.get("network_transport_total_ms"),
+            "round_trip_ms": self.last_client_transport_timing.get("round_trip_ms"),
+            "request_sent_at": self.last_client_transport_timing.get("request_sent_at"),
+            "server_request_received_at": self.last_client_transport_timing.get("server_request_received_at"),
+            "server_model_completed_at": self.last_client_transport_timing.get("server_model_completed_at"),
+            "server_response_ready_at": self.last_client_transport_timing.get("server_response_ready_at"),
+            "response_received_at": self.last_client_transport_timing.get("response_received_at"),
+            "result_to_first_command_ms": self.last_client_transport_timing.get("result_to_first_command_ms"),
+            "observation_to_first_command_ms": self.last_client_transport_timing.get("observation_to_first_command_ms"),
             "rejected_result": self.rejected_result,
             "rejected_result_count": self.rejected_result_count,
             "control_tick_count": self.control_tick_count,
@@ -1862,15 +1974,20 @@ class ExecutionController:
         target: DecodedQueuedAction | None,
         *,
         now_monotonic: float | None = None,
+        now_wall: float | None = None,
     ) -> dict[str, Any] | None:
         if target is None:
             return None
         now_monotonic = (
             time.monotonic() if now_monotonic is None else float(now_monotonic)
         )
+        now_wall = time.time() if now_wall is None else float(now_wall)
+        target_age_s = now_monotonic - float(target.target_monotonic)
         return {
             "target_monotonic": float(target.target_monotonic),
-            "target_age_s": now_monotonic - float(target.target_monotonic),
+            "target_at": now_wall - target_age_s,
+            "target_age_s": target_age_s,
+            "target_time_error_s": target_age_s,
             "source_generation": int(target.generation),
             "source_index": target.source_index,
             "queue_index": int(target.queue_index),
@@ -2036,6 +2153,7 @@ class ExecutionController:
         self.inference_arrival_at = arrived_at
         self.inference_arrival_monotonic = arrived_monotonic
         self.inference_latency_s = latency_s
+        self._record_client_transport_timing(result, generation=launch.generation)
         self.inference_old_remaining = len(self.pending_actions)
         self.inference_skip_steps = 0
         self.inference_blend_steps = 0
@@ -2534,10 +2652,30 @@ class ExecutionController:
         self.last_decoded_absolute_target = self._target_telemetry(
             protocol, queued.absolute_target
         )
+        command_at = time.time()
+        self.current_timed_target_action = replace(queued, hold=holding)
         self.current_timed_target = self._timed_target_telemetry(
-            replace(queued, hold=holding), now_monotonic=now_monotonic
+            self.current_timed_target_action,
+            now_monotonic=now_monotonic,
+            now_wall=command_at,
         )
-        self.last_command_at = time.time()
+        self.last_command_at = command_at
+        if (
+            queued.generation == self.last_transport_generation
+            and self.last_transport_first_command_generation != queued.generation
+        ):
+            response_received_monotonic = self._finite_timing_value(
+                self.last_client_transport_timing.get("response_received_monotonic")
+            )
+            if response_received_monotonic is not None:
+                self.last_client_transport_timing["result_to_first_command_ms"] = max(
+                    0.0, (now_monotonic - response_received_monotonic) * 1000.0
+                )
+            if self.inference_capture_monotonic is not None:
+                self.last_client_transport_timing["observation_to_first_command_ms"] = max(
+                    0.0, (now_monotonic - self.inference_capture_monotonic) * 1000.0
+                )
+            self.last_transport_first_command_generation = queued.generation
         if holding:
             self.hold_count += 1
             self.state = "holding"
@@ -2900,7 +3038,11 @@ def run(args: argparse.Namespace) -> None:
                                 metadata_ref=execution_metadata,
                                 launch_ref=launch,
                             ) -> InferenceWorkerResult:
+                                camera_started_at = time.time()
+                                camera_started_monotonic = time.monotonic()
                                 images, image_timestamps = cameras.read()
+                                camera_finished_at = time.time()
+                                camera_finished_monotonic = time.monotonic()
                                 observation = build_observation(
                                     delivery_state=delivery_ref,
                                     qpos=qpos_ref,
@@ -2915,9 +3057,67 @@ def run(args: argparse.Namespace) -> None:
                                     captured_monotonic=launch_ref.captured_monotonic,
                                     execution_metadata=metadata_ref,
                                 )
+                                request_sent_at = time.time()
+                                request_sent_monotonic = time.monotonic()
+                                observation["client_metadata"].update({
+                                    "request_sent_at": request_sent_at,
+                                    "camera_capture_started_at": camera_started_at,
+                                    "camera_capture_finished_at": camera_finished_at,
+                                    "inference_generation": launch_ref.generation,
+                                })
+                                result = dict(policy_ref.infer(observation))
+                                response_received_at = time.time()
+                                response_received_monotonic = time.monotonic()
+                                server_timing = result.get("transport_timing")
+                                server_timing = server_timing if isinstance(server_timing, dict) else {}
+
+                                def interval_ms(end: Any, start: Any) -> float | None:
+                                    try:
+                                        value = (float(end) - float(start)) * 1000.0
+                                    except (TypeError, ValueError):
+                                        return None
+                                    return value if math.isfinite(value) and value >= 0 else None
+
+                                model_inference_ms = ExecutionController._finite_timing_value(
+                                    server_timing.get("model_inference_ms")
+                                )
+                                round_trip_ms = max(
+                                    0.0,
+                                    (response_received_monotonic - request_sent_monotonic) * 1000.0,
+                                )
+                                observation_upload_ms = ExecutionController._finite_timing_value(
+                                    server_timing.get("observation_upload_ms")
+                                )
+                                result_download_ms = interval_ms(
+                                    response_received_at,
+                                    server_timing.get("server_response_ready_at"),
+                                )
+                                network_transport_total_ms = (
+                                    max(0.0, round_trip_ms - model_inference_ms)
+                                    if model_inference_ms is not None
+                                    else None
+                                )
+                                client_timing = {
+                                    "camera_capture_ms": max(
+                                        0.0, (camera_finished_monotonic - camera_started_monotonic) * 1000.0
+                                    ),
+                                    "observation_upload_ms": observation_upload_ms,
+                                    "model_inference_ms": model_inference_ms,
+                                    "result_download_ms": result_download_ms,
+                                    "network_transport_total_ms": network_transport_total_ms,
+                                    "round_trip_ms": round_trip_ms,
+                                    "request_sent_at": request_sent_at,
+                                    "server_request_received_at": server_timing.get("server_request_received_at"),
+                                    "server_model_completed_at": server_timing.get("server_model_completed_at"),
+                                    "server_response_ready_at": server_timing.get("server_response_ready_at"),
+                                    "response_received_at": response_received_at,
+                                    "response_received_monotonic": response_received_monotonic,
+                                    "inference_generation": launch_ref.generation,
+                                }
                                 return InferenceWorkerResult(
-                                    result=policy_ref.infer(observation),
+                                    result=result,
                                     image_timestamps=image_timestamps,
+                                    client_timing=client_timing,
                                 )
 
                             if worker.launch_callable(capture_and_infer, launch):

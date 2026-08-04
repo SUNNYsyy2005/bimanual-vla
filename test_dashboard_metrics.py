@@ -17,6 +17,9 @@ from server_4090.app import (
     gpu_inventory,
     infer_model_variant,
     parse_training_metrics,
+    complete_checkpoint_steps,
+    merge_eval_metrics,
+    select_idle_eval_gpu,
     policy_config_name,
     MIN_POLICY_ACTION_HORIZON,
     PolicyTelemetryStore,
@@ -58,6 +61,69 @@ class TrainingMetricsParserTest(unittest.TestCase):
         self.assertEqual(result["points"][0]["step"], 0)
         self.assertEqual(result["points"][-1]["step"], 99)
         self.assertEqual(result["summary"]["loss"]["max"], 9.5)
+
+
+class EvalMetricsTest(unittest.TestCase):
+    def test_complete_checkpoint_scan_requires_orbax_markers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            complete = root / "5000"
+            (complete / "params").mkdir(parents=True)
+            (complete / "_CHECKPOINT_METADATA").write_text("{}", encoding="utf-8")
+            (complete / "params" / "_METADATA").write_text("{}", encoding="utf-8")
+            incomplete = root / "10000"
+            (incomplete / "params").mkdir(parents=True)
+            (incomplete / "_CHECKPOINT_METADATA").write_text("{}", encoding="utf-8")
+            (root / "5000.orbax-checkpoint-tmp-1").mkdir()
+
+            self.assertEqual(complete_checkpoint_steps(root), [(5000, complete.resolve())])
+
+    def test_idle_eval_gpu_excludes_managed_external_and_unavailable(self):
+        tasks = [{
+            "type": "train",
+            "state": "starting",
+            "metadata": {"gpu_ids": [0]},
+        }]
+        inventory = [
+            {"index": 0, "memory_total_mib": 24564, "memory_used_mib": 0, "processes": [], "compute_available": True},
+            {"index": 1, "memory_total_mib": 24564, "memory_used_mib": 10, "processes": [{"pid": 1}], "compute_available": True},
+            {"index": 2, "memory_total_mib": 24564, "memory_used_mib": 10, "processes": [], "compute_available": False},
+            {"index": 3, "memory_total_mib": 24564, "memory_used_mib": 100, "processes": [], "compute_available": True},
+        ]
+        self.assertEqual(
+            select_idle_eval_gpu(tasks, inventory, allowed_gpu_ids={0, 1, 2, 3}, minimum_free_mib=23000),
+            3,
+        )
+
+    def test_merges_eval_result_at_checkpoint_step_and_summarizes_best(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "eval5000.json"
+            second = Path(directory) / "eval10000.json"
+            first.write_text(json.dumps({
+                "checkpoint_step": 5000,
+                "eval_loss_model": 0.3,
+                "eval_loss_objective": 0.2,
+            }), encoding="utf-8")
+            second.write_text(json.dumps({
+                "checkpoint_step": 10000,
+                "eval_loss_model": 0.1,
+                "eval_loss_objective": 0.15,
+            }), encoding="utf-8")
+            metrics = parse_training_metrics("Step 0: loss=1.0\nStep 10000: loss=0.2")
+            tasks = [
+                {"id": "eval-1", "type": "eval", "state": "completed", "metadata": {"checkpoint_step": 5000, "result_path": str(first), "gpu_ids": [0]}},
+                {"id": "eval-2", "type": "eval", "state": "completed", "metadata": {"checkpoint_step": 10000, "result_path": str(second), "gpu_ids": [3]}},
+                {"id": "eval-3", "type": "eval", "state": "skipped", "skip_reason": "no_idle_gpu", "metadata": {"checkpoint_step": 15000}},
+            ]
+
+            result = merge_eval_metrics(metrics, tasks)
+
+            self.assertEqual([point["step"] for point in result["eval_points"]], [5000, 10000])
+            self.assertEqual(result["eval_summary"]["best_step"], 10000)
+            self.assertEqual(result["eval_summary"]["best_loss"], 0.1)
+            self.assertEqual(result["eval_summary"]["counts"], {"completed": 2, "skipped": 1})
+            self.assertIn("eval_loss_model", result["series"])
+            self.assertEqual(result["summary"]["loss"]["min"], 0.2)
 
 
 class GpuInventoryTest(unittest.TestCase):
@@ -431,6 +497,53 @@ class AsyncPolicyDashboardContractTest(unittest.TestCase):
             self.assertFalse(summary(15)["dual_gate_open"])
             self.assertFalse(summary(None)["dual_gate_open"])
 
+    def test_summary_extrapolates_signed_target_error_and_falls_back_to_legacy_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PolicyTelemetryStore({"workspace_root": tmp, "robot_observation_max_age_s": 3})
+            session, directory = store.create_session()
+            task = {
+                "id": "policy-time",
+                "type": "policy",
+                "state": "running",
+                "metadata": {"telemetry_session": session, "port": 8000},
+            }
+            store.set_control(task, mode="shadow")
+            (directory / "connections.json").write_text(
+                json.dumps({"client_connected": True, "active_clients": 1}), encoding="utf-8"
+            )
+            (directory / "runtime.json").write_text(
+                json.dumps({"in_flight": False, "active_inferences": 0}), encoding="utf-8"
+            )
+            payload = {
+                "received_at": 100.0,
+                "client_allow_execution": False,
+                "client_execution_state": "shadow",
+                "client_target_time_error_ms": -40.0,
+                "client_timing_snapshot_at": 100.0,
+                "action_horizon": 16,
+                "action_hz": 20.0,
+                "action_time_step_s": 0.05,
+                "action_offset": 0,
+                "model_action_start_offset": 1,
+                "action_start_offset_steps": 1,
+            }
+            (directory / "latest.json").write_text(json.dumps(payload), encoding="utf-8")
+            with mock.patch("server_4090.app.time.time", return_value=100.2):
+                summary = store.summary_for_task(task)
+            self.assertIsNotNone(summary)
+            self.assertAlmostEqual(summary["client_current_target_age_s"], 0.16, places=3)
+            self.assertAlmostEqual(summary["client_current_target_time_error_ms"], 160.0, places=1)
+
+            # A negative target error must survive when no snapshot timestamp is
+            # available; it means the active target is still in the future.
+            payload.pop("client_target_time_error_ms")
+            payload.pop("client_timing_snapshot_at")
+            payload["client_timed_target"] = {"target_age_s": -0.04}
+            (directory / "latest.json").write_text(json.dumps(payload), encoding="utf-8")
+            with mock.patch("server_4090.app.time.time", return_value=100.2):
+                summary = store.summary_for_task(task)
+            self.assertAlmostEqual(summary["client_current_target_time_error_ms"], -40.0, places=1)
+
     def test_dashboard_template_and_readme_publish_full_async_contract(self):
         template = (Path(__file__).parent / "server_4090/templates/index.html").read_text(encoding="utf-8")
         readme = (Path(__file__).parent / "server_4090/README.md").read_text(encoding="utf-8")
@@ -469,6 +582,12 @@ class AsyncPolicyDashboardContractTest(unittest.TestCase):
             "client_timed_target",
             "client_last_safe_target",
             "client_target_monotonic",
+            "client_observation_upload_ms",
+            "client_model_inference_ms",
+            "client_result_download_ms",
+            "client_round_trip_ms",
+            "client_current_target_time_error_ms",
+            "result→first command",
         ):
             self.assertIn(marker, template)
         for marker in ("action_horizon", "action_hz", "action_time_step_s", "action_start_offset_steps", "--hz 4", "4 Hz", "200 ms", "旧 chunk", "动态", "2~4 步", "0.05", "0.18", "0.30", "x[-0.05,0.30]", "y[0.01,0.50]", "z[0.14,0.52]"):

@@ -11,6 +11,7 @@ rsync -av --relative \
   "$LOCAL_ROOT/./server_4090/dataset_editor.py" \
   "$LOCAL_ROOT/./server_4090/episode_split.py" \
   "$LOCAL_ROOT/./server_4090/openpi_single_arm.py" \
+  "$LOCAL_ROOT/./server_4090/eval_heldout_loss.py" \
   "$LOCAL_ROOT/./server_4090/validate_lerobot.py" \
   "$LOCAL_ROOT/./server_4090/config.example.json" \
   "$LOCAL_ROOT/./server_4090/run_server_foreground.sh" \
