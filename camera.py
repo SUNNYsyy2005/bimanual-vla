@@ -17,6 +17,8 @@ import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+import threading
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -185,6 +187,13 @@ class CameraCapture:
         self._parallel_reads = parallel_reads
         self._caps: dict[str, cv2.VideoCapture] = {}
         self._executor: ThreadPoolExecutor | None = None
+        self._read_lock = threading.Lock()
+        self._background_stop = threading.Event()
+        self._background_thread: threading.Thread | None = None
+        self._latest_condition = threading.Condition()
+        self._latest_images: dict[str, np.ndarray] = {}
+        self._latest_timestamps: dict[str, float] = {}
+        self._background_error: BaseException | None = None
 
     def open(self):
         try:
@@ -213,24 +222,26 @@ class CameraCapture:
             )
 
     def close(self):
-        if self._executor is not None:
-            self._executor.shutdown(wait=True)
-            self._executor = None
-        for cap in self._caps.values():
-            cap.release()
-        self._caps.clear()
+        self.stop_background_capture()
+        with self._read_lock:
+            if self._executor is not None:
+                self._executor.shutdown(wait=True)
+                self._executor = None
+            for cap in self._caps.values():
+                cap.release()
+            self._caps.clear()
+        with self._latest_condition:
+            self._latest_images.clear()
+            self._latest_timestamps.clear()
+            self._background_error = None
 
     @staticmethod
     def _read_frame(cap: cv2.VideoCapture) -> tuple[bool, np.ndarray | None, float]:
         ret, frame = cap.read()
         return ret, frame, time.time()
 
-    def read(self) -> tuple[dict, dict]:
-        """Return (images, timestamps).
-
-        images: {key: np.ndarray (3, H, W) uint8 RGB}
-        timestamps: {key: float, unix seconds}
-        """
+    def _read_direct(self) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+        """Read and preprocess one frame from each camera without background mode."""
         images, timestamps = {}, {}
         if self._executor is None:
             results = {
@@ -261,9 +272,100 @@ class CameraCapture:
             y0 = (target_h - new_h) // 2
             x0 = (target_w - new_w) // 2
             padded[y0:y0 + new_h, x0:x0 + new_w] = resized
-            rgb = padded
-            images[key] = rgb.transpose(2, 0, 1)  # (H,W,C) → (C,H,W)
+            images[key] = padded.transpose(2, 0, 1)  # (H,W,C) -> (C,H,W)
         return images, timestamps
+
+    def read(self) -> tuple[dict, dict]:
+        """Return (images, timestamps).
+
+        When ``start_background_capture`` is active, this returns the newest
+        complete camera set.  That makes model observations and recorded video
+        share one acquisition stream instead of competing for V4L2 frames.
+        Images are keyed by camera role and have shape ``(C,H,W)`` RGB uint8.
+        Timestamps are Unix seconds from the source read.
+        """
+        if self._background_thread is not None:
+            with self._latest_condition:
+                if self._background_error is not None:
+                    raise RuntimeError("background camera capture failed") from self._background_error
+                if not self._latest_images:
+                    self._latest_condition.wait(timeout=1.0)
+                if self._background_error is not None:
+                    raise RuntimeError("background camera capture failed") from self._background_error
+                if not self._latest_images:
+                    raise RuntimeError("background camera capture has not produced a frame")
+                return (
+                    {key: frame.copy() for key, frame in self._latest_images.items()},
+                    dict(self._latest_timestamps),
+                )
+        with self._read_lock:
+            return self._read_direct()
+
+    def start_background_capture(
+        self,
+        callback: Callable[[dict[str, np.ndarray], dict[str, float], float], None] | None = None,
+        *,
+        fps: float | None = None,
+    ) -> None:
+        """Continuously capture complete camera sets for video and inference.
+
+        ``callback`` is invoked as ``callback(images, timestamps, monotonic_now)``
+        after each successful capture.  The callback must be non-blocking; the
+        deployment recorder only queues a copy and returns immediately.
+        """
+        if not self._caps:
+            raise RuntimeError("cannot start background capture before cameras are open")
+        if self._background_thread is not None:
+            return
+        capture_fps = self._fps if fps is None else float(fps)
+        if not np.isfinite(capture_fps) or capture_fps <= 0:
+            raise ValueError("background capture fps must be positive and finite")
+        self._background_error = None
+        self._background_stop.clear()
+
+        def loop() -> None:
+            period = 1.0 / capture_fps
+            next_at = time.monotonic()
+            while not self._background_stop.is_set():
+                started = time.monotonic()
+                try:
+                    with self._read_lock:
+                        images, timestamps = self._read_direct()
+                    completed = time.monotonic()
+                    with self._latest_condition:
+                        self._latest_images = {key: frame.copy() for key, frame in images.items()}
+                        self._latest_timestamps = dict(timestamps)
+                        self._latest_condition.notify_all()
+                    if callback is not None:
+                        callback(images, timestamps, completed)
+                except BaseException as exc:
+                    with self._latest_condition:
+                        self._background_error = exc
+                        self._latest_condition.notify_all()
+                    return
+                next_at += period
+                sleep_s = next_at - time.monotonic()
+                if sleep_s > 0:
+                    self._background_stop.wait(sleep_s)
+                else:
+                    next_at = started + period
+
+        self._background_thread = threading.Thread(
+            target=loop, name="camera-capture", daemon=True
+        )
+        self._background_thread.start()
+
+    def stop_background_capture(self) -> None:
+        thread = self._background_thread
+        if thread is None:
+            return
+        self._background_stop.set()
+        with self._latest_condition:
+            self._latest_condition.notify_all()
+        thread.join(timeout=5.0)
+        if thread.is_alive():
+            raise RuntimeError("timed out stopping background camera capture")
+        self._background_thread = None
 
     def check_stale(self, timestamps: dict) -> list[str]:
         """Return list of camera keys whose frames are too old."""
@@ -273,17 +375,18 @@ class CameraCapture:
     def verify(self) -> dict:
         """Read one frame from each camera and return latency info (for setup check)."""
         results = {}
-        for key, cap in self._caps.items():
-            t0 = time.time()
-            ret, frame = cap.read()
-            latency_ms = (time.time() - t0) * 1000
-            results[key] = {
-                "ok": ret,
-                "shape": frame.shape if ret else None,
-                "latency_ms": round(latency_ms, 1),
-                "fps": float(cap.get(cv2.CAP_PROP_FPS)),
-                "configured_device": str(self._configured_ids[key]),
-                "selected_device": str(self._ids[key]),
-                "video_device": resolve_video_device(self._ids[key]),
-            }
+        with self._read_lock:
+            for key, cap in self._caps.items():
+                t0 = time.time()
+                ret, frame = cap.read()
+                latency_ms = (time.time() - t0) * 1000
+                results[key] = {
+                    "ok": ret,
+                    "shape": frame.shape if ret else None,
+                    "latency_ms": round(latency_ms, 1),
+                    "fps": float(cap.get(cv2.CAP_PROP_FPS)),
+                    "configured_device": str(self._configured_ids[key]),
+                    "selected_device": str(self._ids[key]),
+                    "video_device": resolve_video_device(self._ids[key]),
+                }
         return results

@@ -16,6 +16,7 @@ __pycache__/
 .monitor_jobs.json
 start_pose*.npy
 episodes/
+deployment_runs/
 episodes_single/
 episodes_output_arm/
 episodes_piper_v21/
