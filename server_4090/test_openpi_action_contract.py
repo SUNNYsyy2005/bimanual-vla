@@ -219,6 +219,85 @@ class AsyncTelemetrySanitizerTest(unittest.TestCase):
         self.assertIsNone(telemetry["client_last_decoded_target"])
         self.assertEqual(len(telemetry["client_drop_reason"]), 500)
 
+
+    def test_client_telemetry_alias_priority_is_explicit(self):
+        telemetry = HELPER.sanitize_async_client_telemetry(
+            {
+                "round_trip_ms": 222.0,
+                "client_observation_upload_ms": 12.0,
+                "observation_upload_ms": 22.0,
+                "client_result_download_ms": 13.0,
+                "result_download_ms": 23.0,
+                "client_network_transport_total_ms": 14.0,
+                "network_transport_total_ms": 24.0,
+                "client_hold_active": False,
+                "holding": True,
+                "client_timing_source": "canonical-client",
+                "timing_source": "legacy-alias",
+                "client_one_way_timing_clock": "client-wall",
+                "one_way_timing_clock": "legacy-wall",
+                "client_one_way_timing_requires_clock_sync": False,
+                "one_way_timing_requires_clock_sync": True,
+            },
+            action_dim=7,
+            action_horizon=50,
+        )
+
+        # Legacy aliases remain supported, but canonical client fields win.
+        self.assertEqual(telemetry["client_round_trip_ms"], 222.0)
+        self.assertTrue(telemetry["client_hold_active"])
+        self.assertEqual(telemetry["client_observation_upload_ms"], 12.0)
+        self.assertEqual(telemetry["client_result_download_ms"], 13.0)
+        self.assertEqual(telemetry["client_network_transport_total_ms"], 14.0)
+        self.assertEqual(telemetry["client_timing_source"], "canonical-client")
+        self.assertEqual(telemetry["client_one_way_timing_clock"], "client-wall")
+        self.assertFalse(telemetry["client_one_way_timing_requires_clock_sync"])
+
+    def test_nested_transport_timing_supplies_missing_client_fields_and_generation(self):
+        telemetry = HELPER.sanitize_async_client_telemetry(
+            {
+                "client_transport_timing": {
+                    "client_observation_upload_ms": 31.0,
+                    "client_result_download_ms": 32.0,
+                    "client_network_transport_total_ms": 63.0,
+                    "generation": 17,
+                },
+            },
+            action_dim=7,
+            action_horizon=50,
+        )
+
+        self.assertEqual(telemetry["client_observation_upload_ms"], 31.0)
+        self.assertEqual(telemetry["client_result_download_ms"], 32.0)
+        self.assertEqual(telemetry["client_network_transport_total_ms"], 63.0)
+        self.assertEqual(telemetry["client_timing_generation"], 17)
+
+    def test_clock_sync_metadata_is_preserved_and_non_boolean_values_fail_closed(self):
+        telemetry = HELPER.sanitize_async_client_telemetry(
+            {
+                "timing_source": "client_wall_clock_echo",
+                "one_way_timing_clock": "wall_clock",
+                "one_way_timing_requires_clock_sync": True,
+            },
+            action_dim=7,
+            action_horizon=50,
+        )
+
+        self.assertEqual(telemetry["client_timing_source"], "client_wall_clock_echo")
+        self.assertEqual(telemetry["client_one_way_timing_clock"], "wall_clock")
+        self.assertTrue(telemetry["client_one_way_timing_requires_clock_sync"])
+
+        invalid = HELPER.sanitize_async_client_telemetry(
+            {
+                "timing_source": "client_wall_clock_echo",
+                "one_way_timing_clock": "wall_clock",
+                "one_way_timing_requires_clock_sync": "yes",
+            },
+            action_dim=7,
+            action_horizon=50,
+        )
+        self.assertIsNone(invalid["client_one_way_timing_requires_clock_sync"])
+
     def test_current_bridge_queue_fields_map_without_semantic_regression(self):
         telemetry = HELPER.sanitize_async_client_telemetry(
             {
