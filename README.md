@@ -573,12 +573,30 @@ bridge 会同时读取每条机械臂的 10D EEF delivery state 与 7D 实测 jo
 状态检查才会下发。模型切换导致连接断开后客户端会自动重连、重新协商
 schema，并回到 SHADOW。
 
+每次启动 `robot_observation_bridge.py` 默认都会在 `deployment_runs/` 下创建一个独立
+运行目录，异步保存：
+
+- `trajectory.npz`：每个控制 tick 的实际 Piper 反馈、delivery state、是否真正下发
+  command、原始 command row、解码后的绝对目标、chunk generation 和队列索引；
+- `trajectory.jsonl`：同一轨迹的可流式读取版本，包含 Unix/monotonic 时间戳和阻断原因；
+- `model_commands/command_*.npz` + `model_commands.jsonl`：每次收到的完整模型 action
+  chunk，包括被拒绝/过期的 chunk、推理锚点、到达时间和执行授权信息；
+- `videos/<camera>.mp4` + `videos/timestamps.jsonl`：与模型观测帧对应的顶部/腕部视频。
+  MP4 使用 nominal FPS 播放，精确同步应使用旁边的 timestamp index；若本机 MP4 编码器
+  不可用，则自动保留 `video_frames/<camera>/*.jpg`。视频由独立相机采集线程连续记录，
+  模型请求的观测时间戳可直接在 `model_commands.jsonl` 中与视频时间索引对齐。
+
+如果只想临时关闭写盘，可追加 `--no-recording`；也可以通过
+`--record-root /path/to/deployment_runs` 修改保存位置。录制视频的 nominal FPS 默认等于
+`--camera-fps`，可用 `--record-video-fps` 覆盖。
+
 Dashboard Token 只保护管理 API，机械臂客户端不需要 Dashboard URL 或 Token。首次启动自动生成，保存在 4×4090 的 `~/.config/bimanual-vla/server.env`；可用 `ssh 4x4090-wg 'source ~/.config/bimanual-vla/server.env && printf "%s\n" "$BIMANUAL_VLA_SERVER_TOKEN"'` 读取。上传采用并行分块、SHA256 和断点续传。任何合并、删除或 episode 参数修改都会保留隐藏备份、重新校验并让旧 norm stats 失效；下一次训练会自动重新执行 norm→train。详细架构和 Policy 生命周期说明见 `server_4090/README.md`。
 
 ## 9. 相关脚本
 
 - `serve_piper.py`：加载 pi0.5 / openpi policy 并启动服务
-- `run.py`：实机循环，读取观测并请求 policy 动作
+- `robot_observation_bridge.py`：正式实机客户端，记录机械臂轨迹、模型 action chunk 和同步视频
+- `run.py`：旧版简化实机循环，读取观测并请求 policy 动作
 - `robot_smoke_test.py`：机械臂 / 相机 smoke 测试
 - `policy_server_smoke_test.py`：与远程 policy server 联合推理 smoke 测试
 - `inference_smoke_test.py`：本地推理冒烟测试

@@ -35,6 +35,7 @@ from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
 from camera import CameraCapture
+from deployment_recording import DeploymentRunRecorder
 from collect_output_arm import require_can_interface_up
 from piper_action_conventions import (
     DELIVERY_CHUNK_ORIGIN_ACTION_SEMANTICS,
@@ -2965,6 +2966,11 @@ def run(args: argparse.Namespace) -> None:
         parallel_reads=True,
     )
     worker = AsyncPolicyInference()
+    recorder = DeploymentRunRecorder(
+        args.record_root,
+        video_fps=(args.record_video_fps or args.camera_fps),
+        enabled=not args.no_recording,
+    )
     policy = None
     protocol = None
     count = 0
@@ -2998,6 +3004,56 @@ def run(args: argparse.Namespace) -> None:
                 info["shape"],
                 info["latency_ms"],
             )
+
+        recorder.start(
+            {
+                "source_name": source_name,
+                "policy_host": args.host,
+                "policy_port": int(args.port),
+                "instruction": args.instruction,
+                "arm_mode": args.arm_mode,
+                "arm_side": args.arm_side,
+                "can_interfaces": (
+                    {"left": args.left_can, "right": args.right_can}
+                    if args.arm_mode == "bimanual"
+                    else {args.arm_side: args.can}
+                ),
+                "camera_devices": {key: str(value) for key, value in camera_ids.items()},
+                "camera_checks": camera_checks,
+                "control_hz": float(args.control_hz),
+                "inference_hz": float(args.hz),
+                "recording_video_source": "camera_stream",
+                "camera_capture_fps": float(args.camera_fps),
+            }
+        )
+        if recorder.is_active:
+            def record_camera_stream(
+                images: dict[str, np.ndarray],
+                image_timestamps: dict[str, float],
+                captured_monotonic: float,
+            ) -> None:
+                try:
+                    recorder.record_camera_frames(
+                        images,
+                        image_timestamps,
+                        monotonic_timestamp=captured_monotonic,
+                    )
+                except Exception:
+                    logging.exception("Failed to record background camera frames")
+
+            try:
+                cameras.start_background_capture(
+                    record_camera_stream, fps=args.camera_fps
+                )
+            except Exception:
+                logging.exception(
+                    "Could not start background camera recording; "
+                    "continuing with direct inference capture"
+                )
+        logging.info(
+            "Deployment recording: %s",
+            recorder.run_dir if recorder.is_active else "disabled",
+        )
         logging.warning(
             "%s %s client: control=%.3g Hz inference=%.3g Hz expected_chunk=%d "
             "minimum_chunk=%d. Robot commands still require Dashboard EXECUTE.",
@@ -3029,6 +3085,22 @@ def run(args: argparse.Namespace) -> None:
                                 args.host, args.port, args.arm_side, args.arm_mode
                             )
                             execution.configure_protocol(protocol)
+                            recorder.update_metadata({
+                                "policy_protocol": {
+                                    "schema": protocol.schema,
+                                    "state_dim": protocol.state_dim,
+                                    "action_dim": protocol.action_dim,
+                                    "arm_mode": protocol.arm_mode,
+                                    "arm_side": protocol.arm_side,
+                                    "action_semantics": protocol.action_semantics,
+                                    "camera_keys": list(protocol.camera_keys),
+                                    "action_hz": protocol.action_hz,
+                                    "gripper_semantics": protocol.gripper_semantics,
+                                    "state_gripper_semantics": protocol.state_gripper_semantics,
+                                    "contract_version": protocol.contract_version,
+                                    "action_horizon": protocol.action_horizon,
+                                }
+                            })
                             control_period = 1.0 / execution.control_hz
                             launch_schedule = PeriodicSchedule(
                                 execution.inference_hz, next_at=tick_started
@@ -3058,6 +3130,19 @@ def run(args: argparse.Namespace) -> None:
                     if completion is not None:
                         if completion.error is not None:
                             execution.reject_inference_completion(completion)
+                            try:
+                                recorder.record_model_result(
+                                    launch=completion.launch,
+                                    result=None,
+                                    arrived_at=completion.arrived_at,
+                                    arrived_monotonic=completion.arrived_monotonic,
+                                    protocol=protocol,
+                                    accepted=False,
+                                    rejection=execution.rejected_result,
+                                    error=completion.error,
+                                )
+                            except Exception:
+                                logging.exception("Failed to record failed model inference")
                             if policy is not None:
                                 close_policy(policy)
                             policy = None
@@ -3074,6 +3159,18 @@ def run(args: argparse.Namespace) -> None:
                                 arrived_at=completion.arrived_at,
                                 arrived_monotonic=completion.arrived_monotonic,
                             )
+                            try:
+                                recorder.record_model_result(
+                                    launch=completion.launch,
+                                    result=completion.result,
+                                    arrived_at=completion.arrived_at,
+                                    arrived_monotonic=completion.arrived_monotonic,
+                                    protocol=protocol,
+                                    accepted=accepted,
+                                    rejection=None if accepted else execution.rejected_result,
+                                )
+                            except Exception:
+                                logging.exception("Failed to record model action chunk")
                             logging.info(
                                 "Inference generation=%d arrival latency=%.3fs skip=%d "
                                 "blend=%d old_remaining=%d accepted=%s queue=%d rejected=%s",
@@ -3099,12 +3196,53 @@ def run(args: argparse.Namespace) -> None:
                     )
                     if command_sent:
                         command_count += 1
-                        if args.max_commands is not None and command_count >= args.max_commands:
-                            logging.warning(
-                                "Reached --max-commands=%d; stopping after the checked command.",
-                                args.max_commands,
-                            )
-                            return
+                    command_target = execution.current_timed_target_action
+                    try:
+                        recorder.record_control_tick(
+                            timestamp=observation_captured_at,
+                            monotonic_timestamp=observation_captured_monotonic,
+                            delivery_state=delivery_state,
+                            qpos=qpos,
+                            command_sent=command_sent,
+                            action_dim=protocol.action_dim,
+                            absolute_dim=(10 if protocol.schema == "delivery" else 7)
+                            * (2 if protocol.arm_mode == "bimanual" else 1),
+                            command_action=(
+                                None
+                                if not command_sent or execution.last_wire_action is None
+                                else np.asarray(execution.last_wire_action, dtype=np.float32)
+                            ),
+                            command_absolute_target=(
+                                None
+                                if not command_sent or command_target is None
+                                else np.asarray(command_target.absolute_target, dtype=np.float32)
+                            ),
+                            command_generation=(
+                                None
+                                if not command_sent or command_target is None
+                                else command_target.generation
+                            ),
+                            command_queue_index=(
+                                None if not command_sent else execution.last_queued_action_index
+                            ),
+                            command_hold=(
+                                False
+                                if not command_sent or command_target is None
+                                else command_target.hold
+                            ),
+                            execution_state=execution.state,
+                            blocked_reason=execution.blocked_reason,
+                        )
+                    except Exception:
+                        # Recording must never turn a safety-checked control tick
+                        # into a robot-control failure.
+                        logging.exception("Failed to record control tick")
+                    if command_sent and args.max_commands is not None and command_count >= args.max_commands:
+                        logging.warning(
+                            "Reached --max-commands=%d; stopping after the checked command.",
+                            args.max_commands,
+                        )
+                        return
 
                     if launch_schedule.due(tick_started):
                         if worker.in_flight:
@@ -3217,6 +3355,10 @@ def run(args: argparse.Namespace) -> None:
         logging.info("Stopped; no further robot commands will be published.")
     finally:
         worker.shutdown()
+        try:
+            recorder.stop(reason="client_stopped")
+        except Exception:
+            logging.exception("Failed to finalize deployment recording")
         close_policy(policy)
         cameras.close()
         for piper in pipers.values():
@@ -3409,6 +3551,22 @@ def main() -> None:
         help="stop after this many checked robot commands",
     )
     parser.add_argument(
+        "--record-root",
+        default=os.environ.get("BIMANUAL_VLA_RECORD_ROOT", "deployment_runs"),
+        help="directory where one trajectory/model/video folder is created per run",
+    )
+    parser.add_argument(
+        "--record-video-fps",
+        type=float,
+        default=None,
+        help="nominal FPS for recorded MP4; default is --camera-fps",
+    )
+    parser.add_argument(
+        "--no-recording",
+        action="store_true",
+        help="disable deployment trajectory, model-command, and video recording",
+    )
+    parser.add_argument(
         "--arm-settle-s", type=float, default=0.75,
         help="minimum joint-hold settling time after enabling Piper",
     )
@@ -3466,6 +3624,7 @@ def main() -> None:
         args.gripper_lowpass_alpha,
         args.gripper_hysteresis,
         args.enable_timeout_s,
+        args.record_video_fps if args.record_video_fps is not None else 1.0,
     )
     if any(value <= 0 for value in positive) or args.reconnect_delay < 0:
         parser.error("frequencies, freshness/safety limits, and timeout must be positive")
