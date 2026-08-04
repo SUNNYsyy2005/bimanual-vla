@@ -1570,6 +1570,7 @@ client allow: ${Boolean(obs.client_allow_execution)}
 client state: ${obs.client_execution_state || 'unknown'}
 bridge reason (raw): ${obs.client_blocked_reason || '-'}
 robot enabled sides: ${Array.isArray(obs.client_robot_enabled_sides) ? obs.client_robot_enabled_sides.join(', ') || '-' : '-'}
+driver enable feedback: ${obs.client_robot_driver_enable_status ? JSON.stringify(obs.client_robot_driver_enable_status) : '-'}
 enable hold handshake: ${obs.client_robot_enable_hold ? JSON.stringify(obs.client_robot_enable_hold) : '-'}
 last command sent: ${fmtTime(obs.client_last_command_at)}
 safety @20Hz: translation<=0.05m, rotation<=0.18rad, gripper<=0.30 fraction; workspace x[-0.05,0.30] y[0.01,0.50] z[0.14,0.52]; CLI may tighten`;
