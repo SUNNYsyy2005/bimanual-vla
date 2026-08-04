@@ -1030,7 +1030,7 @@ function firstFiniteMetric(values) {
 }
 
 function actionTimeErrorMs(t) {
-  const target = t && typeof t.client_timed_target === 'object' ? t.client_timed_target : {};
+  const target = t && t.client_timed_target && typeof t.client_timed_target === 'object' ? t.client_timed_target : {};
   return firstFiniteMetric([
     t && t.client_current_target_time_error_ms,
     t && t.client_target_time_error_ms,
@@ -1042,7 +1042,7 @@ function actionTimeErrorMs(t) {
 }
 
 function actionTargetAt(t) {
-  const target = t && typeof t.client_timed_target === 'object' ? t.client_timed_target : {};
+  const target = t && t.client_timed_target && typeof t.client_timed_target === 'object' ? t.client_timed_target : {};
   return firstFiniteMetric([
     t && t.client_target_at,
     target.target_at,
