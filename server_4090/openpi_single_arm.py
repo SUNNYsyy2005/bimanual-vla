@@ -1942,6 +1942,7 @@ def sanitize_async_client_telemetry(
         "client_active_plan_remaining": ("active_plan_remaining", "plan_remaining", "queued_action_count", "client_active_plan_remaining"),
         "client_hold_steps": ("hold_steps", "hold_count", "client_hold_steps"),
         "client_blend_remaining": ("blend_remaining", "blend_steps_remaining", "client_blend_remaining"),
+        "client_command_sequence": ("command_sequence", "last_command_sequence", "client_command_sequence"),
     }
     for output, keys in nonnegative_int_fields.items():
         result[output] = _telemetry_nonnegative_int(_first_client_value(client, *keys))
@@ -1986,6 +1987,8 @@ def sanitize_async_client_telemetry(
         "client_timed_target": ("timed_target", "current_timed_target", "client_timed_target"),
         "client_last_safe_target": ("last_safe_target", "client_last_safe_target"),
         "client_transport_timing": ("client_transport_timing", "transport_timing"),
+        "client_last_actuator_command": ("last_actuator_command", "actuator_command", "client_last_actuator_command"),
+        "client_last_command_feedback": ("last_command_feedback", "command_feedback", "client_last_command_feedback"),
     }.items():
         result[output] = _telemetry_json_value(
             _first_client_value(client, *keys), action_dim=action_dim
@@ -2044,6 +2047,61 @@ def sanitize_async_client_telemetry(
         result["client_target_time_error_ms"] = None
     if result.get("client_gripper_filter") is not None and result.get("client_gripper_filter_active") is None:
         result["client_gripper_filter_active"] = True
+
+    actuator_command = result.get("client_last_actuator_command")
+    result["client_actuator_command_sequence"] = (
+        _telemetry_nonnegative_int(actuator_command.get("command_sequence"))
+        if isinstance(actuator_command, dict)
+        else None
+    )
+    result["client_actuator_command_generation"] = (
+        _telemetry_nonnegative_int(actuator_command.get("generation"))
+        if isinstance(actuator_command, dict)
+        else None
+    )
+    result["client_actuator_command_source_index"] = (
+        _telemetry_nonnegative_int(actuator_command.get("source_index"))
+        if isinstance(actuator_command, dict)
+        else None
+    )
+    result["client_actuator_command_queue_index"] = (
+        _telemetry_nonnegative_int(actuator_command.get("queue_index"))
+        if isinstance(actuator_command, dict)
+        else None
+    )
+    command_feedback = result.get("client_last_command_feedback")
+    result["client_feedback_command_sequence"] = (
+        _telemetry_nonnegative_int(command_feedback.get("command_sequence"))
+        if isinstance(command_feedback, dict)
+        else None
+    )
+    result["client_feedback_command_generation"] = (
+        _telemetry_nonnegative_int(command_feedback.get("generation"))
+        if isinstance(command_feedback, dict)
+        else None
+    )
+    result["client_feedback_command_source_index"] = (
+        _telemetry_nonnegative_int(command_feedback.get("source_index"))
+        if isinstance(command_feedback, dict)
+        else None
+    )
+    result["client_feedback_command_queue_index"] = (
+        _telemetry_nonnegative_int(command_feedback.get("queue_index"))
+        if isinstance(command_feedback, dict)
+        else None
+    )
+    for output, key in {
+        "client_command_to_feedback_ms": "command_to_feedback_ms",
+        "client_command_max_joint_abs_error_rad": "max_joint_abs_error_rad",
+        "client_command_max_gripper_abs_error_m": "max_gripper_abs_error_m",
+        "client_command_max_eef_translation_error_m": "max_eef_translation_error_m",
+        "client_command_max_eef_rotation_error_rad": "max_eef_rotation_error_rad",
+    }.items():
+        result[output] = (
+            _telemetry_nonnegative_float(command_feedback.get(key))
+            if isinstance(command_feedback, dict)
+            else None
+        )
 
     result["client_underrun"] = None
     for source in ("underrun", "queue_underrun"):

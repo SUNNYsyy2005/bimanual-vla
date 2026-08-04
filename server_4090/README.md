@@ -20,6 +20,7 @@
 - Dashboard 可以新建、健康检测、停止、强制结束 Policy，并用新 checkpoint 替换运行中的 Policy。
 - 已完成、失败、丢失或停止的训练 / Policy 历史任务可从对应模块删除任务记录和日志；checkpoint、模型与训练输出不会被删除。
 - 机械臂客户端默认是 shadow-only；只有显式添加 `--allow-execution`、Dashboard 对同一 Policy 给出未过期的 EXECUTE 授权、telemetry 新鲜、`action_horizon >= 16` 且本地安全检查全部通过时，才会发布异步 chunk 命令。
+- 机械臂客户端默认把完整本地监测轨迹追加保存到 `./monitoring_data/<session>/events.jsonl`；可用 `--monitoring-dir` 指定其他目录。记录器在后台线程写盘，不阻塞 20 Hz 控制循环；原始图像不写入 JSONL，只保留相机设备和时间戳。
 
 ## 部署并启动 Dashboard
 
@@ -241,7 +242,8 @@ cd /home/sunny/bimanual-vla
    - 最近 telemetry / 客户端推理时间；
    - 独立 Policy 日志、正常停止、强制结束，以及终态历史记录删除。
 9. 在机械臂控制电脑启动官方 WebSocket 客户端。
-10. Dashboard 按 schema 显示 Policy 实际收到的单臂 7D/10D 或双臂 14D/20D state、Policy 要求的两路/三路图像、prompt、7D/14D 预测 action，以及 4 Hz inference launch、20 Hz action/control、horizon、每步目标时间、actuator delay、动态 expired prefix、active plan/hold/blend/gripper filter、queue generation/remaining、underrun/rejected/drop、最后 wire/decoded target 和实际执行/阻断原因。
+10. Dashboard 按 schema 显示 Policy 实际收到的单臂 7D/10D 或双臂 14D/20D state、Policy 要求的两路/三路图像、prompt、7D/14D 预测 action，以及 4 Hz inference launch、20 Hz action/control、horizon、每步目标时间、actuator delay、动态 expired prefix、active plan/hold/blend/gripper filter、queue generation/remaining、underrun/rejected/drop、最后 wire/decoded target 和实际执行/阻断原因。每条真实命令还按 `command_sequence + generation + source_index + queue_index` 对齐显示 IK 前末端目标、完整 IK 解、限速后关节目标、Piper `JointCtrl`/`GripperCtrl` 整数、下一控制周期反馈及指令跟随误差。
+    客户端本地 `monitoring_data/<session>/events.jsonl` 同时保留这些字段的逐控制周期历史，以及推理结果、策略连接、Piper/相机状态和阻断/错误事件，适合离线分析。
 
 训练指标 API（Bearer Token 必需）：
 

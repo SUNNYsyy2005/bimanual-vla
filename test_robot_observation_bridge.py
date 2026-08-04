@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from threading import Event
 from types import SimpleNamespace
+import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -44,6 +46,7 @@ from robot_observation_bridge import (
     GRIPPER_OPENING_METRES,
     InferenceLaunch,
     InferenceWorkerResult,
+    MonitoringRecorder,
     PeriodicSchedule,
     PolicyProtocol,
     RAD_FACTOR,
@@ -59,6 +62,30 @@ from robot_observation_bridge import (
     rotation_from_state,
     validate_policy_metadata,
 )
+
+
+class MonitoringRecorderTest(unittest.TestCase):
+    def test_jsonl_session_preserves_finite_safe_events_and_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = MonitoringRecorder(directory, SimpleNamespace(arm_mode="single"))
+            recorder.record(
+                "control_tick",
+                qpos_m=np.array([1.0, np.nan], dtype=np.float64),
+                nested={"vector": np.array([2, 3], dtype=np.int64)},
+            )
+            events_path = recorder.events_path
+            manifest_path = recorder.manifest_path
+            recorder.close(reason="test")
+
+            self.assertTrue(events_path.exists())
+            self.assertTrue(manifest_path.exists())
+            rows = [json.loads(line) for line in events_path.read_text().splitlines()]
+            self.assertEqual([row["event_type"] for row in rows], [
+                "session_started", "control_tick", "session_finished"
+            ])
+            self.assertIsNone(rows[1]["qpos_m"][1])
+            self.assertEqual(rows[1]["nested"]["vector"], [2, 3])
+            self.assertEqual(json.loads(manifest_path.read_text())["format"], "bimanual-vla-monitoring-v1")
 
 
 def delivery_state(
@@ -1597,6 +1624,68 @@ class ExecutionQueueTest(unittest.TestCase):
         self.assertIn("JointCtrl", names)
         self.assertNotIn("EndPoseCtrl", names)
         self.assertEqual(len(ik_solver.targets), 1)
+
+    def test_command_trace_correlates_ik_piper_units_and_next_cycle_feedback(self):
+        protocol = validate_policy_metadata(DELIVERY_METADATA, "right")
+        piper = FakePiper()
+        execution = ExecutionController(piper, execution_args())
+        execution.configure_protocol(protocol)
+        execution.ik_solver = RecordingContinuousIK()
+        execution.robot_enabled = {"right"}
+        actions = np.zeros((2, 7), dtype=np.float64)
+        actions[:, 0] = [0.004, 0.008]
+        actions[:, 6] = 0.5
+        now = time.time()
+        execution.queue_result(
+            execution_result(actions),
+            self.raw_state,
+            self.qpos,
+            protocol,
+            {"cam_high": now, "cam_wrist": now},
+            0.01,
+        )
+
+        self.assertTrue(
+            execution.execute_next(
+                self.raw_state, self.qpos, protocol, feedback_captured_at=time.time()
+            )
+        )
+        first_trace = execution.metadata()["last_actuator_command"]
+        self.assertEqual(first_trace["generation"], 1)
+        self.assertEqual(first_trace["source_index"], 0)
+        self.assertEqual(first_trace["queue_index"], 0)
+        side = first_trace["sides"]["right"]
+        self.assertEqual(side["control_path"], "delivery_continuous_ik_joint")
+        self.assertEqual(len(side["pre_ik_eef_target"]["absolute_target"]), 10)
+        self.assertEqual(len(side["full_ik_solution_joints_rad"]), 6)
+        self.assertEqual(len(side["commanded_joints_rad"]), 6)
+        self.assertEqual(len(side["piper_jointctrl_units"]), 6)
+        np.testing.assert_array_equal(
+            side["piper_jointctrl_units"],
+            np.rint(np.asarray(side["commanded_joints_rad"]) * RAD_FACTOR).astype(np.int64),
+        )
+
+        next_qpos = self.qpos.copy()
+        next_qpos[:6] = np.asarray(side["commanded_joints_rad"])
+        next_qpos[6] = float(side["commanded_gripper_m"])
+        self.assertTrue(
+            execution.execute_next(
+                self.raw_state, next_qpos, protocol, feedback_captured_at=time.time()
+            )
+        )
+        feedback = execution.metadata()["last_command_feedback"]
+        self.assertEqual(feedback["command_sequence"], first_trace["command_sequence"])
+        self.assertEqual(feedback["generation"], first_trace["generation"])
+        self.assertEqual(feedback["source_index"], first_trace["source_index"])
+        self.assertEqual(feedback["feedback_cycle_offset"], 1)
+        self.assertAlmostEqual(feedback["max_joint_abs_error_rad"], 0.0)
+        self.assertAlmostEqual(feedback["max_gripper_abs_error_m"], 0.0)
+        self.assertEqual(
+            feedback["sides"]["right"]["command_feedback_error"][
+                "joint_error_definition"
+            ],
+            "feedback_minus_command",
+        )
 
     def test_unreachable_delivery_row_is_dropped_without_destroying_chunk(self):
         protocol = validate_policy_metadata(DELIVERY_METADATA, "right")

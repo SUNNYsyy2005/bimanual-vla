@@ -22,13 +22,18 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
+import json
 import logging
 import math
 import os
+from pathlib import Path
+import queue
 import re
 import socket
+import threading
 import time
 from typing import Any, Callable
+import uuid
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -127,6 +132,7 @@ IK_JOINT_REGULARIZATION_SCALE_RAD = 0.08
 DEFAULT_IK_POSITION_TOLERANCE_M = 0.0015
 DEFAULT_IK_ROTATION_TOLERANCE_RAD = 0.02
 DEFAULT_IK_MAX_NFEV = 100
+DEFAULT_MONITORING_DIR = "monitoring_data"
 
 
 class ExecutionBlocked(RuntimeError):
@@ -135,6 +141,126 @@ class ExecutionBlocked(RuntimeError):
 
 class PiperFeedbackStaleError(ExecutionBlocked):
     """Piper SDK getters contain missing or cached CAN feedback."""
+
+
+class MonitoringRecorder:
+    """Append complete bridge monitoring events to a local JSONL session.
+
+    The recorder is deliberately independent of the control path: a recording
+    failure is logged and never blocks or changes a robot command. Numpy values
+    are converted to finite JSON values so the resulting file can be consumed
+    directly by standard analysis tools.
+    """
+
+    def __init__(self, root: str | Path, args: argparse.Namespace):
+        root_path = Path(root).expanduser()
+        root_path.mkdir(parents=True, exist_ok=True)
+        session_id = time.strftime("%Y%m%d_%H%M%S", time.localtime()) + "_" + uuid.uuid4().hex[:8]
+        self.session_dir = root_path / session_id
+        self.session_dir.mkdir(parents=True, exist_ok=False)
+        self.events_path = self.session_dir / "events.jsonl"
+        self.manifest_path = self.session_dir / "manifest.json"
+        self._file = self.events_path.open("a", encoding="utf-8", buffering=1)
+        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=4096)
+        self._accepting = True
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name="monitoring-writer",
+            daemon=True,
+        )
+        self._writer_thread.start()
+        self.event_count = 0
+        self.dropped_event_count = 0
+        self._closed = False
+        manifest = {
+            "format": "bimanual-vla-monitoring-v1",
+            "session_id": session_id,
+            "started_at": time.time(),
+            "host": socket.gethostname(),
+            "pid": os.getpid(),
+            "command": "robot_observation_bridge.py",
+            "args": self._json_safe(vars(args)),
+        }
+        self.manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
+        self.record("session_started", monitoring_dir=str(root_path))
+        logging.info("Monitoring recorder: %s", self.events_path)
+
+    def _writer_loop(self) -> None:
+        while True:
+            row = self._queue.get()
+            try:
+                if row is None:
+                    return
+                self._file.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+                self._file.flush()
+            except Exception:
+                logging.exception("Monitoring writer failed")
+            finally:
+                self._queue.task_done()
+
+    @classmethod
+    def _json_safe(cls, value: Any) -> Any:
+        if isinstance(value, np.ndarray):
+            return cls._json_safe(value.tolist())
+        if isinstance(value, np.generic):
+            return cls._json_safe(value.item())
+        if isinstance(value, dict):
+            return {str(key): cls._json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._json_safe(item) for item in value]
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, (str, int, bool)) or value is None:
+            return value
+        return str(value)
+
+    def record(self, event_type: str, **payload: Any) -> None:
+        if self._closed or not self._accepting:
+            return
+        row = {
+            "event_index": self.event_count,
+            "event_type": str(event_type),
+            "recorded_at": time.time(),
+            "recorded_monotonic": time.monotonic(),
+            **self._json_safe(payload),
+        }
+        self.event_count += 1
+        try:
+            self._queue.put_nowait(row)
+        except queue.Full:
+            self.dropped_event_count += 1
+            if self.dropped_event_count == 1 or self.dropped_event_count % 100 == 0:
+                logging.warning(
+                    "Monitoring queue full; dropped events=%d",
+                    self.dropped_event_count,
+                )
+        except Exception:
+            # Monitoring must not become a new reason to stop or alter control.
+            logging.exception("Monitoring recorder failed for event=%s", event_type)
+
+    def close(self, *, reason: str = "stopped") -> None:
+        if self._closed:
+            return
+        try:
+            self.record(
+                "session_finished",
+                reason=reason,
+                event_count=self.event_count,
+                dropped_event_count=self.dropped_event_count,
+            )
+            self._accepting = False
+            self._queue.put(None, timeout=5.0)
+            self._writer_thread.join(timeout=5.0)
+        finally:
+            self._closed = True
+            try:
+                self._file.flush()
+                self._file.close()
+            except Exception:
+                logging.exception("Failed to close monitoring recorder")
 
 
 @dataclass(frozen=True)
@@ -245,6 +371,23 @@ def rotation_from_state(state: np.ndarray) -> np.ndarray:
     return np.column_stack((c0, c1, np.cross(c0, c1)))
 
 
+@dataclass(frozen=True)
+class PiperIKSolveResult:
+    """Full numerical IK solution and the bounded command sent this control tick."""
+
+    solution_joints_rad: np.ndarray
+    command_joints_rad: np.ndarray
+    rate_limited: bool | None
+    solution_position_error_m: float | None = None
+    solution_rotation_error_rad: float | None = None
+    solution_max_joint_step_rad: float | None = None
+    command_position_error_m: float | None = None
+    command_rotation_error_rad: float | None = None
+    optimizer_success: bool | None = None
+    optimizer_status: int | None = None
+    optimizer_nfev: int | None = None
+
+
 class PiperContinuousIK:
     """Numerical Piper IK constrained to the branch near current feedback."""
 
@@ -277,6 +420,31 @@ class PiperContinuousIK:
         search_joint_radius_rad: float | None = None,
         joint_regularization_weight: float = DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT,
     ) -> np.ndarray:
+        return self.solve_with_diagnostics(
+            current_joints_rad,
+            target_xyz_m,
+            target_rpy_deg,
+            max_joint_step_rad=max_joint_step_rad,
+            position_tolerance_m=position_tolerance_m,
+            rotation_tolerance_rad=rotation_tolerance_rad,
+            max_nfev=max_nfev,
+            search_joint_radius_rad=search_joint_radius_rad,
+            joint_regularization_weight=joint_regularization_weight,
+        ).command_joints_rad.copy()
+
+    def solve_with_diagnostics(
+        self,
+        current_joints_rad: np.ndarray,
+        target_xyz_m: np.ndarray,
+        target_rpy_deg: np.ndarray,
+        *,
+        max_joint_step_rad: float,
+        position_tolerance_m: float,
+        rotation_tolerance_rad: float,
+        max_nfev: int,
+        search_joint_radius_rad: float | None = None,
+        joint_regularization_weight: float = DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT,
+    ) -> PiperIKSolveResult:
         current = np.asarray(current_joints_rad, dtype=np.float64)
         target_xyz = np.asarray(target_xyz_m, dtype=np.float64)
         target_rpy = np.asarray(target_rpy_deg, dtype=np.float64)
@@ -371,7 +539,19 @@ class PiperContinuousIK:
                 f"{search_radius:.5f}rad"
             )
         if solved_joint_step <= max_joint_step_rad + 1e-9:
-            return solved
+            return PiperIKSolveResult(
+                solution_joints_rad=solved.copy(),
+                command_joints_rad=solved.copy(),
+                rate_limited=False,
+                solution_position_error_m=position_error,
+                solution_rotation_error_rad=rotation_error,
+                solution_max_joint_step_rad=solved_joint_step,
+                command_position_error_m=position_error,
+                command_rotation_error_rad=rotation_error,
+                optimizer_success=bool(result.success),
+                optimizer_status=int(result.status),
+                optimizer_nfev=int(result.nfev),
+            )
 
         # Follow the regularized solution direction with a bounded 20 Hz servo
         # step. Requiring the whole future EEF target to be reached in one tick
@@ -400,7 +580,25 @@ class PiperContinuousIK:
             raise ExecutionBlocked(
                 "continuous IK rate-limited step does not make progress toward target"
             )
-        return command
+        command_position_error = float(np.linalg.norm(command_xyz - target_xyz))
+        command_rotation_error = float(
+            np.linalg.norm(
+                Rotation.from_matrix(target_rotation @ command_rotation.T).as_rotvec()
+            )
+        )
+        return PiperIKSolveResult(
+            solution_joints_rad=solved.copy(),
+            command_joints_rad=command.copy(),
+            rate_limited=True,
+            solution_position_error_m=position_error,
+            solution_rotation_error_rad=rotation_error,
+            solution_max_joint_step_rad=solved_joint_step,
+            command_position_error_m=command_position_error,
+            command_rotation_error_rad=command_rotation_error,
+            optimizer_success=bool(result.success),
+            optimizer_status=int(result.status),
+            optimizer_nfev=int(result.nfev),
+        )
 
 
 
@@ -1558,6 +1756,10 @@ class ExecutionController:
         self.queue_underrun_at: float | None = None
         self.control_tick_count = 0
         self.control_overrun_count = 0
+        self.command_sequence = 0
+        self.last_actuator_command: dict[str, Any] | None = None
+        self.last_command_feedback: dict[str, Any] | None = None
+        self._pending_feedback_command: dict[str, Any] | None = None
         self.arm_hold_targets: dict[str, np.ndarray] = {}
         self.arm_hold_started_at: dict[str, float] = {}
         self.ik_solver: PiperContinuousIK | None = None
@@ -1823,6 +2025,9 @@ class ExecutionController:
             "rejected_result_count": self.rejected_result_count,
             "control_tick_count": self.control_tick_count,
             "control_overrun_count": self.control_overrun_count,
+            "command_sequence": self.command_sequence,
+            "last_actuator_command": self.last_actuator_command,
+            "last_command_feedback": self.last_command_feedback,
             "estimated_actuator_delay_s": self.estimated_actuator_delay_s,
             "gripper_filter": {
                 "lowpass_alpha": self.gripper_lowpass_alpha,
@@ -2155,6 +2360,250 @@ class ExecutionController:
             output[slot] = self._opening_to_wire(filtered, protocol.gripper_semantics)
         return replace(queued, absolute_target=output)
 
+    def _solve_delivery_ik(
+        self,
+        current_joints_rad: np.ndarray,
+        target_xyz_m: np.ndarray,
+        target_rpy_deg: np.ndarray,
+    ) -> PiperIKSolveResult:
+        """Run IK with diagnostics while preserving compatibility with test/custom solvers."""
+        if self.ik_solver is None:
+            self.ik_solver = PiperContinuousIK()
+        kwargs = {
+            "max_joint_step_rad": float(
+                getattr(self.args, "ik_max_joint_step_rad", DEFAULT_IK_MAX_JOINT_STEP_RAD)
+            ),
+            "search_joint_radius_rad": float(
+                getattr(
+                    self.args,
+                    "ik_search_joint_radius_rad",
+                    DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD,
+                )
+            ),
+            "joint_regularization_weight": float(
+                getattr(
+                    self.args,
+                    "ik_joint_regularization_weight",
+                    DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT,
+                )
+            ),
+            "position_tolerance_m": float(
+                getattr(
+                    self.args,
+                    "ik_position_tolerance_m",
+                    DEFAULT_IK_POSITION_TOLERANCE_M,
+                )
+            ),
+            "rotation_tolerance_rad": float(
+                getattr(
+                    self.args,
+                    "ik_rotation_tolerance_rad",
+                    DEFAULT_IK_ROTATION_TOLERANCE_RAD,
+                )
+            ),
+            "max_nfev": int(getattr(self.args, "ik_max_nfev", DEFAULT_IK_MAX_NFEV)),
+        }
+        solve_with_diagnostics = getattr(self.ik_solver, "solve_with_diagnostics", None)
+        if callable(solve_with_diagnostics):
+            result = solve_with_diagnostics(
+                current_joints_rad,
+                target_xyz_m,
+                target_rpy_deg,
+                **kwargs,
+            )
+            if not isinstance(result, PiperIKSolveResult):
+                raise ExecutionBlocked(
+                    "continuous IK diagnostics solver returned an invalid result"
+                )
+            return result
+
+        command = np.asarray(
+            self.ik_solver.solve(
+                current_joints_rad,
+                target_xyz_m,
+                target_rpy_deg,
+                **kwargs,
+            ),
+            dtype=np.float64,
+        )
+        if command.shape != (6,) or not np.all(np.isfinite(command)):
+            raise ExecutionBlocked(
+                f"continuous IK command must be finite 6D, got {command.shape}"
+            )
+        # Custom/test solvers using the legacy interface cannot expose the
+        # unconstrained solution separately; retain a valid, explicitly unknown
+        # diagnostic record instead of inventing a different joint target.
+        return PiperIKSolveResult(
+            solution_joints_rad=command.copy(),
+            command_joints_rad=command.copy(),
+            rate_limited=None,
+        )
+
+    def _complete_pending_command_feedback(
+        self,
+        raw_delivery_state: np.ndarray,
+        qpos_m: np.ndarray,
+        protocol: PolicyProtocol,
+        *,
+        feedback_at: float,
+    ) -> None:
+        """Attach the next control-cycle feedback to the preceding command trace."""
+        pending = self._pending_feedback_command
+        if pending is None:
+            return
+        self._pending_feedback_command = None
+        current_sides = (
+            ("left", "right") if protocol.arm_mode == "bimanual" else (protocol.arm_side,)
+        )
+        pending_sides = pending.get("sides")
+        if not isinstance(pending_sides, dict) or set(pending_sides) != set(current_sides):
+            self.last_command_feedback = {
+                **pending,
+                "feedback_status": "unavailable",
+                "feedback_error": "command/feedback arm layout changed before the next cycle",
+                "feedback_at": float(feedback_at),
+            }
+            return
+
+        qpos = np.asarray(qpos_m, dtype=np.float64)
+        delivery = np.asarray(raw_delivery_state, dtype=np.float64)
+        expected_qpos_dim = 7 * len(current_sides)
+        expected_delivery_dim = 10 * len(current_sides)
+        if (
+            qpos.shape != (expected_qpos_dim,)
+            or delivery.shape != (expected_delivery_dim,)
+            or not np.all(np.isfinite(qpos))
+            or not np.all(np.isfinite(delivery))
+        ):
+            self.last_command_feedback = {
+                **pending,
+                "feedback_status": "unavailable",
+                "feedback_error": (
+                    f"next-cycle feedback must be finite {expected_qpos_dim}D qpos and "
+                    f"{expected_delivery_dim}D delivery state"
+                ),
+                "feedback_at": float(feedback_at),
+            }
+            return
+
+        completed_sides: dict[str, Any] = {}
+        max_joint_errors: list[float] = []
+        gripper_errors: list[float] = []
+        eef_translation_errors: list[float] = []
+        eef_rotation_errors: list[float] = []
+        for index, side in enumerate(current_sides):
+            issued = pending_sides[side]
+            issued = issued if isinstance(issued, dict) else {}
+            measured_qpos = qpos[index * 7 : (index + 1) * 7]
+            measured_delivery = delivery[index * 10 : (index + 1) * 10]
+            commanded_joints = np.asarray(
+                issued.get("commanded_joints_rad"), dtype=np.float64
+            )
+            commanded_gripper_m = self._finite_timing_value(
+                issued.get("commanded_gripper_m")
+            )
+            if commanded_joints.shape == (6,) and np.all(np.isfinite(commanded_joints)):
+                joint_error = measured_qpos[:6] - commanded_joints
+                joint_abs_error = np.abs(joint_error)
+                max_joint_error = float(np.max(joint_abs_error))
+                rms_joint_error = float(np.sqrt(np.mean(joint_error**2)))
+                max_joint_errors.append(max_joint_error)
+                joint_error_values: list[float] | None = joint_error.tolist()
+                joint_abs_error_values: list[float] | None = joint_abs_error.tolist()
+            else:
+                max_joint_error = None
+                rms_joint_error = None
+                joint_error_values = None
+                joint_abs_error_values = None
+
+            if commanded_gripper_m is not None:
+                gripper_error_m = float(measured_qpos[6] - commanded_gripper_m)
+                gripper_errors.append(abs(gripper_error_m))
+            else:
+                gripper_error_m = None
+
+            eef_translation_error_m = None
+            eef_rotation_error_rad = None
+            measured_eef_rpy_deg = None
+            try:
+                measured_rotation = rotation_from_state(measured_delivery)
+                measured_eef_rpy_deg = Rotation.from_matrix(measured_rotation).as_euler(
+                    "xyz", degrees=True
+                ).tolist()
+            except (ExecutionBlocked, ValueError, FloatingPointError):
+                measured_rotation = None
+            pre_ik = issued.get("pre_ik_eef_target")
+            if isinstance(pre_ik, dict):
+                absolute_target = np.asarray(
+                    pre_ik.get("absolute_target"), dtype=np.float64
+                )
+                if absolute_target.shape == (10,) and np.all(np.isfinite(absolute_target)):
+                    eef_translation_error_m = float(
+                        np.linalg.norm(measured_delivery[:3] - absolute_target[:3])
+                    )
+                    try:
+                        if measured_rotation is not None:
+                            eef_rotation_error_rad = float(
+                                Rotation.from_matrix(
+                                    rotation_from_state(absolute_target)
+                                    @ measured_rotation.T
+                                ).magnitude()
+                            )
+                    except (ExecutionBlocked, ValueError, FloatingPointError):
+                        eef_rotation_error_rad = None
+                    eef_translation_errors.append(eef_translation_error_m)
+                    if eef_rotation_error_rad is not None:
+                        eef_rotation_errors.append(eef_rotation_error_rad)
+
+            completed_sides[side] = {
+                **issued,
+                "next_cycle_feedback": {
+                    "feedback_at": float(feedback_at),
+                    "joints_rad": measured_qpos[:6].tolist(),
+                    "gripper_opening_m": float(measured_qpos[6]),
+                    "eef_state": measured_delivery.tolist(),
+                    "eef_xyz_m": measured_delivery[:3].tolist(),
+                    "eef_rotation6d": measured_delivery[3:9].tolist(),
+                    "eef_rpy_deg": measured_eef_rpy_deg,
+                    "gripper_opening_fraction": float(
+                        np.clip(measured_qpos[6] / GRIPPER_MAX_M, 0.0, 1.0)
+                    ),
+                },
+                "command_feedback_error": {
+                    "joint_error_definition": "feedback_minus_command",
+                    "joint_error_rad": joint_error_values,
+                    "joint_abs_error_rad": joint_abs_error_values,
+                    "max_joint_abs_error_rad": max_joint_error,
+                    "rms_joint_error_rad": rms_joint_error,
+                    "gripper_error_definition": "feedback_minus_command",
+                    "gripper_error_m": gripper_error_m,
+                    "eef_translation_error_m": eef_translation_error_m,
+                    "eef_rotation_error_rad": eef_rotation_error_rad,
+                },
+            }
+
+        command_at = self._finite_timing_value(pending.get("command_at"))
+        self.last_command_feedback = {
+            **pending,
+            "feedback_status": "complete",
+            "feedback_cycle_offset": 1,
+            "feedback_at": float(feedback_at),
+            "command_to_feedback_ms": (
+                max(0.0, (float(feedback_at) - command_at) * 1000.0)
+                if command_at is not None
+                else None
+            ),
+            "max_joint_abs_error_rad": max(max_joint_errors) if max_joint_errors else None,
+            "max_gripper_abs_error_m": max(gripper_errors) if gripper_errors else None,
+            "max_eef_translation_error_m": (
+                max(eef_translation_errors) if eef_translation_errors else None
+            ),
+            "max_eef_rotation_error_rad": (
+                max(eef_rotation_errors) if eef_rotation_errors else None
+            ),
+            "sides": completed_sides,
+        }
+
     def accept_inference_result(
         self,
         result: Any,
@@ -2411,6 +2860,14 @@ class ExecutionController:
         feedback_captured_at: float | None = None,
     ) -> bool:
         """Execute one time-selected target or hold the last safe absolute target."""
+        feedback_at = time.time() if feedback_captured_at is None else float(feedback_captured_at)
+        self.last_feedback_at = feedback_at
+        self._complete_pending_command_feedback(
+            raw_delivery_state,
+            qpos_m,
+            protocol,
+            feedback_at=feedback_at,
+        )
         if not bool(getattr(self.args, "allow_execution", False)):
             return self._block("client_disabled", "local --allow-execution is absent")
         if self.state in {"shadow", "client_disabled"}:
@@ -2426,8 +2883,6 @@ class ExecutionController:
             self.discard_pending_actions("execution authorization expired")
             return self._block("blocked", "execution authorization expired")
 
-        feedback_at = time.time() if feedback_captured_at is None else float(feedback_captured_at)
-        self.last_feedback_at = feedback_at
         feedback_age = time.time() - feedback_at
         max_feedback_age_s = float(
             getattr(self.args, "max_feedback_age_s", DEFAULT_FEEDBACK_MAX_AGE_S)
@@ -2523,11 +2978,19 @@ class ExecutionController:
             target_prevalidation = True
             queued = self._filter_gripper_target(queued, qpos_m, protocol)
             prepared: dict[str, tuple[Any, ...]] = {}
+            command_pipeline: dict[str, dict[str, Any]] = {}
             for index, side in enumerate(sides):
-                qpos_slice = np.asarray(qpos_m)[index * 7 : (index + 1) * 7]
+                qpos_slice = np.asarray(qpos_m, dtype=np.float64)[
+                    index * 7 : (index + 1) * 7
+                ]
                 if protocol.schema == "delivery":
-                    current_state = np.asarray(raw_delivery_state)[index * 10 : (index + 1) * 10]
-                    target = queued.absolute_target[index * 10 : (index + 1) * 10]
+                    current_state = np.asarray(raw_delivery_state, dtype=np.float64)[
+                        index * 10 : (index + 1) * 10
+                    ]
+                    target = np.asarray(
+                        queued.absolute_target[index * 10 : (index + 1) * 10],
+                        dtype=np.float64,
+                    )
                     checked = _check_delivery_absolute_target(
                         current_state,
                         float(qpos_slice[6]),
@@ -2567,24 +3030,53 @@ class ExecutionController:
                             getattr(self.args, "workspace_z", DEFAULT_WORKSPACE_Z_M)
                         ),
                     )
-                    target_xyz, target_rpy_deg, target_gripper_m, _ = checked
-                    if self.ik_solver is None:
-                        self.ik_solver = PiperContinuousIK()
-                    target_joints = self.ik_solver.solve(
+                    target_xyz, target_rpy_deg, target_gripper_m, opening_fraction = checked
+                    ik_result = self._solve_delivery_ik(
                         qpos_slice[:6],
                         target_xyz,
                         target_rpy_deg,
-                        max_joint_step_rad=float(getattr(self.args, "ik_max_joint_step_rad", DEFAULT_IK_MAX_JOINT_STEP_RAD)),
-                        search_joint_radius_rad=float(getattr(self.args, "ik_search_joint_radius_rad", DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD)),
-                        joint_regularization_weight=float(getattr(self.args, "ik_joint_regularization_weight", DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT)),
-                        position_tolerance_m=float(getattr(self.args, "ik_position_tolerance_m", DEFAULT_IK_POSITION_TOLERANCE_M)),
-                        rotation_tolerance_rad=float(getattr(self.args, "ik_rotation_tolerance_rad", DEFAULT_IK_ROTATION_TOLERANCE_RAD)),
-                        max_nfev=int(getattr(self.args, "ik_max_nfev", DEFAULT_IK_MAX_NFEV)),
                     )
+                    target_joints = ik_result.command_joints_rad.copy()
                     prepared[side] = (target_joints, target_gripper_m)
+                    command_pipeline[side] = {
+                        "control_path": "delivery_continuous_ik_joint",
+                        "command_input_feedback": {
+                            "feedback_at": float(feedback_at),
+                            "joints_rad": qpos_slice[:6].tolist(),
+                            "gripper_opening_m": float(qpos_slice[6]),
+                            "eef_state": current_state.tolist(),
+                            "eef_xyz_m": current_state[:3].tolist(),
+                            "eef_rotation6d": current_state[3:9].tolist(),
+                        },
+                        "pre_ik_eef_target": {
+                            "absolute_target": target.tolist(),
+                            "xyz_m": target_xyz.tolist(),
+                            "rotation6d": target[3:9].tolist(),
+                            "rpy_deg": np.asarray(target_rpy_deg, dtype=np.float64).tolist(),
+                            "gripper_opening_fraction": float(opening_fraction),
+                            "gripper_opening_m": float(target_gripper_m),
+                        },
+                        "full_ik_solution_joints_rad": ik_result.solution_joints_rad.tolist(),
+                        "commanded_joints_rad": target_joints.tolist(),
+                        "commanded_gripper_m": float(target_gripper_m),
+                        "ik_rate_limited": ik_result.rate_limited,
+                        "ik_diagnostics": {
+                            "solution_position_error_m": ik_result.solution_position_error_m,
+                            "solution_rotation_error_rad": ik_result.solution_rotation_error_rad,
+                            "solution_max_joint_step_rad": ik_result.solution_max_joint_step_rad,
+                            "command_position_error_m": ik_result.command_position_error_m,
+                            "command_rotation_error_rad": ik_result.command_rotation_error_rad,
+                            "optimizer_success": ik_result.optimizer_success,
+                            "optimizer_status": ik_result.optimizer_status,
+                            "optimizer_nfev": ik_result.optimizer_nfev,
+                        },
+                    }
                 elif protocol.schema == "joint":
-                    target = queued.absolute_target[index * 7 : (index + 1) * 7]
-                    prepared[side] = build_checked_joint_target(
+                    target = np.asarray(
+                        queued.absolute_target[index * 7 : (index + 1) * 7],
+                        dtype=np.float64,
+                    )
+                    target_joints, target_gripper_m = build_checked_joint_target(
                         qpos_slice,
                         target,
                         max_joint_step_rad=float(getattr(self.args, "max_joint_step_rad", 0.3)),
@@ -2599,6 +3091,21 @@ class ExecutionController:
                         ),
                         gripper_semantics=protocol.gripper_semantics,
                     )
+                    prepared[side] = (target_joints, target_gripper_m)
+                    command_pipeline[side] = {
+                        "control_path": "joint_absolute",
+                        "command_input_feedback": {
+                            "feedback_at": float(feedback_at),
+                            "joints_rad": qpos_slice[:6].tolist(),
+                            "gripper_opening_m": float(qpos_slice[6]),
+                        },
+                        "pre_ik_eef_target": None,
+                        "full_ik_solution_joints_rad": None,
+                        "commanded_joints_rad": target_joints.tolist(),
+                        "commanded_gripper_m": float(target_gripper_m),
+                        "ik_rate_limited": None,
+                        "ik_diagnostics": None,
+                    }
                 else:
                     raise ExecutionBlocked(f"unsupported execution schema: {protocol.schema}")
             target_prevalidation = False
@@ -2625,15 +3132,25 @@ class ExecutionController:
 
             # Blend and hold never bypass safety: both arms are fully prevalidated
             # against the same fresh feedback before either arm receives a command.
+            command_started_at = time.time()
+            command_started_monotonic = time.monotonic()
             for side in sides:
                 piper = self.pipers[side]
                 target_joints, target_gripper_m = prepared[side]
                 raw_joints = np.rint(target_joints * RAD_FACTOR).astype(np.int64)
+                raw_gripper = round(target_gripper_m * GRIPPER_FACTOR)
+                command_pipeline[side]["piper_jointctrl_units"] = raw_joints.tolist()
+                command_pipeline[side]["piper_gripperctrl_units"] = int(raw_gripper)
+                command_pipeline[side]["piper_speed_pct"] = int(
+                    getattr(self.args, "speed_pct", 10)
+                )
+                command_pipeline[side]["piper_gripper_effort"] = int(
+                    getattr(self.args, "gripper_effort", 1000)
+                )
                 piper.ModeCtrl(
                     0x01, 0x01, int(getattr(self.args, "speed_pct", 10)), 0x00
                 )
                 piper.JointCtrl(*map(int, raw_joints))
-                raw_gripper = round(target_gripper_m * GRIPPER_FACTOR)
                 piper.GripperCtrl(
                     int(raw_gripper), int(getattr(self.args, "gripper_effort", 1000)), 0x01, 0
                 )
@@ -2676,16 +3193,57 @@ class ExecutionController:
         self.last_queued_action_index = queued.queue_index
         self.queued_action_index = self.pending_actions[0].queue_index if self.pending_actions else None
         self.last_wire_action = queued.wire_action.tolist()
-        self.last_decoded_absolute_target = self._target_telemetry(
+        decoded_absolute_target = self._target_telemetry(
             protocol, queued.absolute_target
         )
+        self.last_decoded_absolute_target = decoded_absolute_target
         command_at = time.time()
+        command_monotonic = time.monotonic()
         self.current_timed_target_action = replace(queued, hold=holding)
         self.current_timed_target = self._timed_target_telemetry(
             self.current_timed_target_action,
             now_monotonic=now_monotonic,
             now_wall=command_at,
         )
+        self.command_sequence += 1
+        command_trace = {
+            "trace_version": 1,
+            "command_sequence": self.command_sequence,
+            "generation": int(queued.generation),
+            "source_index": queued.source_index,
+            "queue_index": int(queued.queue_index),
+            "correlation": {
+                "generation": int(queued.generation),
+                "source_index": queued.source_index,
+                "queue_index": int(queued.queue_index),
+                "inference_generation": self.inference_generation,
+                "timing_generation": self.last_transport_generation,
+                "control_revision": self.control_revision,
+            },
+            "schema": protocol.schema,
+            "arm_mode": protocol.arm_mode,
+            "arm_side": protocol.arm_side,
+            "action_semantics": protocol.action_semantics,
+            "gripper_semantics": protocol.gripper_semantics,
+            "wire_action": queued.wire_action.tolist(),
+            "decoded_absolute_target": decoded_absolute_target,
+            "target_timing": dict(self.current_timed_target or {}),
+            "blended": bool(queued.blended),
+            "blend_step": queued.blend_step,
+            "hold": bool(holding),
+            "command_started_at": float(command_started_at),
+            "command_at": float(command_at),
+            "command_started_monotonic": float(command_started_monotonic),
+            "command_monotonic": float(command_monotonic),
+            "command_publish_duration_ms": max(
+                0.0, (command_monotonic - command_started_monotonic) * 1000.0
+            ),
+            "queue_anchor_at": self.queue_anchor_at,
+            "queue_loaded_at": self.queue_loaded_at,
+            "sides": command_pipeline,
+        }
+        self.last_actuator_command = command_trace
+        self._pending_feedback_command = command_trace
         self.last_command_at = command_at
         if (
             queued.generation == self.last_transport_generation
@@ -2957,6 +3515,13 @@ def run(args: argparse.Namespace) -> None:
         pipers = {args.arm_side: connect_piper(args.can)}
         camera_ids = {"cam_high": args.cam_high_device, "cam_wrist": args.cam_wrist_device}
 
+    monitoring = MonitoringRecorder(args.monitoring_dir, args)
+    monitoring.record(
+        "piper_connected",
+        can_interfaces={side: getattr(piper, "can_name", None) for side, piper in pipers.items()},
+        arm_mode=args.arm_mode,
+        arm_side=args.arm_side,
+    )
     execution = ExecutionController(pipers, args)
     cameras = CameraCapture(
         cam_ids=camera_ids,
@@ -3004,7 +3569,6 @@ def run(args: argparse.Namespace) -> None:
                 info["shape"],
                 info["latency_ms"],
             )
-
         recorder.start(
             {
                 "source_name": source_name,
@@ -3054,6 +3618,7 @@ def run(args: argparse.Namespace) -> None:
             "Deployment recording: %s",
             recorder.run_dir if recorder.is_active else "disabled",
         )
+        monitoring.record("camera_ready", camera_checks=camera_checks, camera_ids=camera_ids)
         logging.warning(
             "%s %s client: control=%.3g Hz inference=%.3g Hz expected_chunk=%d "
             "minimum_chunk=%d. Robot commands still require Dashboard EXECUTE.",
@@ -3105,8 +3670,18 @@ def run(args: argparse.Namespace) -> None:
                             launch_schedule = PeriodicSchedule(
                                 execution.inference_hz, next_at=tick_started
                             )
+                            monitoring.record(
+                                "policy_connected",
+                                protocol=vars(protocol),
+                                metadata=execution.metadata(),
+                            )
                         except Exception as exc:
                             execution._block("blocked", f"policy connection unavailable: {exc}")
+                            monitoring.record(
+                                "policy_connection_error",
+                                error=repr(exc),
+                                execution=execution.metadata(),
+                            )
                             logging.warning("Policy connection unavailable: %s", exc)
 
                 if protocol is not None:
@@ -3143,6 +3718,16 @@ def run(args: argparse.Namespace) -> None:
                                 )
                             except Exception:
                                 logging.exception("Failed to record failed model inference")
+                            monitoring.record(
+                                "inference_error",
+                                generation=completion.launch.generation,
+                                captured_at=completion.launch.captured_at,
+                                launched_at=completion.launch.launched_at,
+                                arrived_at=completion.arrived_at,
+                                image_timestamps=completion.launch.image_timestamps,
+                                error=repr(completion.error),
+                                execution=execution.metadata(),
+                            )
                             if policy is not None:
                                 close_policy(policy)
                             policy = None
@@ -3171,6 +3756,17 @@ def run(args: argparse.Namespace) -> None:
                                 )
                             except Exception:
                                 logging.exception("Failed to record model action chunk")
+                            monitoring.record(
+                                "inference_result",
+                                generation=completion.launch.generation,
+                                captured_at=completion.launch.captured_at,
+                                launched_at=completion.launch.launched_at,
+                                arrived_at=completion.arrived_at,
+                                image_timestamps=completion.launch.image_timestamps,
+                                accepted=accepted,
+                                result=completion.result,
+                                execution=execution.metadata(),
+                            )
                             logging.info(
                                 "Inference generation=%d arrival latency=%.3fs skip=%d "
                                 "blend=%d old_remaining=%d accepted=%s queue=%d rejected=%s",
@@ -3193,6 +3789,16 @@ def run(args: argparse.Namespace) -> None:
                         qpos,
                         protocol,
                         feedback_captured_at=observation_captured_at,
+                    )
+                    monitoring.record(
+                        "control_tick",
+                        command_sent=command_sent,
+                        control_tick_count=execution.control_tick_count,
+                        captured_at=observation_captured_at,
+                        captured_monotonic=observation_captured_monotonic,
+                        raw_delivery_state=delivery_state,
+                        qpos_m=qpos,
+                        execution=execution.metadata(),
                     )
                     if command_sent:
                         command_count += 1
@@ -3338,9 +3944,19 @@ def run(args: argparse.Namespace) -> None:
                 # Launch retries happen on the next tick; no synchronous infer call.
             except ExecutionBlocked as exc:
                 execution._block("blocked", str(exc))
+                monitoring.record(
+                    "control_tick_blocked",
+                    error=repr(exc),
+                    execution=execution.metadata(),
+                )
                 logging.warning("20 Hz feedback/safety check blocked: %s", exc)
             except Exception as exc:
                 execution._block("blocked", f"control tick failed: {exc}")
+                monitoring.record(
+                    "control_tick_error",
+                    error=repr(exc),
+                    execution=execution.metadata(),
+                )
                 logging.exception("20 Hz control tick failed")
 
             next_control_at += control_period
@@ -3363,6 +3979,7 @@ def run(args: argparse.Namespace) -> None:
         cameras.close()
         for piper in pipers.values():
             piper.DisconnectPort()
+        monitoring.close(reason="stopped")
 
 
 def main() -> None:
@@ -3462,6 +4079,11 @@ def main() -> None:
     )
     parser.add_argument("--instruction", default="pick up the cube")
     parser.add_argument("--source-name", default=None)
+    parser.add_argument(
+        "--monitoring-dir",
+        default=os.environ.get("BIMANUAL_VLA_MONITORING_DIR", DEFAULT_MONITORING_DIR),
+        help="local root for per-run monitoring_data/<session>/events.jsonl",
+    )
     parser.add_argument("--reconnect-delay", type=float, default=2.0)
     parser.add_argument("--once", action="store_true", help="run one successful inference and exit")
     parser.add_argument(
