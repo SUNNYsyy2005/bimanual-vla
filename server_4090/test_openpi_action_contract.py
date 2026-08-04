@@ -159,6 +159,25 @@ class AsyncTelemetrySanitizerTest(unittest.TestCase):
                 "drop_reason": "stale generation",
                 "last_wire_action": [0, 1, 2, 3, 4, 5, 0.6],
                 "last_decoded_target": {"eef_xyz_m": [0.1, 0.2, 0.3], "opening_fraction": 0.6},
+                "command_sequence": 13,
+                "last_actuator_command": {
+                    "command_sequence": 13,
+                    "generation": 9,
+                    "source_index": 5,
+                    "queue_index": 5,
+                    "sides": {"right": {"commanded_joints_rad": [0, 1, -1, 0, 0, 0]}},
+                },
+                "last_command_feedback": {
+                    "command_sequence": 12,
+                    "generation": 9,
+                    "source_index": 4,
+                    "queue_index": 4,
+                    "command_to_feedback_ms": 50.0,
+                    "max_joint_abs_error_rad": 0.012,
+                    "max_gripper_abs_error_m": 0.001,
+                    "max_eef_translation_error_m": 0.004,
+                    "max_eef_rotation_error_rad": 0.02,
+                },
             },
             action_dim=7,
             action_horizon=50,
@@ -187,6 +206,17 @@ class AsyncTelemetrySanitizerTest(unittest.TestCase):
         self.assertEqual(telemetry["client_drop_reason"], "stale generation")
         self.assertEqual(len(telemetry["client_last_wire_action"]), 7)
         self.assertEqual(telemetry["client_last_decoded_target"]["opening_fraction"], 0.6)
+        self.assertEqual(telemetry["client_command_sequence"], 13)
+        self.assertEqual(telemetry["client_actuator_command_sequence"], 13)
+        self.assertEqual(telemetry["client_actuator_command_generation"], 9)
+        self.assertEqual(telemetry["client_actuator_command_source_index"], 5)
+        self.assertEqual(telemetry["client_actuator_command_queue_index"], 5)
+        self.assertEqual(telemetry["client_feedback_command_sequence"], 12)
+        self.assertEqual(telemetry["client_feedback_command_generation"], 9)
+        self.assertEqual(telemetry["client_feedback_command_source_index"], 4)
+        self.assertEqual(telemetry["client_feedback_command_queue_index"], 4)
+        self.assertEqual(telemetry["client_command_to_feedback_ms"], 50.0)
+        self.assertEqual(telemetry["client_command_max_joint_abs_error_rad"], 0.012)
 
     def test_invalid_async_values_fail_closed_without_poisoning_json(self):
         telemetry = HELPER.sanitize_async_client_telemetry(

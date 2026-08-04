@@ -246,7 +246,7 @@
       </div>
       <p class="muted">说明：上传/下行由客户端根据本次请求的服务端时间戳回显计算并汇报；单向值仍需两端 wall-clock 基本同步。RTT 和“结果→首条命令”由客户端 monotonic clock 实测，模型推理由服务端 monotonic clock 实测。</p>
       <div class="grid">
-        <div class="card"><h2>Policy 实时观测</h2><div id="robotObservation" class="warn">尚未收到 telemetry。</div><div class="preview-grid"><div><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div><div><h3>Prompt / predicted action</h3><pre id="policyAction">action: -</pre></div></div><div id="robotImages" class="preview-grid"><figure><figcaption>顶部全局</figcaption><img id="previewHigh" alt="high camera"></figure><figure id="singleWristPreview"><figcaption>单臂腕部</figcaption><img id="previewWrist" alt="wrist camera"></figure><figure id="leftWristPreview" hidden><figcaption>左臂腕部</figcaption><img id="previewLeftWrist" alt="left wrist camera"></figure><figure id="rightWristPreview" hidden><figcaption>右臂腕部</figcaption><img id="previewRightWrist" alt="right wrist camera"></figure></div></div>
+        <div class="card"><h2>Policy 实时观测</h2><div id="robotObservation" class="warn">尚未收到 telemetry。</div><div class="preview-grid"><div><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div><div><h3>Prompt / predicted action</h3><pre id="policyAction">action: -</pre></div></div><h3>模型 → IK → Piper 命令 → 下一周期反馈</h3><pre id="actuatorTrace">actuator trace: -</pre><div id="robotImages" class="preview-grid"><figure><figcaption>顶部全局</figcaption><img id="previewHigh" alt="high camera"></figure><figure id="singleWristPreview"><figcaption>单臂腕部</figcaption><img id="previewWrist" alt="wrist camera"></figure><figure id="leftWristPreview" hidden><figcaption>左臂腕部</figcaption><img id="previewLeftWrist" alt="left wrist camera"></figure><figure id="rightWristPreview" hidden><figcaption>右臂腕部</figcaption><img id="previewRightWrist" alt="right wrist camera"></figure></div></div>
       </div>
     </section>
   </main>
@@ -1021,6 +1021,46 @@ function signedMetricMs(value) {
   return number == null ? '-' : `${number >= 0 ? '+' : ''}${number.toFixed(1)} ms`;
 }
 
+function metricUnit(value, unit, digits = 5) {
+  const number = finiteMetric(value);
+  return number == null ? '-' : `${number.toFixed(digits)} ${unit}`;
+}
+
+function traceJson(value) {
+  return value == null ? '-' : JSON.stringify(value);
+}
+
+function actuatorTraceText(command, feedback) {
+  const lines = [];
+  if (command && typeof command === 'object') {
+    lines.push(`[当前下发] command=${command.command_sequence ?? '-'} · generation/source/queue=${command.generation ?? '-'}/${command.source_index ?? '-'}/${command.queue_index ?? '-'}`);
+    lines.push(`action flags: blended=${Boolean(command.blended)} blend_step=${command.blend_step ?? '-'} hold=${Boolean(command.hold)} · target=${traceJson(command.target_timing)}`);
+    lines.push(`wire action: ${traceJson(command.wire_action)}`);
+    for (const [side, item] of Object.entries(command.sides || {})) {
+      lines.push(`[${side}] path=${item.control_path || '-'}`);
+      lines.push(`  1. IK前末端目标: ${traceJson(item.pre_ik_eef_target)}`);
+      lines.push(`  2. 完整IK解(rad): ${traceJson(item.full_ik_solution_joints_rad)} · rate_limited=${item.ik_rate_limited ?? '-'}`);
+      lines.push(`  3. 实际关节目标(rad): ${traceJson(item.commanded_joints_rad)} · gripper=${item.commanded_gripper_m ?? '-'}m`);
+      lines.push(`  4. Piper整数: JointCtrl=${traceJson(item.piper_jointctrl_units)} · GripperCtrl=${item.piper_gripperctrl_units ?? '-'}`);
+      lines.push(`  IK diagnostics: ${traceJson(item.ik_diagnostics)}`);
+    }
+  } else {
+    lines.push('[当前下发] 尚无真实机械臂命令');
+  }
+  lines.push('');
+  if (feedback && typeof feedback === 'object') {
+    lines.push(`[下一周期反馈] command=${feedback.command_sequence ?? '-'} · generation/source/queue=${feedback.generation ?? '-'}/${feedback.source_index ?? '-'}/${feedback.queue_index ?? '-'} · status=${feedback.feedback_status || '-'}`);
+    lines.push(`feedback delay=${metricMs(feedback.command_to_feedback_ms)} · max joint error=${metricUnit(feedback.max_joint_abs_error_rad, 'rad')} · max EEF translation=${metricUnit(feedback.max_eef_translation_error_m, 'm')} · max EEF rotation=${metricUnit(feedback.max_eef_rotation_error_rad, 'rad')}`);
+    for (const [side, item] of Object.entries(feedback.sides || {})) {
+      lines.push(`[${side}] 5. 下一周期实测: ${traceJson(item.next_cycle_feedback)}`);
+      lines.push(`[${side}] 6. 指令-反馈误差: ${traceJson(item.command_feedback_error)}`);
+    }
+  } else {
+    lines.push('[下一周期反馈] 尚未形成匹配记录');
+  }
+  return lines.join('\n');
+}
+
 function firstFiniteMetric(values) {
   for (const value of values) {
     const number = finiteMetric(value);
@@ -1072,6 +1112,7 @@ function telemetrySummary(t) {
   const activeGeneration = t.client_active_plan_generation ?? t.client_queue_generation ?? '-';
   const activeIndex = t.client_active_plan_index ?? '-';
   const activeRemaining = t.client_active_plan_remaining ?? t.client_new_remaining ?? '-';
+  const commandJointError = finiteMetric(t.client_command_max_joint_abs_error_rad);
   const rejected = t.client_rejected_result && typeof t.client_rejected_result === 'object'
     ? JSON.stringify(t.client_rejected_result)
     : (t.client_rejected_result ?? false);
@@ -1105,6 +1146,8 @@ function telemetrySummary(t) {
     <div>generation active/result=${esc(t.client_queue_generation ?? '-')} / ${esc(t.client_result_generation ?? '-')} · old/new remaining=${esc(t.client_old_remaining ?? '-')}/${esc(t.client_new_remaining ?? '-')}</div>
     <div>hold=${esc(t.client_hold_active ?? false)}(${esc(t.client_hold_steps ?? 0)}) · blend=${esc(t.client_blend_active ?? false)}(${esc(t.client_blend_remaining ?? '-')}） · gripper filter=${esc(t.client_gripper_filter_active ?? false)}</div>
     <div>rejected=${esc(rejected)} (${esc(t.client_rejected_result_count ?? 0)}) · underrun=${esc(t.client_underrun ?? false)} (${esc(t.client_underrun_count ?? 0)})</div>
+    <div>actuator command/feedback sequence=${esc(t.client_actuator_command_sequence ?? '-')} / ${esc(t.client_feedback_command_sequence ?? '-')} · generation=${esc(t.client_actuator_command_generation ?? '-')} / ${esc(t.client_feedback_command_generation ?? '-')}</div>
+    <div>next-cycle feedback=${esc(metricMs(t.client_command_to_feedback_ms))} · max joint=${esc(metricUnit(commandJointError, 'rad'))} · EEF xyz/rot=${esc(metricUnit(t.client_command_max_eef_translation_error_m, 'm'))}/${esc(metricUnit(t.client_command_max_eef_rotation_error_rad, 'rad'))}</div>
     <div>contract=v${esc(t.contract_version || '?')} · raw/model=${esc(t.raw_action_dim || '?')}D/${esc(t.model_action_dim || '?')}D · ${esc(t.model_action_convention || '-')}</div>
     <div>gripper=${esc(t.raw_gripper_semantics || '-')} → ${esc(t.wire_gripper_semantics || '-')} · source=${esc(t.source_name || '-')} · action=${esc(JSON.stringify(t.actions_shape || []))}</div>
   `;
@@ -1119,6 +1162,7 @@ function telemetrySummary(t) {
       ${item('时间误差（now-target）', esc(signedMetricMs(targetError)), targetError != null && targetError > 100 ? 'warn' : '')}
       ${item('模型推理（当前请求）', esc(metricMs(t.server_model_inference_ms ?? t.client_model_inference_ms)))}
       ${item('网络 / RTT', `${esc(metricMs(t.client_network_transport_total_ms))} / ${esc(metricMs(t.client_round_trip_ms))}`)}
+      ${item('下一周期关节误差', esc(metricUnit(commandJointError, 'rad')), commandJointError != null && commandJointError > 0.05 ? 'warn' : '')}
     </div>
     ${reason ? `<div class="telemetry-alert"><strong>当前原因：</strong>${esc(reason)}</div>` : ''}
     <details class="telemetry-details"><summary>展开详细遥测</summary><div class="telemetry-detail-list">${details}</div></details>
@@ -1311,6 +1355,7 @@ function fillObservation(obs) {
     document.getElementById('robotStateTitle').textContent = 'Policy state';
     document.getElementById('robotState').textContent = 'state: -';
     document.getElementById('policyAction').textContent = 'action: -';
+    document.getElementById('actuatorTrace').textContent = 'actuator trace: -';
     ['telemetryUpload', 'telemetryModel', 'telemetryDownload', 'telemetryTransport', 'telemetryFirstCommand', 'telemetryActionError'].forEach(id => { document.getElementById(id).textContent = '-'; });
     ['telemetryUploadDetail', 'telemetryDownloadDetail', 'telemetryTransportDetail'].forEach(id => { document.getElementById(id).textContent = '尚无客户端汇报'; });
     return;
@@ -1375,6 +1420,10 @@ function fillObservation(obs) {
     : '-';
   const decoded = obs.client_last_decoded_target ?? obs.client_last_decoded_absolute_target;
   const decodedTarget = decoded ? JSON.stringify(decoded) : '-';
+  document.getElementById('actuatorTrace').textContent = actuatorTraceText(
+    obs.client_last_actuator_command,
+    obs.client_last_command_feedback,
+  );
   const targetTimes = Array.isArray(obs.client_plan_target_times) ? JSON.stringify(obs.client_plan_target_times) : '-';
   const targetAt = actionTargetAt(obs);
   const rejectedResult = obs.client_rejected_result ? JSON.stringify(obs.client_rejected_result) : false;
@@ -1415,6 +1464,9 @@ safety profile: ${obs.client_safety_profile || '-'}
 safety limits: ${obs.client_delivery_safety_limits ? JSON.stringify(obs.client_delivery_safety_limits) : 'translation=0.05m, rotation=0.18rad, gripper=0.30 fraction; workspace x[-0.05,0.30] y[0.01,0.50] z[0.14,0.52]'}
 last wire action: ${lastWire}
 last decoded target: ${decodedTarget}
+actuator command sequence/generation/source/queue: ${obs.client_actuator_command_sequence ?? '-'} / ${obs.client_actuator_command_generation ?? '-'} / ${obs.client_actuator_command_source_index ?? '-'} / ${obs.client_actuator_command_queue_index ?? '-'}
+feedback command sequence/generation/source/queue: ${obs.client_feedback_command_sequence ?? '-'} / ${obs.client_feedback_command_generation ?? '-'} / ${obs.client_feedback_command_source_index ?? '-'} / ${obs.client_feedback_command_queue_index ?? '-'} · delay=${metricMs(obs.client_command_to_feedback_ms)}
+command feedback max error: joints=${metricUnit(obs.client_command_max_joint_abs_error_rad, 'rad')} · gripper=${metricUnit(obs.client_command_max_gripper_abs_error_m, 'm')} · EEF xyz=${metricUnit(obs.client_command_max_eef_translation_error_m, 'm')} · EEF rot=${metricUnit(obs.client_command_max_eef_rotation_error_rad, 'rad')}
 async switch: old chunk keeps executing during inference; returned chunk expires a dynamically measured prefix, blends for 2~4 steps, then switches generation
 last feedback: ${fmtTime(obs.client_last_feedback_at)}
 min/max: ${obs.action_min} / ${obs.action_max}

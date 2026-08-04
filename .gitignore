@@ -25,6 +25,9 @@ pi0_dataset_bimanual/
 pi0_dataset_single/
 lerobot_datasets/
 eval_videos/
+monitoring_data/*
+!monitoring_data/.gitkeep
+!monitoring_data/README.md
 
 # 本地汇报文档（可选，按需去掉注释保留）
 # daily_report_*.md
