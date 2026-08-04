@@ -1766,12 +1766,17 @@ def _first_client_value(client: dict[str, Any], *keys: str) -> Any:
     return None
 
 
-def _telemetry_nonnegative_float(value: Any) -> float | None:
+def _telemetry_finite_float(value: Any) -> float | None:
     try:
         result = float(value)
     except (TypeError, ValueError):
         return None
-    return result if np.isfinite(result) and result >= 0 else None
+    return result if np.isfinite(result) else None
+
+
+def _telemetry_nonnegative_float(value: Any) -> float | None:
+    result = _telemetry_finite_float(value)
+    return result if result is not None and result >= 0 else None
 
 
 def _telemetry_positive_float(value: Any) -> float | None:
@@ -1876,6 +1881,20 @@ def sanitize_async_client_telemetry(
         "client_last_target_time_at": ("last_target_time_at", "last_action_target_at", "last_command_target_at", "client_last_target_time_at"),
         "client_next_target_time_at": ("next_target_time_at", "next_action_target_at", "client_next_target_time_at"),
         "client_active_plan_started_at": ("active_plan_started_at", "plan_started_at", "client_active_plan_started_at"),
+        "client_timing_snapshot_at": ("timing_snapshot_at", "client_timing_snapshot_at"),
+        "client_request_sent_at": ("request_sent_at", "client_request_sent_at"),
+        "client_server_request_received_at": ("server_request_received_at", "client_server_request_received_at"),
+        "client_server_model_completed_at": ("server_model_completed_at", "client_server_model_completed_at"),
+        "client_server_response_ready_at": ("server_response_ready_at", "client_server_response_ready_at"),
+        "client_response_received_at": ("response_received_at", "client_response_received_at"),
+        "client_camera_capture_ms": ("camera_capture_ms", "client_camera_capture_ms"),
+        "client_observation_upload_ms": ("observation_upload_ms", "client_observation_upload_ms"),
+        "client_model_inference_ms": ("model_inference_ms", "client_model_inference_ms"),
+        "client_result_download_ms": ("result_download_ms", "client_result_download_ms"),
+        "client_network_transport_total_ms": ("network_transport_total_ms", "client_network_transport_total_ms"),
+        "client_round_trip_ms": ("round_trip_ms", "client_round_trip_ms"),
+        "client_result_to_first_command_ms": ("result_to_first_command_ms", "client_result_to_first_command_ms"),
+        "client_observation_to_first_command_ms": ("observation_to_first_command_ms", "client_observation_to_first_command_ms"),
     }
     for output, keys in nonnegative_float_fields.items():
         result[output] = _telemetry_nonnegative_float(_first_client_value(client, *keys))
@@ -1908,6 +1927,7 @@ def sanitize_async_client_telemetry(
         "client_blend_steps": ("blend_steps", "chunk_blend_steps", "inference_blend_steps", "client_blend_steps"),
         "client_queue_generation": ("queue_generation", "action_generation", "generation", "client_queue_generation"),
         "client_result_generation": ("result_generation", "inference_generation", "client_result_generation"),
+        "client_timing_generation": ("timing_generation", "transport_timing_generation", "client_timing_generation"),
         "client_old_remaining": ("old_remaining", "old_chunk_remaining", "inference_old_remaining", "client_old_remaining"),
         "client_new_remaining": ("new_remaining", "new_chunk_remaining", "queued_action_count", "client_new_remaining"),
         "client_rejected_result_count": ("rejected_result_count", "client_rejected_result_count"),
@@ -1965,17 +1985,33 @@ def sanitize_async_client_telemetry(
         "client_gripper_filter": ("gripper_filter", "gripper_filter_state", "client_gripper_filter"),
         "client_timed_target": ("timed_target", "current_timed_target", "client_timed_target"),
         "client_last_safe_target": ("last_safe_target", "client_last_safe_target"),
+        "client_transport_timing": ("client_transport_timing", "transport_timing"),
     }.items():
         result[output] = _telemetry_json_value(
             _first_client_value(client, *keys), action_dim=action_dim
         )
+    if result.get("client_timing_generation") is None:
+        timing_payload = result.get("client_transport_timing")
+        if isinstance(timing_payload, dict):
+            result["client_timing_generation"] = _telemetry_nonnegative_int(
+                timing_payload.get("generation")
+            )
+
     timed_target = result.get("client_timed_target")
     if isinstance(timed_target, dict):
         result["client_target_monotonic"] = _telemetry_nonnegative_float(
             timed_target.get("target_monotonic")
         )
-        result["client_target_age_s"] = _telemetry_nonnegative_float(
-            timed_target.get("target_age_s")
+        result["client_target_at"] = _telemetry_nonnegative_float(
+            timed_target.get("target_at")
+        )
+        result["client_target_age_s"] = _telemetry_finite_float(
+            timed_target.get("target_time_error_s", timed_target.get("target_age_s"))
+        )
+        result["client_target_time_error_ms"] = (
+            result["client_target_age_s"] * 1000.0
+            if result["client_target_age_s"] is not None
+            else None
         )
         if result.get("client_blend_active") is None:
             result["client_blend_active"] = bool(timed_target.get("blended", False))
@@ -1983,7 +2019,9 @@ def sanitize_async_client_telemetry(
             result["client_hold_active"] = bool(timed_target.get("hold", False))
     else:
         result["client_target_monotonic"] = None
+        result["client_target_at"] = None
         result["client_target_age_s"] = None
+        result["client_target_time_error_ms"] = None
     if result.get("client_gripper_filter") is not None and result.get("client_gripper_filter_active") is None:
         result["client_gripper_filter_active"] = True
 
@@ -2193,7 +2231,7 @@ class PolicyTelemetry:
             "server_time": now,
         }
 
-    def publish(self, observation: dict, result: dict, elapsed_s: float) -> None:
+    def publish(self, observation: dict, result: dict, elapsed_s: float) -> int:
         with self.lock:
             self.sequence += 1
             client = observation.get("client_metadata")
@@ -2246,6 +2284,14 @@ class PolicyTelemetry:
             client_last_wire_action = async_client["client_last_wire_action"]
             now = time.time()
             captured_at = _telemetry_nonnegative_float(client.get("captured_at"))
+            transport_timing = result.get("transport_timing")
+            transport_timing = transport_timing if isinstance(transport_timing, dict) else {}
+            server_model_inference_ms = _telemetry_nonnegative_float(
+                transport_timing.get("model_inference_ms")
+            )
+            server_observation_upload_ms = _telemetry_nonnegative_float(
+                transport_timing.get("observation_upload_ms")
+            )
             payload = {
                 "sequence": self.sequence,
                 "received_at": now,
@@ -2333,11 +2379,44 @@ class PolicyTelemetry:
                 "action_min": float(actions.min()) if actions.size else None,
                 "action_max": float(actions.max()) if actions.size else None,
                 "policy_elapsed_s": elapsed_s,
+                "server_model_inference_ms": server_model_inference_ms,
+                "server_timing_generation": _telemetry_nonnegative_int(
+                    transport_timing.get("inference_generation")
+                ),
+                "server_observation_upload_ms": server_observation_upload_ms,
+                "server_request_received_at": _telemetry_nonnegative_float(
+                    transport_timing.get("server_request_received_at")
+                ),
+                "server_model_completed_at": _telemetry_nonnegative_float(
+                    transport_timing.get("server_model_completed_at")
+                ),
+                "transport_timing": _telemetry_json_value(
+                    transport_timing, action_dim=int(self.metadata["action_dim"])
+                ),
                 "server_timing": result.get("server_timing"),
                 "policy_timing": result.get("policy_timing"),
                 "execution_control": result.get("execution_control"),
             }
             self._atomic_json(self.root / "latest.json", payload)
+            return self.sequence
+
+    def mark_response_ready(self, sequence: int, response_ready_at: float) -> None:
+        """Attach the post-publish response boundary to the same telemetry row."""
+        with self.lock:
+            path = self.root / "latest.json"
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                return
+            if not isinstance(payload, dict) or int(payload.get("sequence", -1)) != int(sequence):
+                return
+            transport_timing = payload.get("transport_timing")
+            if not isinstance(transport_timing, dict):
+                transport_timing = {}
+            transport_timing["server_response_ready_at"] = float(response_ready_at)
+            payload["transport_timing"] = transport_timing
+            payload["server_response_ready_at"] = float(response_ready_at)
+            self._atomic_json(path, payload)
 
 
 class TelemetryWebsocketPolicyServer(websocket_policy_server.WebsocketPolicyServer):
@@ -2361,15 +2440,41 @@ class TelemetryPolicy:
         self.telemetry = telemetry
 
     def infer(self, observation: dict) -> dict:
+        server_request_received_at = time.time()
         started = time.monotonic()
         self.telemetry.inference_started()
         try:
             result = dict(self.policy.infer(observation))
+            model_inference_s = time.monotonic() - started
+            server_model_completed_at = time.time()
+            client = observation.get("client_metadata")
+            client = client if isinstance(client, dict) else {}
+            request_sent_at = _telemetry_nonnegative_float(client.get("request_sent_at"))
+            request_generation = _telemetry_nonnegative_int(client.get("inference_generation"))
+            observation_upload_ms = (
+                max(0.0, (server_request_received_at - request_sent_at) * 1000.0)
+                if request_sent_at is not None
+                and server_request_received_at >= request_sent_at
+                else None
+            )
+            transport_timing = {
+                "client_request_sent_at": request_sent_at,
+                "inference_generation": request_generation,
+                "server_request_received_at": server_request_received_at,
+                "server_model_completed_at": server_model_completed_at,
+                "model_inference_ms": model_inference_s * 1000.0,
+                "observation_upload_ms": observation_upload_ms,
+            }
+            result["transport_timing"] = transport_timing
             result["execution_control"] = self.telemetry.execution_control()
             try:
-                self.telemetry.publish(observation, result, time.monotonic() - started)
+                sequence = self.telemetry.publish(observation, result, model_inference_s)
+                response_ready_at = time.time()
+                transport_timing["server_response_ready_at"] = response_ready_at
+                self.telemetry.mark_response_ready(sequence, response_ready_at)
             except Exception:
                 logging.exception("failed to publish policy telemetry")
+                transport_timing["server_response_ready_at"] = time.time()
             return result
         finally:
             self.telemetry.inference_finished()

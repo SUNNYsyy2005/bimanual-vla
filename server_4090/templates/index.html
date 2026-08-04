@@ -41,6 +41,8 @@
     .half { grid-column:span 6; } .third { grid-column:span 4; } .two-third { grid-column:span 8; } .quarter { grid-column:span 3; }
     .stat-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-bottom:14px; }
     .stat-card { padding:14px 15px; border:1px solid var(--line-soft); border-radius:14px; background:linear-gradient(145deg,#11223a,#0c192b); }
+    .telemetry-latency-grid { grid-template-columns:repeat(6,minmax(0,1fr)); margin:0 0 14px; }
+    .telemetry-latency-grid .stat-value { font-size:21px; }
     .stat-label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
     .stat-value { margin-top:5px; font-size:25px; font-weight:800; color:#f7fbff; }
     .stat-detail { margin-top:2px; color:#9fb3cc; font-size:12px; }
@@ -87,11 +89,23 @@
     .chart-toolbar { display:grid; grid-template-columns:minmax(260px,1fr) auto; gap:10px; align-items:end; margin-bottom:10px; }
     .metric-legend { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
     .metric-toggle { width:auto; padding:5px 9px; border-color:#3c5878; background:#12233a; font-size:12px; }
+    .policy-telemetry { min-width:340px; max-width:620px; }
+    .telemetry-badges { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:7px; }
+    .telemetry-badges > span { padding:2px 7px; border:1px solid #2f4966; border-radius:999px; background:#0b1a2d; font-size:11px; }
+    .telemetry-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:5px 12px; }
+    .telemetry-item { min-width:0; padding:4px 0; border-bottom:1px solid rgba(48,75,104,.45); }
+    .telemetry-item-label { display:block; color:var(--muted); font-size:11px; }
+    .telemetry-item-value { display:block; overflow:hidden; color:#eaf4ff; font-size:12px; font-weight:700; text-overflow:ellipsis; white-space:nowrap; }
+    .telemetry-alert { margin-top:7px; padding:6px 8px; border-left:3px solid var(--yellow); border-radius:5px; background:#241d13; color:#ffd98a; font-size:12px; line-height:1.4; }
+    .telemetry-details { margin-top:7px; }
+    .telemetry-details summary { cursor:pointer; color:#9fdcff; font-size:11px; }
+    .telemetry-detail-list { display:grid; gap:4px; margin-top:6px; color:#adc0d6; font-size:11px; line-height:1.4; }
+    .telemetry-detail-list code { color:#d9ebff; }
     .metric-toggle.off { opacity:.45; }
     .progress-track { height:8px; overflow:hidden; border-radius:999px; background:#07101c; }
     .progress-bar { height:100%; width:0; background:linear-gradient(90deg,var(--blue),var(--green)); }
     .section-note { padding:10px 12px; border-left:3px solid var(--blue); border-radius:7px; background:#0b1b2e; color:#aac0d8; }
-    @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid{grid-template-columns:repeat(2,1fr)}.episode-editor-grid{grid-template-columns:1fr}}
+    @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid,.telemetry-latency-grid{grid-template-columns:repeat(2,1fr)}.episode-editor-grid{grid-template-columns:1fr}}
     @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid{grid-template-columns:1fr}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
   </style>
 </head>
@@ -184,13 +198,15 @@
             <div class="row3"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU IDs</label><input name="gpu_ids" value="0,1" placeholder="0,1"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div>
             <div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>全局 Batch</label><input name="batch_size" type="number" value="2"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div>
             <div class="row3"><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div><div><label>JAX 显存预分配比例</label><input name="xla_memory_fraction" type="number" value="0.90" min="0.50" max="0.95" step="0.01"></div><div><label>Episode 划分</label><input value="自动加载已保存的 norm 划分" disabled></div></div>
+            <div class="row3"><div><label>测试集自动评测</label><select name="eval_enabled"><option value="true">启用（推荐）</option><option value="false">禁用</option></select></div><div><label>评测间隔 steps</label><input name="eval_interval_steps" type="number" value="5000" min="5000" step="5000"></div><div><label>最多评测 batches</label><input name="eval_max_batches" type="number" value="50" min="1"></div></div>
+            <div class="row3"><div><label>Eval batch</label><input name="eval_batch_size" type="number" value="1" min="1"></div><div><label>Eval workers</label><input name="eval_num_workers" type="number" value="2" min="0"></div><div><label>Eval JAX 显存比例</label><input name="eval_xla_memory_fraction" type="number" value="0.85" min="0.50" max="0.95" step="0.01"></div></div>
             <label>启动方式</label><select name="mode"><option value="auto">auto（推荐）</option><option value="new">new</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select>
-            <p class="muted">2×24 GiB RTX 4090 上 π0.5 LoRA 建议使用全局 batch 2、FSDP 2、显存比例 0.90；全局 batch 4 在首步编译/通信阶段可能 NCCL OOM。训练会拒绝剩余显存低于安全阈值的 GPU，并自动加载已保存的 episode 划分。</p><p><button type="submit">提交训练</button></p>
+            <p class="muted">2×24 GiB RTX 4090 上 π0.5 LoRA 建议使用全局 batch 2、FSDP 2、显存比例 0.90。自动评测在每个持久化的 5000-step checkpoint 上使用 held-out episodes；只占用完全空闲的单卡，没有空闲卡就记录 skipped，不排队也不阻塞训练。</p><p><button type="submit">提交训练</button></p>
           </form>
         </div>
         <div class="card two-third">
           <h2>训练进程管理</h2>
-          <p class="muted">查看 Norm / Train 任务状态、PID、依赖关系；已结束任务可删除记录和日志，不会删除 checkpoint 或训练输出。</p>
+          <p class="muted">查看 Norm / Train / Eval 任务状态、PID、依赖关系；已结束任务可删除记录和日志，不会删除 checkpoint 或训练输出。</p>
           <div class="table-wrap training-jobs-wrap"><table class="training-jobs-table"><thead><tr><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div>
         </div>
         <div class="card third" id="trainingTaskLogCard">
@@ -212,7 +228,7 @@
       <div class="module-heading"><div><h2>Policy 管理</h2><p>从 checkpoint 启动、切换、健康检测和实机执行授权。</p></div></div>
       <div class="grid">
         <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><input type="hidden" name="model_variant" id="policyModelVariant" value="pi05"><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div><div><label>默认 prompt</label><input name="default_prompt"></div></div><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
-        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code>、<code>action_horizon &gt;= 16</code> 和本地逐 20 Hz command 安全检查。异步客户端默认 4 Hz 启动推理（推理+传输通常约 200 ms），旧 chunk 在推理期间持续执行；新 chunk 到达后按实时 arrival 延迟动态过期 prefix，融合 2~4 步后切换 generation。已结束的历史进程可删除记录和日志。</p><div class="table-wrap"><table><thead><tr><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端 / telemetry</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div></div>
+        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code>、<code>action_horizon &gt;= 16</code> 和本地逐 20 Hz command 安全检查。异步客户端默认 4 Hz 启动推理（推理+传输通常约 200 ms），旧 chunk 在推理期间持续执行；新 chunk 到达后按实时 arrival 延迟动态过期 prefix，融合 2~4 步后切换 generation。已结束的历史进程可删除记录和日志。</p><div class="table-wrap"><table><thead><tr><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端状态 / 延迟摘要</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div></div>
         <div class="card" id="policyTaskLogCard"><h2>Policy 进程日志</h2><p class="muted">从 Policy 进程表点击“日志”查看最近输出。</p><pre id="policyTaskLog">尚未选择 Policy 进程。</pre></div>
         <div class="card"><h2>机械臂客户端命令</h2><pre id="policyClientCommand">python robot_observation_bridge.py --host 192.168.101.9 --port 8000 --hz 4 --arm-mode single --arm-side right --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16 --instruction "pick up the cube"</pre></div>
       </div>
@@ -220,6 +236,15 @@
 
     <section id="module-telemetry" class="dashboard-module" data-module="telemetry" hidden>
       <div class="module-heading"><div><h2>实时遥测</h2><p>只读展示 Policy 实际收到的 state、相机、prompt、预测 action 和异步 chunk 生命周期。默认 delivery 安全阈值来自 <code>8_3_64eps</code> 全量 20 Hz 统计：translation 0.05 m/step、rotation 0.18 rad/step、gripper 0.30 fraction/step，workspace x[-0.05,0.30]、y[0.01,0.50]、z[0.14,0.52]；每条 20 Hz command 仍独立检查，CLI 可继续收紧。</p></div></div>
+      <div class="stat-grid telemetry-latency-grid" aria-label="异步链路延迟">
+        <div class="stat-card"><div class="stat-label">客户端上传（估算）</div><div id="telemetryUpload" class="stat-value">-</div><div class="stat-detail">request sent → server received</div></div>
+        <div class="stat-card"><div class="stat-label">模型推理（实测）</div><div id="telemetryModel" class="stat-value">-</div><div class="stat-detail">server model execution</div></div>
+        <div class="stat-card"><div class="stat-label">下行到客户端（估算）</div><div id="telemetryDownload" class="stat-value">-</div><div class="stat-detail">response ready → client received</div></div>
+        <div class="stat-card"><div class="stat-label">网络总传输 / RTT</div><div id="telemetryTransport" class="stat-value">-</div><div class="stat-detail">RTT - model（RTT 实测）</div></div>
+        <div class="stat-card"><div class="stat-label">结果 → 首条命令</div><div id="telemetryFirstCommand" class="stat-value">-</div><div class="stat-detail">client response → 20 Hz command</div></div>
+        <div class="stat-card"><div class="stat-label">当前动作时间误差</div><div id="telemetryActionError" class="stat-value">-</div><div class="stat-detail">now - target time（带符号）</div></div>
+      </div>
+      <p class="muted">说明：上传/下行是基于客户端与 Policy 服务端 wall-clock 的单向延迟估算，需两端时钟基本同步；RTT、模型推理和“结果→首条命令”分别由单调时钟/服务端或客户端实际测量。</p>
       <div class="grid">
         <div class="card"><h2>Policy 实时观测</h2><div id="robotObservation" class="warn">尚未收到 telemetry。</div><div class="preview-grid"><div><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div><div><h3>Prompt / predicted action</h3><pre id="policyAction">action: -</pre></div></div><div id="robotImages" class="preview-grid"><figure><figcaption>顶部全局</figcaption><img id="previewHigh" alt="high camera"></figure><figure id="singleWristPreview"><figcaption>单臂腕部</figcaption><img id="previewWrist" alt="wrist camera"></figure><figure id="leftWristPreview" hidden><figcaption>左臂腕部</figcaption><img id="previewLeftWrist" alt="left wrist camera"></figure><figure id="rightWristPreview" hidden><figcaption>右臂腕部</figcaption><img id="previewRightWrist" alt="right wrist camera"></figure></div></div>
       </div>
@@ -233,7 +258,7 @@ tokenInput.value = localStorage.getItem('bimanualVlaToken') || '';
 loginUserInput.value = localStorage.getItem('bimanualVlaLoginUser') || '';
 
 const ACTIVE_STATES = new Set(['starting', 'running', 'stopping', 'waiting_norm', 'waiting_gpu']);
-const TERMINAL_STATES = new Set(['completed', 'failed', 'lost', 'stopped']);
+const TERMINAL_STATES = new Set(['completed', 'failed', 'lost', 'stopped', 'skipped']);
 const MODULES = new Set(['overview', 'datasets', 'training', 'policy', 'telemetry']);
 const METRIC_COLORS = ['#42c7ff', '#3ee6a8', '#ffd166', '#ff6f91', '#a78bfa', '#fb923c', '#67e8f9'];
 let latestStatus = null;
@@ -816,7 +841,7 @@ async function loadTrainingMetrics(options = {}) {
       ? enabledMetrics : new Set();
     trainingMetricsData = data;
     if (!previousSeries.size) {
-      const defaults = ['loss', 'loss_physical_14d', 'loss_padding_18d'].filter(key => data.series.includes(key));
+      const defaults = ['loss', 'eval_loss_model', 'loss_physical_14d', 'eval_loss_objective'].filter(key => data.series.includes(key));
       enabledMetrics = new Set(defaults.length ? defaults : data.series.filter(key => key !== 'param_norm').slice(0, 3));
     }
     renderTrainingMetrics();
@@ -832,13 +857,16 @@ function renderTrainingMetrics() {
   if (!data) return;
   const task = data.task || {};
   const loss = data.summary && data.summary.loss;
+  const evalSummary = data.eval_summary || {};
   const progress = data.progress == null ? null : Math.max(0, Math.min(1, Number(data.progress)));
   document.getElementById('trainProgressBar').style.width = progress == null ? '0%' : `${(progress * 100).toFixed(1)}%`;
   document.getElementById('trainMetricsSummary').innerHTML = `
     <span class="${stateClass(task.state)}">${esc(task.state || '-')}</span> ·
     step <strong>${esc(data.latest_step)}</strong>${data.planned_steps ? ` / ${esc(data.planned_steps)}` : ''}${progress == null ? '' : ` · ${(progress * 100).toFixed(1)}%`}
     · 原始点 ${esc(data.total_points)} / 绘制点 ${esc(data.sampled_points)}
-    ${loss ? ` · loss=<strong>${esc(compactNumber(loss.latest))}</strong> (min ${esc(compactNumber(loss.min))})` : ''}`;
+    ${loss ? ` · train loss=<strong>${esc(compactNumber(loss.latest))}</strong> (min ${esc(compactNumber(loss.min))})` : ''}
+    ${evalSummary.latest_loss == null ? '' : ` · eval=<strong>${esc(compactNumber(evalSummary.latest_loss))}</strong>@${esc(evalSummary.latest_step)} · best ${esc(compactNumber(evalSummary.best_loss))}@${esc(evalSummary.best_step)}`}
+    ${evalSummary.counts ? ` · eval状态 ${Object.entries(evalSummary.counts).map(([key, value]) => `${esc(key)}=${esc(value)}`).join(' ')}` : ''}`;
   document.getElementById('trainMetricLegend').innerHTML = (data.series || []).map((key, index) => {
     const item = (data.summary || {})[key] || {};
     const on = enabledMetrics.has(key);
@@ -936,8 +964,12 @@ function drawTrainingMetrics() {
 
   selected.forEach(key => {
     const colorIndex = (data.series || []).indexOf(key);
-    ctx.strokeStyle = METRIC_COLORS[(colorIndex < 0 ? 0 : colorIndex) % METRIC_COLORS.length];
-    ctx.lineWidth = 2;
+    const isEval = key.startsWith('eval_');
+    const color = METRIC_COLORS[(colorIndex < 0 ? 0 : colorIndex) % METRIC_COLORS.length];
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = isEval ? 2.5 : 2;
+    ctx.setLineDash(isEval ? [7, 5] : []);
     ctx.beginPath();
     let started = false;
     for (const point of points) {
@@ -948,6 +980,17 @@ function drawTrainingMetrics() {
       else ctx.lineTo(x(step), y(value));
     }
     if (started) ctx.stroke();
+    ctx.setLineDash([]);
+    if (isEval) {
+      for (const point of points) {
+        const value = Number(point[key]);
+        const step = Number(point.step);
+        if (!Number.isFinite(value) || !Number.isFinite(step)) continue;
+        ctx.beginPath();
+        ctx.arc(x(step), y(value), 3.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
   });
 }
 
@@ -955,32 +998,119 @@ function fmtTime(epoch) {
   return epoch ? new Date(Number(epoch) * 1000).toLocaleTimeString() : '-';
 }
 
+function finiteMetric(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function metricMs(value) {
+  const number = finiteMetric(value);
+  return number == null ? '-' : `${number.toFixed(1)} ms`;
+}
+
+function signedMetricMs(value) {
+  const number = finiteMetric(value);
+  return number == null ? '-' : `${number >= 0 ? '+' : ''}${number.toFixed(1)} ms`;
+}
+
+function firstFiniteMetric(values) {
+  for (const value of values) {
+    const number = finiteMetric(value);
+    if (number != null) return number;
+  }
+  return null;
+}
+
+function actionTimeErrorMs(t) {
+  const target = t && typeof t.client_timed_target === 'object' ? t.client_timed_target : {};
+  return firstFiniteMetric([
+    t && t.client_current_target_time_error_ms,
+    t && t.client_target_time_error_ms,
+    finiteMetric(t && t.client_current_target_age_s) == null ? null : Number(t.client_current_target_age_s) * 1000,
+    finiteMetric(t && t.client_target_age_s) == null ? null : Number(t.client_target_age_s) * 1000,
+    finiteMetric(target.target_time_error_s) == null ? null : Number(target.target_time_error_s) * 1000,
+    finiteMetric(target.target_age_s) == null ? null : Number(target.target_age_s) * 1000,
+  ]);
+}
+
+function actionTargetAt(t) {
+  const target = t && typeof t.client_timed_target === 'object' ? t.client_timed_target : {};
+  return firstFiniteMetric([
+    t && t.client_target_at,
+    target.target_at,
+    t && t.client_last_target_time_at,
+  ]);
+}
+
 function telemetrySummary(t) {
   if (!t) return '<span class="muted">客户端未连接，尚无 telemetry</span>';
   const control = t.execution_control || {};
-  const connection = t.client_connected ? `<span class="ok">WebSocket 已连接 ×${esc(t.active_clients)}</span>` : '<span class="muted">WebSocket 未连接</span>';
-  const freshness = t.received_at == null ? '<span class="muted">尚无推理请求</span>' : t.fresh ? `<span class="ok">近期推理</span> · age=${esc(t.age_s)}s · seq=${esc(t.sequence)}` : `<span class="warn">最近推理已过期</span> · age=${esc(t.age_s)}s`;
-  const serverGate = control.mode === 'execute' ? `<span class="warn">服务端 EXECUTE</span> · 到期 ${esc(fmtTime(control.expires_at))}` : `<span class="muted">服务端 SHADOW</span>${control.expired ? ' · 上次授权已过期' : ''}`;
-  const clientGate = t.client_allow_execution ? '<span class="warn">客户端允许执行</span>' : '<span class="muted">客户端禁止执行</span>';
-  const dualGate = t.dual_gate_open ? '<span class="bad">双重门已打开</span>' : '<span class="ok">双重门已关闭</span>';
-  const actual = `实际状态=<code>${esc(t.client_execution_state || 'unknown')}</code>${t.client_blocked_reason ? `<br>原因=${esc(t.client_blocked_reason)}` : ''}${t.client_last_command_at ? `<br>最近下发=${esc(fmtTime(t.client_last_command_at))}` : ''}`;
+  const age = finiteMetric(t.age_s);
   const launchHz = t.client_inference_launch_hz ?? t.client_inference_hz ?? t.recommended_inference_launch_hz ?? 4;
   const actionHz = t.client_policy_action_hz ?? t.action_hz ?? 20;
   const controlHz = t.client_control_hz ?? t.client_command_hz ?? actionHz;
   const chunkRows = t.client_chunk_rows ?? ((t.actions_shape || [])[0] ?? '-');
   const minHorizon = t.minimum_horizon ?? 16;
   const horizon = t.action_horizon ?? '-';
-  const horizonState = t.horizon_execution_ready ? '<span class="ok">horizon 可执行</span>' : `<span class="bad">horizon 阻断</span>${t.horizon_error ? ` · ${esc(t.horizon_error)}` : ''}`;
-  const timing = `inference launch=${esc(launchHz ?? '-')} Hz · action/control=${esc(actionHz ?? '-')}/${esc(controlHz ?? '-')} Hz<br>chunk rows=${esc(chunkRows)} · action horizon=${esc(horizon)} · min horizon=${esc(minHorizon)} (client=${esc(t.client_minimum_horizon ?? '-')}) · ${horizonState} · in-flight=${esc(t.client_in_flight ?? '-')}`;
+  const horizonState = t.horizon_execution_ready ? '<span class="ok">ready</span>' : '<span class="bad">blocked</span>';
+  const target = t.client_timed_target && typeof t.client_timed_target === 'object' ? t.client_timed_target : {};
+  const targetMonotonic = t.client_target_monotonic ?? target.target_monotonic ?? '-';
+  const targetAge = t.client_target_age_s ?? target.target_age_s ?? '-';
   const targetTimes = Array.isArray(t.client_plan_target_times) ? JSON.stringify(t.client_plan_target_times) : '-';
-  const lifecycle = `launch/capture/arrival=${esc(fmtTime(t.client_launch_at))}/${esc(fmtTime(t.client_capture_at ?? t.captured_at))}/${esc(fmtTime(t.client_arrival_at))}<br>latency=${esc(t.client_latency_ms ?? '-')} ms / ${esc(t.client_latency_steps ?? '-')} steps · actuator=${esc(t.client_actuator_delay_ms ?? '-')} ms · expired prefix=${esc(t.client_expired_prefix ?? t.client_skipped_prefix ?? '-')} · blend=${esc(t.client_blend_steps ?? '-')} steps<br>target dt/start=${esc(t.action_time_step_s ?? '-')}s/${esc(t.action_start_offset_steps ?? '-')} step · target monotonic/age=${esc(t.client_target_monotonic ?? '-')}/${esc(t.client_target_age_s ?? '-')}s`;
+  const targetError = actionTimeErrorMs(t);
+  const activeGeneration = t.client_active_plan_generation ?? t.client_queue_generation ?? '-';
+  const activeIndex = t.client_active_plan_index ?? '-';
+  const activeRemaining = t.client_active_plan_remaining ?? t.client_new_remaining ?? '-';
   const rejected = t.client_rejected_result && typeof t.client_rejected_result === 'object'
     ? JSON.stringify(t.client_rejected_result)
     : (t.client_rejected_result ?? false);
-  const plan = `active plan=${esc(t.client_active_plan_generation ?? t.client_queue_generation ?? '-')} · index/remaining=${esc(t.client_active_plan_index ?? '-')}/${esc(t.client_active_plan_remaining ?? t.client_new_remaining ?? '-')} · in-flight=${esc(t.client_in_flight ?? '-')} · hold=${esc(t.client_hold_active ?? false)}(${esc(t.client_hold_steps ?? 0)}) · blend=${esc(t.client_blend_active ?? false)}(${esc(t.client_blend_remaining ?? '-')}) · gripper filter=${esc(t.client_gripper_filter_active ?? false)}`;
-  const queue = `generation active/result=${esc(t.client_queue_generation ?? '-')}/${esc(t.client_result_generation ?? '-')} · old/new remaining=${esc(t.client_old_remaining ?? '-')}/${esc(t.client_new_remaining ?? '-')} · underrun=${esc(t.client_underrun ?? false)} (${esc(t.client_underrun_count ?? 0)}) · rejected=${esc(rejected)} (${esc(t.client_rejected_result_count ?? 0)})${t.client_drop_reason ? `<br>drop=${esc(t.client_drop_reason)}` : ''}<br>${plan}<br>target times=${esc(targetTimes)}`;
-  const contract = `contract=v${esc(t.contract_version || '?')} · raw/model=${esc(t.raw_action_dim || '?')}D/${esc(t.model_action_dim || '?')}D · ${esc(t.model_action_convention || '-')}<br>gripper=${esc(t.raw_gripper_semantics || '-')} → ${esc(t.wire_gripper_semantics || '-')}`;
-  return `${connection}<br>${freshness}<br>${serverGate}<br>${clientGate} · ${dualGate}<br>${actual}<br>${timing}<br>${lifecycle}<br>${queue}<br>${contract}${t.received_at == null ? '' : `<br>source=${esc(t.source_name || '-')} · action=${esc(JSON.stringify(t.actions_shape || []))}`}`;
+  const item = (label, value, className = '') => `<div class="telemetry-item"><span class="telemetry-item-label">${label}</span><strong class="telemetry-item-value ${className}">${value}</strong></div>`;
+  const connection = t.client_connected
+    ? `<span class="ok">WebSocket 已连接 ×${esc(t.active_clients)}</span>`
+    : '<span class="muted">WebSocket 未连接</span>';
+  const freshness = t.received_at == null
+    ? '<span class="muted">尚无推理请求</span>'
+    : t.fresh
+      ? `<span class="ok">近期推理 · age=${esc(age == null ? '-' : age.toFixed(1))}s</span>`
+      : `<span class="warn">推理已过期 · age=${esc(age == null ? '-' : age.toFixed(1))}s</span>`;
+  const serverGate = control.mode === 'execute'
+    ? `<span class="warn">服务端 EXECUTE · 到期 ${esc(fmtTime(control.expires_at))}</span>`
+    : '<span class="muted">服务端 SHADOW</span>';
+  const clientGate = t.client_allow_execution
+    ? '<span class="warn">客户端允许执行</span>'
+    : '<span class="muted">客户端禁止执行</span>';
+  const dualGate = t.dual_gate_open
+    ? '<span class="bad">双重门 OPEN</span>'
+    : '<span class="ok">双重门 CLOSED</span>';
+  const reason = t.client_blocked_reason || t.client_drop_reason || t.horizon_error || '';
+  const details = `
+    <div>推理时序：launch/capture/arrival=${esc(fmtTime(t.client_launch_at))}/${esc(fmtTime(t.client_capture_at ?? t.captured_at))}/${esc(fmtTime(t.client_arrival_at))}</div>
+    <div>异步延迟：capture→result=${esc(metricMs(t.client_latency_ms))} · 上传≈${esc(metricMs(t.server_observation_upload_ms ?? t.client_observation_upload_ms))} · 模型=${esc(metricMs(t.server_model_inference_ms ?? t.client_model_inference_ms))} · 下行≈${esc(metricMs(t.client_result_download_ms))} · RTT=${esc(metricMs(t.client_round_trip_ms))}</div>
+    <div>result→first command=${esc(metricMs(t.client_result_to_first_command_ms))} · observation→first command=${esc(metricMs(t.client_observation_to_first_command_ms))} · actuator=${esc(metricMs(t.client_actuator_delay_ms))}</div>
+    <div>timing generation client/server=${esc(t.client_timing_generation ?? '-')} / ${esc(t.server_timing_generation ?? '-')} · upload/model 属于当前请求，download/RTT 属于最近完成结果</div>
+    <div>时间契约：dt=${esc(t.action_time_step_s ?? '-')}s · start=${esc(t.action_start_offset_steps ?? '-')} step · 当前动作误差=${esc(signedMetricMs(targetError))} · target_at=${esc(fmtTime(actionTargetAt(t)))}</div>
+    <div>target monotonic/age=${esc(targetMonotonic)}/${esc(targetAge)}s · target times=${esc(targetTimes)}</div>
+    <div>generation active/result=${esc(t.client_queue_generation ?? '-')} / ${esc(t.client_result_generation ?? '-')} · old/new remaining=${esc(t.client_old_remaining ?? '-')}/${esc(t.client_new_remaining ?? '-')}</div>
+    <div>hold=${esc(t.client_hold_active ?? false)}(${esc(t.client_hold_steps ?? 0)}) · blend=${esc(t.client_blend_active ?? false)}(${esc(t.client_blend_remaining ?? '-')}） · gripper filter=${esc(t.client_gripper_filter_active ?? false)}</div>
+    <div>rejected=${esc(rejected)} (${esc(t.client_rejected_result_count ?? 0)}) · underrun=${esc(t.client_underrun ?? false)} (${esc(t.client_underrun_count ?? 0)})</div>
+    <div>contract=v${esc(t.contract_version || '?')} · raw/model=${esc(t.raw_action_dim || '?')}D/${esc(t.model_action_dim || '?')}D · ${esc(t.model_action_convention || '-')}</div>
+    <div>gripper=${esc(t.raw_gripper_semantics || '-')} → ${esc(t.wire_gripper_semantics || '-')} · source=${esc(t.source_name || '-')} · action=${esc(JSON.stringify(t.actions_shape || []))}</div>
+  `;
+  return `<div class="policy-telemetry">
+    <div class="telemetry-badges">${connection}${freshness}${serverGate}${clientGate}${dualGate}</div>
+    <div class="telemetry-grid">
+      ${item('实际状态', `<code>${esc(t.client_execution_state || 'unknown')}</code>`, t.client_execution_state === 'ready' || t.client_execution_state === 'executing' ? 'ok' : '')}
+      ${item('推理 / 控制频率', `${esc(launchHz)} / ${esc(controlHz)} Hz`)}
+      ${item('动作频率 / chunk', `${esc(actionHz)} Hz · ${esc(chunkRows)}×${esc(t.model_action_dim || '?')}`)}
+      ${item('horizon', `${esc(horizon)} / min ${esc(minHorizon)} · ${horizonState}`)}
+      ${item('当前 plan', `gen ${esc(activeGeneration)} · ${esc(activeIndex)} / ${esc(activeRemaining)}`)}
+      ${item('时间误差（now-target）', esc(signedMetricMs(targetError)), targetError != null && targetError > 100 ? 'warn' : '')}
+      ${item('模型推理（当前请求）', esc(metricMs(t.server_model_inference_ms ?? t.client_model_inference_ms)))}
+      ${item('网络 / RTT', `${esc(metricMs(t.client_network_transport_total_ms))} / ${esc(metricMs(t.client_round_trip_ms))}`)}
+    </div>
+    ${reason ? `<div class="telemetry-alert"><strong>当前原因：</strong>${esc(reason)}</div>` : ''}
+    <details class="telemetry-details"><summary>展开详细遥测</summary><div class="telemetry-detail-list">${details}</div></details>
+  </div>`;
 }
 
 function policyControlButtons(task) {
@@ -1002,6 +1132,7 @@ function jobDependencySummary(task) {
   const dependency = task.dependency || {};
   const id = dependency.task_id || (task.metadata || {}).depends_on;
   if (!id) return '';
+  if (task.type === 'eval') return `<br><span class="muted">父训练 <code class="task-ref" title="${esc(id)}">${esc(shortTaskId(id))}</code></span>`;
   if (task.dependency_failed) return `<br><span class="bad">norm 串联失败</span><br><span class="muted">${esc(task.dependency_error || '依赖任务失败')}</span>`;
   if (task.state === 'waiting_norm') return `<br><span class="warn">等待 norm</span><br><code class="task-ref" title="${esc(id)}">${esc(shortTaskId(id))}</code> · ${esc(task.dependency_state || 'pending')}`;
   if (task.state === 'waiting_gpu') return `<br><span class="warn">norm 已完成，等待 GPU</span><br><code class="task-ref" title="${esc(id)}">${esc(shortTaskId(id))}</code><br><span class="muted">${esc(task.waiting_reason || 'GPU 暂不可用')}</span>`;
@@ -1023,13 +1154,26 @@ function fillTasks(items) {
   document.getElementById('jobs').innerHTML = jobs.map(t => {
     const m = t.metadata || {};
     const active = ACTIVE_STATES.has(t.state);
-    const split = m.train_episodes !== undefined ? `<br>split=${esc(m.train_episodes)} train / ${esc(m.test_episodes)} test · ratio ${esc(m.test_ratio)} · seed ${esc(m.split_seed)}${m.split_source ? ` · ${esc(m.split_source)}` : ''}` : '';
-    const model = `<br>model=${esc(modelVariantLabel(m.model_variant))}${m.base_checkpoint ? ` · base=<code class="path" title="${esc(m.base_checkpoint)}">${esc(shortPath(m.base_checkpoint))}</code>` : ''}`;
-    const contract = `<br>contract=v${esc(m.contract_version || '?')} · raw/model=${esc(m.raw_action_dim || '?')}D/${esc(m.model_action_dim || '?')}D · offset=${esc(m.action_offset ?? '-')}/+${esc(m.model_action_start_offset ?? 1)} · ${esc(m.model_action_convention || '-')}<br>gripper=${esc(m.raw_gripper_semantics || '-')} → ${esc(m.gripper_semantics || m.wire_gripper_semantics || '-')}`;
-    const params = `dataset=${esc(m.dataset_id || '-')} · arm=${esc(m.arm_mode || '-')} · schema=${esc(m.schema || '-')}${contract}${model}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}<br>train batch=${esc(m.batch_size || '-')} · FSDP ${esc(m.fsdp_devices || '-')} · XLA ${esc(m.xla_memory_fraction || '-')}<br>norm batch=${esc(m.norm_batch_size || '等待/未知')}` : `<br>norm batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}${split}`;
     const deletable = TERMINAL_STATES.has(t.state);
-    return `<tr><td><code class="task-ref" title="${esc(t.id)}">${esc(shortTaskId(t.id))}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${jobDependencySummary(t)}${t.start_error ? `<br><span class="bad">${esc(t.start_error)}</span>` : ''}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}','training')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','training')">删除记录</button>` : ''}</td></tr>`;
-  }).join('') || '<tr><td colspan="4" class="muted">暂无 Norm / Train 任务</td></tr>';
+    let params = '';
+    if (t.type === 'eval') {
+      const result = t.result || {};
+      const loss = result.eval_loss_model;
+      params = `dataset=${esc(m.dataset_id || '-')} · checkpoint step <strong>${esc(m.checkpoint_step || '-')}</strong> · GPU ${esc((m.gpu_ids || []).join(',') || '-')}<br>` +
+        `<code class="path" title="${esc(m.checkpoint || '')}">${esc(shortPath(m.checkpoint || '-'))}</code><br>` +
+        `test=${esc(m.test_episodes || (m.test_episode_indexes || []).length || '-')} episodes · batch=${esc(m.batch_size || '-')} × ${esc(m.max_batches || '-')} max` +
+        (loss == null ? '' : `<br><span class="ok">eval loss=${esc(compactNumber(loss))}</span> · objective=${esc(compactNumber(result.eval_loss_objective))} · ${esc(result.evaluated_batches || '-')} batches`) +
+        (t.skip_reason ? `<br><span class="warn">${esc(t.skip_reason)}</span>` : '');
+    } else {
+      const split = m.train_episodes !== undefined ? `<br>split=${esc(m.train_episodes)} train / ${esc(m.test_episodes)} test · ratio ${esc(m.test_ratio)} · seed ${esc(m.split_seed)}${m.split_source ? ` · ${esc(m.split_source)}` : ''}` : '';
+      const model = `<br>model=${esc(modelVariantLabel(m.model_variant))}${m.base_checkpoint ? ` · base=<code class="path" title="${esc(m.base_checkpoint)}">${esc(shortPath(m.base_checkpoint))}</code>` : ''}`;
+      const contract = `<br>contract=v${esc(m.contract_version || '?')} · raw/model=${esc(m.raw_action_dim || '?')}D/${esc(m.model_action_dim || '?')}D · offset=${esc(m.action_offset ?? '-')}/+${esc(m.model_action_start_offset ?? 1)} · ${esc(m.model_action_convention || '-')}<br>gripper=${esc(m.raw_gripper_semantics || '-')} → ${esc(m.gripper_semantics || m.wire_gripper_semantics || '-')}`;
+      const evalConfig = m.auto_eval ? `<br>eval=${m.auto_eval.enabled ? `每 ${esc(m.auto_eval.every_steps)} steps · batch ${esc(m.auto_eval.batch_size)} × ${esc(m.auto_eval.max_batches)}` : `禁用${m.auto_eval.disabled_reason ? ` (${esc(m.auto_eval.disabled_reason)})` : ''}`}` : '';
+      params = `dataset=${esc(m.dataset_id || '-')} · arm=${esc(m.arm_mode || '-')} · schema=${esc(m.schema || '-')}${contract}${model}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}<br>train batch=${esc(m.batch_size || '-')} · FSDP ${esc(m.fsdp_devices || '-')} · XLA ${esc(m.xla_memory_fraction || '-')}<br>norm batch=${esc(m.norm_batch_size || '等待/未知')}${evalConfig}` : `<br>norm batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}${split}`;
+    }
+    const stateDetails = `${jobDependencySummary(t)}${t.skip_reason ? `<br><span class="warn">${esc(t.skip_reason)}</span>` : ''}${t.start_error ? `<br><span class="bad">${esc(t.start_error)}</span>` : ''}`;
+    return `<tr><td><code class="task-ref" title="${esc(t.id)}">${esc(shortTaskId(t.id))}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${stateDetails}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}','training')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','training')">删除记录</button>` : ''}</td></tr>`;
+  }).join('') || '<tr><td colspan="4" class="muted">暂无 Norm / Train / Eval 任务</td></tr>';
   fillReplacePolicies(items);
   updateClientCommand();
 }
@@ -1043,7 +1187,8 @@ function updateSummaries(data) {
   const frames = datasets.reduce((sum, dataset) => sum + Number(dataset.frames || 0), 0);
   const trainTasks = tasks.filter(task => task.type === 'train');
   const normTasks = tasks.filter(task => task.type === 'norm');
-  const activeTraining = [...trainTasks, ...normTasks].filter(task => ACTIVE_STATES.has(task.state));
+  const evalTasks = tasks.filter(task => task.type === 'eval');
+  const activeTraining = [...trainTasks, ...normTasks, ...evalTasks].filter(task => ACTIVE_STATES.has(task.state));
   const policies = tasks.filter(task => task.type === 'policy');
   const activePolicies = policies.filter(task => ['starting', 'running', 'stopping'].includes(task.state));
   const observation = data.robot_observation;
@@ -1154,12 +1299,27 @@ function fillObservation(obs) {
     document.getElementById('robotStateTitle').textContent = 'Policy state';
     document.getElementById('robotState').textContent = 'state: -';
     document.getElementById('policyAction').textContent = 'action: -';
+    ['telemetryUpload', 'telemetryModel', 'telemetryDownload', 'telemetryTransport', 'telemetryFirstCommand', 'telemetryActionError'].forEach(id => { document.getElementById(id).textContent = '-'; });
     return;
   }
   const control = obs.execution_control || {};
   status.className = obs.dual_gate_open ? 'bad' : obs.fresh ? 'ok' : 'warn';
   const captured = fmtTime(obs.client_capture_at ?? obs.captured_at);
-  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · 服务端=${control.mode || 'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open ? 'OPEN' : 'CLOSED'} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
+  const currentTargetErrorMs = actionTimeErrorMs(obs);
+  // Server-side upload/model values belong to the current request; client-side
+  // download/RTT values arrive with the most recently completed result.
+  const uploadMs = obs.server_observation_upload_ms ?? obs.client_observation_upload_ms;
+  const modelMs = obs.server_model_inference_ms ?? obs.client_model_inference_ms;
+  const downloadMs = obs.client_result_download_ms;
+  const transportMs = obs.client_network_transport_total_ms;
+  const roundTripMs = obs.client_round_trip_ms;
+  document.getElementById('telemetryUpload').textContent = metricMs(uploadMs);
+  document.getElementById('telemetryModel').textContent = metricMs(modelMs);
+  document.getElementById('telemetryDownload').textContent = metricMs(downloadMs);
+  document.getElementById('telemetryTransport').textContent = `${metricMs(transportMs)} / ${metricMs(roundTripMs)}`;
+  document.getElementById('telemetryFirstCommand').textContent = metricMs(obs.client_result_to_first_command_ms);
+  document.getElementById('telemetryActionError').textContent = signedMetricMs(currentTargetErrorMs);
+  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · 服务端=${control.mode || 'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open ? 'OPEN' : 'CLOSED'} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · 上传估算=${metricMs(uploadMs)} · 推理实测=${metricMs(modelMs)} · 下行估算=${metricMs(downloadMs)} · 当前动作时间误差=${signedMetricMs(currentTargetErrorMs)} · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
   const joint = obs.schema === 'joint';
   const stateGripper = String(obs.state_gripper_semantics || obs.raw_gripper_semantics || '');
   const gripperLabel = stateGripper.includes('metre') || stateGripper.endsWith('_m')
@@ -1189,6 +1349,7 @@ function fillObservation(obs) {
   const decoded = obs.client_last_decoded_target ?? obs.client_last_decoded_absolute_target;
   const decodedTarget = decoded ? JSON.stringify(decoded) : '-';
   const targetTimes = Array.isArray(obs.client_plan_target_times) ? JSON.stringify(obs.client_plan_target_times) : '-';
+  const targetAt = actionTargetAt(obs);
   const rejectedResult = obs.client_rejected_result ? JSON.stringify(obs.client_rejected_result) : false;
   const horizonStatus = obs.horizon_execution_ready
     ? `ready (>= ${obs.minimum_horizon ?? 16})`
@@ -1205,7 +1366,10 @@ action_horizon / min horizon: ${obs.action_horizon ?? '-'} / ${obs.minimum_horiz
 time contract: offset=${obs.action_offset ?? '-'} · model/wire start=${obs.model_action_start_offset ?? '-'}/${obs.action_start_offset_steps ?? '-'} · dt=${obs.action_time_step_s ?? '-'}s · ${obs.time_contract_ready ? 'ready' : ('BLOCKED: ' + (obs.time_contract_error || 'invalid'))}
 in-flight: ${obs.client_in_flight ?? '-'} · actuator delay=${obs.client_actuator_delay_ms ?? '-'} ms / ${obs.client_actuator_delay_steps ?? '-'} steps
 launch / capture / arrival: ${fmtTime(obs.client_launch_at)} / ${fmtTime(obs.client_capture_at ?? obs.captured_at)} / ${fmtTime(obs.client_arrival_at)}
-latency: ${obs.client_latency_ms ?? '-'} ms / ${obs.client_latency_steps ?? '-'} steps
+latency (capture→result): ${metricMs(obs.client_latency_ms)} / ${obs.client_latency_steps ?? '-'} steps
+async latency breakdown: camera=${metricMs(obs.client_camera_capture_ms)} · upload≈${metricMs(obs.server_observation_upload_ms ?? obs.client_observation_upload_ms)} · model=${metricMs(obs.server_model_inference_ms ?? obs.client_model_inference_ms)} · result→client≈${metricMs(obs.client_result_download_ms)} · transport total=${metricMs(obs.client_network_transport_total_ms)} · RTT=${metricMs(obs.client_round_trip_ms)}
+result→first command: ${metricMs(obs.client_result_to_first_command_ms)} · observation→first command=${metricMs(obs.client_observation_to_first_command_ms)}
+server timing: request received=${fmtTime(obs.client_server_request_received_at ?? obs.server_request_received_at)} · model done=${fmtTime(obs.client_server_model_completed_at ?? obs.server_model_completed_at)} · response ready=${fmtTime(obs.client_server_response_ready_at)} · client received=${fmtTime(obs.client_response_received_at)}
 expired prefix / skipped prefix / blend: ${obs.client_expired_prefix ?? '-'} / ${obs.client_skipped_prefix ?? '-'} / ${obs.client_blend_steps ?? '-'} steps
 active plan generation/index/remaining: ${obs.client_active_plan_generation ?? '-'} / ${obs.client_active_plan_index ?? '-'} / ${obs.client_active_plan_remaining ?? '-'}
 queue generation active/result: ${obs.client_queue_generation ?? '-'} / ${obs.client_result_generation ?? '-'} · old/new remaining: ${obs.client_old_remaining ?? '-'} / ${obs.client_new_remaining ?? '-'}
@@ -1216,7 +1380,8 @@ underrun: ${obs.client_underrun ?? false} (count=${obs.client_underrun_count ?? 
 rejected result: ${rejectedResult} (count=${obs.client_rejected_result_count ?? 0})
 drop reason: ${obs.client_drop_reason || '-'}
 plan target times: ${targetTimes}
-current timed target: ${obs.client_timed_target ? JSON.stringify(obs.client_timed_target) : '-'}
+current model action target: ${obs.client_timed_target ? JSON.stringify(obs.client_timed_target) : '-'}
+current action target timestamp: ${fmtTime(targetAt)} · time error (now-target, signed): ${signedMetricMs(currentTargetErrorMs)} · snapshot=${fmtTime(obs.client_timing_snapshot_at)}
 last safe target: ${obs.client_last_safe_target ? JSON.stringify(obs.client_last_safe_target) : '-'}
 queue anchor: ${queueAnchor}
 safety profile: ${obs.client_safety_profile || '-'}

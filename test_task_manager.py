@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from server_4090.app import TaskManager
 
@@ -19,6 +20,15 @@ class TaskManagerDeleteTest(unittest.TestCase):
         self.manager = TaskManager({
             "workspace_root": self.tempdir.name,
             "task_monitor_interval_s": 0,
+            "openpi_python": "/opt/openpi/bin/python",
+            "openpi_repo": "/opt/openpi",
+            "dataset_root": "/datasets",
+            "assets_base_dir": "/assets",
+            "checkpoint_base_dir": "/checkpoints",
+            "base_checkpoint": "/base/pi05",
+            "allowed_gpu_ids": [0, 1, 2, 3],
+            "evaluation_min_free_gpu_mib": 23000,
+            "evaluation_xla_memory_fraction": 0.85,
         })
 
     def tearDown(self):
@@ -81,6 +91,102 @@ class TaskManagerDeleteTest(unittest.TestCase):
             self.manager.delete("norm-history")
 
         self.assertTrue(norm_dir.exists())
+
+    def make_auto_eval_train(self) -> dict:
+        checkpoint_dir = Path(self.tempdir.name) / "checkpoints" / "experiment"
+        step = checkpoint_dir / "5000"
+        (step / "params").mkdir(parents=True)
+        (step / "_CHECKPOINT_METADATA").write_text("{}", encoding="utf-8")
+        (step / "params" / "_METADATA").write_text("{}", encoding="utf-8")
+        return {
+            "id": "train-live",
+            "type": "train",
+            "state": "running",
+            "created_at": "2026-08-04T00:00:00+0800",
+            "command": ["python", "train.py"],
+            "metadata": {
+                "dataset_id": "dataset-v3",
+                "arm_mode": "single",
+                "arm_side": "right",
+                "schema": "delivery",
+                "model_variant": "pi05",
+                "base_checkpoint": "/base/pi05",
+                "checkpoint_dir": str(checkpoint_dir),
+                "save_interval": 1000,
+                "test_episodes": 1,
+                "test_episode_indexes": [8],
+                "test_ratio": 0.1,
+                "split_seed": 42,
+                "contract_version": 3,
+                "raw_action_dim": 10,
+                "model_action_dim": 7,
+                "raw_action_semantics": "absolute_eef_target",
+                "model_action_semantics": "eef_delta_chunk_origin_base_xyz_left_rotvec_gripper_opening_target",
+                "raw_action_convention": "absolute_eef_target",
+                "model_action_convention": "chunk_origin",
+                "raw_gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+                "gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+                "action_offset": 1,
+                "model_action_start_offset": 1,
+                "auto_eval": {
+                    "enabled": True,
+                    "every_steps": 5000,
+                    "batch_size": 1,
+                    "num_workers": 0,
+                    "max_batches": 2,
+                    "seed": 42,
+                    "minimum_free_gpu_mib": 23000,
+                    "xla_memory_fraction": 0.85,
+                },
+            },
+        }
+
+    @mock.patch("server_4090.app.gpu_inventory", return_value=[])
+    def test_auto_eval_records_no_gpu_skip_once(self, _inventory):
+        train = self.make_auto_eval_train()
+
+        self.manager._reconcile_auto_evals_locked([train])
+        eval_tasks = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in (Path(self.tempdir.name) / "tasks").glob("eval-*/task.json")
+        ]
+        self.assertEqual(len(eval_tasks), 1)
+        self.assertEqual(eval_tasks[0]["state"], "skipped")
+        self.assertEqual(eval_tasks[0]["skip_reason"], "no_idle_gpu")
+
+        self.manager._reconcile_auto_evals_locked([train, *eval_tasks])
+        self.assertEqual(len(list((Path(self.tempdir.name) / "tasks").glob("eval-*/task.json"))), 1)
+
+    @mock.patch("server_4090.app.cuda_visible_devices", return_value="GPU-zero")
+    @mock.patch("server_4090.app.gpu_inventory")
+    def test_auto_eval_launches_independent_single_gpu_task(self, inventory, _visible):
+        inventory.return_value = [{
+            "index": 0,
+            "uuid": "GPU-zero",
+            "memory_total_mib": 24564,
+            "memory_used_mib": 10,
+            "processes": [],
+            "compute_available": True,
+        }]
+        train = self.make_auto_eval_train()
+        launched = []
+
+        def fake_launch(task, *, env, raise_on_error):
+            task["state"] = "running"
+            task["captured_env"] = env
+            launched.append(task)
+            return task
+
+        with mock.patch.object(self.manager, "_launch", side_effect=fake_launch):
+            self.manager._reconcile_auto_evals_locked([train])
+
+        self.assertEqual(len(launched), 1)
+        task = launched[0]
+        self.assertEqual(task["metadata"]["gpu_ids"], [0])
+        self.assertEqual(task["metadata"]["checkpoint_step"], 5000)
+        self.assertIn("eval_heldout_loss.py", " ".join(task["command"]))
+        self.assertEqual(task["captured_env"]["CUDA_VISIBLE_DEVICES"], "GPU-zero")
+        self.assertEqual(task["captured_env"]["XLA_PYTHON_CLIENT_MEM_FRACTION"], "0.85")
 
     def test_accepts_dependency_field_used_only_by_terminal_task(self):
         norm_dir = self.write_task("norm-old", task_type="norm", state="completed")

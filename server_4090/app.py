@@ -119,10 +119,10 @@ APP_DIR = Path(__file__).resolve().parent
 REPO_DIR = APP_DIR.parent
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-TASK_TYPES = {"norm", "train", "policy"}
+TASK_TYPES = {"norm", "train", "eval", "policy"}
 PROCESS_STATES = {"starting", "running", "stopping"}
 WAITING_STATES = {"waiting_norm", "waiting_gpu"}
-TERMINAL_STATES = {"completed", "failed", "lost", "stopped"}
+TERMINAL_STATES = {"completed", "failed", "lost", "stopped", "skipped"}
 ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 TRAIN_STEP = re.compile(r"\bStep\s+(\d+)\s*:\s*(.*)$", re.IGNORECASE)
 TRAIN_METRIC = re.compile(
@@ -174,6 +174,123 @@ def parse_training_metrics(log_text: str, *, max_points: int = 1200) -> dict[str
         "total_points": total_points,
         "sampled_points": len(points),
     }
+
+
+def complete_checkpoint_steps(checkpoint_dir: Path) -> list[tuple[int, Path]]:
+    """Return complete numeric Orbax checkpoints without expensive size scans."""
+    checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.is_dir():
+        return []
+    checkpoints: list[tuple[int, Path]] = []
+    for child in checkpoint_dir.iterdir():
+        if not child.is_dir() or not child.name.isdigit():
+            continue
+        if not (child / "_CHECKPOINT_METADATA").is_file():
+            continue
+        if not (child / "params" / "_METADATA").is_file():
+            continue
+        checkpoints.append((int(child.name), child.resolve()))
+    return sorted(checkpoints)
+
+
+def select_idle_eval_gpu(
+    task_list: list[dict[str, Any]],
+    inventory: list[dict[str, Any]],
+    *,
+    allowed_gpu_ids: set[int],
+    minimum_free_mib: int,
+) -> int | None:
+    """Choose a truly idle GPU, including the process-start reservation window."""
+    reserved = {
+        int(gpu_id)
+        for task in task_list
+        if task.get("state") in PROCESS_STATES
+        and task.get("type") in {"train", "eval", "policy"}
+        for gpu_id in task.get("metadata", {}).get("gpu_ids", [])
+    }
+    candidates: list[tuple[int, int]] = []
+    for gpu in inventory:
+        gpu_id = int(gpu.get("index", -1))
+        if gpu_id not in allowed_gpu_ids or gpu_id in reserved:
+            continue
+        if gpu.get("compute_available") is not True or gpu.get("processes"):
+            continue
+        free_mib = int(gpu.get("memory_total_mib", 0)) - int(gpu.get("memory_used_mib", 0))
+        if free_mib < minimum_free_mib:
+            continue
+        candidates.append((free_mib, gpu_id))
+    if not candidates:
+        return None
+    # Prefer the emptiest candidate, then a stable physical GPU id.
+    return max(candidates, key=lambda item: (item[0], -item[1]))[1]
+
+
+def merge_eval_metrics(
+    training_metrics: dict[str, Any],
+    eval_tasks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Merge completed held-out metrics into the same step-indexed chart points."""
+    by_step = {int(point["step"]): dict(point) for point in training_metrics.get("points", [])}
+    original_summary = dict(training_metrics.get("summary", {}))
+    original_total_points = int(training_metrics.get("total_points", len(by_step)))
+    eval_runs: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    for task in sorted(eval_tasks, key=lambda item: int(item.get("metadata", {}).get("checkpoint_step", 0))):
+        metadata = task.get("metadata", {})
+        state = str(task.get("state", "unknown"))
+        counts[state] = counts.get(state, 0) + 1
+        run: dict[str, Any] = {
+            "task_id": task.get("id"),
+            "state": state,
+            "checkpoint_step": metadata.get("checkpoint_step"),
+            "checkpoint": metadata.get("checkpoint"),
+            "gpu_ids": metadata.get("gpu_ids", []),
+            "skip_reason": task.get("skip_reason") or metadata.get("skip_reason"),
+            "finished_at": task.get("finished_at"),
+        }
+        result_path = metadata.get("result_path")
+        result = read_json(Path(result_path)) if result_path else None
+        if isinstance(result, dict):
+            run["result"] = result
+            step = int(result.get("checkpoint_step", metadata.get("checkpoint_step", 0)))
+            point = by_step.setdefault(step, {"step": step})
+            for key, value in result.items():
+                if key.startswith("eval_") and key != "eval_loss_per_dim" and isinstance(value, (int, float)):
+                    number = float(value)
+                    if math.isfinite(number):
+                        point[key] = number
+        eval_runs.append(run)
+
+    all_points = [by_step[step] for step in sorted(by_step)]
+    series = sorted({key for point in all_points for key in point if key != "step"})
+    summary: dict[str, dict[str, float]] = original_summary
+    for key in (item for item in series if item.startswith("eval_")):
+        values = [float(point[key]) for point in all_points if key in point]
+        if values:
+            summary[key] = {"latest": values[-1], "min": min(values), "max": max(values)}
+    eval_points = [point for point in all_points if any(key.startswith("eval_") for key in point)]
+    model_points = [point for point in eval_points if "eval_loss_model" in point]
+    eval_summary: dict[str, Any] = {"counts": counts}
+    if model_points:
+        latest = model_points[-1]
+        best = min(model_points, key=lambda point: float(point["eval_loss_model"]))
+        eval_summary.update({
+            "latest_step": int(latest["step"]),
+            "latest_loss": float(latest["eval_loss_model"]),
+            "best_step": int(best["step"]),
+            "best_loss": float(best["eval_loss_model"]),
+        })
+    training_metrics.update({
+        "points": all_points,
+        "series": series,
+        "summary": summary,
+        "total_points": original_total_points,
+        "sampled_points": len(all_points),
+        "eval_points": eval_points,
+        "eval_runs": eval_runs,
+        "eval_summary": eval_summary,
+    })
+    return training_metrics
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -979,6 +1096,8 @@ def load_config(path: Path) -> dict[str, Any]:
         "allow_busy_gpus": False,
         "xla_memory_fraction": 0.90,
         "training_min_free_gpu_mib": 23_000,
+        "evaluation_min_free_gpu_mib": 23_000,
+        "evaluation_xla_memory_fraction": 0.85,
         "max_upload_gib": 500,
         "max_chunk_mib": 64,
         "policy_port_min": 8000,
@@ -1035,7 +1154,9 @@ class TaskManager:
             if self.monitor_stop.is_set():
                 return
             try:
-                self.list()
+                with self.lock:
+                    current = self._refresh_all_locked()
+                    self._reconcile_auto_evals_locked(current)
             except Exception:
                 logging.getLogger(__name__).exception("task dependency monitor failed")
 
@@ -1142,7 +1263,7 @@ class TaskManager:
             other = read_json(path)
             if not isinstance(other, dict) or other.get("id") == task["id"]:
                 continue
-            if other.get("state") not in PROCESS_STATES or other.get("type") not in {"train", "policy"}:
+            if other.get("state") not in PROCESS_STATES or other.get("type") not in {"train", "eval", "policy"}:
                 continue
             overlap = requested.intersection(other.get("metadata", {}).get("gpu_ids", []))
             for gpu_id in overlap:
@@ -1297,21 +1418,249 @@ class TaskManager:
         atomic_json(self._path(task_id), task)
         return task
 
+    def _decorate_eval_result(self, task: dict[str, Any]) -> dict[str, Any]:
+        if task.get("type") != "eval":
+            return task
+        result_path = task.get("metadata", {}).get("result_path")
+        result = read_json(Path(result_path)) if result_path else None
+        if isinstance(result, dict):
+            task["result"] = result
+        return task
+
+    def _refresh_all_locked(self) -> list[dict[str, Any]]:
+        tasks = []
+        for path in self.root.glob("*/task.json"):
+            task = read_json(path)
+            if isinstance(task, dict):
+                tasks.append(self._decorate_eval_result(self._refresh(task)))
+        return sorted(tasks, key=lambda item: item.get("created_at", ""), reverse=True)
+
+    def _auto_eval_settings(self, train_task: dict[str, Any]) -> dict[str, Any]:
+        metadata = train_task.get("metadata", {})
+        explicit = metadata.get("auto_eval")
+        save_interval = max(1, int(metadata.get("save_interval", 1000)))
+        if isinstance(explicit, dict):
+            settings = dict(explicit)
+        else:
+            # Backward compatibility: active training tasks created before this
+            # feature evaluate durable 5000-step checkpoints automatically.
+            settings = {
+                "enabled": bool(
+                    metadata.get(
+                        "eval_enabled",
+                        train_task.get("state") in PROCESS_STATES,
+                    )
+                ),
+                "every_steps": int(metadata.get("eval_interval_steps", max(5000, save_interval))),
+                "batch_size": int(metadata.get("eval_batch_size", 1)),
+                "num_workers": int(metadata.get("eval_num_workers", 2)),
+                "max_batches": int(metadata.get("eval_max_batches", 50)),
+                "seed": int(metadata.get("eval_seed", metadata.get("split_seed", 0))),
+                "minimum_free_gpu_mib": int(
+                    metadata.get(
+                        "eval_minimum_free_gpu_mib",
+                        self.config.get("evaluation_min_free_gpu_mib", 23_000),
+                    )
+                ),
+                "xla_memory_fraction": float(
+                    metadata.get(
+                        "eval_xla_memory_fraction",
+                        self.config.get("evaluation_xla_memory_fraction", 0.85),
+                    )
+                ),
+            }
+        settings.setdefault("enabled", True)
+        settings.setdefault("every_steps", max(5000, save_interval))
+        settings.setdefault("batch_size", 1)
+        settings.setdefault("num_workers", 2)
+        settings.setdefault("max_batches", 50)
+        settings.setdefault("seed", int(metadata.get("split_seed", 0)))
+        settings.setdefault(
+            "minimum_free_gpu_mib",
+            int(self.config.get("evaluation_min_free_gpu_mib", 23_000)),
+        )
+        settings.setdefault(
+            "xla_memory_fraction",
+            float(self.config.get("evaluation_xla_memory_fraction", 0.85)),
+        )
+        return settings
+
+    def _auto_eval_command(
+        self,
+        train_task: dict[str, Any],
+        checkpoint: Path,
+        result_path: Path,
+        settings: dict[str, Any],
+    ) -> list[str]:
+        metadata = train_task.get("metadata", {})
+        contract = {
+            **metadata,
+            "schema": metadata["schema"],
+            "raw_gripper_semantics": metadata["raw_gripper_semantics"],
+            "model_gripper_semantics": metadata["gripper_semantics"],
+        }
+        return [
+            self.config["openpi_python"],
+            str(APP_DIR / "eval_heldout_loss.py"),
+            "--checkpoint", str(checkpoint),
+            "--result-json", str(result_path),
+            "--dataset-id", str(metadata["dataset_id"]),
+            "--arm-mode", str(metadata["arm_mode"]),
+            "--arm-side", str(metadata["arm_side"]),
+            "--schema", str(metadata["schema"]),
+            "--model-variant", str(metadata.get("model_variant", "pi05")),
+            "--assets-base-dir", self.config["assets_base_dir"],
+            "--checkpoint-base-dir", self.config["checkpoint_base_dir"],
+            "--base-checkpoint", str(metadata.get("base_checkpoint", self.config["base_checkpoint"])),
+            "--batch-size", str(settings["batch_size"]),
+            "--num-workers", str(settings["num_workers"]),
+            "--max-batches", str(settings["max_batches"]),
+            "--eval-seed", str(settings["seed"]),
+        ] + action_contract_command_args(contract)
+
+    def _create_auto_eval_locked(
+        self,
+        train_task: dict[str, Any],
+        checkpoint_step: int,
+        checkpoint: Path,
+        settings: dict[str, Any],
+        *,
+        gpu_id: int | None,
+        skip_reason: str | None = None,
+    ) -> dict[str, Any]:
+        train_metadata = train_task.get("metadata", {})
+        metadata = {
+            "parent_train_task_id": train_task["id"],
+            "depends_on": train_task["id"],
+            "automatic": True,
+            "trigger": "checkpoint_complete",
+            "dedupe_key": f"{train_task['id']}:{checkpoint_step}",
+            "dataset_id": train_metadata.get("dataset_id"),
+            "arm_mode": train_metadata.get("arm_mode"),
+            "arm_side": train_metadata.get("arm_side"),
+            "schema": train_metadata.get("schema"),
+            "model_variant": train_metadata.get("model_variant"),
+            "checkpoint": str(checkpoint),
+            "checkpoint_step": checkpoint_step,
+            "gpu_ids": [] if gpu_id is None else [gpu_id],
+            "test_ratio": train_metadata.get("test_ratio"),
+            "split_seed": train_metadata.get("split_seed"),
+            "test_episodes": train_metadata.get("test_episodes"),
+            "test_episode_indexes": train_metadata.get("test_episode_indexes", []),
+            "batch_size": int(settings["batch_size"]),
+            "num_workers": int(settings["num_workers"]),
+            "max_batches": int(settings["max_batches"]),
+            "eval_seed": int(settings["seed"]),
+            "xla_memory_fraction": float(settings["xla_memory_fraction"]),
+        }
+        task = self._new_task(
+            "eval",
+            [],
+            metadata,
+            state="skipped" if skip_reason else "starting",
+        )
+        result_path = self.root / task["id"] / "result.json"
+        task["metadata"]["result_path"] = str(result_path)
+        task["command"] = self._auto_eval_command(
+            train_task, checkpoint, result_path, settings
+        )
+        if skip_reason:
+            task["skip_reason"] = skip_reason
+            task["metadata"]["skip_reason"] = skip_reason
+            task["finished_at"] = now_iso()
+            atomic_json(self._path(task["id"]), task)
+            self._append_log(task, f"evaluation skipped: {skip_reason}")
+            return task
+        atomic_json(self._path(task["id"]), task)
+        self._append_log(
+            task,
+            f"starting held-out evaluation for checkpoint step {checkpoint_step} on GPU {gpu_id}",
+        )
+        return self._launch(
+            task,
+            env=build_environment(
+                self.config,
+                [int(gpu_id)],
+                xla_memory_fraction=float(settings["xla_memory_fraction"]),
+            ),
+            raise_on_error=False,
+        )
+
+    def _reconcile_auto_evals_locked(self, task_list: list[dict[str, Any]]) -> None:
+        existing_keys = {
+            task.get("metadata", {}).get("dedupe_key")
+            for task in task_list
+            if task.get("type") == "eval"
+        }
+        allowed_gpu_ids = set(map(int, self.config.get("allowed_gpu_ids", [])))
+        for train_task in sorted(
+            (task for task in task_list if task.get("type") == "train"),
+            key=lambda item: item.get("created_at", ""),
+        ):
+            if train_task.get("state") not in PROCESS_STATES | {"completed"}:
+                continue
+            metadata = train_task.get("metadata", {})
+            settings = self._auto_eval_settings(train_task)
+            if not settings.get("enabled") or int(metadata.get("test_episodes", 0)) <= 0:
+                continue
+            every_steps = int(settings["every_steps"])
+            if every_steps <= 0:
+                continue
+            eval_after_step = int(metadata.get("eval_after_step", 0))
+            checkpoints = [
+                (step, path)
+                for step, path in complete_checkpoint_steps(Path(metadata.get("checkpoint_dir", "")))
+                if step > eval_after_step and step % every_steps == 0
+                and f"{train_task['id']}:{step}" not in existing_keys
+            ]
+            if not checkpoints:
+                continue
+            # At most one new eval decision per train per monitor cycle.
+            checkpoint_step, checkpoint = checkpoints[0]
+            active_eval = next((
+                task for task in task_list
+                if task.get("type") == "eval"
+                and task.get("state") in PROCESS_STATES
+                and task.get("metadata", {}).get("parent_train_task_id") == train_task["id"]
+            ), None)
+            if active_eval is not None:
+                created = self._create_auto_eval_locked(
+                    train_task,
+                    checkpoint_step,
+                    checkpoint,
+                    settings,
+                    gpu_id=None,
+                    skip_reason=f"previous_eval_still_running:{active_eval['id']}",
+                )
+            else:
+                inventory = gpu_inventory()
+                gpu_id = select_idle_eval_gpu(
+                    task_list,
+                    inventory,
+                    allowed_gpu_ids=allowed_gpu_ids,
+                    minimum_free_mib=int(settings["minimum_free_gpu_mib"]),
+                )
+                created = self._create_auto_eval_locked(
+                    train_task,
+                    checkpoint_step,
+                    checkpoint,
+                    settings,
+                    gpu_id=gpu_id,
+                    skip_reason="no_idle_gpu" if gpu_id is None else None,
+                )
+            task_list.append(created)
+            existing_keys.add(created.get("metadata", {}).get("dedupe_key"))
+
     def list(self) -> list[dict[str, Any]]:
         with self.lock:
-            tasks = []
-            for path in self.root.glob("*/task.json"):
-                task = read_json(path)
-                if isinstance(task, dict):
-                    tasks.append(self._refresh(task))
-            return sorted(tasks, key=lambda item: item.get("created_at", ""), reverse=True)
+            return self._refresh_all_locked()
 
     def get(self, task_id: str) -> dict[str, Any]:
         with self.lock:
             task = read_json(self._path(task_id))
             if not isinstance(task, dict):
                 raise FileNotFoundError(task_id)
-            return self._refresh(task)
+            return self._decorate_eval_result(self._refresh(task))
 
     def start(
         self,
@@ -1833,7 +2182,37 @@ class PolicyTelemetryStore:
         runtime = runtime if isinstance(runtime, dict) else {}
         control = self.control_for_task(task)
         received_at = payload.get("received_at")
-        age_s = max(0.0, time.time() - float(received_at)) if received_at is not None else None
+        now = time.time()
+        age_s = max(0.0, now - float(received_at)) if received_at is not None else None
+        # ``target_time_error_s`` is signed: positive means the active command
+        # is behind its target timestamp, negative means the target is still in
+        # the future. Prefer the new explicit field, then preserve compatibility
+        # with older telemetry payloads that only stored ``target_age_s`` or the
+        # millisecond form.
+        timed_target = payload.get("client_timed_target")
+        timed_target = timed_target if isinstance(timed_target, dict) else {}
+        target_age_at_snapshot = payload.get("client_target_age_s")
+        if target_age_at_snapshot is None:
+            target_age_at_snapshot = payload.get("client_target_time_error_ms")
+            if target_age_at_snapshot is not None:
+                try:
+                    target_age_at_snapshot = float(target_age_at_snapshot) / 1000.0
+                except (TypeError, ValueError):
+                    target_age_at_snapshot = None
+        if target_age_at_snapshot is None:
+            target_age_at_snapshot = timed_target.get("target_time_error_s", timed_target.get("target_age_s"))
+        timing_snapshot_at = payload.get("client_timing_snapshot_at")
+        current_target_age_s = None
+        try:
+            target_age_at_snapshot = float(target_age_at_snapshot)
+            if math.isfinite(target_age_at_snapshot):
+                current_target_age_s = target_age_at_snapshot
+                if timing_snapshot_at is not None:
+                    elapsed_since_snapshot = now - float(timing_snapshot_at)
+                    if math.isfinite(elapsed_since_snapshot) and abs(elapsed_since_snapshot) <= 10.0:
+                        current_target_age_s += elapsed_since_snapshot
+        except (TypeError, ValueError):
+            current_target_age_s = None
         process_active = task.get("state") in {"starting", "running", "stopping"}
         client_connected = process_active and bool(connections.get("client_connected", False))
         client_allow = bool(payload.get("client_allow_execution", False))
@@ -1864,6 +2243,16 @@ class PolicyTelemetryStore:
             "telemetry_session": session,
             "age_s": round(age_s, 3) if age_s is not None else None,
             "fresh": age_s is not None and age_s <= self.max_age_s,
+            "client_current_target_age_s": (
+                round(current_target_age_s, 4)
+                if current_target_age_s is not None
+                else None
+            ),
+            "client_current_target_time_error_ms": (
+                round(current_target_age_s * 1000.0, 2)
+                if current_target_age_s is not None
+                else None
+            ),
             "max_age_s": self.max_age_s,
             "client_connected": client_connected,
             "active_clients": int(connections.get("active_clients", 0)) if process_active else 0,
@@ -2910,6 +3299,52 @@ def create_app(config_path: Path) -> Flask:
         )
         steps = safe_int(payload.get("num_train_steps", 30_000), "num_train_steps", 1, 10_000_000)
         save_interval = safe_int(payload.get("save_interval", 1_000), "save_interval", 1, steps)
+        eval_enabled_raw = payload.get("eval_enabled", True)
+        eval_enabled = (
+            eval_enabled_raw
+            if isinstance(eval_enabled_raw, bool)
+            else str(eval_enabled_raw).strip().lower() not in {"0", "false", "no", "off", ""}
+        )
+        eval_interval_steps = safe_int(
+            payload.get("eval_interval_steps", 5_000),
+            "eval_interval_steps",
+            1,
+            10_000_000,
+        )
+        eval_batch_size = safe_int(payload.get("eval_batch_size", 1), "eval_batch_size", 1, 64)
+        eval_num_workers = safe_int(payload.get("eval_num_workers", 2), "eval_num_workers", 0, 16)
+        eval_max_batches = safe_int(payload.get("eval_max_batches", 50), "eval_max_batches", 1, 100_000)
+        eval_seed = safe_int(
+            payload.get("eval_seed", split.seed),
+            "eval_seed",
+            0,
+            2**31 - 1,
+        )
+        eval_xla_memory_fraction = safe_float(
+            payload.get(
+                "eval_xla_memory_fraction",
+                config.get("evaluation_xla_memory_fraction", 0.85),
+            ),
+            "eval_xla_memory_fraction",
+            0.50,
+            0.95,
+        )
+        eval_disabled_reason = None
+        if eval_enabled and not split.test_episodes:
+            eval_enabled = False
+            eval_disabled_reason = "test_split_is_empty"
+        if eval_enabled and eval_interval_steps % save_interval:
+            raise ValueError("eval_interval_steps must be divisible by save_interval")
+        # Upstream Orbax currently retains 5000-step checkpoints. Restricting
+        # asynchronous eval to durable checkpoints prevents a save/delete race.
+        if eval_enabled and eval_interval_steps % 5_000:
+            raise ValueError("eval_interval_steps must be a multiple of 5000")
+        existing_complete_steps = complete_checkpoint_steps(checkpoint_dir)
+        eval_after_step = (
+            existing_complete_steps[-1][0]
+            if effective_mode == "resume" and existing_complete_steps
+            else 0
+        )
         command = [
             config["openpi_python"], openpi_helper, "train",
             "--dataset-id", dataset_id,
@@ -2970,6 +3405,21 @@ def create_app(config_path: Path) -> Flask:
                 if isinstance(saved_norm_config, dict)
                 else None
             ),
+            "eval_after_step": eval_after_step,
+            "auto_eval": {
+                "enabled": eval_enabled,
+                "disabled_reason": eval_disabled_reason,
+                "every_steps": eval_interval_steps,
+                "batch_size": eval_batch_size,
+                "num_workers": eval_num_workers,
+                "max_batches": eval_max_batches,
+                "seed": eval_seed,
+                "minimum_free_gpu_mib": int(
+                    config.get("evaluation_min_free_gpu_mib", 23_000)
+                ),
+                "xla_memory_fraction": eval_xla_memory_fraction,
+                "split": "test",
+            },
         }
         with tasks.lock:
             if norm_ready:
@@ -3317,6 +3767,13 @@ def create_app(config_path: Path) -> Flask:
             raise ValueError("metrics are only available for train tasks")
         max_points = safe_int(request.args.get("max_points", 1200), "max_points", 50, 5000)
         result = parse_training_metrics(tasks.log_tail(task_id, 16 * 1024 * 1024), max_points=max_points)
+        eval_tasks = [
+            item
+            for item in tasks.list()
+            if item.get("type") == "eval"
+            and item.get("metadata", {}).get("parent_train_task_id") == task_id
+        ]
+        result = merge_eval_metrics(result, eval_tasks)
         planned_steps = task.get("metadata", {}).get("steps")
         latest_step = int(result["points"][-1]["step"]) if result["points"] else 0
         result.update(

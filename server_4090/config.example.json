@@ -12,6 +12,8 @@
   "allow_busy_gpus": false,
   "xla_memory_fraction": 0.90,
   "training_min_free_gpu_mib": 23000,
+  "evaluation_min_free_gpu_mib": 23000,
+  "evaluation_xla_memory_fraction": 0.85,
   "task_monitor_interval_s": 2.0,
   "robot_observation_max_age_s": 3.0,
   "max_upload_gib": 500,
