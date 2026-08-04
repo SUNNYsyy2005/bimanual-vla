@@ -2554,6 +2554,9 @@ class PolicyTelemetry:
                 **async_client,
                 "robot_arm_status": client.get("robot_arm_status"),
                 "client_robot_enabled_sides": client.get("robot_enabled_sides"),
+                "client_robot_driver_enable_status": client.get(
+                    "robot_driver_enable_status"
+                ),
                 "client_robot_enable_hold": client.get("robot_enable_hold"),
                 "schema": self.metadata["schema"],
                 "arm_mode": self.metadata["arm_mode"],

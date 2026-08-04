@@ -512,10 +512,11 @@ class EnableHoldTest(unittest.TestCase):
 
     def test_enable_rejects_stale_arm_status_feedback(self):
         piper = FakePiper(status_timestamp=time.time() - 1.0)
-        execution = ExecutionController(piper, execution_args(enable_timeout_s=0.5))
+        execution = ExecutionController(piper, execution_args(enable_timeout_s=0.03))
         measured = np.array([0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.035])
-        with self.assertRaisesRegex(ExecutionBlocked, "became unhealthy"):
-            execution._enable_robot("right", piper, measured)
+        with patch("robot_observation_bridge.time.sleep", return_value=None):
+            with self.assertRaisesRegex(ExecutionBlocked, "enable timed out"):
+                execution._enable_robot("right", piper, measured)
         self.assertNotIn("right", execution.robot_enabled)
 
     def test_protocol_reconnect_preserves_active_enable_hold(self):
@@ -527,6 +528,58 @@ class EnableHoldTest(unittest.TestCase):
         execution.configure_protocol(validate_policy_metadata(JOINT_METADATA, "right"))
         self.assertIn("right", execution.arm_hold_targets)
         self.assertTrue(execution.waiting_fresh_after_enable)
+
+    def test_enable_confirmation_requires_distinct_status_frames(self):
+        piper = FakePiper(status_timestamp=time.time())
+        execution = ExecutionController(
+            piper, execution_args(enable_timeout_s=0.03)
+        )
+        measured = np.array([0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.035])
+        with patch("robot_observation_bridge.time.sleep", return_value=None):
+            with self.assertRaisesRegex(ExecutionBlocked, "enable timed out"):
+                execution._enable_robot("right", piper, measured)
+        self.assertNotIn("right", execution.robot_enabled)
+
+    def test_enable_waits_for_all_six_driver_enable_bits(self):
+        class DriverFeedbackPiper(FakePiper):
+            def __init__(self):
+                super().__init__()
+                self.driver_reads = 0
+
+            def GetArmLowSpdInfoMsgs(self):
+                self.driver_reads += 1
+                enabled = self.driver_reads >= 3
+                motors = {}
+                for index in range(1, 7):
+                    foc = SimpleNamespace(
+                        driver_enable_status=enabled,
+                        voltage_too_low=False,
+                        motor_overheating=False,
+                        driver_overcurrent=False,
+                        driver_overheating=False,
+                        collision_status=False,
+                        driver_error_status=False,
+                        stall_status=False,
+                    )
+                    motors[f"motor_{index}"] = SimpleNamespace(
+                        can_id=0x260 + index, foc_status=foc
+                    )
+                return SimpleNamespace(
+                    time_stamp=time.time(), Hz=100.0, **motors
+                )
+
+        piper = DriverFeedbackPiper()
+        execution = ExecutionController(
+            piper, execution_args(enable_timeout_s=0.5)
+        )
+        measured = np.array([0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.035])
+        with patch("robot_observation_bridge.time.sleep", return_value=None):
+            execution._enable_robot("right", piper, measured)
+        self.assertGreaterEqual(piper.driver_reads, 4)
+        self.assertTrue(
+            execution.robot_driver_enable_status["right"]["ready"]
+        )
+        self.assertIn("right", execution.robot_enabled)
 
 
 class MetadataCompatibilityTest(unittest.TestCase):
@@ -997,6 +1050,23 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         execution.robot_enabled = {"right"}
         return execution, piper
 
+    def settled_enable_hold(self, *, base: float, **overrides):
+        piper = FakePiper()
+        execution = ExecutionController(
+            piper, execution_args(arm_settle_s=0.0, **overrides)
+        )
+        execution.configure_protocol(self.joint_protocol)
+        execution.robot_enabled = {"right"}
+        execution.arm_hold_targets["right"] = self.qpos[:6].copy()
+        execution.arm_hold_gripper_targets["right"] = float(self.qpos[6])
+        execution.arm_hold_started_at["right"] = base - 1.0
+        execution.arm_hold_stable_since["right"] = base - 1.0
+        execution.waiting_fresh_after_enable = True
+        execution.fresh_inference_required_after_monotonic = base
+        execution.enable_hold_settled_at = time.time()
+        execution.state = "armed"
+        return execution, piper
+
     def test_enable_settle_freezes_pre_settle_plan_and_requires_post_settle_inference(self):
         piper = FakePiper(initial_ctrl_mode=0, ctrl_mode_ready_after_status_reads=1)
         execution = ExecutionController(
@@ -1070,7 +1140,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
                     )
                 )
         with patch(
-            "robot_observation_bridge.time.monotonic", return_value=base + 0.26
+            "robot_observation_bridge.time.monotonic", return_value=base + 0.36
         ):
             self.assertFalse(
                 execution.execute_next(
@@ -1099,7 +1169,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
             self.raw_state,
             self.qpos,
             generation=12,
-            captured_monotonic=base + 0.27,
+            captured_monotonic=base + 0.37,
         )
         self.assertTrue(
             execution.accept_inference_result(
@@ -1107,13 +1177,15 @@ class AsyncInferencePipelineTest(unittest.TestCase):
                 fresh_launch,
                 self.joint_protocol,
                 arrived_at=time.time(),
-                arrived_monotonic=base + 0.27,
+                arrived_monotonic=base + 0.37,
             )
         )
         self.assertFalse(execution.waiting_fresh_after_enable)
-        self.assertFalse(execution.metadata()["robot_enable_hold"]["active"])
+        enable_hold = execution.metadata()["robot_enable_hold"]
+        self.assertTrue(enable_hold["active"])
+        self.assertEqual(enable_hold["staged_generation"], 12)
         with patch(
-            "robot_observation_bridge.time.monotonic", return_value=base + 0.27
+            "robot_observation_bridge.time.monotonic", return_value=base + 0.37
         ):
             self.assertTrue(
                 execution.execute_next(
@@ -1123,10 +1195,178 @@ class AsyncInferencePipelineTest(unittest.TestCase):
                     feedback_captured_at=time.time(),
                 )
             )
+        self.assertFalse(execution.metadata()["robot_enable_hold"]["active"])
         last_joint_call = [
             call for call in piper.calls if call[0] == "JointCtrl"
         ][-1]
         self.assertEqual(last_joint_call[1], int(np.rint(0.02 * RAD_FACTOR)))
+
+    def test_enable_settle_requires_one_continuous_stable_window(self):
+        base = time.monotonic()
+        execution, _ = self.settled_enable_hold(base=base)
+        execution.args.arm_settle_s = 0.25
+        execution.arm_hold_stable_since.clear()
+        execution.fresh_inference_required_after_monotonic = None
+        execution.enable_hold_settled_at = None
+        for tick, qpos in (
+            (base + 0.10, self.qpos),
+            (base + 0.20, self.qpos + np.array([0.05, 0, 0, 0, 0, 0, 0])),
+            (base + 0.40, self.qpos),
+            (base + 0.60, self.qpos),
+        ):
+            with patch("robot_observation_bridge.time.monotonic", return_value=tick):
+                self.assertFalse(
+                    execution.execute_next(
+                        self.raw_state, qpos, self.joint_protocol,
+                        feedback_captured_at=time.time(),
+                    )
+                )
+            self.assertIsNone(execution.fresh_inference_required_after_monotonic)
+        with patch(
+            "robot_observation_bridge.time.monotonic", return_value=base + 0.66
+        ):
+            self.assertFalse(
+                execution.execute_next(
+                    self.raw_state, self.qpos, self.joint_protocol,
+                    feedback_captured_at=time.time(),
+                )
+            )
+        self.assertAlmostEqual(
+            execution.fresh_inference_required_after_monotonic, base + 0.66
+        )
+
+    def test_staged_first_target_unsafe_keeps_enable_hold_until_new_inference(self):
+        base = time.monotonic()
+        execution, piper = self.settled_enable_hold(base=base)
+        unsafe = self.joint_chunk(20, 0.40)
+        launch, _ = inference_launch(
+            self.raw_state, self.qpos, generation=20, captured_monotonic=base + 0.01
+        )
+        self.assertTrue(
+            execution.accept_inference_result(
+                execution_result(unsafe),
+                launch,
+                self.joint_protocol,
+                arrived_at=time.time(),
+                arrived_monotonic=base + 0.01,
+            )
+        )
+        self.assertEqual(execution.enable_staged_generation, 20)
+        with patch(
+            "robot_observation_bridge.time.monotonic", return_value=base + 0.01
+        ):
+            self.assertFalse(
+                execution.execute_next(
+                    self.raw_state, self.qpos, self.joint_protocol,
+                    feedback_captured_at=time.time(),
+                )
+            )
+        self.assertIsNone(execution.enable_staged_generation)
+        self.assertTrue(execution.waiting_fresh_after_enable)
+        self.assertIn("right", execution.arm_hold_targets)
+        self.assertEqual(execution.last_queue_drop_kind, "unsafe")
+        sent_before_hold = len([c for c in piper.calls if c[0] == "JointCtrl"] )
+        with patch(
+            "robot_observation_bridge.time.monotonic", return_value=base + 0.02
+        ):
+            self.assertFalse(
+                execution.execute_next(
+                    self.raw_state, self.qpos, self.joint_protocol,
+                    feedback_captured_at=time.time(),
+                )
+            )
+        joint_calls = [c for c in piper.calls if c[0] == "JointCtrl"]
+        self.assertEqual(len(joint_calls), sent_before_hold + 1)
+        np.testing.assert_array_equal(
+            np.asarray(joint_calls[-1][1:]),
+            np.rint(self.qpos[:6] * RAD_FACTOR).astype(np.int64),
+        )
+
+    def test_authorization_expiry_cancels_staged_plan_and_refreshes_hold(self):
+        base = time.monotonic()
+        execution, piper = self.settled_enable_hold(base=base)
+        safe = self.joint_chunk(20, 0.02)
+        launch, _ = inference_launch(
+            self.raw_state, self.qpos, generation=21, captured_monotonic=base + 0.01
+        )
+        self.assertTrue(
+            execution.accept_inference_result(
+                execution_result(safe),
+                launch,
+                self.joint_protocol,
+                arrived_at=time.time(),
+                arrived_monotonic=base + 0.01,
+            )
+        )
+        execution.authorization_deadline_monotonic = base + 0.015
+        with patch(
+            "robot_observation_bridge.time.monotonic", return_value=base + 0.02
+        ):
+            self.assertFalse(
+                execution.execute_next(
+                    self.raw_state, self.qpos, self.joint_protocol,
+                    feedback_captured_at=time.time(),
+                )
+            )
+        self.assertIsNone(execution.enable_staged_generation)
+        self.assertTrue(execution.waiting_fresh_after_enable)
+        self.assertIn("right", execution.arm_hold_targets)
+        joint_call = [c for c in piper.calls if c[0] == "JointCtrl"][-1]
+        np.testing.assert_array_equal(
+            np.asarray(joint_call[1:]),
+            np.rint(self.qpos[:6] * RAD_FACTOR).astype(np.int64),
+        )
+
+    def test_blocked_policy_state_streams_last_safe_target_after_commit(self):
+        execution, piper = self.configured_execution()
+        target = self.joint_chunk(1, 0.02)
+        now = time.time()
+        execution.queue_result(
+            execution_result(target),
+            self.raw_state,
+            self.qpos,
+            self.joint_protocol,
+            {"cam_high": now, "cam_wrist": now},
+            0.01,
+        )
+        self.assertTrue(
+            execution.execute_next(
+                self.raw_state, self.qpos, self.joint_protocol,
+                feedback_captured_at=time.time(),
+            )
+        )
+        first_joint_call = [c for c in piper.calls if c[0] == "JointCtrl"][-1]
+        execution.state = "blocked"
+        execution.blocked_reason = "policy connection unavailable"
+        qpos_after = target[0].copy()
+        qpos_after[6] *= GRIPPER_MAX_M
+        self.assertTrue(
+            execution.execute_next(
+                self.raw_state, qpos_after, self.joint_protocol,
+                feedback_captured_at=time.time(),
+            )
+        )
+        last_joint_call = [c for c in piper.calls if c[0] == "JointCtrl"][-1]
+        self.assertEqual(last_joint_call[1:], first_joint_call[1:])
+        self.assertEqual(execution.state, "holding")
+
+    def test_blocked_policy_state_does_not_stop_existing_enable_hold(self):
+        base = time.monotonic()
+        execution, piper = self.settled_enable_hold(base=base)
+        execution.state = "blocked"
+        execution.blocked_reason = "policy connection unavailable"
+        with patch(
+            "robot_observation_bridge.time.monotonic", return_value=base + 0.02
+        ):
+            self.assertFalse(
+                execution.execute_next(
+                    self.raw_state, self.qpos, self.joint_protocol,
+                    feedback_captured_at=time.time(),
+                )
+            )
+        self.assertIn("right", execution.arm_hold_targets)
+        self.assertTrue(execution.waiting_fresh_after_enable)
+        self.assertIn("JointCtrl", [call[0] for call in piper.calls])
 
     def test_slow_async_inference_does_not_stop_old_20hz_queue(self):
         class BlockingPolicy:

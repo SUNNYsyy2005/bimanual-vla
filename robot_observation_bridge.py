@@ -135,7 +135,9 @@ DEFAULT_IK_MAX_NFEV = 100
 DEFAULT_MONITORING_DIR = "monitoring_data"
 PIPER_CTRL_MODE_CAN = 0x01
 PIPER_MOVE_MODE_J = 0x01
-PIPER_ENABLE_CONFIRM_CYCLES = 2
+PIPER_ARM_STATUS_NORMAL = 0x00
+PIPER_ARM_STATUS_JOINT_BRAKE_NOT_RELEASED = 0x06
+PIPER_ENABLE_CONFIRM_CYCLES = 3
 PIPER_ENABLE_RETRY_S = 0.02
 
 
@@ -700,6 +702,81 @@ def arm_status_dict(piper: Any) -> dict[str, Any]:
         "feedback_hz": hz if has_timestamp else None,
         "feedback_fresh": feedback_fresh,
     }
+
+
+def driver_enable_status_dict(piper: Any) -> dict[str, Any]:
+    getter = getattr(piper, "GetArmLowSpdInfoMsgs", None)
+    if not callable(getter):
+        return {
+            "available": False,
+            "faulted": None,
+            "healthy": None,
+            "ready": None,
+            "feedback_timestamp": None,
+            "feedback_age_s": None,
+            "feedback_hz": None,
+            "enabled": None,
+            "received": None,
+            "faults": None,
+        }
+    try:
+        message = getter()
+        timestamp = float(getattr(message, "time_stamp", 0.0) or 0.0)
+        hz = float(getattr(message, "Hz", 0.0) or 0.0)
+        feedback_age_s = time.time() - timestamp if timestamp > 0 else None
+        fresh = bool(
+            timestamp > 0
+            and feedback_age_s is not None
+            and -1.0 <= feedback_age_s <= PIPER_FEEDBACK_MAX_AGE_S
+        )
+        enabled: list[bool] = []
+        received: list[bool] = []
+        faults: list[list[str]] = []
+        fault_fields = (
+            "voltage_too_low",
+            "motor_overheating",
+            "driver_overcurrent",
+            "driver_overheating",
+            "collision_status",
+            "driver_error_status",
+            "stall_status",
+        )
+        for motor_index in range(1, 7):
+            motor = getattr(message, f"motor_{motor_index}")
+            foc = motor.foc_status
+            enabled.append(bool(foc.driver_enable_status))
+            received.append(bool(getattr(motor, "can_id", 0)))
+            faults.append(
+                [name for name in fault_fields if bool(getattr(foc, name, False))]
+            )
+        faulted = bool(any(faults))
+        healthy = bool(fresh and all(received) and not faulted)
+        ready = bool(healthy and all(enabled))
+        return {
+            "available": True,
+            "faulted": faulted,
+            "healthy": healthy,
+            "ready": ready,
+            "feedback_timestamp": timestamp,
+            "feedback_age_s": feedback_age_s,
+            "feedback_hz": hz,
+            "enabled": enabled,
+            "received": received,
+            "faults": faults,
+        }
+    except Exception as exc:
+        return {
+            "available": True,
+            "faulted": True,
+            "healthy": False,
+            "ready": False,
+            "feedback_timestamp": None,
+            "feedback_age_s": None,
+            "feedback_hz": None,
+            "enabled": None,
+            "received": None,
+            "faults": [[f"feedback_error:{type(exc).__name__}:{exc}"]],
+        }
 
 
 def _metadata_contract_version(metadata: dict[str, Any], errors: list[str]) -> int | None:
@@ -1740,6 +1817,7 @@ class ExecutionController:
         self.waiting_fresh_after_enable = False
         self.fresh_inference_required_after_monotonic: float | None = None
         self.enable_hold_settled_at: float | None = None
+        self.enable_staged_generation: int | None = None
 
         self.last_action_chunk_steps = 0
         self.last_composed_action: list[float] | None = None
@@ -1801,6 +1879,8 @@ class ExecutionController:
         self.arm_hold_targets: dict[str, np.ndarray] = {}
         self.arm_hold_gripper_targets: dict[str, float] = {}
         self.arm_hold_started_at: dict[str, float] = {}
+        self.arm_hold_stable_since: dict[str, float] = {}
+        self.robot_driver_enable_status: dict[str, dict[str, Any]] = {}
         self.ik_solver: PiperContinuousIK | None = None
 
     def configure_protocol(self, protocol: PolicyProtocol) -> None:
@@ -1842,8 +1922,10 @@ class ExecutionController:
         if self.arm_hold_targets:
             # A policy reconnect must not cancel a physical measured-pose hold.
             # Keep the enable barrier and require a fresh result on the new link.
+            self.enable_staged_generation = None
             self.waiting_fresh_after_enable = True
         else:
+            self.enable_staged_generation = None
             self.waiting_fresh_after_enable = False
             self.fresh_inference_required_after_monotonic = None
             self.enable_hold_settled_at = None
@@ -1995,10 +2077,12 @@ class ExecutionController:
             "control_revision": self.control_revision,
             "robot_arm_status": self.robot_status,
             "robot_enabled_sides": sorted(self.robot_enabled),
+            "robot_driver_enable_status": self.robot_driver_enable_status,
             "robot_enable_hold": {
                 "active": bool(self.arm_hold_targets),
                 "sides": sorted(self.arm_hold_targets),
                 "waiting_fresh_inference": self.waiting_fresh_after_enable,
+                "staged_generation": self.enable_staged_generation,
                 "settled": self.fresh_inference_required_after_monotonic is not None,
                 "settled_at": self.enable_hold_settled_at,
                 "hold_age_s": {
@@ -2007,6 +2091,13 @@ class ExecutionController:
                     )
                     for side in self.arm_hold_targets
                     if side in self.arm_hold_started_at
+                },
+                "stable_age_s": {
+                    side: max(
+                        0.0, timing_snapshot_monotonic - self.arm_hold_stable_since[side]
+                    )
+                    for side in self.arm_hold_targets
+                    if side in self.arm_hold_stable_since
                 },
             },
             "policy_action_hz": self.policy_action_hz,
@@ -2240,34 +2331,75 @@ class ExecutionController:
         deadline = time.monotonic() + enable_timeout_s
         ready_cycles = 0
         last_status: dict[str, Any] | None = None
+        last_status_timestamp: float | None = None
+        last_driver_timestamp: float | None = None
+        last_driver_status: dict[str, Any] | None = None
         while time.monotonic() < deadline:
             enabled_feedback = bool(piper.EnablePiper())
             self._send_enable_hold(side, piper, hold_joints, hold_gripper_m)
             self._refresh_known_enable_holds(exclude_side=side)
             last_status = arm_status_dict(piper)
+            driver_status = driver_enable_status_dict(piper)
+            last_driver_status = driver_status
+            self.robot_driver_enable_status[side] = driver_status
             if (
-                last_status["arm_status"] != 0
-                or last_status["err_code"] != 0
-                or last_status.get("feedback_fresh") is False
-            ):
-                raise ExecutionBlocked(
-                    f"{side} Piper became unhealthy during enable: {last_status}"
+                last_status.get("feedback_fresh") is True
+                and (
+                    last_status["arm_status"]
+                    not in {
+                        PIPER_ARM_STATUS_NORMAL,
+                        PIPER_ARM_STATUS_JOINT_BRAKE_NOT_RELEASED,
+                    }
+                    or last_status["err_code"] != 0
                 )
-            if enabled_feedback and self._piper_can_joint_mode_ready(last_status):
+            ) or driver_status["faulted"] is True:
+                raise ExecutionBlocked(
+                    f"{side} Piper became unhealthy during enable: "
+                    f"arm_status={last_status} driver_status={driver_status}"
+                )
+            status_timestamp = last_status.get("feedback_timestamp")
+            status_advanced = (
+                status_timestamp is None
+                or last_status_timestamp is None
+                or float(status_timestamp) > float(last_status_timestamp) + 1e-9
+            )
+            driver_timestamp = driver_status.get("feedback_timestamp")
+            driver_advanced = (
+                driver_timestamp is None
+                or last_driver_timestamp is None
+                or float(driver_timestamp) > float(last_driver_timestamp) + 1e-9
+            )
+            mode_ready = self._piper_can_joint_mode_ready(last_status)
+            drivers_ready = (
+                enabled_feedback
+                if driver_status["ready"] is None
+                else bool(driver_status["ready"])
+            )
+            if (
+                drivers_ready
+                and mode_ready
+                and status_advanced
+                and driver_advanced
+            ):
                 ready_cycles += 1
                 if ready_cycles >= PIPER_ENABLE_CONFIRM_CYCLES:
                     confirmed_at = time.monotonic()
                     self.arm_hold_targets[side] = hold_joints.copy()
                     self.arm_hold_gripper_targets[side] = hold_gripper_m
                     self.arm_hold_started_at[side] = confirmed_at
+                    self.arm_hold_stable_since.pop(side, None)
                     self.robot_enabled.add(side)
                     return
-            else:
+            elif not mode_ready or not drivers_ready:
                 ready_cycles = 0
+            if status_timestamp is not None:
+                last_status_timestamp = float(status_timestamp)
+            if driver_timestamp is not None:
+                last_driver_timestamp = float(driver_timestamp)
             time.sleep(PIPER_ENABLE_RETRY_S)
         raise ExecutionBlocked(
             f"{side} Piper enable timed out after {enable_timeout_s:.1f}s; "
-            f"last_status={last_status}"
+            f"last_status={last_status} last_driver_status={last_driver_status}"
         )
 
     def _maintain_post_enable_hold(
@@ -2282,19 +2414,25 @@ class ExecutionController:
         hold_sides = [side for side in sides if side in self.arm_hold_targets]
         if not hold_sides:
             return False
+        if self.enable_staged_generation is not None:
+            return False
 
         waiting_for_hold: list[str] = []
         for index, side in enumerate(sides):
             if side not in self.arm_hold_targets:
                 continue
             status = statuses[side]
+            driver_status = driver_enable_status_dict(self.pipers[side])
+            self.robot_driver_enable_status[side] = driver_status
             if (
                 status["arm_status"] != 0
                 or status["err_code"] != 0
                 or status.get("feedback_fresh") is False
+                or driver_status["ready"] is False
             ):
                 raise ExecutionBlocked(
-                    f"{side} Piper became unhealthy during enable hold: {status}"
+                    f"{side} Piper became unhealthy during enable hold: "
+                    f"arm_status={status} driver_status={driver_status}"
                 )
             hold_target = self.arm_hold_targets[side]
             hold_gripper_m = self.arm_hold_gripper_targets[side]
@@ -2306,15 +2444,28 @@ class ExecutionController:
             ]
             hold_age = now_monotonic - self.arm_hold_started_at[side]
             hold_error = float(np.max(np.abs(qpos_slice[:6] - hold_target)))
+            mode_ready = self._piper_can_joint_mode_ready(status)
+            within_tolerance = hold_error <= float(
+                getattr(self.args, "arm_hold_tolerance_rad", 0.02)
+            )
+            if mode_ready and within_tolerance and driver_status["ready"] is not False:
+                self.arm_hold_stable_since.setdefault(side, now_monotonic)
+            else:
+                self.arm_hold_stable_since.pop(side, None)
+            stable_since = self.arm_hold_stable_since.get(side)
+            stable_age = (
+                now_monotonic - stable_since if stable_since is not None else 0.0
+            )
             if (
-                not self._piper_can_joint_mode_ready(status)
-                or hold_age < float(getattr(self.args, "arm_settle_s", 0.0))
-                or hold_error
-                > float(getattr(self.args, "arm_hold_tolerance_rad", 0.02))
+                not mode_ready
+                or not within_tolerance
+                or stable_since is None
+                or stable_age < float(getattr(self.args, "arm_settle_s", 0.0))
             ):
                 waiting_for_hold.append(
                     f"{side}: ctrl={status['ctrl_mode']} mode={status['mode_feed']} "
-                    f"age={hold_age:.2f}s joint_error={hold_error:.4f}rad"
+                    f"age={hold_age:.2f}s stable={stable_age:.2f}s "
+                    f"joint_error={hold_error:.4f}rad"
                 )
 
         if waiting_for_hold:
@@ -2340,6 +2491,28 @@ class ExecutionController:
             "Piper enable hold is stable; waiting for inference captured after settle"
         )
         return True
+
+    def _cancel_staged_enable_plan(self, reason: str, *, kind: str = "other") -> bool:
+        if self.enable_staged_generation is None or not self.arm_hold_targets:
+            return False
+        self.enable_staged_generation = None
+        self.waiting_fresh_after_enable = True
+        self.fresh_inference_required_after_monotonic = time.monotonic()
+        self.enable_hold_settled_at = time.time()
+        self.discard_pending_actions(reason, kind=kind)
+        self.state = "armed"
+        self.blocked_reason = f"{reason}; continuing measured-pose hold"
+        return True
+
+    def _commit_staged_enable_plan(self, generation: int) -> None:
+        if self.enable_staged_generation != int(generation):
+            return
+        self.enable_staged_generation = None
+        self.waiting_fresh_after_enable = False
+        self.arm_hold_targets.clear()
+        self.arm_hold_gripper_targets.clear()
+        self.arm_hold_started_at.clear()
+        self.arm_hold_stable_since.clear()
 
     def _candidate_execution_control(
         self,
@@ -3057,10 +3230,11 @@ class ExecutionController:
         self.queue_underrun = False
         self.hold_active = False
         self.hold_started_at = None
-        if self.waiting_fresh_after_enable:
-            self.arm_hold_targets.clear()
-            self.arm_hold_gripper_targets.clear()
-            self.arm_hold_started_at.clear()
+        if self.arm_hold_targets:
+            # This is only a staged plan until its first checked command is
+            # actually published.  Keep refreshing the physical hold if that
+            # first row later fails safety, authorization, IK, or queue timing.
+            self.enable_staged_generation = launch.generation
         self.waiting_fresh_after_enable = False
         self.rejected_result = None
         if bool(getattr(self.args, "allow_execution", False)):
@@ -3167,23 +3341,7 @@ class ExecutionController:
             protocol,
             feedback_at=feedback_at,
         )
-        if not bool(getattr(self.args, "allow_execution", False)):
-            return self._block("client_disabled", "local --allow-execution is absent")
-        if self.state in {"shadow", "client_disabled"}:
-            return False
-        if self.state == "blocked":
-            return False
-
         now_monotonic = time.monotonic()
-        if (
-            self.authorization_deadline_monotonic is None
-            or now_monotonic >= self.authorization_deadline_monotonic
-        ):
-            self.discard_pending_actions(
-                "execution authorization expired", kind="expired"
-            )
-            return self._block("blocked", "execution authorization expired")
-
         feedback_age = time.time() - feedback_at
         max_feedback_age_s = float(
             getattr(self.args, "max_feedback_age_s", DEFAULT_FEEDBACK_MAX_AGE_S)
@@ -3201,6 +3359,7 @@ class ExecutionController:
                 f"connected Piper sides {sorted(self.pipers)} do not match policy sides {list(sides)}",
             )
 
+        safety_hold_only = False
         # Enable and post-enable hold are handled before timed-plan selection.
         # Otherwise the queue advances by wall time while the controller is still
         # switching out of STANDBY, and the first real command can jump deep into
@@ -3214,7 +3373,11 @@ class ExecutionController:
                 side: status
                 for side, status in statuses.items()
                 if (
-                    status["arm_status"] != 0
+                    side in self.robot_enabled
+                    or side in self.arm_hold_targets
+                )
+                and (
+                    status["arm_status"] != PIPER_ARM_STATUS_NORMAL
                     or status["err_code"] != 0
                     or status.get("feedback_fresh") is False
                 )
@@ -3222,12 +3385,87 @@ class ExecutionController:
             if bad_status:
                 raise ExecutionBlocked(f"Piper status is not normal: {bad_status}")
 
+            if self.arm_hold_targets:
+                driver_statuses = {
+                    side: driver_enable_status_dict(self.pipers[side])
+                    for side in sides
+                    if side in self.arm_hold_targets
+                }
+                self.robot_driver_enable_status.update(driver_statuses)
+                staged_hold_invalid = bool(
+                    self.enable_staged_generation is not None
+                    and any(
+                        not self._piper_can_joint_mode_ready(statuses[side])
+                        or driver_statuses[side]["ready"] is False
+                        for side in driver_statuses
+                    )
+                )
+                if staged_hold_invalid:
+                    self._cancel_staged_enable_plan(
+                        "staged post-enable plan lost CAN/MOVE_J or driver enable"
+                    )
+                if self.enable_staged_generation is None:
+                    if self._maintain_post_enable_hold(
+                        sides, qpos_m, statuses, now_monotonic=now_monotonic
+                    ):
+                        return False
+
+            allow_execution = bool(getattr(self.args, "allow_execution", False))
+            gate_reason = None
+            gate_state = None
+            if not allow_execution:
+                gate_reason = "local --allow-execution is absent"
+                gate_state = "client_disabled"
+            elif self.state in {"shadow", "client_disabled"}:
+                gate_reason = self.blocked_reason or "dashboard is shadow"
+                gate_state = self.state
+            elif self.state == "blocked":
+                gate_reason = self.blocked_reason or "execution is blocked"
+                gate_state = "blocked"
+            elif (
+                self.authorization_deadline_monotonic is None
+                or now_monotonic >= self.authorization_deadline_monotonic
+            ):
+                gate_reason = "execution authorization expired"
+                gate_state = "blocked"
+
+            if gate_reason is not None:
+                if self._cancel_staged_enable_plan(
+                    gate_reason,
+                    kind="expired" if "expired" in gate_reason else "other",
+                ):
+                    self._maintain_post_enable_hold(
+                        sides, qpos_m, statuses, now_monotonic=now_monotonic
+                    )
+                    return False
+                self.discard_pending_actions(
+                    gate_reason,
+                    kind="expired" if "expired" in gate_reason else "other",
+                )
+                if self.last_safe_target is not None and self.robot_enabled:
+                    safety_hold_only = True
+                    self.state = "holding"
+                    self.blocked_reason = (
+                        f"policy execution disabled ({gate_reason}); holding last safe target"
+                    )
+                else:
+                    return self._block(gate_state or "blocked", gate_reason)
+
+            active_driver_statuses = {
+                side: driver_enable_status_dict(self.pipers[side])
+                for side in sides
+                if side in self.robot_enabled and side not in self.arm_hold_targets
+            }
+            self.robot_driver_enable_status.update(active_driver_statuses)
             lost_control_mode = [
                 side
                 for side in sides
                 if side in self.robot_enabled
                 and side not in self.arm_hold_targets
-                and not self._piper_can_joint_mode_ready(statuses[side])
+                and (
+                    not self._piper_can_joint_mode_ready(statuses[side])
+                    or active_driver_statuses[side]["ready"] is False
+                )
             ]
             for side in lost_control_mode:
                 logging.warning(
@@ -3238,7 +3476,7 @@ class ExecutionController:
 
             missing_enabled = [side for side in sides if side not in self.robot_enabled]
             if missing_enabled:
-                if not self.pending_actions:
+                if not self.pending_actions and not safety_hold_only:
                     return self._mark_queue_underrun(holding=False)
                 for side in missing_enabled:
                     side_index = sides.index(side)
@@ -3254,6 +3492,7 @@ class ExecutionController:
                     "Piper enabled; discarded pre-enable trajectory and waiting for stable hold",
                     kind="other",
                 )
+                self.enable_staged_generation = None
                 self.waiting_fresh_after_enable = True
                 self.fresh_inference_required_after_monotonic = None
                 self.enable_hold_settled_at = None
@@ -3261,10 +3500,6 @@ class ExecutionController:
                 self.blocked_reason = "Piper enabled; stabilizing measured-pose hold"
                 return False
 
-            if self._maintain_post_enable_hold(
-                sides, qpos_m, statuses, now_monotonic=now_monotonic
-            ):
-                return False
         except ExecutionBlocked as exc:
             self.discard_pending_actions(str(exc), kind="other")
             return self._block("blocked", str(exc))
@@ -3298,6 +3533,16 @@ class ExecutionController:
                 )
                 self._record_queue_drop(future_index, reason, kind="expired")
                 del self.pending_actions[:future_index]
+
+        if self.enable_staged_generation is not None and not self.pending_actions:
+            self._cancel_staged_enable_plan(
+                "staged post-enable plan expired before its first command",
+                kind="expired",
+            )
+            self._maintain_post_enable_hold(
+                sides, qpos_m, statuses, now_monotonic=now_monotonic
+            )
+            return False
 
         holding = False
         if self.pending_actions:
@@ -3481,6 +3726,10 @@ class ExecutionController:
                     int(raw_gripper), int(getattr(self.args, "gripper_effort", 1000)), 0x01, 0
                 )
         except ExecutionBlocked as exc:
+            staged_enable_failure = bool(
+                self.enable_staged_generation == queued.generation
+                and self.arm_hold_targets
+            )
             (
                 self._filtered_gripper_opening,
                 self._gripper_extreme_candidate,
@@ -3510,7 +3759,18 @@ class ExecutionController:
                 self.unsafe_active = True
                 self.queued_action_index = None
                 self.timeline_resync_active = False
+                if staged_enable_failure:
+                    self._cancel_staged_enable_plan(
+                        f"staged post-enable target was unsafe: {exc}",
+                        kind="unsafe",
+                    )
+                    return False
                 return self._block("ready", f"dropped unsafe queued target: {exc}")
+            if staged_enable_failure:
+                self._cancel_staged_enable_plan(
+                    f"staged post-enable target was rejected: {exc}", kind="other"
+                )
+                return False
             self.discard_pending_actions(str(exc), kind="other")
             return self._block("blocked", str(exc))
         except Exception as exc:
@@ -3521,9 +3781,18 @@ class ExecutionController:
                 self._gripper_extreme_latch,
             ) = filter_snapshot
             logging.exception("robot command failed")
+            if (
+                self.enable_staged_generation == queued.generation
+                and self.arm_hold_targets
+            ):
+                self._cancel_staged_enable_plan(
+                    f"staged post-enable robot command failed: {exc}", kind="other"
+                )
+                return False
             self.discard_pending_actions(f"robot command failed: {exc}", kind="other")
             return self._block("blocked", f"robot command failed: {exc}")
 
+        self._commit_staged_enable_plan(queued.generation)
         if not holding:
             self.pending_actions.pop(0)
             self.last_safe_target = replace(queued, hold=False)
@@ -3881,6 +4150,7 @@ def run(args: argparse.Namespace) -> None:
     protocol = None
     count = 0
     command_count = 0
+    once_result_accepted = False
     last_reconnect_attempt = 0.0
     control_period = 1.0 / float(getattr(args, "control_hz", DEFAULT_ACTION_HZ))
     try:
@@ -4122,7 +4392,7 @@ def run(args: argparse.Namespace) -> None:
                             )
                             count += 1
                             if args.once and accepted:
-                                return
+                                once_result_accepted = True
 
                     # This is the only robot command path and runs every control tick.
                     command_sent = execution.execute_next(
@@ -4143,6 +4413,12 @@ def run(args: argparse.Namespace) -> None:
                     )
                     if command_sent:
                         command_count += 1
+                    if (
+                        args.once
+                        and once_result_accepted
+                        and (not args.allow_execution or command_sent)
+                    ):
+                        return
                     command_target = execution.current_timed_target_action
                     try:
                         recorder.record_control_tick(
