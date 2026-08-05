@@ -159,11 +159,11 @@
     </section>
 
     <section id="module-datasets" class="dashboard-module" data-module="datasets" hidden>
-      <div class="module-heading"><div><h2>数据集管理</h2><p>上传、检查、编辑 Episode，并独立预览每一路相机媒体。</p></div></div>
+      <div class="module-heading"><div><h2>真机数据集管理</h2><p>上传、检查、编辑真机 Episode，并独立预览每一路相机媒体；仿真数据集不会在 Dashboard 中显示。</p></div></div>
       <div class="grid">
-        <div class="card half"><h2>上传数据集</h2><p>真机采集机执行：</p><pre id="uploadCommand">python upload_dataset_4090.py LEROBOT_OR_GUI_NPZ_DIR --name my_dataset --dataset-origin real --server http://192.168.101.9:8090 --token TOKEN --workers 4 --merge</pre><p class="muted">仿真数据上传时改为 <code>--dataset-origin simulation</code>。上传暂存目录按 <code>uploads/real</code> 和 <code>uploads/simulation</code> 隔离；正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。</p></div>
-        <div class="card half"><h2>格式与媒体说明</h2><div class="section-note">Dashboard 可识别单臂 7D / 10D、双臂 14D / 20D 和其他自定义维度，并显示所有 <code>dtype: video</code> / <code>dtype: image</code> 相机。真机/仿真分类不改变数据集 ID 和训练加载路径，可在列表中随时修正。</div></div>
-        <div class="card"><h2>已接收数据集</h2><div class="toolbar"><label style="margin:0">来源筛选</label><select id="datasetOriginFilter" class="dataset-origin-select"><option value="all">全部</option><option value="real">真机</option><option value="simulation">仿真</option><option value="unknown">未分类</option></select><span id="datasetOriginSummary" class="muted">等待状态数据。</span></div><div class="table-wrap"><table><thead><tr><th>ID / 来源</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div></div>
+        <div class="card half"><h2>上传数据集</h2><p>真机采集机执行：</p><pre id="uploadCommand">python upload_dataset_4090.py LEROBOT_OR_GUI_NPZ_DIR --name my_dataset --dataset-origin real --server http://192.168.101.9:8090 --token TOKEN --workers 4 --merge</pre><p class="muted">仿真数据上传时仍使用 <code>--dataset-origin simulation</code>，其暂存目录与真机数据隔离，并且不会出现在 Dashboard 列表或训练/Policy 数据集选择器中。正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。</p></div>
+        <div class="card half"><h2>格式与媒体说明</h2><div class="section-note">Dashboard 可识别单臂 7D / 10D、双臂 14D / 20D 和其他自定义维度，并显示所有 <code>dtype: video</code> / <code>dtype: image</code> 相机。这里只呈现真机和未分类数据集；将来源标记为仿真后，该数据集会从 Dashboard 隐藏，但数据集 ID 和底层训练加载路径不会改变。</div></div>
+        <div class="card"><h2>已接收真机数据集</h2><div class="toolbar"><label style="margin:0">来源筛选</label><select id="datasetOriginFilter" class="dataset-origin-select"><option value="all">全部</option><option value="real">真机</option><option value="unknown">未分类</option></select><span id="datasetOriginSummary" class="muted">等待状态数据。</span></div><div class="table-wrap"><table><thead><tr><th>ID / 来源</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div></div>
         <div class="card">
           <h2>Episode 级数据集编辑与相机预览</h2>
           <p class="muted">参数编辑不修改 state/action/图像帧；合并、删除或编辑会先构造临时数据集并校验，成功后原子替换。已有 norm stats 将失效。</p>
@@ -408,19 +408,24 @@ function datasetOriginOptions(selected) {
   ).join('');
 }
 
+function dashboardDatasets(items) {
+  return (items || []).filter(item => item.dataset_origin !== 'simulation');
+}
+
 function fillDatasets(items) {
+  items = dashboardDatasets(items);
   const filter = document.getElementById('datasetOriginFilter').value || 'all';
-  const counts = {real: 0, simulation: 0, unknown: 0};
+  const counts = {real: 0, unknown: 0};
   items.forEach(item => {
-    const origin = ['real', 'simulation'].includes(item.dataset_origin) ? item.dataset_origin : 'unknown';
+    const origin = item.dataset_origin === 'real' ? 'real' : 'unknown';
     counts[origin] += 1;
   });
   document.getElementById('datasetOriginSummary').textContent =
-    `真机 ${counts.real} · 仿真 ${counts.simulation} · 未分类 ${counts.unknown}`;
+    `真机 ${counts.real} · 未分类 ${counts.unknown} · 仿真数据集已隐藏`;
 
   const visible = filter === 'all' ? items : items.filter(item => (item.dataset_origin || 'unknown') === filter);
   const rows = [];
-  for (const origin of ['real', 'simulation', 'unknown']) {
+  for (const origin of ['real', 'unknown']) {
     const grouped = visible.filter(item => (item.dataset_origin || 'unknown') === origin);
     if (!grouped.length) continue;
     rows.push(`<tr class="dataset-group-row"><td colspan="5">${datasetOriginBadge(origin)} ${grouped.length} 个数据集</td></tr>`);
@@ -1456,7 +1461,7 @@ function fillTasks(items) {
 
 function updateSummaries(data) {
   const gpus = data.gpus || [];
-  const datasets = data.datasets || [];
+  const datasets = dashboardDatasets(data.datasets || []);
   const tasks = data.tasks || [];
   const freeGpus = gpus.filter(gpu => gpu.compute_available !== false && !(gpu.processes || []).length).length;
   const freeMemory = gpus.reduce((sum, gpu) => sum + (gpu.compute_available === false ? 0 : Math.max(0, Number(gpu.memory_total_mib || 0) - Number(gpu.memory_used_mib || 0))), 0);
