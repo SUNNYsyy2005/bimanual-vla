@@ -1696,8 +1696,9 @@ function fillTasks(items) {
     if (t.type === 'eval') {
       const result = t.result || {};
       const loss = result.eval_loss_model;
-      params = `dataset=${esc(m.dataset_id || '-')} · checkpoint step <strong>${esc(m.checkpoint_step || '-')}</strong> · GPU ${esc((m.gpu_ids || []).join(',') || '-')}<br>` +
-        `<code class="path" title="${esc(m.checkpoint || '')}">${esc(shortPath(m.checkpoint || '-'))}</code><br>` +
+      const external = m.external ? `<br><span class="pill">外部评测进程</span> task=${esc(m.task_name || '-')} · config=${esc(m.task_config || '-')}<br>ckpt_setting=<code class="path" title="${esc(m.ckpt_setting || '')}">${esc(shortPath(m.ckpt_setting || '-'))}</code>${m.external_log_path ? `<br>log=<code class="path" title="${esc(m.external_log_path)}">${esc(shortPath(m.external_log_path))}</code>` : ''}` : '';
+      params = `dataset=${esc(m.dataset_id || '-')} · checkpoint step <strong>${esc(m.checkpoint_step || m.checkpoint_id || '-')}</strong> · GPU ${esc((m.gpu_ids || []).join(',') || '-')}<br>` +
+        `<code class="path" title="${esc(m.checkpoint || m.model_name || '')}">${esc(shortPath(m.checkpoint || m.model_name || '-'))}</code>${external}<br>` +
         `test=${esc(m.test_episodes || (m.test_episode_indexes || []).length || '-')} episodes · batch=${esc(m.batch_size || '-')} × ${esc(m.max_batches || '-')} max` +
         (loss == null ? '' : `<br><span class="ok">eval loss=${esc(compactNumber(loss))}</span> · objective=${esc(compactNumber(result.eval_loss_objective))} · ${esc(result.evaluated_batches || '-')} batches`) +
         (t.skip_reason ? `<br><span class="warn">${esc(t.skip_reason)}</span>` : '');

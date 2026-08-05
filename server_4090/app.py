@@ -1228,6 +1228,16 @@ def process_cmdline(pid: int) -> list[str]:
         return []
 
 
+def process_fd_path(pid: int, fd: int) -> str | None:
+    try:
+        target = os.readlink(f"/proc/{pid}/fd/{fd}")
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return None
+    if target.startswith("/") and Path(target).is_file():
+        return target
+    return None
+
+
 def _cmd_arg(command: list[str], flag: str) -> str | None:
     prefix = flag + "="
     for item in command:
@@ -1649,7 +1659,11 @@ class TaskManager:
         pid = int(task.get("pid", 0))
         if pid and pid_alive(pid) and process_matches_task(pid, task):
             return task
-        task["state"] = "stopped" if task.get("state") == "stopping" else "lost"
+        if task.get("metadata", {}).get("external") and task.get("type") == "eval" and not (pid and pid_alive(pid)):
+            task["state"] = "stopped" if task.get("state") == "stopping" else "completed"
+            task["external_exit_unknown"] = True
+        else:
+            task["state"] = "stopped" if task.get("state") == "stopping" else "lost"
         if pid and pid_alive(pid):
             task["lost_reason"] = "PID is alive but no longer matches the recorded task command"
         task["finished_at"] = now_iso()
@@ -1941,15 +1955,17 @@ class TaskManager:
             self.monitor_wakeup.set()
             return task
 
-    def _active_policy_pids(self) -> set[int]:
+    def _active_task_pids(self, task_types: set[str] | None = None, *, include_external: bool = False) -> set[int]:
         pids: set[int] = set()
         for path in self.root.glob("*/task.json"):
             task = read_json(path)
             if not isinstance(task, dict):
                 continue
-            if task.get("type") != "policy" or task.get("state") not in PROCESS_STATES:
+            if task_types is not None and task.get("type") not in task_types:
                 continue
-            if task.get("metadata", {}).get("external"):
+            if task.get("state") not in PROCESS_STATES:
+                continue
+            if not include_external and task.get("metadata", {}).get("external"):
                 continue
             try:
                 pids.add(int(task.get("pid", 0)))
@@ -1957,6 +1973,12 @@ class TaskManager:
                 continue
         pids.discard(0)
         return pids
+
+    def _active_policy_pids(self) -> set[int]:
+        return self._active_task_pids({"policy"}, include_external=False)
+
+    def _active_eval_pids(self) -> set[int]:
+        return self._active_task_pids({"eval"}, include_external=False)
 
     def adopt_external_policy(
         self,
@@ -2003,6 +2025,53 @@ class TaskManager:
             adopted = []
             for candidate in discover_external_policy_candidates(self.config, ignored_pids=active_pids):
                 adopted.append(self.adopt_external_policy(**candidate))
+            return adopted
+
+    def adopt_external_eval(
+        self,
+        *,
+        pid: int,
+        command: list[str],
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        task_id = f"eval-external-{pid}"
+        task_dir = self.root / task_id
+        task_dir.mkdir(parents=True, exist_ok=True)
+        task = read_json(task_dir / "task.json")
+        if not isinstance(task, dict):
+            task = {
+                "id": task_id,
+                "type": "eval",
+                "state": "running",
+                "pid": pid,
+                "created_at": now_iso(),
+                "started_at": None,
+                "discovered_at": now_iso(),
+                "command": command,
+                "metadata": metadata,
+                "log_path": str(task_dir / "task.log"),
+            }
+            atomic_json(task_dir / "task.json", task)
+            self._append_log(task, "adopted external RoboTwin eval process discovered on a managed GPU")
+            return task
+        task["command"] = command
+        task["metadata"] = {**task.get("metadata", {}), **metadata}
+        task["pid"] = pid
+        if pid_alive(pid) and process_matches_task(pid, task) and task.get("state") not in {"stopping"}:
+            task["state"] = "running"
+            task.pop("finished_at", None)
+            task.pop("returncode", None)
+            task.pop("lost_reason", None)
+        task["last_discovered_at"] = now_iso()
+        atomic_json(task_dir / "task.json", task)
+        return self._refresh(task)
+
+    def discover_external_evals(self) -> list[dict[str, Any]]:
+        with self.lock:
+            active_pids = self._active_eval_pids()
+            adopted = []
+            for candidate in discover_external_eval_candidates(self.config, ignored_pids=active_pids):
+                adopted.append(self.adopt_external_eval(**candidate))
             return adopted
 
     def stop(self, task_id: str, *, force: bool = False) -> dict[str, Any]:
@@ -2075,7 +2144,15 @@ class TaskManager:
             return {"deleted": True, "task": task}
 
     def log_tail(self, task_id: str, max_bytes: int = 64 * 1024) -> str:
+        task = read_json(self._path(task_id))
         path = self._log_path(task_id)
+        external_log = None
+        if isinstance(task, dict):
+            external_log = task.get("metadata", {}).get("external_log_path")
+        if external_log:
+            candidate = Path(str(external_log))
+            if candidate.is_file():
+                path = candidate
         if not path.exists():
             return ""
         with path.open("rb") as handle:
@@ -2739,6 +2816,71 @@ def discover_external_policy_candidates(
     return candidates
 
 
+def _is_external_eval_command(command: list[str]) -> bool:
+    if len(command) < 2:
+        return False
+    joined = " ".join(command)
+    return "eval_policy.py" in joined and "script/eval_policy.py" in joined or any(
+        Path(item).name == "eval_policy.py" for item in command[1:3]
+    )
+
+
+def discover_external_eval_candidates(
+    config: dict[str, Any],
+    *,
+    ignored_pids: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    ignored_pids = ignored_pids or set()
+    candidates = []
+    seen: set[int] = set()
+    for gpu in gpu_inventory():
+        gpu_id = int(gpu["index"])
+        for process in gpu.get("processes", []):
+            try:
+                pid = int(process["pid"])
+            except (TypeError, ValueError):
+                continue
+            if pid in seen or pid in ignored_pids:
+                continue
+            command = process_cmdline(pid)
+            if not command or not _is_external_eval_command(command):
+                continue
+            seen.add(pid)
+            gpu_ids = sorted(
+                int(item["index"])
+                for item in gpu_inventory()
+                for proc in item.get("processes", [])
+                if int(proc.get("pid", -1)) == pid
+            )
+            stdout_path = process_fd_path(pid, 1) or process_fd_path(pid, 2)
+            checkpoint_id = _cmd_arg(command, "--checkpoint_id")
+            metadata = {
+                "external": True,
+                "adopted": True,
+                "source": "gpu_eval_policy_process",
+                "gpu_ids": gpu_ids or [gpu_id],
+                "runtime": "external_4x4090",
+                "execution_target": "local_4090",
+                "dataset_id": _cmd_arg(command, "--train_config_name") or _cmd_arg(command, "--task_name") or "external_eval",
+                "task_name": _cmd_arg(command, "--task_name"),
+                "task_config": _cmd_arg(command, "--task_config"),
+                "train_config_name": _cmd_arg(command, "--train_config_name"),
+                "model_name": _cmd_arg(command, "--model_name"),
+                "exp_name": _cmd_arg(command, "--model_name") or _cmd_arg(command, "--ckpt_setting") or "external_eval",
+                "checkpoint_id": checkpoint_id,
+                "checkpoint_step": int(checkpoint_id) if checkpoint_id and checkpoint_id.isdigit() else checkpoint_id,
+                "ckpt_setting": _cmd_arg(command, "--ckpt_setting"),
+                "seed": _cmd_arg(command, "--seed"),
+                "policy_name": _cmd_arg(command, "--policy_name"),
+                "instruction_type": _cmd_arg(command, "--instruction_type"),
+                "pi0_step": _cmd_arg(command, "--pi0_step"),
+            }
+            if stdout_path:
+                metadata["external_log_path"] = stdout_path
+            candidates.append({"pid": pid, "command": command, "metadata": metadata})
+    return candidates
+
+
 def build_environment(
     config: dict[str, Any],
     gpu_ids: list[int] | None,
@@ -3165,6 +3307,7 @@ def create_app(config_path: Path) -> Flask:
     @app.get("/api/status")
     def status():
         tasks.discover_external_policies()
+        tasks.discover_external_evals()
         task_list = tasks.list()
         for task in task_list:
             if task["type"] != "policy":
@@ -5296,6 +5439,8 @@ print(json.dumps(rows, ensure_ascii=False))
         terminal_only = str(request.args.get("terminal", "")).lower() in {"1", "true", "yes"}
         include_metrics = str(request.args.get("include_metrics", "")).lower() in {"1", "true", "yes"}
         limit = safe_int(request.args.get("limit", 200), "limit", 1, 1000)
+        tasks.discover_external_policies()
+        tasks.discover_external_evals()
         task_list = tasks.list()
         filtered = []
         for task in task_list:
