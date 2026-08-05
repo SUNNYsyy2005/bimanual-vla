@@ -14,6 +14,7 @@ VIDEO_SUFFIXES = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".gif"}
 SSH_OPTS = [
     "ssh",
     "-o", "BatchMode=yes",
+    "-o", "StrictHostKeyChecking=accept-new",
     "-o", "ConnectTimeout=15",
     "-o", "ServerAliveInterval=30",
     "-o", "ServerAliveCountMax=3",

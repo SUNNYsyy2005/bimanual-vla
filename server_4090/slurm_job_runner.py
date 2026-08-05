@@ -29,7 +29,16 @@ def shell_join(command: list[str]) -> str:
 
 
 def run_ssh(host: str, command: str, *, input_text: str | None = None, timeout: int = 60) -> subprocess.CompletedProcess[str]:
-    ssh_cmd = ["ssh", "-o", "BatchMode=yes", host, command]
+    ssh_cmd = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=15",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
+        host,
+        command,
+    ]
     return subprocess.run(
         ssh_cmd,
         input=input_text,

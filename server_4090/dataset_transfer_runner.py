@@ -20,6 +20,7 @@ SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SSH_OPTS = [
     "ssh",
     "-o", "BatchMode=yes",
+    "-o", "StrictHostKeyChecking=accept-new",
     "-o", "ConnectTimeout=15",
     "-o", "ServerAliveInterval=30",
     "-o", "ServerAliveCountMax=3",
