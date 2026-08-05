@@ -66,6 +66,12 @@ Recent high usage lowers scheduling priority. Company/business jobs have priorit
 - Do not start a long formal training run on a 4090 merely because it is immediately available before checking H100/H200 availability.
 - H100/H200 training must still obey Slurm, storage, environment, checkpoint/resume, and per-node staging rules below.
 
+### Dashboard API priority
+
+- For dataset upload/movement/synchronization, norm calculation, training submission, heldout evaluation, task logs/metrics, evaluation-video queries/sync, and H100/H200 resource queries, prefer the 4×4090 Dashboard web API documented in `server_4090/API_USAGE.md`.
+- Use the simulation Dashboard (`http://192.168.101.9:8091`) for simulation datasets and π0.5 simulation workflows. Obtain its token at runtime from the protected 4×4090 `server.env`; never print, commit, or persist the token in project files or logs.
+- Use direct SSH/Slurm scripts only when the Dashboard API does not expose the required operation (for example, a strict cuRobo-only RoboTwin rollout evaluation), or when recovering/debugging the API itself. Keep all cluster hard rules in force for API-submitted work.
+
 ## Pre-Run Checks
 
 Before heavy jobs, check:
