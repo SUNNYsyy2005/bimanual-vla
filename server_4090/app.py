@@ -586,6 +586,82 @@ def policy_config_name(arm_mode: str, model_variant: str = "pi05") -> str:
     return f"{model_variant}_piper_{suffix}_lora"
 
 
+def training_checkpoint_identity(
+    path: Path, checkpoint_base_dir: Path
+) -> dict[str, Any] | None:
+    """Describe a standard ``config/experiment/step`` training checkpoint."""
+    path = Path(path).expanduser().resolve()
+    checkpoint_base_dir = Path(checkpoint_base_dir).expanduser().resolve()
+    try:
+        relative = path.relative_to(checkpoint_base_dir)
+    except ValueError:
+        return None
+    if len(relative.parts) != 3 or not relative.parts[2].isdigit():
+        return None
+    config_name, experiment, step_text = relative.parts
+    for model_variant in sorted(MODEL_VARIANTS):
+        for arm_mode in ("single", "bimanual"):
+            if config_name == policy_config_name(arm_mode, model_variant):
+                return {
+                    "config_name": config_name,
+                    "experiment": experiment,
+                    "checkpoint_step": int(step_text),
+                    "model_variant": model_variant,
+                    "arm_mode": arm_mode,
+                }
+    return None
+
+
+def training_experiment_catalog(checkpoint_base_dir: Path) -> list[dict[str, Any]]:
+    """List existing experiment directories, including runs without a complete step."""
+    checkpoint_base_dir = Path(checkpoint_base_dir).expanduser().resolve()
+    experiments: dict[str, dict[str, Any]] = {}
+    for model_variant in sorted(MODEL_VARIANTS):
+        for arm_mode in ("single", "bimanual"):
+            config_name = policy_config_name(arm_mode, model_variant)
+            config_root = checkpoint_base_dir / config_name
+            if not config_root.is_dir():
+                continue
+            for experiment_dir in config_root.iterdir():
+                if not experiment_dir.is_dir() or experiment_dir.name.startswith("."):
+                    continue
+                complete = complete_checkpoint_steps(experiment_dir)
+                entry = experiments.setdefault(
+                    experiment_dir.name,
+                    {
+                        "name": experiment_dir.name,
+                        "model_variants": set(),
+                        "arm_modes": set(),
+                        "config_names": set(),
+                        "checkpoint_count": 0,
+                        "latest_step": None,
+                        "mtime": 0.0,
+                    },
+                )
+                entry["model_variants"].add(model_variant)
+                entry["arm_modes"].add(arm_mode)
+                entry["config_names"].add(config_name)
+                entry["checkpoint_count"] += len(complete)
+                if complete:
+                    latest_step = complete[-1][0]
+                    entry["latest_step"] = max(entry["latest_step"] or 0, latest_step)
+                entry["mtime"] = max(entry["mtime"], experiment_dir.stat().st_mtime)
+    result = []
+    for entry in experiments.values():
+        result.append(
+            {
+                **entry,
+                "model_variants": sorted(entry["model_variants"]),
+                "arm_modes": sorted(entry["arm_modes"]),
+                "config_names": sorted(entry["config_names"]),
+                "updated_at": time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(entry["mtime"])
+                ),
+            }
+        )
+    return sorted(result, key=lambda item: (-item["mtime"], item["name"]))
+
+
 def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
     """Describe and validate raw/model Piper action contracts for the UI."""
     features = info.get("features", {})
@@ -2699,6 +2775,7 @@ def create_app(config_path: Path) -> Flask:
                 ):
                     candidates.add(params_dir.parent.resolve())
         default_path = Path(config["base_checkpoint"]).resolve()
+        checkpoint_base_dir = Path(config["checkpoint_base_dir"]).resolve()
         models = []
         for path in sorted(candidates, key=str):
             if not (path / "params").is_dir():
@@ -2706,16 +2783,35 @@ def create_app(config_path: Path) -> Flask:
             model_variant = infer_model_variant(path)
             if model_variant is None:
                 continue
+            identity = training_checkpoint_identity(path, checkpoint_base_dir)
+            foundation = bool(
+                path == default_path
+                or path.is_relative_to(Path.home() / ".cache/openpi")
+            )
             models.append(
                 {
                     "path": str(path),
                     "name": path.name,
                     "model_variant": model_variant,
                     "default": path == default_path,
-                    "source": "pretrained" if path.is_relative_to(Path.home() / ".cache/openpi") else "checkpoint",
+                    "foundation": foundation,
+                    "source": "pretrained" if foundation else "checkpoint",
+                    "experiment": identity.get("experiment") if identity else None,
+                    "checkpoint_step": identity.get("checkpoint_step") if identity else None,
+                    "arm_mode": identity.get("arm_mode") if identity else None,
+                    "config_name": identity.get("config_name") if identity else None,
                 }
             )
-        return sorted(models, key=lambda item: (not item["default"], item["model_variant"], item["path"]))
+        return sorted(
+            models,
+            key=lambda item: (
+                not item["default"],
+                item["model_variant"],
+                item["experiment"] or "",
+                -(item["checkpoint_step"] or 0),
+                item["path"],
+            ),
+        )
 
     def resolve_base_model(payload: dict[str, Any]) -> tuple[Path, str]:
         requested_path = payload.get("base_checkpoint") or config["base_checkpoint"]
@@ -2813,10 +2909,14 @@ def create_app(config_path: Path) -> Flask:
                 except Exception:
                     pass
         latest_observation = observations.latest(task_list)
+        checkpoints = list_checkpoints()
         return jsonify(
             {
                 "datasets": list_datasets(),
-                "checkpoints": list_checkpoints(),
+                "checkpoints": checkpoints,
+                "experiments": training_experiment_catalog(
+                    Path(config["checkpoint_base_dir"])
+                ),
                 "base_models": list_base_models(),
                 "robot_observation": latest_observation,
                 "tasks": task_list,

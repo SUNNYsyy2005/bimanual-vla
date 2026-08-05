@@ -193,9 +193,10 @@
         <div class="card two-third">
           <h2>2. 提交 LoRA 微调</h2>
           <form id="trainForm">
-            <div class="row"><div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div><div><label>实验名</label><input name="exp_name" required placeholder="pick_cube_r1"></div></div>
+            <div class="row"><div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div><div><label>实验名</label><input id="trainExperimentName" name="exp_name" list="trainExperimentOptions" required autocomplete="off" placeholder="选择已有实验或输入新名称"><datalist id="trainExperimentOptions"></datalist></div></div>
+            <p id="trainExperimentInfo" class="muted">选择已有实验可继续该实验下的 checkpoint；直接输入新名称时只提供基础模型。</p>
             <div class="row"><div><label>模型系列</label><select name="model_variant" class="model-variant-select"><option value="pi05">π0.5</option><option value="pi0">π0</option></select></div><div><label>基础模型 / 初始化 checkpoint</label><select name="base_checkpoint" class="base-model-select" required></select></div></div>
-            <p class="muted base-model-info">可选择预训练权重，也可从已有完整 checkpoint 继续微调。</p>
+            <p class="muted base-model-info">可选择基础模型，已有实验还会显示该实验下的完整 checkpoint。</p>
             <div class="row3"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU IDs</label><input name="gpu_ids" value="0,1" placeholder="0,1"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div>
             <div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>全局 Batch</label><input name="batch_size" type="number" value="2"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div>
             <div class="row3"><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div><div><label>JAX 显存预分配比例</label><input name="xla_memory_fraction" type="number" value="0.90" min="0.50" max="0.95" step="0.01"></div><div><label>Episode 划分</label><input value="自动加载已保存的 norm 划分" disabled></div></div>
@@ -723,9 +724,52 @@ function modelVariantLabel(variant) {
   return variant === 'pi0' ? 'π0' : variant === 'pi05' ? 'π0.5' : (variant || '-');
 }
 
+function isFoundationModel(model) {
+  return Boolean(model && (model.foundation || model.source === 'pretrained'));
+}
+
 function baseModelLabel(model) {
-  const source = model.source === 'pretrained' ? '预训练' : 'checkpoint';
-  return `${source} · ${modelVariantLabel(model.model_variant)} · ${model.name} · ${shortPath(model.path)}`;
+  if (isFoundationModel(model)) {
+    return `基础模型 · ${modelVariantLabel(model.model_variant)} · ${model.name} · ${shortPath(model.path)}`;
+  }
+  const experiment = model.experiment || '未归类实验';
+  const step = model.checkpoint_step == null ? model.name : `step ${model.checkpoint_step}`;
+  const armMode = model.arm_mode ? ` · ${model.arm_mode}` : '';
+  return `${experiment} / ${step} · ${modelVariantLabel(model.model_variant)}${armMode} · ${shortPath(model.path)}`;
+}
+
+function trainingExperimentByName(name) {
+  const value = String(name || '').trim();
+  return ((latestStatus && latestStatus.experiments) || []).find(item => item.name === value);
+}
+
+function fillTrainingExperiments(items) {
+  const input = document.getElementById('trainExperimentName');
+  const options = document.getElementById('trainExperimentOptions');
+  if (!input || !options) return;
+  options.innerHTML = items.map(item => {
+    const variants = (item.model_variants || []).map(modelVariantLabel).join(', ');
+    const latest = item.latest_step == null ? '暂无完整 checkpoint' : `latest step ${item.latest_step}`;
+    return `<option value="${esc(item.name)}" label="${esc(`${variants || '-'} · ${latest}`)}"></option>`;
+  }).join('');
+  updateTrainingExperimentInfo();
+}
+
+function updateTrainingExperimentInfo() {
+  const input = document.getElementById('trainExperimentName');
+  const info = document.getElementById('trainExperimentInfo');
+  if (!input || !info) return;
+  const name = input.value.trim();
+  const existing = trainingExperimentByName(name);
+  if (!name) {
+    info.textContent = '请选择已有实验，或直接输入一个新的实验名；未填写时仅显示基础模型。';
+  } else if (existing) {
+    const variants = (existing.model_variants || []).map(modelVariantLabel).join(', ') || '-';
+    const latest = existing.latest_step == null ? '尚无完整 checkpoint' : `最新 step ${existing.latest_step}`;
+    info.textContent = `已有实验 · ${variants} · ${latest}；模型列表仅显示该实验 checkpoint 与基础模型。`;
+  } else {
+    info.textContent = `新实验 ${name}；模型列表仅显示基础模型。`;
+  }
 }
 
 function fillBaseModels(items) {
@@ -733,21 +777,45 @@ function fillBaseModels(items) {
     const form = select.closest('form');
     const variantSelect = form && form.querySelector('.model-variant-select');
     const variant = variantSelect ? variantSelect.value : 'pi05';
+    const experimentInput = form && form.querySelector('[name="exp_name"]');
+    const experiment = experimentInput ? experimentInput.value.trim() : '';
+    const datasetSelect = form && form.querySelector('[name="dataset_id"]');
+    const dataset = datasetSelect ? datasetById(datasetSelect.value) : null;
     const old = select.value;
-    const matches = items.filter(model => model.model_variant === variant);
+    let matches = items.filter(model => model.model_variant === variant);
+    if (form && form.id === 'trainForm') {
+      matches = matches.filter(model => {
+        if (isFoundationModel(model)) return true;
+        if (!experiment || model.experiment !== experiment) return false;
+        return !dataset || !dataset.arm_mode || !model.arm_mode || model.arm_mode === dataset.arm_mode;
+      });
+      matches.sort((left, right) => {
+        const foundationOrder = Number(isFoundationModel(left)) - Number(isFoundationModel(right));
+        if (foundationOrder) return foundationOrder;
+        return Number(right.checkpoint_step || 0) - Number(left.checkpoint_step || 0);
+      });
+    }
     select.innerHTML = matches.length
       ? matches.map(model => `<option value="${esc(model.path)}">${esc(baseModelLabel(model))}${model.default ? '（默认）' : ''}</option>`).join('')
       : `<option value="" disabled>未发现 ${esc(modelVariantLabel(variant))} 可用权重</option>`;
     if (matches.some(model => model.path === old)) select.value = old;
     else {
-      const preferred = matches.find(model => model.default) || matches[0];
+      const experimentCheckpoint = matches.find(model => !isFoundationModel(model));
+      const preferred = experimentCheckpoint || matches.find(model => model.default) || matches[0];
       if (preferred) select.value = preferred.path;
     }
     const selected = matches.find(model => model.path === select.value);
     const info = form && form.querySelector('.base-model-info');
-    if (info) info.textContent = selected
-      ? `当前：${selected.path}`
-      : `允许目录中没有 ${modelVariantLabel(variant)} 权重；安装后刷新页面即可选择。`;
+    if (info) {
+      if (selected) {
+        const scope = form.id === 'trainForm' && experiment
+          ? `实验 ${experiment}：${matches.filter(model => !isFoundationModel(model)).length} 个 checkpoint + ${matches.filter(isFoundationModel).length} 个基础模型`
+          : `${matches.length} 个可用权重`;
+        info.textContent = `${scope}；当前：${selected.path}`;
+      } else {
+        info.textContent = `当前实验和模型系列下没有可用权重。`;
+      }
+    }
     const submit = form && form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = !selected;
   });
@@ -1601,6 +1669,7 @@ async function refreshAll() {
     const data = await api('/api/status');
     latestStatus = data;
     fillDatasets(data.datasets || []);
+    fillTrainingExperiments(data.experiments || []);
     fillBaseModels(data.base_models || []);
     fillCheckpoints(data.checkpoints || []);
     fillGpus(data.gpus || []);
@@ -1608,7 +1677,7 @@ async function refreshAll() {
     fillTrainingTasks(data.tasks || []);
     fillObservation(data.robot_observation);
     updateSummaries(data);
-    document.getElementById('serverInfo').innerHTML = `管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>默认基础模型: <code>${esc(data.config.base_checkpoint)}</code><br>可选基础权重: ${esc((data.base_models || []).length)}`;
+    document.getElementById('serverInfo').innerHTML = `管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>默认基础模型: <code>${esc(data.config.base_checkpoint)}</code><br>可选基础权重: ${esc((data.base_models || []).length)}<br>已有训练实验: ${esc((data.experiments || []).length)}`;
     if (!episodeDatasetData && document.getElementById('editorDataset').value) loadDatasetEpisodes(0);
     const trainingVisible = !document.getElementById('module-training').hidden;
     if (trainingVisible && document.getElementById('trainMetricsTask').value) loadTrainingMetrics({quiet: true});
@@ -1714,9 +1783,17 @@ window.addEventListener('beforeunload', () => {
 document.querySelectorAll('.dataset-select').forEach(select => select.addEventListener('change', () => {
   syncArmSideForDatasetSelect(select);
   if (select.id === 'policyDataset') fillCheckpoints((latestStatus && latestStatus.checkpoints) || []);
+  if (select.closest('form') && select.closest('form').id === 'trainForm') {
+    fillBaseModels((latestStatus && latestStatus.base_models) || []);
+  }
   updateClientCommand();
 }));
 document.querySelectorAll('.model-variant-select').forEach(select => select.addEventListener('change', () => {
+  fillBaseModels((latestStatus && latestStatus.base_models) || []);
+}));
+const trainExperimentInput = document.getElementById('trainExperimentName');
+['input', 'change'].forEach(eventName => trainExperimentInput.addEventListener(eventName, () => {
+  updateTrainingExperimentInfo();
   fillBaseModels((latestStatus && latestStatus.base_models) || []);
 }));
 document.getElementById('replacePolicy').addEventListener('change', () => updatePolicyOperation(true));
