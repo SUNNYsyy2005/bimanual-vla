@@ -3,6 +3,18 @@ import unittest
 
 
 class DashboardTemplateNullGuardTest(unittest.TestCase):
+    def test_training_experiment_picker_filters_initialization_models(self):
+        template = (
+            Path(__file__).parent / "server_4090/templates/index.html"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('id="trainExperimentName"', template)
+        self.assertIn('list="trainExperimentOptions"', template)
+        self.assertIn("fillTrainingExperiments(data.experiments || [])", template)
+        self.assertIn("if (isFoundationModel(model)) return true;", template)
+        self.assertIn("model.experiment !== experiment", template)
+        self.assertIn("model.arm_mode === dataset.arm_mode", template)
+
     def test_timed_target_helpers_guard_null_object_values(self):
         template = (
             Path(__file__).parent / "server_4090/templates/index.html"

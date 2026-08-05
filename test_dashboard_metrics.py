@@ -21,6 +21,8 @@ from server_4090.app import (
     merge_eval_metrics,
     select_idle_eval_gpu,
     policy_config_name,
+    training_checkpoint_identity,
+    training_experiment_catalog,
     MIN_POLICY_ACTION_HORIZON,
     PolicyTelemetryStore,
     policy_horizon_status,
@@ -30,6 +32,55 @@ from server_4090.app import (
     policy_time_contract_status,
     require_policy_execution_time_contract,
 )
+
+
+class TrainingExperimentCatalogTest(unittest.TestCase):
+    def test_identifies_standard_training_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "checkpoints"
+            checkpoint = (
+                root
+                / policy_config_name("single", "pi05")
+                / "pick_cube_r1"
+                / "5000"
+            )
+            identity = training_checkpoint_identity(checkpoint, root)
+
+            self.assertEqual(identity, {
+                "config_name": "pi05_piper_single_arm_lora",
+                "experiment": "pick_cube_r1",
+                "checkpoint_step": 5000,
+                "model_variant": "pi05",
+                "arm_mode": "single",
+            })
+            self.assertIsNone(
+                training_checkpoint_identity(root / "custom" / "5000", root)
+            )
+
+    def test_catalog_includes_incomplete_experiment_and_merges_variants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "checkpoints"
+            single = root / policy_config_name("single", "pi05") / "shared_exp"
+            complete = single / "5000"
+            (complete / "params").mkdir(parents=True)
+            (complete / "_CHECKPOINT_METADATA").write_text("{}", encoding="utf-8")
+            (complete / "params" / "_METADATA").write_text("{}", encoding="utf-8")
+            (root / policy_config_name("bimanual", "pi0") / "shared_exp").mkdir(
+                parents=True
+            )
+            (root / policy_config_name("single", "pi05") / "new_no_step").mkdir(
+                parents=True
+            )
+
+            catalog = {item["name"]: item for item in training_experiment_catalog(root)}
+
+            self.assertEqual(set(catalog), {"shared_exp", "new_no_step"})
+            self.assertEqual(catalog["shared_exp"]["model_variants"], ["pi0", "pi05"])
+            self.assertEqual(catalog["shared_exp"]["arm_modes"], ["bimanual", "single"])
+            self.assertEqual(catalog["shared_exp"]["checkpoint_count"], 1)
+            self.assertEqual(catalog["shared_exp"]["latest_step"], 5000)
+            self.assertEqual(catalog["new_no_step"]["checkpoint_count"], 0)
+            self.assertIsNone(catalog["new_no_step"]["latest_step"])
 
 
 class TrainingMetricsParserTest(unittest.TestCase):
