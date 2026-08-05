@@ -91,6 +91,14 @@ SSH_HOST_FALLBACKS = {
     "h200-ali-01": "sunny@47.116.14.100",
     "h200-ali-02": "sunny@120.55.15.209",
 }
+SSH_COMMAND = [
+    "ssh",
+    "-o", "BatchMode=yes",
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "ConnectTimeout=15",
+    "-o", "ServerAliveInterval=30",
+    "-o", "ServerAliveCountMax=3",
+]
 
 try:
     from .dataset_editor import (
@@ -3758,7 +3766,7 @@ print(json.dumps(rows, ensure_ascii=False))
             )
             try:
                 result = subprocess.run(
-                    ["ssh", "-o", "BatchMode=yes", str(host), command],
+                    [*SSH_COMMAND, str(host), command],
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -3992,7 +4000,7 @@ print(json.dumps(rows, ensure_ascii=False))
         command = f"{env} python3 - <<'REMOTE_DATASET_PY'\n{REMOTE_DATASET_INVENTORY_SCRIPT}\nREMOTE_DATASET_PY"
         try:
             result = subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", str(host), command],
+                [*SSH_COMMAND, str(host), command],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
