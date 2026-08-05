@@ -2811,6 +2811,12 @@ def create_app(config_path: Path) -> Flask:
             info = read_json(directory / "meta" / "info.json")
             if not isinstance(info, dict):
                 continue
+            origin = dataset_origin_info(directory.name, directory, info)
+            # The Dashboard is intentionally a real-robot operations surface.
+            # Simulation datasets remain installed and addressable by their ID,
+            # but don't appear in status payloads, selectors, or summaries.
+            if origin.get("dataset_origin") == "simulation":
+                continue
             schema = describe_dataset_schema(info)
             split_info = read_json(directory / "meta" / "train_test_split.json")
             norm_ready_by_model: dict[str, bool] = {}
@@ -2848,7 +2854,6 @@ def create_app(config_path: Path) -> Flask:
                         )
                     )
             default_model_variant = infer_model_variant(Path(config["base_checkpoint"])) or "pi05"
-            origin = dataset_origin_info(directory.name, directory, info)
             datasets.append(
                 {
                     "id": directory.name,

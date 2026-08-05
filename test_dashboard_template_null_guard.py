@@ -22,10 +22,15 @@ class DashboardTemplateNullGuardTest(unittest.TestCase):
 
         self.assertIn('id="datasetOriginFilter"', template)
         self.assertIn('--dataset-origin real', template)
-        self.assertIn('uploads/real', template)
-        self.assertIn('uploads/simulation', template)
+        self.assertIn('--dataset-origin simulation', template)
         self.assertIn('setDatasetOrigin', template)
         self.assertIn('datasetOriginBadge', template)
+        self.assertIn("item.dataset_origin !== 'simulation'", template)
+        self.assertNotIn('<option value="simulation">仿真</option>', template)
+        self.assertIn('仿真数据集已隐藏', template)
+
+        app_source = (Path(__file__).parent / "server_4090/app.py").read_text(encoding="utf-8")
+        self.assertIn('if origin.get("dataset_origin") == "simulation":', app_source)
 
     def test_timed_target_helpers_guard_null_object_values(self):
         template = (
