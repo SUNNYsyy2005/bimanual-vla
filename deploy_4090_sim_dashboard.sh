@@ -76,8 +76,13 @@ fi
 # Best-effort mirror of H200 Slurm inventory caches onto 4x4090 so the UI does
 # not block on SSH to login-server on every refresh.
 for node in h200-ali-01 h200-ali-02; do
-  timeout 20 ssh -n -o BatchMode=yes -o ConnectTimeout=8 login-server "test -s /DATA/NAS/GPUServer/sunny/dashboard_probe/${node}_inventory.json && cat /DATA/NAS/GPUServer/sunny/dashboard_probe/${node}_inventory.json" \
-    > "$HOME/.local/share/bimanual-vla-sim-dashboard/cluster_inventory/${node}_inventory.json" 2>/dev/null || true
+  cache="$HOME/.local/share/bimanual-vla-sim-dashboard/cluster_inventory/${node}_inventory.json"
+  tmp="${cache}.tmp"
+  if timeout 20 ssh -n -o BatchMode=yes -o ConnectTimeout=8 login-server "test -s /DATA/NAS/GPUServer/sunny/dashboard_probe/${node}_inventory.json && cat /DATA/NAS/GPUServer/sunny/dashboard_probe/${node}_inventory.json" > "$tmp" 2>/dev/null; then
+    if [[ -s "$tmp" ]]; then mv "$tmp" "$cache"; else rm -f "$tmp"; fi
+  else
+    rm -f "$tmp"
+  fi
 done
 systemctl --user daemon-reload
 systemctl --user stop bimanual-vla-sim-dashboard.service 2>/dev/null || true

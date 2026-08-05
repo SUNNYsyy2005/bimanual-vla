@@ -3229,6 +3229,7 @@ def create_app(config_path: Path) -> Flask:
                     "xla_memory_fraction": config.get("xla_memory_fraction", 0.90),
                     "training_min_free_gpu_mib": config.get("training_min_free_gpu_mib", 23_000),
                     "transfer_parallelism": config.get("transfer_parallelism", 4),
+                    "nas_dataset_staging_root": config.get("nas_dataset_staging_root"),
                     "policy_port_range": [config["policy_port_min"], config["policy_port_max"]],
                     "robot_observation_max_age_s": observations.max_age_s,
                 },
