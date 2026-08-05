@@ -87,6 +87,10 @@ LEGACY_CONTRACT_VERSION = 2
 MIN_POLICY_ACTION_HORIZON = 16
 MODEL_ACTION_START_OFFSET_STEPS = 1
 ACTION_CONTRACT_MARKER_VERSION = 3
+SSH_HOST_FALLBACKS = {
+    "h200-ali-01": "sunny@47.116.14.100",
+    "h200-ali-02": "sunny@120.55.15.209",
+}
 
 try:
     from .dataset_editor import (
@@ -1252,6 +1256,11 @@ def _policy_port_from_command(command: list[str]) -> int | None:
         return None
 
 
+def normalize_ssh_host(value: Any) -> str:
+    host = str(value or "").strip()
+    return SSH_HOST_FALLBACKS.get(host, host)
+
+
 def load_config(path: Path) -> dict[str, Any]:
     config = read_json(path)
     if not isinstance(config, dict):
@@ -1319,6 +1328,9 @@ def load_config(path: Path) -> dict[str, Any]:
         if not isinstance(target, dict):
             continue
         item = dict(target)
+        for host_key in ("host", "submit_host"):
+            if item.get(host_key):
+                item[host_key] = normalize_ssh_host(item[host_key])
         for path_key in (
             "workdir",
             "openpi_repo",
