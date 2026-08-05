@@ -106,6 +106,11 @@
     .progress-track { height:8px; overflow:hidden; border-radius:999px; background:#07101c; }
     .progress-bar { height:100%; width:0; background:linear-gradient(90deg,var(--blue),var(--green)); }
     .section-note { padding:10px 12px; border-left:3px solid var(--blue); border-radius:7px; background:#0b1b2e; color:#aac0d8; }
+    .dataset-origin-real { color:#bfffe5; border-color:#217a5f !important; background:#103529 !important; }
+    .dataset-origin-simulation { color:#d9ccff; border-color:#624ca8 !important; background:#261f46 !important; }
+    .dataset-origin-unknown { color:#ffe5a3; border-color:#8d6c22 !important; background:#392d14 !important; }
+    .dataset-group-row td { padding:9px 12px; background:#0a1728; color:#cfe2f7; border-top:2px solid #31506f; font-weight:800; }
+    .dataset-origin-select { width:auto; min-width:104px; display:inline-block; padding:6px 8px; margin:2px; }
     @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid,.telemetry-latency-grid{grid-template-columns:repeat(2,1fr)}.episode-editor-grid{grid-template-columns:1fr}}
     @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid{grid-template-columns:1fr}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
   </style>
@@ -156,9 +161,9 @@
     <section id="module-datasets" class="dashboard-module" data-module="datasets" hidden>
       <div class="module-heading"><div><h2>数据集管理</h2><p>上传、检查、编辑 Episode，并独立预览每一路相机媒体。</p></div></div>
       <div class="grid">
-        <div class="card half"><h2>上传数据集</h2><p>采集机执行：</p><pre id="uploadCommand">python upload_dataset_4090.py LEROBOT_OR_GUI_NPZ_DIR --name my_dataset --server http://192.168.101.9:8090 --token TOKEN --workers 4 --merge</pre><p class="muted">支持含 <code>meta/info.json</code> 的 LeRobot 目录，或含 <code>ep_*.npz</code> 的 GUI 采集目录（自动导出）。<code>--merge</code> 增量追加；<code>--overwrite</code> 替换，二者互斥。</p></div>
-        <div class="card half"><h2>格式与媒体说明</h2><div class="section-note">Dashboard 可识别单臂 7D / 10D、双臂 14D / 20D 和其他自定义维度，并显示所有 <code>dtype: video</code> / <code>dtype: image</code> 相机。图片既可来自外部逐帧目录，也可直接读取 Parquet 内嵌 bytes。</div></div>
-        <div class="card"><h2>已接收数据集</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div></div>
+        <div class="card half"><h2>上传数据集</h2><p>真机采集机执行：</p><pre id="uploadCommand">python upload_dataset_4090.py LEROBOT_OR_GUI_NPZ_DIR --name my_dataset --dataset-origin real --server http://192.168.101.9:8090 --token TOKEN --workers 4 --merge</pre><p class="muted">仿真数据上传时改为 <code>--dataset-origin simulation</code>。上传暂存目录按 <code>uploads/real</code> 和 <code>uploads/simulation</code> 隔离；正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。</p></div>
+        <div class="card half"><h2>格式与媒体说明</h2><div class="section-note">Dashboard 可识别单臂 7D / 10D、双臂 14D / 20D 和其他自定义维度，并显示所有 <code>dtype: video</code> / <code>dtype: image</code> 相机。真机/仿真分类不改变数据集 ID 和训练加载路径，可在列表中随时修正。</div></div>
+        <div class="card"><h2>已接收数据集</h2><div class="toolbar"><label style="margin:0">来源筛选</label><select id="datasetOriginFilter" class="dataset-origin-select"><option value="all">全部</option><option value="real">真机</option><option value="simulation">仿真</option><option value="unknown">未分类</option></select><span id="datasetOriginSummary" class="muted">等待状态数据。</span></div><div class="table-wrap"><table><thead><tr><th>ID / 来源</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div></div>
         <div class="card">
           <h2>Episode 级数据集编辑与相机预览</h2>
           <p class="muted">参数编辑不修改 state/action/图像帧；合并、删除或编辑会先构造临时数据集并校验，成功后原子替换。已有 norm stats 将失效。</p>
@@ -388,26 +393,60 @@ function cameraDisplayName(key, armSide = 'right') {
   return value;
 }
 
+function datasetOriginLabel(origin) {
+  return origin === 'real' ? '真机' : origin === 'simulation' ? '仿真' : '未分类';
+}
+
+function datasetOriginBadge(origin) {
+  const normalized = ['real', 'simulation'].includes(origin) ? origin : 'unknown';
+  return `<span class="pill dataset-origin-${normalized}">${esc(datasetOriginLabel(normalized))}</span>`;
+}
+
+function datasetOriginOptions(selected) {
+  return ['real', 'simulation', 'unknown'].map(origin =>
+    `<option value="${origin}"${origin === selected ? ' selected' : ''}>${esc(datasetOriginLabel(origin))}</option>`
+  ).join('');
+}
+
 function fillDatasets(items) {
-  document.getElementById('datasets').innerHTML = items.map(d => `
-    <tr>
-      <td><code>${esc(d.id)}</code><br><span class="muted">${esc(d.robot_type)}</span></td>
-      <td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps<br>${d.train_episodes == null ? '<span class="muted">尚未生成 train/test 划分</span>' : `<span class="pill">${esc(d.train_episodes)} train</span> <span class="pill">${esc(d.test_episodes)} test</span>`}<br>${(d.norm_model_variants || []).length ? `<span class="ok">norm ready: ${esc((d.norm_model_variants || []).map(modelVariantLabel).join(', '))}</span>` : '<span class="warn">norm 需计算或划分已变化</span>'}</td>
-      <td><span class="pill">${esc(d.schema_label || d.schema)}</span> <span class="pill">${esc(d.arm_mode || '-')}</span> <span class="pill">${esc(d.dataset_layout || '-')}</span> <span class="pill">contract v${esc(d.contract_version || '?')}</span> ${d.training_supported ? '<span class="ok">训练兼容</span>' : '<span class="warn">仅管理 / 预览</span>'}<br><code>${esc(d.state_key || 'state?')}</code> ${esc(JSON.stringify(d.state_shape))} → <code>${esc(d.action_key || 'action?')}</code> ${esc(JSON.stringify(d.action_shape))}<br>state=${esc(d.state_dim || '?')}D · raw action=${esc(d.raw_action_dim || '?')}D · model/wire=${esc(d.model_action_dim || '?')}D · arm=${esc(d.arm_side || '-')}<br>${d.contract_error ? `<span class="bad">${esc(d.contract_error)}</span><br>` : ''}${d.training_error ? `<span class="warn">${esc(d.training_error)}</span><br>` : ''}${(d.media || []).map(m => `<span class="pill">${esc(m.type)} · ${esc(cameraDisplayName(m.key, d.arm_side))}</span>`).join(' ') || '<span class="muted">无相机媒体</span>'}</td>
-      <td><strong>raw</strong> ${esc(d.raw_action_semantics || '-')}<br><span class="muted">convention=${esc(d.raw_action_convention || '-')}</span><br><strong>model</strong> ${esc(d.model_action_semantics || '-')}<br><span class="muted">convention=${esc(d.model_action_convention || '-')}</span><br><strong>gripper</strong> raw=${esc(d.raw_gripper_semantics || '-')} → wire=${esc(d.wire_gripper_semantics || '-')}<br><span class="muted">raw offset=${d.action_offset == null ? '-' : esc(d.action_offset)} · model start=+${esc(d.model_action_start_offset ?? 1)} step</span></td>
-      <td><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button><button class="inline secondary" onclick="renameDataset('${esc(d.id)}')">重命名</button><button class="inline danger" onclick="deleteDataset('${esc(d.id)}')">删除数据集</button></td>
-    </tr>`).join('') || '<tr><td colspan="5" class="muted">暂无数据集</td></tr>';
+  const filter = document.getElementById('datasetOriginFilter').value || 'all';
+  const counts = {real: 0, simulation: 0, unknown: 0};
+  items.forEach(item => {
+    const origin = ['real', 'simulation'].includes(item.dataset_origin) ? item.dataset_origin : 'unknown';
+    counts[origin] += 1;
+  });
+  document.getElementById('datasetOriginSummary').textContent =
+    `真机 ${counts.real} · 仿真 ${counts.simulation} · 未分类 ${counts.unknown}`;
+
+  const visible = filter === 'all' ? items : items.filter(item => (item.dataset_origin || 'unknown') === filter);
+  const rows = [];
+  for (const origin of ['real', 'simulation', 'unknown']) {
+    const grouped = visible.filter(item => (item.dataset_origin || 'unknown') === origin);
+    if (!grouped.length) continue;
+    rows.push(`<tr class="dataset-group-row"><td colspan="5">${datasetOriginBadge(origin)} ${grouped.length} 个数据集</td></tr>`);
+    for (const d of grouped) {
+      rows.push(`
+        <tr>
+          <td>${datasetOriginBadge(d.dataset_origin)} <code>${esc(d.id)}</code><br><span class="muted">${esc(d.robot_type)} · source=${esc(d.dataset_origin_source || '-')}</span></td>
+          <td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps<br>${d.train_episodes == null ? '<span class="muted">尚未生成 train/test 划分</span>' : `<span class="pill">${esc(d.train_episodes)} train</span> <span class="pill">${esc(d.test_episodes)} test</span>`}<br>${(d.norm_model_variants || []).length ? `<span class="ok">norm ready: ${esc((d.norm_model_variants || []).map(modelVariantLabel).join(', '))}</span>` : '<span class="warn">norm 需计算或划分已变化</span>'}</td>
+          <td><span class="pill">${esc(d.schema_label || d.schema)}</span> <span class="pill">${esc(d.arm_mode || '-')}</span> <span class="pill">${esc(d.dataset_layout || '-')}</span> <span class="pill">contract v${esc(d.contract_version || '?')}</span> ${d.training_supported ? '<span class="ok">训练兼容</span>' : '<span class="warn">仅管理 / 预览</span>'}<br><code>${esc(d.state_key || 'state?')}</code> ${esc(JSON.stringify(d.state_shape))} → <code>${esc(d.action_key || 'action?')}</code> ${esc(JSON.stringify(d.action_shape))}<br>state=${esc(d.state_dim || '?')}D · raw action=${esc(d.raw_action_dim || '?')}D · model/wire=${esc(d.model_action_dim || '?')}D · arm=${esc(d.arm_side || '-')}<br>${d.contract_error ? `<span class="bad">${esc(d.contract_error)}</span><br>` : ''}${d.training_error ? `<span class="warn">${esc(d.training_error)}</span><br>` : ''}${(d.media || []).map(m => `<span class="pill">${esc(m.type)} · ${esc(cameraDisplayName(m.key, d.arm_side))}</span>`).join(' ') || '<span class="muted">无相机媒体</span>'}</td>
+          <td><strong>raw</strong> ${esc(d.raw_action_semantics || '-')}<br><span class="muted">convention=${esc(d.raw_action_convention || '-')}</span><br><strong>model</strong> ${esc(d.model_action_semantics || '-')}<br><span class="muted">convention=${esc(d.model_action_convention || '-')}</span><br><strong>gripper</strong> raw=${esc(d.raw_gripper_semantics || '-')} → wire=${esc(d.wire_gripper_semantics || '-')}<br><span class="muted">raw offset=${d.action_offset == null ? '-' : esc(d.action_offset)} · model start=+${esc(d.model_action_start_offset ?? 1)} step</span></td>
+          <td><select class="dataset-origin-select" onchange="setDatasetOrigin('${esc(d.id)}', this.value)">${datasetOriginOptions(d.dataset_origin)}</select><br><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button><button class="inline secondary" onclick="renameDataset('${esc(d.id)}')">重命名</button><button class="inline danger" onclick="deleteDataset('${esc(d.id)}')">删除数据集</button></td>
+        </tr>`);
+    }
+  }
+  document.getElementById('datasets').innerHTML = rows.join('') || '<tr><td colspan="5" class="muted">当前筛选下暂无数据集</td></tr>';
 
   const trainable = items.filter(d => d.training_supported);
   document.querySelectorAll('.dataset-select').forEach(select => {
     const old = select.value;
-    select.innerHTML = trainable.map(d => `<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.arm_mode || '-')} · ${esc(d.schema_label || d.schema)}</option>`).join('') || '<option value="" disabled>没有兼容训练的数据集</option>';
+    select.innerHTML = trainable.map(d => `<option value="${esc(d.id)}">[${esc(datasetOriginLabel(d.dataset_origin))}] ${esc(d.id)} · ${esc(d.arm_mode || '-')} · ${esc(d.schema_label || d.schema)}</option>`).join('') || '<option value="" disabled>没有兼容训练的数据集</option>';
     if (trainable.some(d => d.id === old)) select.value = old;
     syncArmSideForDatasetSelect(select);
   });
   const editor = document.getElementById('editorDataset');
   const previous = editor.value;
-  editor.innerHTML = items.map(d => `<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.episodes)} episodes</option>`).join('');
+  editor.innerHTML = items.map(d => `<option value="${esc(d.id)}">[${esc(datasetOriginLabel(d.dataset_origin))}] ${esc(d.id)} · ${esc(d.episodes)} episodes</option>`).join('');
   if (items.some(d => d.id === previous)) editor.value = previous;
   updateMergeSourceOptions(items);
 }
@@ -428,8 +467,15 @@ function updateMergeSourceOptions(items = (latestStatus && latestStatus.datasets
   const target = document.getElementById('editorDataset').value;
   const source = document.getElementById('mergeSourceDataset');
   const previous = source.value;
-  const choices = items.filter(d => d.id !== target);
-  source.innerHTML = choices.map(d => `<option value="${esc(d.id)}">${esc(d.id)} · ${esc(d.episodes)} episodes</option>`).join('');
+  const targetDataset = items.find(d => d.id === target);
+  const choices = items.filter(d => {
+    if (d.id === target) return false;
+    if (!targetDataset) return true;
+    const targetOrigin = targetDataset.dataset_origin || 'unknown';
+    const sourceOrigin = d.dataset_origin || 'unknown';
+    return targetOrigin === 'unknown' || sourceOrigin === 'unknown' || targetOrigin === sourceOrigin;
+  });
+  source.innerHTML = choices.map(d => `<option value="${esc(d.id)}">[${esc(datasetOriginLabel(d.dataset_origin))}] ${esc(d.id)} · ${esc(d.episodes)} episodes</option>`).join('');
   if (choices.some(d => d.id === previous)) source.value = previous;
   document.getElementById('mergeDatasetButton').disabled = !target || !choices.length;
 }
@@ -440,6 +486,21 @@ async function openDatasetEditor(datasetId) {
   updateMergeSourceOptions();
   await loadDatasetEpisodes(0);
   document.getElementById('episodeEditorSummary').scrollIntoView({behavior: 'smooth', block: 'center'});
+}
+
+async function setDatasetOrigin(datasetId, datasetOrigin) {
+  try {
+    await api(`/api/datasets/${encodeURIComponent(datasetId)}/origin`, {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({dataset_origin: datasetOrigin}),
+    });
+    show(`数据集 ${datasetId} 已标记为${datasetOriginLabel(datasetOrigin)}。`, false);
+    await refreshAll();
+  } catch (error) {
+    show(error.message);
+    await refreshAll();
+  }
 }
 
 async function renameDataset(datasetId) {
@@ -1677,7 +1738,7 @@ async function refreshAll() {
     fillTrainingTasks(data.tasks || []);
     fillObservation(data.robot_observation);
     updateSummaries(data);
-    document.getElementById('serverInfo').innerHTML = `管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>默认基础模型: <code>${esc(data.config.base_checkpoint)}</code><br>可选基础权重: ${esc((data.base_models || []).length)}<br>已有训练实验: ${esc((data.experiments || []).length)}`;
+    document.getElementById('serverInfo').innerHTML = `管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>真机上传暂存: <code>${esc((data.config.upload_roots || {}).real || '-')}</code><br>仿真上传暂存: <code>${esc((data.config.upload_roots || {}).simulation || '-')}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>默认基础模型: <code>${esc(data.config.base_checkpoint)}</code><br>可选基础权重: ${esc((data.base_models || []).length)}<br>已有训练实验: ${esc((data.experiments || []).length)}`;
     if (!episodeDatasetData && document.getElementById('editorDataset').value) loadDatasetEpisodes(0);
     const trainingVisible = !document.getElementById('module-training').hidden;
     if (trainingVisible && document.getElementById('trainMetricsTask').value) loadTrainingMetrics({quiet: true});
@@ -1780,6 +1841,9 @@ window.addEventListener('beforeunload', () => {
   previewUrls.forEach(URL.revokeObjectURL);
 });
 
+document.getElementById('datasetOriginFilter').addEventListener('change', () => {
+  fillDatasets((latestStatus && latestStatus.datasets) || []);
+});
 document.querySelectorAll('.dataset-select').forEach(select => select.addEventListener('change', () => {
   syncArmSideForDatasetSelect(select);
   if (select.id === 'policyDataset') fillCheckpoints((latestStatus && latestStatus.checkpoints) || []);

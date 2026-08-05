@@ -674,6 +674,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", type=Path, help="LeRobot directory, GUI ep_*.npz directory, or .tar with --archive")
     parser.add_argument("--name", default=None, help="server-side LeRobot repo/directory name")
+    parser.add_argument(
+        "--dataset-origin",
+        choices=("real", "simulation"),
+        default="real",
+        help="separate real-robot uploads from simulation uploads (default: real)",
+    )
     parser.add_argument("--server", default=os.environ.get("BIMANUAL_VLA_SERVER", DEFAULT_SERVER))
     parser.add_argument("--token", default=os.environ.get("BIMANUAL_VLA_SERVER_TOKEN"))
     parser.add_argument("--workers", type=int, default=4)
@@ -762,6 +768,7 @@ def main() -> int:
         "/api/uploads/init",
         {
             "dataset_name": dataset_name,
+            "dataset_origin": args.dataset_origin,
             "size": size,
             "sha256": archive_sha,
             "chunk_size": chunk_size,
@@ -812,7 +819,7 @@ def main() -> int:
     result = complete_upload(client, upload_id)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     operation = result.get("operation", "install")
-    print(f"Dataset {operation} complete: {dataset_name}")
+    print(f"Dataset {operation} complete: {dataset_name} ({args.dataset_origin})")
     return 0
 
 

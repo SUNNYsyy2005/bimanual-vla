@@ -494,6 +494,7 @@ bash deploy_4090_server.sh
 ```bash
 python upload_dataset_4090.py episodes_batches/20260803_pick_cube_01 \
   --name piper_v1 \
+  --dataset-origin real \
   --server http://192.168.101.9:8090 \
   --token "$BIMANUAL_VLA_SERVER_TOKEN" \
   --workers 4 \
@@ -506,11 +507,14 @@ python upload_dataset_4090.py episodes_batches/20260803_pick_cube_01 \
 ```bash
 python upload_dataset_4090.py piper/piper_v1_increment \
   --name piper_v1 \
+  --dataset-origin real \
   --server http://192.168.101.9:8090 \
   --token "$BIMANUAL_VLA_SERVER_TOKEN" \
   --workers 4 \
   --merge
 ```
+
+真机数据使用 `--dataset-origin real`，仿真数据使用 `--dataset-origin simulation`。服务端上传暂存目录按来源隔离，最终数据通过来源 marker 在 Dashboard 中分组，同时保持统一 LeRobot 根目录以兼容训练加载。
 
 原始 NPZ 的自动导出结果保存在 `~/.cache/bimanual-vla/uploads/exports`，源目录未变化时会复用；`--rebuild` 可强制重新导出并重建 tar。若一个原始目录混合了不同 arm mode/schema，导出会拒绝。`--merge` 与 `--overwrite` 互斥；目标不存在时 `--merge` 按首次安装处理。服务端会检查两个数据集的版本、robot type、FPS、chunk size、features、action semantics 和 action offset，随后重新编号新增 episode/global/task index，并在临时目录完成结构与 loader 校验后原子替换。
 

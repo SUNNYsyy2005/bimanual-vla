@@ -106,6 +106,8 @@ POLICY_CONFIG_NAMES = (
     "pi05_piper_single_arm_lora",
     "pi05_piper_bimanual_lora",
 )
+DATASET_ORIGINS = {"real", "simulation", "unknown"}
+DATASET_ORIGIN_METADATA_FILENAME = "dashboard_dataset_origin.json"
 
 
 class DatasetValidationError(ValueError):
@@ -143,6 +145,55 @@ def _atomic_json(path: Path, value: Any) -> None:
     temp = path.with_name(path.name + f".tmp-{uuid.uuid4().hex}")
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temp, path)
+
+
+def normalize_dataset_origin(value: Any, *, allow_unknown: bool = True) -> str:
+    origin = str(value or "unknown").strip().lower()
+    aliases = {
+        "real_robot": "real",
+        "real-robot": "real",
+        "hardware": "real",
+        "sim": "simulation",
+        "synthetic": "simulation",
+        "unknown": "unknown",
+    }
+    origin = aliases.get(origin, origin)
+    allowed = DATASET_ORIGINS if allow_unknown else DATASET_ORIGINS - {"unknown"}
+    if origin not in allowed:
+        raise ValueError(f"dataset origin must be one of {sorted(allowed)}")
+    return origin
+
+
+def read_dataset_origin_marker(dataset_path: Path) -> dict[str, Any] | None:
+    value = _read_json(
+        Path(dataset_path) / "meta" / DATASET_ORIGIN_METADATA_FILENAME
+    )
+    if not isinstance(value, dict):
+        return None
+    try:
+        origin = normalize_dataset_origin(value.get("origin"))
+    except ValueError:
+        return None
+    return {**value, "origin": origin}
+
+
+def write_dataset_origin_marker(
+    dataset_path: Path,
+    origin: Any,
+    *,
+    source: str,
+) -> dict[str, Any]:
+    normalized = normalize_dataset_origin(origin)
+    payload = {
+        "version": 1,
+        "origin": normalized,
+        "source": str(source),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    _atomic_json(
+        Path(dataset_path) / "meta" / DATASET_ORIGIN_METADATA_FILENAME, payload
+    )
+    return payload
 
 
 def _atomic_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -611,6 +662,7 @@ class DatasetEditor:
             )
         return {
             "id": dataset_id,
+            "dataset_origin_marker": read_dataset_origin_marker(root),
             "info": display_info,
             "tasks": [{"task_index": key, "task": value} for key, value in sorted(tasks.items())],
             "episodes": rows,
@@ -678,6 +730,26 @@ class DatasetEditor:
             f"image frame not found: dataset={dataset_id} episode={episode_index} "
             f"key={image_key} frame={frame_index}"
         )
+
+    def set_dataset_origin(
+        self, dataset_id: str, origin: Any, *, source: str = "dashboard"
+    ) -> dict[str, Any]:
+        dataset_id = _safe_dataset_id(dataset_id)
+        normalized = normalize_dataset_origin(origin)
+        with self._lock(dataset_id):
+            target = self._dataset_path(dataset_id)
+            if not target.is_dir():
+                raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
+            marker = write_dataset_origin_marker(
+                target, normalized, source=source
+            )
+        return {
+            "operation": "set_dataset_origin",
+            "dataset_id": dataset_id,
+            "dataset_origin": normalized,
+            "marker": marker,
+            "path": str(target),
+        }
 
     def rename_dataset(self, old_id: str, new_id: str) -> dict[str, Any]:
         old_id = _safe_dataset_id(old_id)
@@ -776,9 +848,19 @@ class DatasetEditor:
                 "warning": "historical checkpoints, models, and task records were not deleted",
             }
 
-    def install_upload(self, dataset_id: str, extracted: Path, *, overwrite: bool, merge: bool) -> dict[str, Any]:
+    def install_upload(
+        self,
+        dataset_id: str,
+        extracted: Path,
+        *,
+        overwrite: bool,
+        merge: bool,
+        dataset_origin: Any = "real",
+    ) -> dict[str, Any]:
         if overwrite and merge:
             raise ValueError("overwrite and merge are mutually exclusive")
+        normalized_origin = normalize_dataset_origin(dataset_origin, allow_unknown=False)
+        write_dataset_origin_marker(extracted, normalized_origin, source="upload")
         with self._lock(dataset_id):
             target = self._dataset_path(dataset_id)
             source_validation = self.validate_staging(extracted)
@@ -787,9 +869,18 @@ class DatasetEditor:
             final_validation = source_validation
             if target.exists():
                 self.assert_idle(dataset_id)
+                existing_marker = read_dataset_origin_marker(target)
+                existing_origin = (existing_marker or {}).get("origin")
+                if merge and existing_origin not in {None, "unknown", normalized_origin}:
+                    raise ValueError(
+                        f"cannot merge {normalized_origin} upload into {existing_origin} dataset {dataset_id}"
+                    )
                 if merge:
                     operation = "merge"
                     candidate = self._rebuild_candidate(dataset_id, [(target, None), (extracted, None)])
+                    write_dataset_origin_marker(
+                        candidate, normalized_origin, source="upload_merge"
+                    )
                     final_validation, result = self._validated_commit(dataset_id, candidate)
                 elif overwrite:
                     operation = "overwrite"
@@ -804,6 +895,7 @@ class DatasetEditor:
             result.update(
                 {
                     "operation": operation,
+                    "dataset_origin": normalized_origin,
                     "source_validation": source_validation,
                     "structural_validation": final_validation,
                 }
