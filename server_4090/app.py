@@ -3748,6 +3748,12 @@ print(json.dumps(rows, ensure_ascii=False))
         videos: list[dict[str, Any]] = []
         errors: dict[str, str] = {}
         for name, target in config.get("cluster_targets", {}).items():
+            if target.get("access_mode") == "slurm_only":
+                errors[name] = (
+                    target.get("inventory_note")
+                    or "slurm-only target: direct SSH video scan is disabled; sync videos through a Slurm staging job/NAS first"
+                )
+                continue
             host = target.get("submit_host")
             roots = remote_eval_video_roots(target)
             if not host or not roots:
@@ -3852,6 +3858,10 @@ print(json.dumps(rows, ensure_ascii=False))
         if source not in targets:
             raise ValueError(f"unknown video source target: {source}")
         target = targets[source]
+        if target.get("access_mode") == "slurm_only":
+            raise ValueError(
+                "remote video source is Slurm-only; copy/export the video via a Slurm staging job or NAS before Dashboard playback"
+            )
         roots = remote_eval_video_roots(target)
         rel = PurePosixPath(relative_path)
         if root not in roots:
@@ -3904,7 +3914,10 @@ print(json.dumps(rows, ensure_ascii=False))
                 continue
             locations[name] = {
                 "name": name,
-                "kind": "ssh",
+                "kind": "slurm_only" if target.get("access_mode") == "slurm_only" else "ssh",
+                "access_mode": target.get("access_mode", "ssh"),
+                "inventory_note": target.get("inventory_note"),
+                "inventory_cache_path": target.get("inventory_cache_path"),
                 "host": target.get("submit_host"),
                 "partition": target.get("partition"),
                 "node": target.get("node"),
@@ -3988,6 +4001,43 @@ print(json.dumps(rows, ensure_ascii=False))
     def remote_dataset_inventory(location: dict[str, Any], *, timeout: int = 30) -> tuple[list[dict[str, Any]], str | None]:
         if location.get("kind") == "local":
             return local_dataset_inventory(location), None
+        if location.get("kind") == "slurm_only":
+            cache_path = location.get("inventory_cache_path")
+            host = location.get("host")
+            if not cache_path:
+                return [], (
+                    location.get("inventory_note")
+                    or "slurm-only target: no inventory_cache_path configured; submit a staging/setup job through login-server"
+                )
+            if not host:
+                return [], "slurm-only target missing submit_host for inventory cache read"
+            command = f"test -s {shlex.quote(str(cache_path))} && cat {shlex.quote(str(cache_path))}"
+            try:
+                result = subprocess.run(
+                    [*SSH_COMMAND, str(host), command],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                return [], str(exc)
+            if result.returncode != 0:
+                note = location.get("inventory_note") or "slurm-only inventory cache is not ready"
+                return [], f"{note}; cache={cache_path}; {(result.stderr or result.stdout)[-1000:]}"
+            try:
+                payload = json.loads(result.stdout or "{}")
+            except json.JSONDecodeError as exc:
+                return [], f"invalid JSON inventory cache from {host}:{cache_path}: {exc}"
+            if isinstance(payload, dict):
+                rows = payload.get("datasets", [])
+                if not rows and payload.get("roots"):
+                    note = location.get("inventory_note") or "slurm-only inventory cache contains no datasets"
+                    return [], f"{note}; roots={payload.get('roots')}"
+                return rows if isinstance(rows, list) else [], None
+            if isinstance(payload, list):
+                return payload, None
+            return [], f"unsupported inventory cache format from {host}:{cache_path}"
         host = location.get("host")
         if not host:
             return [], "missing ssh host"
@@ -4103,6 +4153,10 @@ print(json.dumps(rows, ensure_ascii=False))
             raise ValueError(f"unknown target location: {target_name}")
         if source_name == target_name:
             raise ValueError("source and target must differ")
+        if locations[source_name].get("kind") == "slurm_only" or locations[target_name].get("kind") == "slurm_only":
+            raise ValueError(
+                "dataset sync involving a Slurm-only target must be done by a staging/setup Slurm job through login-server; direct SSH tar transfer is disabled"
+            )
         command = [
             config["openpi_python"],
             str(APP_DIR / "dataset_transfer_runner.py"),
