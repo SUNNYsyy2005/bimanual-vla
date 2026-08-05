@@ -35,13 +35,45 @@ X-API-Token: <token>
 /api/eval-videos/<video_id>?token=<token>
 ```
 
-在 4×4090 上查询当前仿真 Dashboard token：
+### 1.1.1 获取 Token
+
+Token 不写入 Git；由 4×4090 上的 user systemd 启动脚本首次启动时生成，保存在 `sunny` 用户自己的 `server.env` 中。
+
+仿真 Dashboard（8091）：
 
 ```bash
-ssh 4x4090 'source ~/.config/bimanual-vla-sim-dashboard/server.env && echo "$BIMANUAL_VLA_SERVER_TOKEN"'
+ssh 4x4090 'source ~/.config/bimanual-vla-sim-dashboard/server.env && printf "%s\n" "$BIMANUAL_VLA_SERVER_TOKEN"'
 ```
 
-如配置了登录账号密码，可换 token：
+实机 Dashboard（8090）：
+
+```bash
+ssh 4x4090 'source ~/.config/bimanual-vla/server.env && printf "%s\n" "$BIMANUAL_VLA_SERVER_TOKEN"'
+```
+
+也可以直接在 4×4090 本机执行：
+
+```bash
+# 仿真 8091
+source ~/.config/bimanual-vla-sim-dashboard/server.env
+printf "%s\n" "$BIMANUAL_VLA_SERVER_TOKEN"
+
+# 实机 8090
+source ~/.config/bimanual-vla/server.env
+printf "%s\n" "$BIMANUAL_VLA_SERVER_TOKEN"
+```
+
+如果你需要通过 Dashboard 登录账号密码换取 API token，可先查看对应服务的登录用户名。密码属于敏感信息，不要写入脚本、日志、Git 或聊天记录；只在交互式终端临时读取/复制：
+
+```bash
+# 仿真 8091 登录凭据位置
+ssh 4x4090 'source ~/.config/bimanual-vla-sim-dashboard/server.env && printf "user=%s\n" "$BIMANUAL_VLA_LOGIN_USER"'
+
+# 实机 8090 登录凭据位置
+ssh 4x4090 'source ~/.config/bimanual-vla/server.env && printf "user=%s\n" "$BIMANUAL_VLA_LOGIN_USER"'
+```
+
+账号密码换 token：
 
 ```bash
 curl -sS -X POST "$DASH/api/auth/token" \
@@ -53,6 +85,14 @@ curl -sS -X POST "$DASH/api/auth/token" \
 
 ```json
 {"token":"...","token_type":"Bearer","username":"..."}
+```
+
+AI agent 自动化调用时推荐优先通过 SSH 读取 `BIMANUAL_VLA_SERVER_TOKEN` 到当前 shell 变量，而不是处理登录密码：
+
+```bash
+export DASH=http://192.168.101.9:8091
+export TOKEN=$(ssh 4x4090 'source ~/.config/bimanual-vla-sim-dashboard/server.env && printf "%s" "$BIMANUAL_VLA_SERVER_TOKEN"')
+curl -H "Authorization: Bearer $TOKEN" "$DASH/api/status" | jq .
 ```
 
 ### 1.2 错误格式
