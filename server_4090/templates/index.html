@@ -238,7 +238,7 @@
           <div class="chart-shell"><canvas id="trainMetricsChart"></canvas></div><div id="trainMetricLegend" class="metric-legend"></div>
         </div>
         <div class="card third"><h2>Checkpoint</h2><div class="table-wrap"><table><thead><tr><th>实验 / step</th><th>数据集</th><th>大小 / 时间</th></tr></thead><tbody id="checkpoints"></tbody></table></div></div>
-        <div class="card" id="manualEvalCard">
+        <div class="card two-third" id="manualEvalCard">
           <h2>手动评测</h2>
           <p class="muted">用于仿真模型 held-out loss / 安全阈值评测；可选择 4×4090 本地或 H100/H200 Slurm 目标。H100/H200 通过 SSH 提交 sbatch，实际 GPU 工作在 Slurm 节点执行。</p>
           <form id="evalForm">
@@ -249,6 +249,11 @@
             <div class="row3"><div><label>Workers</label><input name="num_workers" type="number" value="2" min="0"></div><div><label>JAX 显存比例</label><input name="xla_memory_fraction" type="number" value="0.85" min="0.50" max="0.95" step="0.01"></div><div><label>Slurm GPU count（可选）</label><input name="cluster_gpus" type="number" min="1" max="8"></div></div>
             <p><button type="submit">提交评测</button></p>
           </form>
+        </div>
+        <div class="card third" id="evalTaskLogCard">
+          <h2>评测任务日志</h2>
+          <p class="muted">从训练进程管理表点击 Eval 行的“评测日志”，或提交手动评测后查看最近输出。</p>
+          <pre id="evalTaskLog">尚未选择评测任务。</pre>
         </div>
       </div>
     </section>
@@ -320,7 +325,7 @@ let episodeOffset = 0;
 let trainingMetricsData = null;
 let enabledMetrics = new Set();
 let metricsRequestSerial = 0;
-const selectedTaskLogs = {training: null, policy: null};
+const selectedTaskLogs = {training: null, eval: null, policy: null};
 const episodeLimit = 100;
 
 function saveToken() {
@@ -1704,7 +1709,9 @@ function fillTasks(items) {
       params = `dataset=${esc(m.dataset_id || '-')} · arm=${esc(m.arm_mode || '-')} · schema=${esc(m.schema || '-')}${contract}${model}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}<br>train batch=${esc(m.batch_size || '-')} · FSDP ${esc(m.fsdp_devices || '-')} · XLA ${esc(m.xla_memory_fraction || '-')}<br>norm batch=${esc(m.norm_batch_size || '等待/未知')}${evalConfig}` : `<br>norm batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}${split}`;
     }
     const stateDetails = `${jobDependencySummary(t)}${t.skip_reason ? `<br><span class="warn">${esc(t.skip_reason)}</span>` : ''}${t.start_error ? `<br><span class="bad">${esc(t.start_error)}</span>` : ''}`;
-    return `<tr><td><code class="task-ref" title="${esc(t.id)}">${esc(shortTaskId(t.id))}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${stateDetails}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}','training')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','training')">删除记录</button>` : ''}</td></tr>`;
+    const logModule = t.type === 'eval' ? 'eval' : 'training';
+    const logLabel = t.type === 'eval' ? '评测日志' : '日志';
+    return `<tr><td><code class="task-ref" title="${esc(t.id)}">${esc(shortTaskId(t.id))}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${stateDetails}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}','${logModule}')">${logLabel}</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','${logModule}')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="4" class="muted">暂无 Norm / Train / Eval 任务</td></tr>';
   fillReplacePolicies(items);
   updateClientCommand();
@@ -1997,6 +2004,7 @@ async function refreshAll() {
     loadClusterResources({quiet: true});
     fillTasks(data.tasks || []);
     fillTrainingTasks(data.tasks || []);
+    refreshSelectedLogs();
     fillObservation(data.robot_observation);
     updateSummaries(data);
     document.getElementById('serverInfo').innerHTML = `管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>真机上传暂存: <code>${esc((data.config.upload_roots || {}).real || '-')}</code><br>仿真上传暂存: <code>${esc((data.config.upload_roots || {}).simulation || '-')}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>默认基础模型: <code>${esc(data.config.base_checkpoint)}</code><br>可选基础权重: ${esc((data.base_models || []).length)}<br>已有训练实验: ${esc((data.experiments || []).length)}`;
@@ -2040,31 +2048,45 @@ async function setPolicyShadow(id) {
   }
 }
 
-async function loadLog(id, moduleName = 'training') {
-  const targetModule = moduleName === 'policy' ? 'policy' : 'training';
-  const logId = targetModule === 'policy' ? 'policyTaskLog' : 'taskLog';
-  const cardId = targetModule === 'policy' ? 'policyTaskLogCard' : 'trainingTaskLogCard';
+function taskLogTarget(moduleName = 'training') {
+  if (moduleName === 'policy') {
+    return {module: 'policy', viewModule: 'policy', logId: 'policyTaskLog', cardId: 'policyTaskLogCard', empty: '尚未选择 Policy 进程。', kind: 'Policy'};
+  }
+  if (moduleName === 'eval') {
+    return {module: 'eval', viewModule: 'training', logId: 'evalTaskLog', cardId: 'evalTaskLogCard', empty: '尚未选择评测任务。', kind: '评测'};
+  }
+  return {module: 'training', viewModule: 'training', logId: 'taskLog', cardId: 'trainingTaskLogCard', empty: '尚未选择任务。', kind: '训练'};
+}
+
+async function loadLog(id, moduleName = 'training', options = {}) {
+  const target = taskLogTarget(moduleName);
   try {
     const data = await api(`/api/tasks/${encodeURIComponent(id)}/log?max_bytes=131072`);
-    document.getElementById(logId).textContent = data.log || '(empty)';
-    selectedTaskLogs[targetModule] = id;
-    showModule(targetModule);
-    document.getElementById(cardId).scrollIntoView({behavior: 'smooth', block: 'center'});
+    document.getElementById(target.logId).textContent = data.log || '(empty)';
+    selectedTaskLogs[target.module] = id;
+    if (!options.quiet) {
+      showModule(target.viewModule);
+      document.getElementById(target.cardId).scrollIntoView({behavior: 'smooth', block: 'center'});
+    }
   } catch (error) {
-    show(error.message);
+    if (!options.quiet) show(error.message);
+  }
+}
+
+async function refreshSelectedLogs() {
+  for (const [moduleName, id] of Object.entries(selectedTaskLogs)) {
+    if (id) await loadLog(id, moduleName, {quiet: true});
   }
 }
 
 async function deleteTask(id, moduleName = 'training') {
-  const targetModule = moduleName === 'policy' ? 'policy' : 'training';
-  const kind = targetModule === 'policy' ? 'Policy' : '训练';
-  if (!confirm(`删除历史${kind}任务 ${id}？\n将删除 Dashboard 任务记录和日志，但不会删除 checkpoint、模型或训练输出。`)) return;
+  const target = taskLogTarget(moduleName);
+  if (!confirm(`删除历史${target.kind}任务 ${id}？\n将删除 Dashboard 任务记录和日志，但不会删除 checkpoint、模型或训练输出。`)) return;
   try {
     await api(`/api/tasks/${encodeURIComponent(id)}`, {method: 'DELETE'});
-    if (selectedTaskLogs[targetModule] === id) {
-      const logId = targetModule === 'policy' ? 'policyTaskLog' : 'taskLog';
-      document.getElementById(logId).textContent = targetModule === 'policy' ? '尚未选择 Policy 进程。' : '尚未选择任务。';
-      selectedTaskLogs[targetModule] = null;
+    if (selectedTaskLogs[target.module] === id) {
+      document.getElementById(target.logId).textContent = target.empty;
+      selectedTaskLogs[target.module] = null;
     }
     show(`历史任务 ${id} 已删除。`, false);
     await refreshAll();
@@ -2219,7 +2241,10 @@ document.getElementById('evalForm').onsubmit = async event => {
   try {
     const task = await api('/api/tasks/eval', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
     show(`评测任务已启动：${task.id}`, false);
+    selectedTaskLogs.eval = task.id;
+    document.getElementById('evalTaskLog').textContent = `评测任务已启动：${task.id}\n等待日志输出...`;
     showModule('training');
+    document.getElementById('evalTaskLogCard').scrollIntoView({behavior: 'smooth', block: 'center'});
     refreshAll();
   } catch (error) {
     show(error.message);
