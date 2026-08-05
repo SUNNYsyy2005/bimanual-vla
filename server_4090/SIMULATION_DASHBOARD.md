@@ -950,7 +950,7 @@ ssh <source> 'tar -C <remote_root> -cf - <relative_path>' | tar -C <local_eval_v
 
 所有 Dashboard 托管的跨服务器传输默认采用并行流式传输：
 
-- 数据集同步 `/api/datasets/<dataset_id>/sync`：对可 SSH 访问的位置，先在源端按文件大小做均衡分片，然后同时启动多个 `tar` 流，经由 4×4090 控制端并行抽取/写入目标位置；H200 Slurm-only 不走该直传接口，需要 staging/setup Slurm 作业或 NAS 中转。
+- 数据集同步 `/api/datasets/<dataset_id>/sync`：对可 SSH 访问的位置，先在源端按文件大小做均衡分片，然后同时启动多个 `tar` 流，经由 4×4090 控制端并行抽取/写入目标位置；涉及 H200 Slurm-only 时，接口会自动采用 NAS staging + CPU-only Slurm copy job，不在 H200 上开端口。
 - 远端评估视频同步 `/api/eval-videos/sync`：按 64MiB 分片并行从远端读取，全部分片校验大小后再在 4×4090 合并为可播放文件。
 - 默认并行度来自 `config.simulation.json` 的 `transfer_parallelism`，建议 4；接口也可在 JSON body 里临时覆盖：
 
@@ -964,7 +964,7 @@ curl -X POST "$SIM_DASHBOARD/api/eval-videos/sync" \
   -d '{"source":"h100","root":"/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/outputs","relative_path":"eval/run.mp4","parallelism":8}'
 ```
 
-并行度上限为 16。若源/目标是 H200 Slurm-only，接口会直接拒绝直传并提示使用 staging/setup Slurm 作业或 NAS；不会在 H200 上启动任何监听服务。
+并行度上限为 16。若源/目标是 H200 Slurm-only，接口不会直连 H200 计算节点，而是通过 login-server 提交 Slurm staging/copy 作业；不会在 H200 上启动任何监听服务。
 
 ## 15. 仿真 joint 数据集训练兼容
 
@@ -1021,3 +1021,57 @@ Inventory cache：
 ```
 
 当前探测结果：`/DATA/disk0/sunny/.cache/huggingface/lerobot` 不存在或无 LeRobot 数据集。若要在 h200-ali-02 训练，需要先单独 staging 数据、项目、环境和 checkpoint。
+
+## 19. 数据集位置显示、同步与视频懒加载（2026-08-05 更新）
+
+### 19.1 数据集位置
+
+仿真 Dashboard 的数据集表现在会合并 `/api/status` 本地清单和 `/api/dataset-locations?origin=simulation` 跨服务器清单，并在“位置 / 同步”列显示：
+
+- `4×4090`：`/home/sunny/.cache/huggingface/lerobot`，也是上传默认安装位置；
+- `H100`：通过 `login-server` 轻量扫描 `/DATA/disk0/sunny/.cache/huggingface/lerobot`；
+- `H200 ali-01 / ali-02`：不直接 SSH 扫描计算节点，读取 4×4090 本地镜像 inventory：
+  `/home/sunny/.local/share/bimanual-vla-sim-dashboard/cluster_inventory/*_inventory.json`。
+
+刷新位置：
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SIM_DASHBOARD/api/dataset-locations?origin=simulation" | jq .
+```
+
+### 19.2 数据集同步接口
+
+上传客户端无需指定服务器，默认安装到 4×4090：
+
+```bash
+python upload_dataset_4090.py LEROBOT_OR_GUI_NPZ_DIR \
+  --name my_sim_dataset --dataset-origin simulation \
+  --server "$SIM_DASHBOARD" --token "$TOKEN" --workers 4 --merge
+```
+
+同步到其他服务器：
+
+```bash
+curl -X POST "$SIM_DASHBOARD/api/datasets/my_sim_dataset/sync" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"source":"local_4090","target":"h100","parallelism":8,"overwrite":false}'
+
+curl -X POST "$SIM_DASHBOARD/api/datasets/my_sim_dataset/sync" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"source":"local_4090","target":"h200-ali-01","parallelism":8,"overwrite":false}'
+```
+
+H100 走 4×4090 ↔ login-server 的并行 tar 流。H200 仍遵守 Slurm-only 规则：Dashboard 先把数据并行 staging 到 NAS
+`/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync`，然后通过 `login-server` 提交 CPU-only Slurm copy job 到目标 H200 节点，复制到 `/DATA/disk0/sunny/.cache/huggingface/lerobot`，不会在 H200 上开端口或绕过 Slurm。
+
+### 19.3 评估视频
+
+评估视频页面现在只渲染列表，不会一次性创建所有 `<video>` 播放器；点击“加载 / 播放”后才请求具体视频流。列表支持按：
+
+- 任务/目录；
+- 实验/checkpoint；
+- 成功/失败/未知；
+- 路径关键词；
+
+进行筛选。成功状态从同目录或父目录 `_result.txt` 中尽量推断；无法推断时显示“未知”。

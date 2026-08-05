@@ -110,7 +110,14 @@
     .dataset-origin-simulation { color:#d9ccff; border-color:#624ca8 !important; background:#261f46 !important; }
     .dataset-origin-unknown { color:#ffe5a3; border-color:#8d6c22 !important; background:#392d14 !important; }
     .dataset-group-row td { padding:9px 12px; background:#0a1728; color:#cfe2f7; border-top:2px solid #31506f; font-weight:800; }
-    .dataset-origin-select { width:auto; min-width:104px; display:inline-block; padding:6px 8px; margin:2px; }
+    .dataset-origin-select,.dataset-sync-select { width:auto; min-width:104px; display:inline-block; padding:6px 8px; margin:2px; }
+    .location-list { display:flex; flex-wrap:wrap; gap:5px; margin-top:5px; }
+    .location-pill { max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .eval-filter-grid { display:grid; grid-template-columns:1.2fr 1.2fr .8fr 1fr auto auto; gap:10px; align-items:end; margin-bottom:12px; }
+    .eval-video-list { display:grid; gap:10px; margin-top:12px; }
+    .eval-video-card { padding:12px; border:1px solid #304b68; border-radius:11px; background:#07121f; }
+    .eval-video-card header { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
+    .eval-video-card video { display:block; width:100%; max-height:520px; margin-top:10px; border:1px solid #2e465f; border-radius:9px; background:#000; }
     @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid,.telemetry-latency-grid{grid-template-columns:repeat(2,1fr)}.episode-editor-grid{grid-template-columns:1fr}}
     @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid{grid-template-columns:1fr}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
   </style>
@@ -165,7 +172,7 @@
       <div class="grid">
         <div class="card half"><h2>上传数据集</h2><p>{{ "仿真数据上传执行：" if dashboard_profile == "simulation" else "真机采集机执行：" }}</p><pre id="uploadCommand">python upload_dataset_4090.py LEROBOT_OR_GUI_NPZ_DIR --name my_dataset --dataset-origin {{ upload_default_origin }} --server http://192.168.101.9:{{ server_port }} --token TOKEN --workers 4 --merge</pre><p class="muted">{{ "仿真 Dashboard 默认只接收并显示 --dataset-origin simulation 的数据；正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。" if dashboard_profile == "simulation" else "仿真数据上传时仍使用 --dataset-origin simulation，其暂存目录与真机数据隔离，并且不会出现在实机 Dashboard 列表或训练/Policy 数据集选择器中。正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。" }}</p></div>
         <div class="card half"><h2>格式与媒体说明</h2><div class="section-note">Dashboard 可识别单臂 7D / 10D、双臂 14D / 20D 和其他自定义维度，并显示所有 <code>dtype: video</code> / <code>dtype: image</code> 相机。{{ "这里只呈现仿真数据集；可从本页面统一提交 4×4090 本地训练/评测或 H100/H200 Slurm 训练/评测。" if dashboard_profile == "simulation" else "这里只呈现真机和未分类数据集；将来源标记为仿真后，该数据集会从 Dashboard 隐藏，但数据集 ID 和底层训练加载路径不会改变。" }}</div></div>
-        <div class="card"><h2>{{ "已接收仿真数据集" if dashboard_profile == "simulation" else "已接收真机数据集" }}</h2><div class="toolbar"><label style="margin:0">来源筛选</label><select id="datasetOriginFilter" class="dataset-origin-select"><option value="all">全部</option>{% for origin in visible_dataset_origins %}<option value="{{ origin }}">{{ "真机" if origin == "real" else "仿真" if origin == "simulation" else "未分类" }}</option>{% endfor %}</select><span id="datasetOriginSummary" class="muted">等待状态数据。</span></div><div class="table-wrap"><table><thead><tr><th>ID / 来源</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div></div>
+        <div class="card"><h2>{{ "已接收仿真数据集" if dashboard_profile == "simulation" else "已接收真机数据集" }}</h2><div class="toolbar"><label style="margin:0">来源筛选</label><select id="datasetOriginFilter" class="dataset-origin-select"><option value="all">全部</option>{% for origin in visible_dataset_origins %}<option value="{{ origin }}">{{ "真机" if origin == "real" else "仿真" if origin == "simulation" else "未分类" }}</option>{% endfor %}</select><button class="inline secondary" type="button" onclick="loadDatasetLocations(true)">刷新 4×4090/H100/H200 位置</button><span id="datasetOriginSummary" class="muted">等待状态数据。</span></div><div class="table-wrap"><table><thead><tr><th>ID / 来源</th><th>位置 / 同步</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div></div>
         <div class="card">
           <h2>Episode 级数据集编辑与相机预览</h2>
           <p class="muted">参数编辑不修改 state/action/图像帧；合并、删除或编辑会先构造临时数据集并校验，成功后原子替换。已有 norm stats 将失效。</p>
@@ -247,8 +254,19 @@
     </section>
 
     <section id="module-eval-videos" class="dashboard-module" data-module="eval-videos" hidden>
-      <div class="module-heading"><div><h2>评估视频</h2><p>直接在服务器上查看仿真评测录制结果，无需同步到本地。</p></div></div>
-      <div class="grid"><div class="card"><div class="toolbar"><button class="inline secondary" onclick="loadEvalVideos(false)">刷新本地视频</button><button class="inline secondary" onclick="loadEvalVideos(true)">扫描 H100/H200 并同步</button><span id="evalVideoSummary" class="muted">尚未加载。</span></div><div id="evalVideoList" class="preview-grid"></div></div></div>
+      <div class="module-heading"><div><h2>评估视频</h2><p>先显示列表，按实际任务/实验/成功状态筛选；点击某个视频后才加载播放器。</p></div></div>
+      <div class="grid"><div class="card">
+        <div class="eval-filter-grid">
+          <div><label>任务 / 目录</label><input id="evalVideoTaskFilter" placeholder="如 put_bottles / pb3"></div>
+          <div><label>实验 / checkpoint</label><input id="evalVideoExperimentFilter" placeholder="如 cp16000 / h200-7630"></div>
+          <div><label>成功状态</label><select id="evalVideoSuccessFilter"><option value="all">全部</option><option value="success">成功</option><option value="failed">失败</option><option value="unknown">未知</option></select></div>
+          <div><label>关键词</label><input id="evalVideoQueryFilter" placeholder="路径关键词"></div>
+          <button class="inline secondary" onclick="loadEvalVideos(false)">刷新本地列表</button>
+          <button class="inline secondary" onclick="loadEvalVideos(true)">扫描 H100/H200</button>
+        </div>
+        <span id="evalVideoSummary" class="muted">尚未加载。</span>
+        <div id="evalVideoList" class="eval-video-list"></div>
+      </div></div>
     </section>
 
     <section id="module-policy" class="dashboard-module" data-module="policy" hidden>
@@ -293,6 +311,7 @@ const ENABLE_POLICY = {{ enable_policy|tojson }};
 const MODULES = new Set(ENABLE_POLICY ? ['overview', 'datasets', 'training', 'policy', 'telemetry', 'eval-videos'] : ['overview', 'datasets', 'training', 'eval-videos']);
 const METRIC_COLORS = ['#42c7ff', '#3ee6a8', '#ffd166', '#ff6f91', '#a78bfa', '#fb923c', '#67e8f9'];
 let latestStatus = null;
+let latestDatasetLocations = null;
 let latestTelemetryKey = null;
 let previewUrls = [];
 let episodeMediaPlayers = [];
@@ -372,30 +391,53 @@ async function loadEvalVideos(includeRemote = false) {
   const summary = document.getElementById('evalVideoSummary');
   const list = document.getElementById('evalVideoList');
   if (!summary || !list) return;
-  summary.textContent = '正在扫描评估视频…';
+  const params = new URLSearchParams({limit: '300'});
+  if (includeRemote) params.set('include_remote', 'true');
+  const taskFilter = document.getElementById('evalVideoTaskFilter')?.value.trim();
+  const experimentFilter = document.getElementById('evalVideoExperimentFilter')?.value.trim();
+  const successFilter = document.getElementById('evalVideoSuccessFilter')?.value || 'all';
+  const queryFilter = document.getElementById('evalVideoQueryFilter')?.value.trim();
+  if (taskFilter) params.set('task', taskFilter);
+  if (experimentFilter) params.set('experiment', experimentFilter);
+  if (successFilter !== 'all') params.set('success', successFilter);
+  if (queryFilter) params.set('q', queryFilter);
+  summary.textContent = '正在扫描评估视频列表…';
   try {
-    const data = await api(`/api/eval-videos?limit=200${includeRemote ? '&include_remote=true' : ''}`);
+    const data = await api(`/api/eval-videos?${params.toString()}`);
     const videos = data.videos || [];
-    document.getElementById('navEvalVideoCount').textContent = String(videos.length);
-    summary.textContent = videos.length
-      ? `${videos.length} 个视频 · roots=${(data.roots || []).join(', ') || '-'}`
-      : `暂无视频 · roots=${(data.roots || []).join(', ') || '-'}`;
-    list.innerHTML = videos.map(video => {
-      if (video.remote) {
-        return `<figure>
-          <figcaption>${esc(video.source)} · ${esc(video.relative_path)}<br><span class="muted">${esc(video.updated_at)} · ${esc(video.size_mib)} MiB · 远端待同步</span></figcaption>
-          <button class="inline" type="button" onclick="syncEvalVideo('${esc(video.source)}','${esc(video.root)}','${esc(video.relative_path)}')">同步到 4×4090 后播放</button>
-        </figure>`;
-      }
-      return `<figure>
-        <figcaption>${esc(video.relative_path)}<br><span class="muted">${esc(video.updated_at)} · ${esc(video.size_mib)} MiB</span></figcaption>
-        <video controls preload="metadata" style="width:100%;max-height:360px;border-radius:10px;background:#000" src="${esc(video.url)}?token=${encodeURIComponent(tokenInput.value)}&cache=${Date.now()}"></video>
-      </figure>`;
-    }).join('') || '<div class="muted">没有找到 mp4/webm/mov/mkv/avi/gif 文件。</div>';
+    document.getElementById('navEvalVideoCount').textContent = String(data.total ?? videos.length);
+    const success = (data.facets && data.facets.success) || {};
+    const remoteErrors = Object.entries(data.remote_errors || {}).map(([k, v]) => `${k}: ${String(v).slice(0, 160)}`);
+    summary.textContent = `${videos.length}/${data.total ?? videos.length} 个视频 · 成功 ${success.success || 0} · 失败 ${success.failed || 0} · 未知 ${success.unknown || 0}${remoteErrors.length ? ' · 远端提示: ' + remoteErrors.join(' ; ') : ''}`;
+    list.innerHTML = videos.map(video => renderEvalVideoRow(video)).join('') || '<div class="muted">没有找到符合筛选条件的 mp4/webm/mov/mkv/avi/gif 文件。</div>';
   } catch (error) {
     summary.textContent = `视频加载失败：${error.message}`;
     show(error.message);
   }
+}
+
+function renderEvalVideoRow(video) {
+  const statusClass = video.success === 'success' ? 'ok' : video.success === 'failed' ? 'bad' : 'warn';
+  const statusLabel = video.success === 'success' ? '成功' : video.success === 'failed' ? '失败' : '未知';
+  const meta = `${esc(video.source || (video.remote ? 'remote' : '4×4090'))} · task=${esc(video.task || '-')} · exp=${esc(video.experiment || '-')} · ${esc(video.updated_at)} · ${esc(video.size_mib)} MiB`;
+  const holderId = `evalPlayer_${esc(video.id)}`;
+  const action = video.remote
+    ? `<button class="inline" type="button" onclick="syncEvalVideo('${esc(video.source)}','${esc(video.root)}','${esc(video.relative_path)}')">同步到 4×4090</button>`
+    : `<button class="inline" type="button" onclick="playEvalVideo('${esc(video.id)}')">加载 / 播放</button>`;
+  return `<div class="eval-video-card">
+    <header><div><strong>${esc(video.display_name || video.name || video.relative_path)}</strong> <span class="${statusClass}">${statusLabel}</span><br><code class="path">${esc(video.relative_path)}</code><br><span class="muted">${meta}${video.score == null ? '' : ` · score=${esc(video.score)}`}</span></div><div>${action}</div></header>
+    <div id="${holderId}"></div>
+  </div>`;
+}
+
+function playEvalVideo(videoId) {
+  const holder = document.getElementById(`evalPlayer_${videoId}`);
+  if (!holder) return;
+  if (holder.innerHTML.trim()) {
+    holder.innerHTML = '';
+    return;
+  }
+  holder.innerHTML = `<video controls autoplay preload="metadata" src="/api/eval-videos/${encodeURIComponent(videoId)}?token=${encodeURIComponent(tokenInput.value)}&cache=${Date.now()}"></video>`;
 }
 
 async function syncEvalVideo(source, root, relativePath) {
@@ -482,6 +524,100 @@ function dashboardDatasets(items) {
   return (items || []).filter(item => VISIBLE_DATASET_ORIGINS.has(item.dataset_origin || 'unknown'));
 }
 
+
+function datasetLocationLabel(target) {
+  if (target === 'local_4090') return '4×4090';
+  if (target === 'h100') return 'H100';
+  if (String(target || '').startsWith('h200')) return String(target).replace('h200-', 'H200 ');
+  return target || '-';
+}
+
+function datasetLocationOptions() {
+  const locations = (latestDatasetLocations && latestDatasetLocations.locations) || {local_4090: {label: '4×4090'}};
+  return Object.entries(locations).map(([name, loc]) => ({id: name, label: loc.label || datasetLocationLabel(name), kind: loc.kind || '-'}));
+}
+
+function mergeDatasetLocationInfo(items, locationData) {
+  if (!locationData || !Array.isArray(locationData.datasets)) return items;
+  const byId = new Map(items.map(item => [item.id, item]));
+  for (const remote of locationData.datasets) {
+    const existing = byId.get(remote.id);
+    const locations = (remote.locations || []).map(loc => ({...loc, label: loc.label || datasetLocationLabel(loc.target)}));
+    if (existing) {
+      existing.locations = locations;
+      existing.targets = remote.targets || locations.map(loc => loc.target);
+      existing.duplicate_count = remote.duplicate_count || locations.length;
+      continue;
+    }
+    const first = locations[0] || {};
+    const origin = (remote.origins && remote.origins[0]) || first.origin || 'unknown';
+    if (!VISIBLE_DATASET_ORIGINS.has(origin)) continue;
+    byId.set(remote.id, {
+      id: remote.id,
+      dataset_origin: origin,
+      dataset_origin_source: 'remote_inventory',
+      remote_only: true,
+      training_supported: false,
+      training_error: '仅在远端发现；同步到 4×4090 后可本地编辑/校验，或用于对应集群训练。',
+      schema_label: 'remote only', schema: 'remote', arm_mode: '-', dataset_layout: '-', contract_version: '-',
+      state_key: 'state?', state_shape: null, action_key: 'action?', action_shape: null,
+      state_dim: null, raw_action_dim: null, model_action_dim: null, arm_side: '-', media: [],
+      raw_action_semantics: '-', raw_action_convention: '-', model_action_semantics: '-', model_action_convention: '-',
+      raw_gripper_semantics: '-', wire_gripper_semantics: '-', action_offset: null, model_action_start_offset: null,
+      episodes: first.episodes, frames: first.frames, fps: first.fps, robot_type: first.robot_type || '-',
+      locations, targets: remote.targets || locations.map(loc => loc.target), duplicate_count: remote.duplicate_count || locations.length,
+    });
+  }
+  return Array.from(byId.values());
+}
+
+function renderDatasetLocations(d) {
+  const locations = d.locations || [];
+  const pills = locations.length ? locations.map(loc => `<span class="pill location-pill" title="${esc((loc.host ? loc.host + ':' : '') + (loc.path || loc.root || ''))}">${esc(loc.label || datasetLocationLabel(loc.target))}${loc.kind === 'slurm_only' ? ' · Slurm' : ''}</span>`).join('') : '<span class="muted">仅本地状态未知</span>';
+  const selectId = `syncTarget_${d.id.replace(/[^A-Za-z0-9_-]/g, '_')}`;
+  const source = (locations.some(loc => loc.target === 'local_4090') ? 'local_4090' : (locations[0] && locations[0].target) || 'local_4090');
+  const options = datasetLocationOptions().filter(loc => loc.id !== source).map(loc => `<option value="${esc(loc.id)}">${esc(loc.label)}${loc.kind === 'slurm_only' ? ' · Slurm' : ''}</option>`).join('');
+  return `<div class="location-list">${pills}</div><div style="margin-top:7px"><select id="${esc(selectId)}" class="dataset-sync-select">${options}</select><button class="inline secondary" type="button" onclick="syncDatasetTo('${esc(d.id)}','${esc(selectId)}','${esc(source)}')">同步</button></div>`;
+}
+
+async function loadDatasetLocations(forceRender = false) {
+  if (!tokenInput.value) return null;
+  const origin = DASHBOARD_PROFILE === 'simulation' ? 'simulation' : '';
+  const suffix = origin ? `?origin=${encodeURIComponent(origin)}` : '';
+  try {
+    latestDatasetLocations = await api(`/api/dataset-locations${suffix}`);
+    if (latestDatasetLocations.errors && Object.keys(latestDatasetLocations.errors).length) {
+      console.warn('dataset location errors', latestDatasetLocations.errors);
+    }
+    if (forceRender && latestStatus) {
+      latestStatus.datasets = mergeDatasetLocationInfo(latestStatus.datasets || [], latestDatasetLocations);
+      fillDatasets(latestStatus.datasets || []);
+    }
+    return latestDatasetLocations;
+  } catch (error) {
+    console.warn('dataset locations failed', error);
+    if (forceRender) show(`数据集位置刷新失败：${error.message}`);
+    return null;
+  }
+}
+
+async function syncDatasetTo(datasetId, selectId, source) {
+  const target = document.getElementById(selectId)?.value;
+  if (!target) { show('请选择同步目标。'); return; }
+  const overwrite = confirm(`同步 ${datasetId}: ${source} → ${target}\n如果目标已存在，是否覆盖？\n\n确定=覆盖；取消=不覆盖且目标存在时失败。`);
+  try {
+    const task = await api(`/api/datasets/${encodeURIComponent(datasetId)}/sync`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({source, target, overwrite, parallelism: 4}),
+    });
+    show(`数据集同步任务已启动：${task.id}（${source} → ${target}）`, false);
+    showModule('training');
+    refreshAll();
+  } catch (error) {
+    show(error.message);
+  }
+}
+
 function fillDatasets(items) {
   items = dashboardDatasets(items);
   const filter = document.getElementById('datasetOriginFilter').value || 'all';
@@ -498,19 +634,20 @@ function fillDatasets(items) {
   for (const origin of ['real', 'simulation', 'unknown'].filter(origin => VISIBLE_DATASET_ORIGINS.has(origin))) {
     const grouped = visible.filter(item => (item.dataset_origin || 'unknown') === origin);
     if (!grouped.length) continue;
-    rows.push(`<tr class="dataset-group-row"><td colspan="5">${datasetOriginBadge(origin)} ${grouped.length} 个数据集</td></tr>`);
+    rows.push(`<tr class="dataset-group-row"><td colspan="6">${datasetOriginBadge(origin)} ${grouped.length} 个数据集</td></tr>`);
     for (const d of grouped) {
       rows.push(`
         <tr>
-          <td>${datasetOriginBadge(d.dataset_origin)} <code>${esc(d.id)}</code><br><span class="muted">${esc(d.robot_type)} · source=${esc(d.dataset_origin_source || '-')}</span></td>
+          <td>${datasetOriginBadge(d.dataset_origin)} <code>${esc(d.id)}</code><br><span class="muted">${esc(d.robot_type)} · source=${esc(d.dataset_origin_source || '-')}</span>${d.remote_only ? '<br><span class="warn">远端清单项，本地未安装</span>' : ''}</td>
+          <td>${renderDatasetLocations(d)}</td>
           <td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps<br>${d.train_episodes == null ? '<span class="muted">尚未生成 train/test 划分</span>' : `<span class="pill">${esc(d.train_episodes)} train</span> <span class="pill">${esc(d.test_episodes)} test</span>`}<br>${(d.norm_model_variants || []).length ? `<span class="ok">norm ready: ${esc((d.norm_model_variants || []).map(modelVariantLabel).join(', '))}</span>` : '<span class="warn">norm 需计算或划分已变化</span>'}</td>
           <td><span class="pill">${esc(d.schema_label || d.schema)}</span> <span class="pill">${esc(d.arm_mode || '-')}</span> <span class="pill">${esc(d.dataset_layout || '-')}</span> <span class="pill">contract v${esc(d.contract_version || '?')}</span> ${d.training_supported ? '<span class="ok">训练兼容</span>' : '<span class="warn">仅管理 / 预览</span>'}<br><code>${esc(d.state_key || 'state?')}</code> ${esc(JSON.stringify(d.state_shape))} → <code>${esc(d.action_key || 'action?')}</code> ${esc(JSON.stringify(d.action_shape))}<br>state=${esc(d.state_dim || '?')}D · raw action=${esc(d.raw_action_dim || '?')}D · model/wire=${esc(d.model_action_dim || '?')}D · arm=${esc(d.arm_side || '-')}<br>${d.contract_error ? `<span class="bad">${esc(d.contract_error)}</span><br>` : ''}${d.training_error ? `<span class="warn">${esc(d.training_error)}</span><br>` : ''}${(d.media || []).map(m => `<span class="pill">${esc(m.type)} · ${esc(cameraDisplayName(m.key, d.arm_side))}</span>`).join(' ') || '<span class="muted">无相机媒体</span>'}</td>
           <td><strong>raw</strong> ${esc(d.raw_action_semantics || '-')}<br><span class="muted">convention=${esc(d.raw_action_convention || '-')}</span><br><strong>model</strong> ${esc(d.model_action_semantics || '-')}<br><span class="muted">convention=${esc(d.model_action_convention || '-')}</span><br><strong>gripper</strong> raw=${esc(d.raw_gripper_semantics || '-')} → wire=${esc(d.wire_gripper_semantics || '-')}<br><span class="muted">raw offset=${d.action_offset == null ? '-' : esc(d.action_offset)} · model start=+${esc(d.model_action_start_offset ?? 1)} step</span></td>
-          <td><select class="dataset-origin-select" onchange="setDatasetOrigin('${esc(d.id)}', this.value)">${datasetOriginOptions(d.dataset_origin)}</select><br><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button><button class="inline secondary" onclick="renameDataset('${esc(d.id)}')">重命名</button><button class="inline danger" onclick="deleteDataset('${esc(d.id)}')">删除数据集</button></td>
+          <td>${d.remote_only ? '<span class="muted">远端数据集：先同步到 4×4090 后可编辑/重命名/删除。</span>' : `<select class="dataset-origin-select" onchange="setDatasetOrigin('${esc(d.id)}', this.value)">${datasetOriginOptions(d.dataset_origin)}</select><br><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button><button class="inline secondary" onclick="renameDataset('${esc(d.id)}')">重命名</button><button class="inline danger" onclick="deleteDataset('${esc(d.id)}')">删除数据集</button>`}</td>
         </tr>`);
     }
   }
-  document.getElementById('datasets').innerHTML = rows.join('') || '<tr><td colspan="5" class="muted">当前筛选下暂无数据集</td></tr>';
+  document.getElementById('datasets').innerHTML = rows.join('') || '<tr><td colspan="6" class="muted">当前筛选下暂无数据集</td></tr>';
 
   const trainable = items.filter(d => d.training_supported);
   document.querySelectorAll('.dataset-select').forEach(select => {
@@ -995,7 +1132,7 @@ function fillExecutionTargets(config) {
   const targets = [{id: 'local_4090', label: '4×4090 本地'}];
   Object.entries((config && config.cluster_targets) || {}).forEach(([name, target]) => {
     const gpu = target.gpu_type ? `${target.gpu_type.toUpperCase()}` : 'Slurm';
-    targets.push({id: name, label: `${name} · ${gpu} · ${target.partition || '-'}`});
+    targets.push({id: name, label: `${target.label || name} · ${gpu} · ${target.partition || '-'}`});
   });
   document.querySelectorAll('.execution-target-select').forEach(select => {
     const old = select.value;
@@ -1849,7 +1986,9 @@ async function refreshAll() {
   try {
     const data = await api('/api/status');
     latestStatus = data;
-    fillDatasets(data.datasets || []);
+    const locationData = await loadDatasetLocations(false);
+    if (locationData) latestStatus.datasets = mergeDatasetLocationInfo(data.datasets || [], locationData);
+    fillDatasets(latestStatus.datasets || []);
     fillTrainingExperiments(data.experiments || []);
     fillBaseModels(data.base_models || []);
     fillExecutionTargets(data.config || {});

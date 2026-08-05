@@ -1292,6 +1292,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "eval_video_roots": [],
         "cluster_resources_script": str(REPO_DIR / "scripts" / "query_h100_h200_resources.sh"),
         "transfer_parallelism": 4,
+        "nas_dataset_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync",
     }
     defaults.update(config)
     profile = str(defaults.get("dashboard_profile") or "real").lower()
@@ -1322,6 +1323,8 @@ def load_config(path: Path) -> dict[str, Any]:
     defaults["cluster_resources_script"] = str(
         Path(defaults["cluster_resources_script"]).expanduser().resolve()
     )
+    if defaults.get("nas_dataset_staging_root"):
+        defaults["nas_dataset_staging_root"] = str(defaults["nas_dataset_staging_root"])
     try:
         defaults["transfer_parallelism"] = max(1, min(16, int(defaults.get("transfer_parallelism", 4))))
     except (TypeError, ValueError):
@@ -1343,6 +1346,9 @@ def load_config(path: Path) -> dict[str, Any]:
             "checkpoint_base_dir",
             "base_checkpoint",
             "eval_video_roots",
+            "inventory_cache_path",
+            "inventory_source_path",
+            "nas_dataset_staging_root",
         ):
             if item.get(path_key):
                 if path_key == "eval_video_roots" and isinstance(item[path_key], list):
@@ -2968,6 +2974,21 @@ def create_app(config_path: Path) -> Flask:
                         variant for variant, ready in norm_ready_by_model.items() if ready
                     ],
                     "mtime": directory.stat().st_mtime,
+                    "locations": [
+                        {
+                            "target": "local_4090",
+                            "label": "4×4090",
+                            "kind": "local",
+                            "path": str(directory),
+                            "root": str(dataset_root),
+                            "origin": origin.get("dataset_origin", "unknown"),
+                            "episodes": info.get("total_episodes"),
+                            "frames": info.get("total_frames"),
+                            "fps": info.get("fps"),
+                            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(directory.stat().st_mtime)),
+                        }
+                    ],
+                    "targets": ["local_4090"],
                 }
             )
         return datasets
@@ -3744,6 +3765,59 @@ print(json.dumps(rows, ensure_ascii=False))
             candidates.append(str(PurePosixPath(str(target["workdir"])) / "eval_videos"))
         return candidates
 
+    def eval_video_metadata(root: Path | str, relative_path: str, *, source: str = "local_4090") -> dict[str, Any]:
+        parts = list(PurePosixPath(relative_path).parts)
+        name = parts[-1] if parts else relative_path
+        experiment = next((part for part in parts if "eval" in part.lower() or "ckpt" in part.lower() or "cp" in part.lower()), None)
+        if experiment is None and len(parts) >= 2:
+            experiment = parts[-2]
+        task_name = parts[0] if parts else "-"
+        success: str | None = None
+        score: float | None = None
+        root_path = Path(root)
+        path = root_path / relative_path
+        for parent in [path.parent, *path.parents]:
+            try:
+                if root_path.resolve() not in [parent.resolve(), *parent.resolve().parents]:
+                    break
+            except Exception:
+                pass
+            result_file = parent / "_result.txt"
+            if not result_file.is_file():
+                continue
+            text = result_file.read_text(encoding="utf-8", errors="replace")[-4000:]
+            lowered = text.lower()
+            if "success" in lowered and "fail" not in lowered:
+                success = "success"
+            elif "fail" in lowered or "failure" in lowered:
+                success = "failed"
+            else:
+                for token in reversed(text.replace(",", " ").split()):
+                    try:
+                        score = float(token)
+                        success = "success" if score >= 0.5 else "failed"
+                        break
+                    except ValueError:
+                        continue
+            if success:
+                break
+        if success is None:
+            lowered = relative_path.lower()
+            if "success" in lowered:
+                success = "success"
+            elif "fail" in lowered or "failed" in lowered:
+                success = "failed"
+            else:
+                success = "unknown"
+        return {
+            "task": task_name,
+            "experiment": experiment or "-",
+            "success": success,
+            "score": score,
+            "source": source,
+            "display_name": name,
+        }
+
     def list_remote_eval_videos() -> tuple[list[dict[str, Any]], dict[str, str]]:
         videos: list[dict[str, Any]] = []
         errors: dict[str, str] = {}
@@ -3791,6 +3865,7 @@ print(json.dumps(rows, ensure_ascii=False))
                     continue
                 videos.append({
                     **row,
+                    **eval_video_metadata(root, rel, source=name),
                     "id": base64.urlsafe_b64encode(f"{name}\0{root}\0{rel}".encode()).decode().rstrip("="),
                     "source": name,
                     "host": host,
@@ -3806,6 +3881,10 @@ print(json.dumps(rows, ensure_ascii=False))
     def list_eval_videos():
         limit = safe_int(request.args.get("limit", 200), "limit", 1, 1000)
         include_remote = str(request.args.get("include_remote", "")).lower() in {"1", "true", "yes"}
+        task_filter = str(request.args.get("task", "")).strip().lower()
+        experiment_filter = str(request.args.get("experiment", "")).strip().lower()
+        success_filter = str(request.args.get("success", "")).strip().lower()
+        query_filter = str(request.args.get("q", "")).strip().lower()
         videos = []
         for root in eval_video_roots():
             if not root.exists():
@@ -3820,6 +3899,7 @@ print(json.dumps(rows, ensure_ascii=False))
                     rel = path.name
                 videos.append({
                     "id": encode_video_id(path),
+                    **eval_video_metadata(root, rel),
                     "name": path.name,
                     "relative_path": rel,
                     "root": str(root),
@@ -3835,9 +3915,29 @@ print(json.dumps(rows, ensure_ascii=False))
         if include_remote:
             remote_videos, remote_errors = list_remote_eval_videos()
             videos.extend(remote_videos)
+        def video_matches(item: dict[str, Any]) -> bool:
+            if task_filter and task_filter not in str(item.get("task", "")).lower():
+                return False
+            if experiment_filter and experiment_filter not in str(item.get("experiment", "")).lower():
+                return False
+            if success_filter and success_filter not in {"all", str(item.get("success", "unknown")).lower()}:
+                return False
+            if query_filter:
+                haystack = " ".join(str(item.get(key, "")) for key in ("relative_path", "name", "task", "experiment", "source")).lower()
+                if query_filter not in haystack:
+                    return False
+            return True
+        videos = [item for item in videos if video_matches(item)]
         videos.sort(key=lambda item: item["mtime"], reverse=True)
+        facets = {
+            "tasks": sorted({str(item.get("task") or "-") for item in videos}),
+            "experiments": sorted({str(item.get("experiment") or "-") for item in videos}),
+            "success": {key: sum(1 for item in videos if item.get("success") == key) for key in ("success", "failed", "unknown")},
+        }
         return jsonify({
             "videos": videos[:limit],
+            "total": len(videos),
+            "facets": facets,
             "roots": [str(root) for root in eval_video_roots()],
             "remote_errors": remote_errors,
         })
@@ -3895,6 +3995,8 @@ print(json.dumps(rows, ensure_ascii=False))
                 "target_path": str(local_roots[0] / source / Path(*rel.parts)),
                 "overwrite": overwrite,
                 "parallelism": parallelism,
+                "slurm_involved": slurm_involved,
+                "nas_dataset_staging_root": config.get("nas_dataset_staging_root"),
             },
         )
         return jsonify(task), 201
@@ -3903,6 +4005,7 @@ print(json.dumps(rows, ensure_ascii=False))
         locations = {
             "local_4090": {
                 "name": "local_4090",
+                "label": "4×4090",
                 "kind": "local",
                 "host": None,
                 "dataset_root": config["dataset_root"],
@@ -3914,11 +4017,17 @@ print(json.dumps(rows, ensure_ascii=False))
                 continue
             locations[name] = {
                 "name": name,
+                "label": target.get("label") or name,
                 "kind": "slurm_only" if target.get("access_mode") == "slurm_only" else "ssh",
                 "access_mode": target.get("access_mode", "ssh"),
                 "inventory_note": target.get("inventory_note"),
                 "inventory_cache_path": target.get("inventory_cache_path"),
+                "inventory_cache_host": target.get("inventory_cache_host", target.get("submit_host")),
+                "inventory_source_path": target.get("inventory_source_path"),
+                "inventory_source_host": target.get("inventory_source_host", target.get("submit_host")),
+                "nas_dataset_staging_root": target.get("nas_dataset_staging_root") or config.get("nas_dataset_staging_root"),
                 "host": target.get("submit_host"),
+                "submit_host": target.get("submit_host"),
                 "partition": target.get("partition"),
                 "node": target.get("node"),
                 "gpu_type": target.get("gpu_type"),
@@ -4003,32 +4112,42 @@ print(json.dumps(rows, ensure_ascii=False))
             return local_dataset_inventory(location), None
         if location.get("kind") == "slurm_only":
             cache_path = location.get("inventory_cache_path")
-            host = location.get("host")
+            cache_host = location.get("inventory_cache_host")
             if not cache_path:
                 return [], (
                     location.get("inventory_note")
                     or "slurm-only target: no inventory_cache_path configured; submit a staging/setup job through login-server"
                 )
-            if not host:
-                return [], "slurm-only target missing submit_host for inventory cache read"
-            command = f"test -s {shlex.quote(str(cache_path))} && cat {shlex.quote(str(cache_path))}"
+            stdout = ""
+            source_label = str(cache_path)
+            if not cache_host or str(cache_host) in {"local", "local_4090", "4x4090"}:
+                local_cache = Path(str(cache_path)).expanduser()
+                if not local_cache.is_file() or local_cache.stat().st_size <= 0:
+                    note = location.get("inventory_note") or "slurm-only local inventory cache is not ready"
+                    return [], f"{note}; cache={local_cache}"
+                stdout = local_cache.read_text(encoding="utf-8")
+                source_label = str(local_cache)
+            else:
+                command = f"test -s {shlex.quote(str(cache_path))} && cat {shlex.quote(str(cache_path))}"
+                try:
+                    result = subprocess.run(
+                        [*SSH_COMMAND, str(cache_host), command],
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=min(timeout, 12),
+                    )
+                except Exception as exc:
+                    return [], str(exc)
+                if result.returncode != 0:
+                    note = location.get("inventory_note") or "slurm-only inventory cache is not ready"
+                    return [], f"{note}; cache={cache_path}; {(result.stderr or result.stdout)[-1000:]}"
+                stdout = result.stdout
+                source_label = f"{cache_host}:{cache_path}"
             try:
-                result = subprocess.run(
-                    [*SSH_COMMAND, str(host), command],
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=timeout,
-                )
-            except Exception as exc:
-                return [], str(exc)
-            if result.returncode != 0:
-                note = location.get("inventory_note") or "slurm-only inventory cache is not ready"
-                return [], f"{note}; cache={cache_path}; {(result.stderr or result.stdout)[-1000:]}"
-            try:
-                payload = json.loads(result.stdout or "{}")
+                payload = json.loads(stdout or "{}")
             except json.JSONDecodeError as exc:
-                return [], f"invalid JSON inventory cache from {host}:{cache_path}: {exc}"
+                return [], f"invalid JSON inventory cache from {source_label}: {exc}"
             if isinstance(payload, dict):
                 rows = payload.get("datasets", [])
                 if not rows and payload.get("roots"):
@@ -4037,7 +4156,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 return rows if isinstance(rows, list) else [], None
             if isinstance(payload, list):
                 return payload, None
-            return [], f"unsupported inventory cache format from {host}:{cache_path}"
+            return [], f"unsupported inventory cache format from {source_label}"
         host = location.get("host")
         if not host:
             return [], "missing ssh host"
@@ -4079,6 +4198,7 @@ print(json.dumps(rows, ensure_ascii=False))
                     **row,
                     "origin": origin,
                     "target": name,
+                    "label": location.get("label") or name,
                     "host": location.get("host"),
                     "root": location.get("dataset_root"),
                     "kind": location.get("kind"),
@@ -4153,18 +4273,21 @@ print(json.dumps(rows, ensure_ascii=False))
             raise ValueError(f"unknown target location: {target_name}")
         if source_name == target_name:
             raise ValueError("source and target must differ")
-        if locations[source_name].get("kind") == "slurm_only" or locations[target_name].get("kind") == "slurm_only":
-            raise ValueError(
-                "dataset sync involving a Slurm-only target must be done by a staging/setup Slurm job through login-server; direct SSH tar transfer is disabled"
-            )
+        slurm_involved = (
+            locations[source_name].get("kind") == "slurm_only"
+            or locations[target_name].get("kind") == "slurm_only"
+        )
+        runner = "slurm_dataset_sync_runner.py" if slurm_involved else "dataset_transfer_runner.py"
         command = [
             config["openpi_python"],
-            str(APP_DIR / "dataset_transfer_runner.py"),
+            str(APP_DIR / runner),
             "--dataset-id", dataset_id,
             "--source-json", json_arg(locations[source_name]),
             "--target-json", json_arg(locations[target_name]),
             "--parallelism", str(parallelism),
         ]
+        if slurm_involved and config.get("nas_dataset_staging_root"):
+            command += ["--nas-staging-root", str(config["nas_dataset_staging_root"])]
         if overwrite:
             command.append("--overwrite")
         task = tasks.start(
