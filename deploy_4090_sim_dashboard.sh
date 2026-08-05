@@ -68,7 +68,7 @@ chmod +x server_4090/slurm_job_runner.py server_4090/dataset_transfer_runner.py 
 # Best-effort staging for H100/login-server Slurm helpers. H200 remains
 # independent and should be prepared via its dedicated setup Slurm jobs.
 if command -v rsync >/dev/null 2>&1; then
-  timeout 20 ssh -o BatchMode=yes -o ConnectTimeout=8 login-server 'mkdir -p /DATA/disk0/sunny/bimanual-vla /DATA/NAS/GPUServer/sunny/dashboard_dataset_sync' 2>/dev/null && \
+  timeout 20 ssh -n -o BatchMode=yes -o ConnectTimeout=8 login-server 'mkdir -p /DATA/disk0/sunny/bimanual-vla /DATA/NAS/GPUServer/sunny/dashboard_dataset_sync' 2>/dev/null && \
   timeout 60 rsync -az --delete \
     server_4090 piper_action_conventions.py piper_data_contract.py pi0_dataset.py check_pi05_dataset.py download_openpi_checkpoint.py \
     login-server:/DATA/disk0/sunny/bimanual-vla/ 2>/dev/null || true
@@ -76,10 +76,9 @@ fi
 # Best-effort mirror of H200 Slurm inventory caches onto 4x4090 so the UI does
 # not block on SSH to login-server on every refresh.
 for node in h200-ali-01 h200-ali-02; do
-  timeout 20 ssh -o BatchMode=yes -o ConnectTimeout=8 login-server "test -s /DATA/NAS/GPUServer/sunny/dashboard_probe/${node}_inventory.json && cat /DATA/NAS/GPUServer/sunny/dashboard_probe/${node}_inventory.json" \
+  timeout 20 ssh -n -o BatchMode=yes -o ConnectTimeout=8 login-server "test -s /DATA/NAS/GPUServer/sunny/dashboard_probe/${node}_inventory.json && cat /DATA/NAS/GPUServer/sunny/dashboard_probe/${node}_inventory.json" \
     > "$HOME/.local/share/bimanual-vla-sim-dashboard/cluster_inventory/${node}_inventory.json" 2>/dev/null || true
 done
-fi
 systemctl --user daemon-reload
 systemctl --user stop bimanual-vla-sim-dashboard.service 2>/dev/null || true
 systemctl --user enable --now bimanual-vla-sim-dashboard.service
