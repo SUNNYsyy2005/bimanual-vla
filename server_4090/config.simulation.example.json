@@ -65,7 +65,9 @@
       "access_mode": "login_shared_slurm",
       "log_dir": "/DATA/disk0/sunny/openpi_h100/slurm_logs",
       "remote_job_dir": "/DATA/disk0/sunny/openpi_h100/slurm/dashboard_jobs",
-      "inventory_note": "H100 shares /DATA/disk0 with login-server; inventory is scanned on login-server."
+      "inventory_note": "H100 shares /DATA/disk0 with login-server; inventory is scanned on login-server.",
+      "label": "H100 h100-ksy-01",
+      "nas_dataset_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync"
     },
     "h200-ali-01": {
       "submit_host": "login-server",
@@ -92,7 +94,12 @@
       "inventory_note": "H200 is Slurm-only from Dashboard; dataset inventory is read from the latest Slurm probe cache on NAS.",
       "log_dir": "/DATA/NAS/GPUServer/sunny/pi05_contract_v3_jobs",
       "remote_job_dir": "/DATA/disk0/sunny/openpi_h100/slurm/dashboard_jobs",
-      "inventory_cache_path": "/DATA/NAS/GPUServer/sunny/dashboard_probe/h200-ali-01_inventory.json"
+      "inventory_cache_path": "/home/sunny/.local/share/bimanual-vla-sim-dashboard/cluster_inventory/h200-ali-01_inventory.json",
+      "label": "H200 ali-01",
+      "inventory_cache_host": "local_4090",
+      "inventory_source_path": "/DATA/NAS/GPUServer/sunny/dashboard_probe/h200-ali-01_inventory.json",
+      "inventory_source_host": "login-server",
+      "nas_dataset_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync"
     },
     "h200-ali-02": {
       "submit_host": "login-server",
@@ -119,8 +126,14 @@
       "inventory_note": "H200 is Slurm-only from Dashboard; dataset inventory is read from the latest Slurm probe cache on NAS.",
       "log_dir": "/DATA/NAS/GPUServer/sunny/pi05_contract_v3_jobs",
       "remote_job_dir": "/DATA/disk0/sunny/openpi_h100/slurm/dashboard_jobs",
-      "inventory_cache_path": "/DATA/NAS/GPUServer/sunny/dashboard_probe/h200-ali-02_inventory.json"
+      "inventory_cache_path": "/home/sunny/.local/share/bimanual-vla-sim-dashboard/cluster_inventory/h200-ali-02_inventory.json",
+      "label": "H200 ali-02",
+      "inventory_cache_host": "local_4090",
+      "inventory_source_path": "/DATA/NAS/GPUServer/sunny/dashboard_probe/h200-ali-02_inventory.json",
+      "inventory_source_host": "login-server",
+      "nas_dataset_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync"
     }
   },
-  "transfer_parallelism": 4
+  "transfer_parallelism": 4,
+  "nas_dataset_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync"
 }
