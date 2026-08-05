@@ -4,9 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${1:-$SCRIPT_DIR/config.json}"
 PYTHON_DEFAULT="${BIMANUAL_VLA_BOOTSTRAP_PYTHON:-/home/sunny/miniconda3/envs/openpi/bin/python}"
-TOKEN_DIR="${HOME}/.config/bimanual-vla"
+TOKEN_DIR="${BIMANUAL_VLA_TOKEN_DIR:-${HOME}/.config/bimanual-vla}"
 TOKEN_FILE="${TOKEN_DIR}/server.env"
-STATE_DIR="${HOME}/.local/share/bimanual-vla-server"
+STATE_DIR="${BIMANUAL_VLA_STATE_DIR:-${HOME}/.local/share/bimanual-vla-server}"
 PID_FILE="${STATE_DIR}/dashboard.pid"
 LOG_FILE="${STATE_DIR}/dashboard.log"
 

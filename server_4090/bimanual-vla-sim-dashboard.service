@@ -1,0 +1,24 @@
+[Unit]
+Description=Bimanual VLA Simulation Dashboard
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=%h/bimanual-vla
+ExecStart=%h/bimanual-vla/server_4090/run_server_foreground.sh %h/bimanual-vla/server_4090/config.simulation.json
+ExecStopPost=/usr/bin/rm -f %h/.local/share/bimanual-vla-sim-dashboard/dashboard.pid
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillMode=process
+Environment=PYTHONUNBUFFERED=1
+Environment=BIMANUAL_VLA_TOKEN_DIR=%h/.config/bimanual-vla-sim-dashboard
+Environment=BIMANUAL_VLA_STATE_DIR=%h/.local/share/bimanual-vla-sim-dashboard
+LimitNOFILE=65536
+UMask=0077
+
+[Install]
+WantedBy=default.target

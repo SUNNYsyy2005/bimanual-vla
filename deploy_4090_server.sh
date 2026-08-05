@@ -12,10 +12,13 @@ rsync -av --relative \
   "$LOCAL_ROOT/./server_4090/episode_split.py" \
   "$LOCAL_ROOT/./server_4090/openpi_single_arm.py" \
   "$LOCAL_ROOT/./server_4090/eval_heldout_loss.py" \
+  "$LOCAL_ROOT/./server_4090/slurm_job_runner.py" \
   "$LOCAL_ROOT/./server_4090/validate_lerobot.py" \
   "$LOCAL_ROOT/./server_4090/config.example.json" \
+  "$LOCAL_ROOT/./server_4090/config.simulation.example.json" \
   "$LOCAL_ROOT/./server_4090/run_server_foreground.sh" \
   "$LOCAL_ROOT/./server_4090/bimanual-vla-dashboard.service" \
+  "$LOCAL_ROOT/./server_4090/bimanual-vla-sim-dashboard.service" \
   "$LOCAL_ROOT/./server_4090/start_server.sh" \
   "$LOCAL_ROOT/./server_4090/stop_server.sh" \
   "$LOCAL_ROOT/./server_4090/templates/index.html" \
