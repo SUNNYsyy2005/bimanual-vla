@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Bimanual-VLA · 4×4090 控制台</title>
+  <title>{{ dashboard_title }}</title>
   <style>
     :root {
       color-scheme:dark;
@@ -120,7 +120,7 @@
     <header class="topbar">
       <div class="brand">
         <div class="brand-mark">π</div>
-        <div><h1>4×4090 · Bimanual-VLA 控制台</h1><div class="muted">数据集、训练、Policy 与实机遥测统一管理</div></div>
+        <div><h1>{{ dashboard_title }}</h1><div class="muted">{{ "仿真数据上传、4×4090/H100/H200 训练评测与视频查看" if dashboard_profile == "simulation" else "数据集、训练、Policy 与实机遥测统一管理" }}</div></div>
       </div>
       <div class="auth-panel">
         <div class="toolbar"><input id="token" type="password" placeholder="Dashboard API Token"><button class="inline" onclick="saveToken()">保存 Token</button><button class="inline secondary" onclick="refreshAll()">刷新</button></div>
@@ -131,8 +131,9 @@
       <button class="nav-button active" data-module="overview">总览 <span id="navOverviewCount" class="nav-count">-</span></button>
       <button class="nav-button" data-module="datasets">数据集 <span id="navDatasetCount" class="nav-count">-</span></button>
       <button class="nav-button" data-module="training">训练 <span id="navTrainingCount" class="nav-count">-</span></button>
-      <button class="nav-button" data-module="policy">Policy <span id="navPolicyCount" class="nav-count">-</span></button>
-      <button class="nav-button" data-module="telemetry">实时遥测 <span id="navTelemetryCount" class="nav-count">-</span></button>
+      {% if enable_policy %}<button class="nav-button" data-module="policy">Policy <span id="navPolicyCount" class="nav-count">-</span></button>
+      <button class="nav-button" data-module="telemetry">实时遥测 <span id="navTelemetryCount" class="nav-count">-</span></button>{% endif %}
+      <button class="nav-button" data-module="eval-videos">评估视频 <span id="navEvalVideoCount" class="nav-count">-</span></button>
     </nav>
   </div>
 
@@ -159,11 +160,11 @@
     </section>
 
     <section id="module-datasets" class="dashboard-module" data-module="datasets" hidden>
-      <div class="module-heading"><div><h2>真机数据集管理</h2><p>上传、检查、编辑真机 Episode，并独立预览每一路相机媒体；仿真数据集不会在 Dashboard 中显示。</p></div></div>
+      <div class="module-heading"><div><h2>{{ "仿真数据集管理" if dashboard_profile == "simulation" else "真机数据集管理" }}</h2><p>{{ "上传、检查、编辑仿真 Episode，并独立预览每一路相机媒体。" if dashboard_profile == "simulation" else "上传、检查、编辑真机 Episode，并独立预览每一路相机媒体；仿真数据集不会在 Dashboard 中显示。" }}</p></div></div>
       <div class="grid">
-        <div class="card half"><h2>上传数据集</h2><p>真机采集机执行：</p><pre id="uploadCommand">python upload_dataset_4090.py LEROBOT_OR_GUI_NPZ_DIR --name my_dataset --dataset-origin real --server http://192.168.101.9:8090 --token TOKEN --workers 4 --merge</pre><p class="muted">仿真数据上传时仍使用 <code>--dataset-origin simulation</code>，其暂存目录与真机数据隔离，并且不会出现在 Dashboard 列表或训练/Policy 数据集选择器中。正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。</p></div>
-        <div class="card half"><h2>格式与媒体说明</h2><div class="section-note">Dashboard 可识别单臂 7D / 10D、双臂 14D / 20D 和其他自定义维度，并显示所有 <code>dtype: video</code> / <code>dtype: image</code> 相机。这里只呈现真机和未分类数据集；将来源标记为仿真后，该数据集会从 Dashboard 隐藏，但数据集 ID 和底层训练加载路径不会改变。</div></div>
-        <div class="card"><h2>已接收真机数据集</h2><div class="toolbar"><label style="margin:0">来源筛选</label><select id="datasetOriginFilter" class="dataset-origin-select"><option value="all">全部</option><option value="real">真机</option><option value="unknown">未分类</option></select><span id="datasetOriginSummary" class="muted">等待状态数据。</span></div><div class="table-wrap"><table><thead><tr><th>ID / 来源</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div></div>
+        <div class="card half"><h2>上传数据集</h2><p>{{ "仿真数据上传执行：" if dashboard_profile == "simulation" else "真机采集机执行：" }}</p><pre id="uploadCommand">python upload_dataset_4090.py LEROBOT_OR_GUI_NPZ_DIR --name my_dataset --dataset-origin {{ upload_default_origin }} --server http://192.168.101.9:{{ server_port }} --token TOKEN --workers 4 --merge</pre><p class="muted">{{ "仿真 Dashboard 默认只接收并显示 --dataset-origin simulation 的数据；正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。" if dashboard_profile == "simulation" else "仿真数据上传时仍使用 --dataset-origin simulation，其暂存目录与真机数据隔离，并且不会出现在实机 Dashboard 列表或训练/Policy 数据集选择器中。正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。" }}</p></div>
+        <div class="card half"><h2>格式与媒体说明</h2><div class="section-note">Dashboard 可识别单臂 7D / 10D、双臂 14D / 20D 和其他自定义维度，并显示所有 <code>dtype: video</code> / <code>dtype: image</code> 相机。{{ "这里只呈现仿真数据集；可从本页面统一提交 4×4090 本地训练/评测或 H100/H200 Slurm 训练/评测。" if dashboard_profile == "simulation" else "这里只呈现真机和未分类数据集；将来源标记为仿真后，该数据集会从 Dashboard 隐藏，但数据集 ID 和底层训练加载路径不会改变。" }}</div></div>
+        <div class="card"><h2>{{ "已接收仿真数据集" if dashboard_profile == "simulation" else "已接收真机数据集" }}</h2><div class="toolbar"><label style="margin:0">来源筛选</label><select id="datasetOriginFilter" class="dataset-origin-select"><option value="all">全部</option>{% for origin in visible_dataset_origins %}<option value="{{ origin }}">{{ "真机" if origin == "real" else "仿真" if origin == "simulation" else "未分类" }}</option>{% endfor %}</select><span id="datasetOriginSummary" class="muted">等待状态数据。</span></div><div class="table-wrap"><table><thead><tr><th>ID / 来源</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div></div>
         <div class="card">
           <h2>Episode 级数据集编辑与相机预览</h2>
           <p class="muted">参数编辑不修改 state/action/图像帧；合并、删除或编辑会先构造临时数据集并校验，成功后原子替换。已有 norm stats 将失效。</p>
@@ -202,7 +203,8 @@
             <p id="trainExperimentInfo" class="muted">选择已有实验可继续该实验下的 checkpoint；直接输入新名称时只提供基础模型。</p>
             <div class="row"><div><label>模型系列</label><select name="model_variant" class="model-variant-select"><option value="pi05">π0.5</option><option value="pi0">π0</option></select></div><div><label>基础模型 / 初始化 checkpoint</label><select name="base_checkpoint" class="base-model-select" required></select></div></div>
             <p class="muted base-model-info">可选择基础模型，已有实验还会显示该实验下的完整 checkpoint。</p>
-            <div class="row3"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU IDs</label><input name="gpu_ids" value="0,1" placeholder="0,1"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div>
+            <div class="row3"><div><label>执行目标</label><select name="execution_target" class="execution-target-select"><option value="local_4090">4×4090 本地</option></select></div><div><label>GPU IDs / 集群卡数</label><input name="gpu_ids" value="0,1" placeholder="本地 0,1；集群填 1/2/4"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div>
+            <div class="row"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>Slurm GPU count（可选）</label><input name="cluster_gpus" type="number" min="1" max="8" placeholder="选择 H100/H200 时使用"></div></div>
             <div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>全局 Batch</label><input name="batch_size" type="number" value="2"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div>
             <div class="row3"><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div><div><label>JAX 显存预分配比例</label><input name="xla_memory_fraction" type="number" value="0.90" min="0.50" max="0.95" step="0.01"></div><div><label>Episode 划分</label><input value="自动加载已保存的 norm 划分" disabled></div></div>
             <div class="row3"><div><label>测试集自动评测</label><select name="eval_enabled"><option value="true">启用（推荐）</option><option value="false">禁用</option></select></div><div><label>评测间隔 steps</label><input name="eval_interval_steps" type="number" value="5000" min="5000" step="5000"></div><div><label>最多评测 batches</label><input name="eval_max_batches" type="number" value="50" min="1"></div></div>
@@ -228,7 +230,24 @@
           <div class="chart-shell"><canvas id="trainMetricsChart"></canvas></div><div id="trainMetricLegend" class="metric-legend"></div>
         </div>
         <div class="card third"><h2>Checkpoint</h2><div class="table-wrap"><table><thead><tr><th>实验 / step</th><th>数据集</th><th>大小 / 时间</th></tr></thead><tbody id="checkpoints"></tbody></table></div></div>
+        <div class="card" id="manualEvalCard">
+          <h2>手动评测</h2>
+          <p class="muted">用于仿真模型 held-out loss / 安全阈值评测；可选择 4×4090 本地或 H100/H200 Slurm 目标。H100/H200 通过 SSH 提交 sbatch，实际 GPU 工作在 Slurm 节点执行。</p>
+          <form id="evalForm">
+            <div class="row3"><div><label>执行目标</label><select name="execution_target" class="execution-target-select"><option value="local_4090">4×4090 本地</option></select></div><div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div></div>
+            <div class="row"><div><label>Checkpoint</label><select name="checkpoint" class="eval-checkpoint-select" required></select></div><div><label>模型系列</label><select name="model_variant" class="model-variant-select"><option value="pi05">π0.5</option><option value="pi0">π0</option></select></div></div>
+            <label>基础模型 / 初始化 checkpoint</label><select name="base_checkpoint" class="base-model-select" required></select>
+            <div class="row3"><div><label>GPU ID / 集群卡数</label><input name="gpu_ids" value="2" placeholder="本地单卡 ID；集群填卡数"></div><div><label>Eval batch</label><input name="batch_size" type="number" value="1" min="1"></div><div><label>最多 batches</label><input name="max_batches" type="number" value="50" min="1"></div></div>
+            <div class="row3"><div><label>Workers</label><input name="num_workers" type="number" value="2" min="0"></div><div><label>JAX 显存比例</label><input name="xla_memory_fraction" type="number" value="0.85" min="0.50" max="0.95" step="0.01"></div><div><label>Slurm GPU count（可选）</label><input name="cluster_gpus" type="number" min="1" max="8"></div></div>
+            <p><button type="submit">提交评测</button></p>
+          </form>
+        </div>
       </div>
+    </section>
+
+    <section id="module-eval-videos" class="dashboard-module" data-module="eval-videos" hidden>
+      <div class="module-heading"><div><h2>评估视频</h2><p>直接在服务器上查看仿真评测录制结果，无需同步到本地。</p></div></div>
+      <div class="grid"><div class="card"><div class="toolbar"><button class="inline secondary" onclick="loadEvalVideos()">刷新视频</button><span id="evalVideoSummary" class="muted">尚未加载。</span></div><div id="evalVideoList" class="preview-grid"></div></div></div>
     </section>
 
     <section id="module-policy" class="dashboard-module" data-module="policy" hidden>
@@ -266,7 +285,11 @@ loginUserInput.value = localStorage.getItem('bimanualVlaLoginUser') || '';
 
 const ACTIVE_STATES = new Set(['starting', 'running', 'stopping', 'waiting_norm', 'waiting_gpu']);
 const TERMINAL_STATES = new Set(['completed', 'failed', 'lost', 'stopped', 'skipped']);
-const MODULES = new Set(['overview', 'datasets', 'training', 'policy', 'telemetry']);
+const DASHBOARD_PROFILE = {{ dashboard_profile|tojson }};
+const UPLOAD_DEFAULT_ORIGIN = {{ upload_default_origin|tojson }};
+const VISIBLE_DATASET_ORIGINS = new Set({{ visible_dataset_origins|tojson }});
+const ENABLE_POLICY = {{ enable_policy|tojson }};
+const MODULES = new Set(ENABLE_POLICY ? ['overview', 'datasets', 'training', 'policy', 'telemetry', 'eval-videos'] : ['overview', 'datasets', 'training', 'eval-videos']);
 const METRIC_COLORS = ['#42c7ff', '#3ee6a8', '#ffd166', '#ff6f91', '#a78bfa', '#fb923c', '#67e8f9'];
 let latestStatus = null;
 let latestTelemetryKey = null;
@@ -343,6 +366,30 @@ async function apiBlob(path) {
   return response.blob();
 }
 
+async function loadEvalVideos() {
+  if (!tokenInput.value) return;
+  const summary = document.getElementById('evalVideoSummary');
+  const list = document.getElementById('evalVideoList');
+  if (!summary || !list) return;
+  summary.textContent = '正在扫描评估视频…';
+  try {
+    const data = await api('/api/eval-videos?limit=200');
+    const videos = data.videos || [];
+    document.getElementById('navEvalVideoCount').textContent = String(videos.length);
+    summary.textContent = videos.length
+      ? `${videos.length} 个视频 · roots=${(data.roots || []).join(', ') || '-'}`
+      : `暂无视频 · roots=${(data.roots || []).join(', ') || '-'}`;
+    list.innerHTML = videos.map(video => `
+      <figure>
+        <figcaption>${esc(video.relative_path)}<br><span class="muted">${esc(video.updated_at)} · ${esc(video.size_mib)} MiB</span></figcaption>
+        <video controls preload="metadata" style="width:100%;max-height:360px;border-radius:10px;background:#000" src="${esc(video.url)}?token=${encodeURIComponent(tokenInput.value)}&cache=${Date.now()}"></video>
+      </figure>`).join('') || '<div class="muted">没有找到 mp4/webm/mov/mkv/avi/gif 文件。</div>';
+  } catch (error) {
+    summary.textContent = `视频加载失败：${error.message}`;
+    show(error.message);
+  }
+}
+
 function esc(value) {
   return String(value ?? '').replace(/[&<>'"]/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
@@ -409,23 +456,23 @@ function datasetOriginOptions(selected) {
 }
 
 function dashboardDatasets(items) {
-  return (items || []).filter(item => item.dataset_origin !== 'simulation');
+  return (items || []).filter(item => VISIBLE_DATASET_ORIGINS.has(item.dataset_origin || 'unknown'));
 }
 
 function fillDatasets(items) {
   items = dashboardDatasets(items);
   const filter = document.getElementById('datasetOriginFilter').value || 'all';
-  const counts = {real: 0, unknown: 0};
+  const counts = {real: 0, simulation: 0, unknown: 0};
   items.forEach(item => {
-    const origin = item.dataset_origin === 'real' ? 'real' : 'unknown';
+    const origin = ['real', 'simulation'].includes(item.dataset_origin) ? item.dataset_origin : 'unknown';
     counts[origin] += 1;
   });
   document.getElementById('datasetOriginSummary').textContent =
-    `真机 ${counts.real} · 未分类 ${counts.unknown} · 仿真数据集已隐藏`;
+    DASHBOARD_PROFILE === 'simulation' ? `仿真 ${counts.simulation}` : `真机 ${counts.real} · 未分类 ${counts.unknown} · 仿真数据集已隐藏`;
 
   const visible = filter === 'all' ? items : items.filter(item => (item.dataset_origin || 'unknown') === filter);
   const rows = [];
-  for (const origin of ['real', 'unknown']) {
+  for (const origin of ['real', 'simulation', 'unknown'].filter(origin => VISIBLE_DATASET_ORIGINS.has(origin))) {
     const grouped = visible.filter(item => (item.dataset_origin || 'unknown') === origin);
     if (!grouped.length) continue;
     rows.push(`<tr class="dataset-group-row"><td colspan="5">${datasetOriginBadge(origin)} ${grouped.length} 个数据集</td></tr>`);
@@ -914,10 +961,41 @@ function fillCheckpoints(items) {
     ? `${modelVariantLabel(selected.model_variant)} 完整 checkpoint；当前：${selected.path}`
     : `数据集 ${dataset || '-'} 暂无完整 checkpoint，请先完成训练。`;
   document.getElementById('policySubmit').disabled = !selected;
+  fillEvalCheckpoints(items);
 }
 
 function syncPolicyCheckpointVariant() {
   fillCheckpoints((latestStatus && latestStatus.checkpoints) || []);
+}
+
+function fillExecutionTargets(config) {
+  const targets = [{id: 'local_4090', label: '4×4090 本地'}];
+  Object.entries((config && config.cluster_targets) || {}).forEach(([name, target]) => {
+    const gpu = target.gpu_type ? `${target.gpu_type.toUpperCase()}` : 'Slurm';
+    targets.push({id: name, label: `${name} · ${gpu} · ${target.partition || '-'}`});
+  });
+  document.querySelectorAll('.execution-target-select').forEach(select => {
+    const old = select.value;
+    select.innerHTML = targets.map(target => `<option value="${esc(target.id)}">${esc(target.label)}</option>`).join('');
+    if (targets.some(target => target.id === old)) select.value = old;
+  });
+}
+
+function fillEvalCheckpoints(items) {
+  const select = document.querySelector('.eval-checkpoint-select');
+  if (!select) return;
+  const form = select.closest('form');
+  const dataset = form && form.querySelector('[name="dataset_id"]') ? form.querySelector('[name="dataset_id"]').value : '';
+  const datasetInfo = datasetById(dataset);
+  const variantSelect = form && form.querySelector('.model-variant-select');
+  const variant = variantSelect ? variantSelect.value : '';
+  const old = select.value;
+  const matches = items.filter(c => Array.isArray(c.dataset_ids)
+    && (!dataset || c.dataset_ids.includes(dataset))
+    && (!datasetInfo || c.arm_mode === datasetInfo.arm_mode)
+    && (!variant || c.model_variant === variant));
+  select.innerHTML = matches.map(c => `<option value="${esc(c.path)}">${esc(checkpointLabel(c))}</option>`).join('') || '<option value="" disabled>暂无匹配 checkpoint</option>';
+  if (matches.some(c => c.path === old)) select.value = old;
 }
 
 function fillGpus(items) {
@@ -1485,8 +1563,9 @@ function updateSummaries(data) {
   document.getElementById('navOverviewCount').textContent = String(activeTraining.length + activePolicies.length);
   document.getElementById('navDatasetCount').textContent = String(datasets.length);
   document.getElementById('navTrainingCount').textContent = String(activeTraining.length);
-  document.getElementById('navPolicyCount').textContent = String(activePolicies.length);
-  document.getElementById('navTelemetryCount').textContent = observation && observation.fresh ? '1' : '0';
+  if (document.getElementById('navPolicyCount')) document.getElementById('navPolicyCount').textContent = String(activePolicies.length);
+  if (document.getElementById('navTelemetryCount')) document.getElementById('navTelemetryCount').textContent = observation && observation.fresh ? '1' : '0';
+  if (document.getElementById('navEvalVideoCount') && document.getElementById('navEvalVideoCount').textContent === '-') document.getElementById('navEvalVideoCount').textContent = '0';
   document.getElementById('lastRefresh').textContent = `刷新于 ${new Date().toLocaleTimeString()}`;
 }
 
@@ -1737,6 +1816,7 @@ async function refreshAll() {
     fillDatasets(data.datasets || []);
     fillTrainingExperiments(data.experiments || []);
     fillBaseModels(data.base_models || []);
+    fillExecutionTargets(data.config || {});
     fillCheckpoints(data.checkpoints || []);
     fillGpus(data.gpus || []);
     fillTasks(data.tasks || []);
@@ -1745,6 +1825,7 @@ async function refreshAll() {
     updateSummaries(data);
     document.getElementById('serverInfo').innerHTML = `管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>真机上传暂存: <code>${esc((data.config.upload_roots || {}).real || '-')}</code><br>仿真上传暂存: <code>${esc((data.config.upload_roots || {}).simulation || '-')}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>默认基础模型: <code>${esc(data.config.base_checkpoint)}</code><br>可选基础权重: ${esc((data.base_models || []).length)}<br>已有训练实验: ${esc((data.experiments || []).length)}`;
     if (!episodeDatasetData && document.getElementById('editorDataset').value) loadDatasetEpisodes(0);
+    if (!document.getElementById('module-eval-videos').hidden) loadEvalVideos();
     const trainingVisible = !document.getElementById('module-training').hidden;
     if (trainingVisible && document.getElementById('trainMetricsTask').value) loadTrainingMetrics({quiet: true});
   } catch (error) {
@@ -1852,6 +1933,7 @@ document.getElementById('datasetOriginFilter').addEventListener('change', () => 
 document.querySelectorAll('.dataset-select').forEach(select => select.addEventListener('change', () => {
   syncArmSideForDatasetSelect(select);
   if (select.id === 'policyDataset') fillCheckpoints((latestStatus && latestStatus.checkpoints) || []);
+  if (select.closest('form') && select.closest('form').id === 'evalForm') fillEvalCheckpoints((latestStatus && latestStatus.checkpoints) || []);
   if (select.closest('form') && select.closest('form').id === 'trainForm') {
     fillBaseModels((latestStatus && latestStatus.base_models) || []);
   }
@@ -1859,6 +1941,7 @@ document.querySelectorAll('.dataset-select').forEach(select => select.addEventLi
 }));
 document.querySelectorAll('.model-variant-select').forEach(select => select.addEventListener('change', () => {
   fillBaseModels((latestStatus && latestStatus.base_models) || []);
+  if (select.closest('form') && select.closest('form').id === 'evalForm') fillEvalCheckpoints((latestStatus && latestStatus.checkpoints) || []);
 }));
 const trainExperimentInput = document.getElementById('trainExperimentName');
 ['input', 'change'].forEach(eventName => trainExperimentInput.addEventListener(eventName, () => {
@@ -1943,6 +2026,23 @@ document.getElementById('trainForm').onsubmit = async event => {
     if (task.state === 'waiting_norm') show(`训练已排队；正在自动计算 norm stats：${dependency}`, false);
     else if (task.state === 'waiting_gpu') show(`norm stats 已就绪；训练正在等待 GPU：${task.waiting_reason || ''}`, false);
     else show(`训练任务已启动：${task.id}`, false);
+    showModule('training');
+    refreshAll();
+  } catch (error) {
+    show(error.message);
+  }
+};
+
+document.getElementById('evalForm').onsubmit = async event => {
+  event.preventDefault();
+  const payload = formJSON(event.target);
+  payload.gpu_ids = String(payload.gpu_ids || '').split(',').map(x => x.trim()).filter(Boolean);
+  if (payload.execution_target !== 'local_4090') {
+    payload.cluster_gpus = payload.cluster_gpus || payload.gpu_ids[0] || '1';
+  }
+  try {
+    const task = await api('/api/tasks/eval', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+    show(`评测任务已启动：${task.id}`, false);
     showModule('training');
     refreshAll();
   } catch (error) {
