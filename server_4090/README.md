@@ -104,6 +104,7 @@ ssh 4x4090 'tail -n 100 ~/.local/share/bimanual-vla-server/dashboard.log'
 ```bash
 python upload_dataset_4090.py /path/to/gui_episodes \
   --name pick_cube_piper_r1 \
+  --dataset-origin real \
   --server http://192.168.101.9:8090 \
   --token "$BIMANUAL_VLA_SERVER_TOKEN" \
   --workers 4 \
@@ -116,12 +117,15 @@ python upload_dataset_4090.py /path/to/gui_episodes \
 ```bash
 python upload_dataset_4090.py /path/to/pi0_dataset_single \
   --name pick_cube_piper_r1 \
+  --dataset-origin real \
   --server http://192.168.101.9:8090 \
   --token "$BIMANUAL_VLA_SERVER_TOKEN" \
   --workers 4 \
   --chunk-mib 32 \
   --merge
 ```
+
+真机上传默认使用 `--dataset-origin real`，仿真上传使用 `--dataset-origin simulation`。服务端分开暂存到 `uploads/real` 与 `uploads/simulation`，安装后通过 `meta/dashboard_dataset_origin.json` 保留来源分类，同时继续使用 OpenPI 兼容的统一 LeRobot 根目录。
 
 原始 NPZ 自动导出缓存在 `~/.cache/bimanual-vla/uploads/exports`。同一命令重跑会复用未变化的导出和 tar，并查询服务端已有分块后断点续传；`--rebuild` 强制重建本地缓存。服务端完成 SHA256、tar 安全、LeRobot v2.1 结构、视频帧数和 OpenPI loader 校验后才安装数据集。
 

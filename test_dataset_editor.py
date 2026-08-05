@@ -10,7 +10,10 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from server_4090.dataset_editor import DatasetEditor
+from server_4090.dataset_editor import (
+    DatasetEditor,
+    read_dataset_origin_marker,
+)
 
 
 DATA_PATH = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
@@ -263,6 +266,43 @@ class DatasetEditorTest(unittest.TestCase):
         basic_validate(target)
         remaining = json.loads((target / "meta" / "info.json").read_text())
         self.assertEqual((remaining["total_episodes"], remaining["total_frames"]), (2, 4))
+
+    def test_dataset_origin_marker_is_editable_and_visible(self):
+        target = make_dataset(self.datasets, "target", [2])
+
+        result = self.editor().set_dataset_origin("target", "real")
+        details = self.editor().details("target")
+
+        self.assertEqual(result["dataset_origin"], "real")
+        self.assertEqual(read_dataset_origin_marker(target)["origin"], "real")
+        self.assertEqual(details["dataset_origin_marker"]["origin"], "real")
+
+    def test_upload_origin_is_installed_and_cross_origin_merge_is_rejected(self):
+        staging_root = self.root / "staging_origin"
+        staging_root.mkdir()
+        extracted = make_dataset(staging_root, "incoming", [2])
+
+        result = self.editor().install_upload(
+            "uploaded",
+            extracted,
+            overwrite=False,
+            merge=False,
+            dataset_origin="simulation",
+        )
+        uploaded = self.datasets / "uploaded"
+        self.assertEqual(result["dataset_origin"], "simulation")
+        self.assertEqual(read_dataset_origin_marker(uploaded)["origin"], "simulation")
+
+        self.editor().set_dataset_origin("uploaded", "real")
+        incoming = make_dataset(staging_root, "incoming_again", [1])
+        with self.assertRaisesRegex(ValueError, "cannot merge simulation upload"):
+            self.editor().install_upload(
+                "uploaded",
+                incoming,
+                overwrite=False,
+                merge=True,
+                dataset_origin="simulation",
+            )
 
     def test_uploaded_dataset_can_merge_into_existing_dataset(self):
         target = make_dataset(self.datasets, "target", [2])

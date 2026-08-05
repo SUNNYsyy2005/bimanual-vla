@@ -15,6 +15,18 @@ class DashboardTemplateNullGuardTest(unittest.TestCase):
         self.assertIn("model.experiment !== experiment", template)
         self.assertIn("model.arm_mode === dataset.arm_mode", template)
 
+    def test_dataset_origin_filter_and_upload_classification_are_visible(self):
+        template = (
+            Path(__file__).parent / "server_4090/templates/index.html"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('id="datasetOriginFilter"', template)
+        self.assertIn('--dataset-origin real', template)
+        self.assertIn('uploads/real', template)
+        self.assertIn('uploads/simulation', template)
+        self.assertIn('setDatasetOrigin', template)
+        self.assertIn('datasetOriginBadge', template)
+
     def test_timed_target_helpers_guard_null_object_values(self):
         template = (
             Path(__file__).parent / "server_4090/templates/index.html"

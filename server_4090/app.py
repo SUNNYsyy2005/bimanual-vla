@@ -88,7 +88,13 @@ MODEL_ACTION_START_OFFSET_STEPS = 1
 ACTION_CONTRACT_MARKER_VERSION = 3
 
 try:
-    from .dataset_editor import DatasetEditor, DatasetValidationError
+    from .dataset_editor import (
+        DATASET_ORIGINS,
+        DatasetEditor,
+        DatasetValidationError,
+        normalize_dataset_origin,
+        read_dataset_origin_marker,
+    )
     from .episode_split import (
         DEFAULT_SPLIT_SEED,
         DEFAULT_TEST_RATIO,
@@ -101,7 +107,13 @@ try:
         resolve_episode_split,
     )
 except ImportError:  # app.py is normally executed directly by start_server.sh
-    from dataset_editor import DatasetEditor, DatasetValidationError
+    from dataset_editor import (
+        DATASET_ORIGINS,
+        DatasetEditor,
+        DatasetValidationError,
+        normalize_dataset_origin,
+        read_dataset_origin_marker,
+    )
     from episode_split import (
         DEFAULT_SPLIT_SEED,
         DEFAULT_TEST_RATIO,
@@ -660,6 +672,67 @@ def training_experiment_catalog(checkpoint_base_dir: Path) -> list[dict[str, Any
             }
         )
     return sorted(result, key=lambda item: (-item["mtime"], item["name"]))
+
+
+def dataset_origin_info(
+    dataset_id: str, dataset_path: Path, info: dict[str, Any]
+) -> dict[str, Any]:
+    """Classify datasets while allowing an explicit Dashboard marker to win."""
+    if not isinstance(info, dict):
+        info = {}
+    marker = read_dataset_origin_marker(dataset_path)
+    if marker is not None:
+        return {
+            "dataset_origin": marker["origin"],
+            "dataset_origin_source": "marker",
+            "dataset_origin_marker": marker,
+        }
+
+    for key in ("dataset_origin", "data_origin", "source_domain"):
+        if info.get(key) is None:
+            continue
+        try:
+            origin = normalize_dataset_origin(info.get(key))
+        except ValueError:
+            continue
+        return {
+            "dataset_origin": origin,
+            "dataset_origin_source": f"info.{key}",
+            "dataset_origin_marker": None,
+        }
+    if isinstance(info.get("simulation"), bool):
+        return {
+            "dataset_origin": "simulation" if info["simulation"] else "real",
+            "dataset_origin_source": "info.simulation",
+            "dataset_origin_marker": None,
+        }
+
+    name = dataset_id.lower()
+    robot_type = str(info.get("robot_type", "")).strip().lower()
+    simulation_name = bool(
+        re.search(r"(?:^|[._-])(sim|synth|synthetic|smoke|robottwin)(?:[._-]|$)", name)
+    )
+    if (
+        simulation_name
+        or robot_type == "aloha"
+        or (robot_type.startswith("piper_single_arm") and bool(info.get("video_path")))
+    ):
+        return {
+            "dataset_origin": "simulation",
+            "dataset_origin_source": "heuristic",
+            "dataset_origin_marker": None,
+        }
+    if robot_type == "piper":
+        return {
+            "dataset_origin": "real",
+            "dataset_origin_source": "heuristic",
+            "dataset_origin_marker": None,
+        }
+    return {
+        "dataset_origin": "unknown",
+        "dataset_origin_source": "unclassified",
+        "dataset_origin_marker": None,
+    }
 
 
 def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
@@ -1930,6 +2003,8 @@ class UploadManager:
         self.root.mkdir(parents=True, exist_ok=True)
         self.dataset_root = Path(config["dataset_root"])
         self.dataset_root.mkdir(parents=True, exist_ok=True)
+        for origin in ("real", "simulation"):
+            (self.root / origin).mkdir(parents=True, exist_ok=True)
         self.locks: dict[str, threading.Lock] = {}
         self.global_lock = threading.Lock()
 
@@ -1938,7 +2013,18 @@ class UploadManager:
             return self.locks.setdefault(upload_id, threading.Lock())
 
     def _dir(self, upload_id: str) -> Path:
-        return self.root / safe_name(upload_id, "upload id")
+        upload_id = safe_name(upload_id, "upload id")
+        prefix = upload_id.split("-", 1)[0]
+        if prefix in {"real", "simulation"}:
+            return self.root / prefix / upload_id
+        legacy = self.root / upload_id
+        if legacy.exists():
+            return legacy
+        for origin in ("real", "simulation"):
+            candidate = self.root / origin / upload_id
+            if candidate.exists():
+                return candidate
+        return legacy
 
     def _state(self, upload_id: str) -> dict[str, Any]:
         state = read_json(self._dir(upload_id) / "upload.json")
@@ -1978,8 +2064,14 @@ class UploadManager:
         merge = bool(payload.get("merge", False))
         if overwrite and merge:
             raise ValueError("overwrite and merge are mutually exclusive")
-        upload_id = hashlib.sha256(f"{dataset_name}\0{size}\0{sha256}".encode()).hexdigest()[:32]
-        upload_dir = self._dir(upload_id)
+        dataset_origin = normalize_dataset_origin(
+            payload.get("dataset_origin", "real"), allow_unknown=False
+        )
+        digest = hashlib.sha256(
+            f"{dataset_origin}\0{dataset_name}\0{size}\0{sha256}".encode()
+        ).hexdigest()[:24]
+        upload_id = f"{dataset_origin}-{digest}"
+        upload_dir = self.root / dataset_origin / upload_id
         upload_dir.mkdir(parents=True, exist_ok=True)
         (upload_dir / "chunks").mkdir(exist_ok=True)
         state_path = upload_dir / "upload.json"
@@ -1987,6 +2079,7 @@ class UploadManager:
         expected = {
             "id": upload_id,
             "dataset_name": dataset_name,
+            "dataset_origin": dataset_origin,
             "size": size,
             "sha256": sha256,
             "chunk_size": chunk_size,
@@ -1995,7 +2088,7 @@ class UploadManager:
             "merge": merge,
         }
         if isinstance(state, dict):
-            for key in ("dataset_name", "size", "sha256", "chunk_size"):
+            for key in ("dataset_name", "dataset_origin", "size", "sha256", "chunk_size"):
                 if state.get(key) != expected[key]:
                     raise ValueError(f"existing upload metadata mismatch for {key}")
             state["overwrite"] = overwrite
@@ -2106,11 +2199,26 @@ class UploadManager:
             staging = self.dataset_root / f".{dataset_name}.installing-{uuid.uuid4().hex}"
             try:
                 self._extract_tar(archive, staging)
+                requested_origin = normalize_dataset_origin(
+                    state.get("dataset_origin", "real"), allow_unknown=False
+                )
+                target = self.dataset_root / dataset_name
+                if bool(state.get("merge")) and target.is_dir():
+                    target_info = read_json(target / "meta" / "info.json", {})
+                    existing_origin = dataset_origin_info(
+                        dataset_name, target, target_info
+                    )["dataset_origin"]
+                    if existing_origin not in {"unknown", requested_origin}:
+                        raise ValueError(
+                            f"cannot merge {requested_origin} upload into "
+                            f"{existing_origin} dataset {dataset_name}"
+                        )
                 result = self.dataset_editor.install_upload(
                     dataset_name,
                     staging,
                     overwrite=bool(state.get("overwrite")),
                     merge=bool(state.get("merge")),
+                    dataset_origin=requested_origin,
                 )
                 state.pop("error", None)
                 state.pop("failed_at", None)
@@ -2740,6 +2848,7 @@ def create_app(config_path: Path) -> Flask:
                         )
                     )
             default_model_variant = infer_model_variant(Path(config["base_checkpoint"])) or "pi05"
+            origin = dataset_origin_info(directory.name, directory, info)
             datasets.append(
                 {
                     "id": directory.name,
@@ -2748,6 +2857,7 @@ def create_app(config_path: Path) -> Flask:
                     "frames": info.get("total_frames"),
                     "fps": info.get("fps"),
                     "robot_type": info.get("robot_type"),
+                    **origin,
                     **schema,
                     "episode_split": split_info if isinstance(split_info, dict) else None,
                     "train_episodes": split_info.get("num_train_episodes") if isinstance(split_info, dict) else None,
@@ -2923,6 +3033,11 @@ def create_app(config_path: Path) -> Flask:
                 "gpus": gpu_inventory(),
                 "config": {
                     "dataset_root": config["dataset_root"],
+                    "upload_roots": {
+                        origin: str(Path(config["workspace_root"]) / "uploads" / origin)
+                        for origin in ("real", "simulation")
+                    },
+                    "dataset_origins": sorted(DATASET_ORIGINS),
                     "checkpoint_base_dir": config["checkpoint_base_dir"],
                     "base_checkpoint": config["base_checkpoint"],
                     "allowed_gpu_ids": sorted(allowed_gpus),
@@ -2980,6 +3095,17 @@ def create_app(config_path: Path) -> Flask:
         )
         return jsonify(dataset_editor.rename_dataset(dataset_id, new_dataset_id))
 
+    @app.patch("/api/datasets/<dataset_id>/origin")
+    def set_dataset_origin(dataset_id: str):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        payload = request.get_json(force=True)
+        origin = normalize_dataset_origin(
+            payload.get("dataset_origin") if isinstance(payload, dict) else None
+        )
+        return jsonify(
+            dataset_editor.set_dataset_origin(dataset_id, origin, source="dashboard")
+        )
+
     @app.delete("/api/datasets/<dataset_id>")
     def delete_dataset(dataset_id: str):
         dataset_id = safe_name(dataset_id, "dataset id")
@@ -3021,7 +3147,27 @@ def create_app(config_path: Path) -> Flask:
         dataset_id = safe_name(dataset_id, "dataset id")
         payload = request.get_json(force=True)
         source_id = safe_name(payload.get("source_dataset_id") if isinstance(payload, dict) else None, "source dataset id")
-        return jsonify(dataset_editor.merge_existing(dataset_id, source_id))
+        target_path = dataset_root / dataset_id
+        source_path = dataset_root / source_id
+        target_info = read_json(target_path / "meta" / "info.json", {})
+        source_info = read_json(source_path / "meta" / "info.json", {})
+        target_origin = dataset_origin_info(dataset_id, target_path, target_info).get("dataset_origin")
+        source_origin = dataset_origin_info(source_id, source_path, source_info).get("dataset_origin")
+        if (
+            target_origin != "unknown"
+            and source_origin != "unknown"
+            and target_origin != source_origin
+        ):
+            raise ValueError(
+                f"cannot merge {source_origin} dataset {source_id} into {target_origin} dataset {dataset_id}"
+            )
+        result = dataset_editor.merge_existing(dataset_id, source_id)
+        if target_origin == "unknown" and source_origin != "unknown":
+            dataset_editor.set_dataset_origin(
+                dataset_id, source_origin, source="merge_inherited"
+            )
+            result["dataset_origin"] = source_origin
+        return jsonify(result)
 
     def parse_dataset(payload: dict[str, Any]) -> tuple[str, str, str, str, dict[str, Any]]:
         dataset_id = safe_name(payload.get("dataset_id"), "dataset id")

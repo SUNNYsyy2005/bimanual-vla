@@ -13,6 +13,7 @@ from server_4090.app import (
     build_environment,
     cuda_visible_devices,
     describe_dataset_schema,
+    dataset_origin_info,
     gpu_memory_shortfalls,
     gpu_inventory,
     infer_model_variant,
@@ -25,6 +26,7 @@ from server_4090.app import (
     training_experiment_catalog,
     MIN_POLICY_ACTION_HORIZON,
     PolicyTelemetryStore,
+    UploadManager,
     policy_horizon_status,
     require_policy_execution_horizon,
     complete_action_contract_fingerprint,
@@ -32,6 +34,74 @@ from server_4090.app import (
     policy_time_contract_status,
     require_policy_execution_time_contract,
 )
+
+
+class DatasetOriginClassificationTest(unittest.TestCase):
+    def test_marker_overrides_heuristics_and_legacy_shapes_are_classified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real = root / "real_capture"
+            sim = root / "simulation_capture"
+            for path in (real, sim):
+                (path / "meta").mkdir(parents=True)
+
+            self.assertEqual(
+                dataset_origin_info("real_capture", real, {"robot_type": "piper"})["dataset_origin"],
+                "real",
+            )
+            self.assertEqual(
+                dataset_origin_info("simulation_capture", sim, {"robot_type": "aloha"})["dataset_origin"],
+                "simulation",
+            )
+            marker = sim / "meta" / "dashboard_dataset_origin.json"
+            marker.write_text(json.dumps({"origin": "real", "source": "test"}), encoding="utf-8")
+            marked = dataset_origin_info("simulation_capture", sim, {"robot_type": "aloha"})
+            self.assertEqual(marked["dataset_origin"], "real")
+            self.assertEqual(marked["dataset_origin_source"], "marker")
+
+
+class UploadOriginDirectoryTest(unittest.TestCase):
+    def test_upload_ids_and_staging_directories_are_separated_by_origin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = UploadManager(
+                {
+                    "workspace_root": str(root / "workspace"),
+                    "dataset_root": str(root / "datasets"),
+                    "max_upload_gib": 1,
+                    "max_chunk_mib": 64,
+                },
+                mock.Mock(),
+            )
+            common = {
+                "dataset_name": "sample",
+                "size": 1024 * 1024,
+                "sha256": "a" * 64,
+                "chunk_size": 1024 * 1024,
+                "overwrite": False,
+                "merge": False,
+            }
+
+            real = manager.initialize({**common, "dataset_origin": "real"})
+            simulation = manager.initialize(
+                {**common, "dataset_origin": "simulation"}
+            )
+
+            self.assertTrue(real["id"].startswith("real-"))
+            self.assertTrue(simulation["id"].startswith("simulation-"))
+            self.assertNotEqual(real["id"], simulation["id"])
+            self.assertTrue(
+                (root / "workspace" / "uploads" / "real" / real["id"]).is_dir()
+            )
+            self.assertTrue(
+                (
+                    root
+                    / "workspace"
+                    / "uploads"
+                    / "simulation"
+                    / simulation["id"]
+                ).is_dir()
+            )
 
 
 class TrainingExperimentCatalogTest(unittest.TestCase):
