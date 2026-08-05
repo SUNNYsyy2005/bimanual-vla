@@ -4,7 +4,9 @@
   "dashboard_profile": "simulation",
   "dashboard_title": "Bimanual-VLA · 仿真训练控制台",
   "upload_default_origin": "simulation",
-  "visible_dataset_origins": ["simulation"],
+  "visible_dataset_origins": [
+    "simulation"
+  ],
   "enable_policy": false,
   "openpi_repo": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05",
   "openpi_python": "/home/sunny/miniconda3/envs/openpi/bin/python",
@@ -13,9 +15,14 @@
   "assets_base_dir": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/assets",
   "checkpoint_base_dir": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints",
   "base_checkpoint": "/home/sunny/.cache/openpi/openpi-assets/checkpoints/pi05_base",
-  "allowed_gpu_ids": [0, 1, 2, 3],
+  "allowed_gpu_ids": [
+    0,
+    1,
+    2,
+    3
+  ],
   "allow_busy_gpus": false,
-  "xla_memory_fraction": 0.90,
+  "xla_memory_fraction": 0.9,
   "training_min_free_gpu_mib": 23000,
   "evaluation_min_free_gpu_mib": 23000,
   "evaluation_xla_memory_fraction": 0.85,
@@ -50,6 +57,10 @@
       "assets_base_dir": "/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/assets",
       "checkpoint_base_dir": "/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints",
       "base_checkpoint": "/DATA/sync/sunny/.cache/openpi/openpi-assets/checkpoints/pi05_base",
+      "eval_video_roots": [
+        "/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/outputs",
+        "/DATA/sync/sunny/bimanual-vla/eval_videos"
+      ],
       "cache_root": "/DATA/sync/sunny/.cache"
     },
     "h200-ali-01": {
@@ -71,6 +82,10 @@
       "assets_base_dir": "/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/assets",
       "checkpoint_base_dir": "/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints",
       "base_checkpoint": "/DATA/sync/sunny/.cache/openpi/openpi-assets/checkpoints/pi05_base",
+      "eval_video_roots": [
+        "/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/outputs",
+        "/DATA/sync/sunny/bimanual-vla/eval_videos"
+      ],
       "cache_root": "/DATA/sync/sunny/.cache"
     },
     "h200-ali-02": {
@@ -92,7 +107,12 @@
       "assets_base_dir": "/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/assets",
       "checkpoint_base_dir": "/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints",
       "base_checkpoint": "/DATA/sync/sunny/.cache/openpi/openpi-assets/checkpoints/pi05_base",
+      "eval_video_roots": [
+        "/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/outputs",
+        "/DATA/sync/sunny/bimanual-vla/eval_videos"
+      ],
       "cache_root": "/DATA/sync/sunny/.cache"
     }
-  }
+  },
+  "transfer_parallelism": 4
 }

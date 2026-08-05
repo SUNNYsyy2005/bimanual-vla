@@ -1,5 +1,14 @@
 # 4×4090 数据 / π0.5 微调 / Policy 管理服务
 
+
+## 仿真 Dashboard
+
+仿真训练 / 评测 / 视频查看的独立 8091 服务和 AI API 使用流程见：
+
+```text
+server_4090/SIMULATION_DASHBOARD.md
+```
+
 ## 架构
 
 管理面和真实推理数据面彼此分离：
