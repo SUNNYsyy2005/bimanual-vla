@@ -37,6 +37,22 @@ set -euo pipefail
 cd "$REMOTE_ROOT"
 if [[ ! -f server_4090/config.simulation.json ]]; then
   cp server_4090/config.simulation.example.json server_4090/config.simulation.json
+else
+  python3 - <<'PY'
+import json
+from pathlib import Path
+example = json.loads(Path('server_4090/config.simulation.example.json').read_text())
+path = Path('server_4090/config.simulation.json')
+current = json.loads(path.read_text())
+for key in (
+    'dataset_root', 'assets_base_dir', 'checkpoint_base_dir', 'base_checkpoint',
+    'checkpoint_allowed_roots', 'eval_video_roots', 'cluster_targets',
+    'transfer_parallelism', 'cluster_resources_script',
+):
+    if key in example:
+        current[key] = example[key]
+path.write_text(json.dumps(current, ensure_ascii=False, indent=2) + '\n')
+PY
 fi
 mkdir -p \
   "$HOME/.config/systemd/user" \
@@ -46,6 +62,14 @@ install -m 0644 \
   server_4090/bimanual-vla-sim-dashboard.service \
   "$HOME/.config/systemd/user/bimanual-vla-sim-dashboard.service"
 chmod +x server_4090/slurm_job_runner.py server_4090/dataset_transfer_runner.py server_4090/video_transfer_runner.py server_4090/run_server_foreground.sh scripts/query_h100_h200_resources.sh
+# Best-effort staging for H100/login-server Slurm helpers. H200 remains
+# independent and should be prepared via its dedicated setup Slurm jobs.
+if command -v rsync >/dev/null 2>&1; then
+  ssh -o BatchMode=yes -o ConnectTimeout=8 login-server 'mkdir -p /DATA/disk0/sunny/bimanual-vla' 2>/dev/null && \
+  rsync -az --delete \
+    server_4090 piper_action_conventions.py piper_data_contract.py pi0_dataset.py check_pi05_dataset.py download_openpi_checkpoint.py \
+    login-server:/DATA/disk0/sunny/bimanual-vla/ 2>/dev/null || true
+fi
 systemctl --user daemon-reload
 systemctl --user stop bimanual-vla-sim-dashboard.service 2>/dev/null || true
 systemctl --user enable --now bimanual-vla-sim-dashboard.service

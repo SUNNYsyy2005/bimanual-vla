@@ -257,10 +257,12 @@ curl -sS -X POST "$SIM_DASHBOARD/api/tasks/train" \
   }' | jq .
 ```
 
-注意：根据 `AGENTS.md`，H200 节点默认是密码 SSH。后台 Dashboard 不能交互输入密码。若要让 8091 自动提交 H200 任务，需要先确保：
+注意：H200 不作为 Dashboard 可直连登录节点使用。8091 自动提交 H200 任务时只 SSH 到 `login-server`，再由 `login-server` 调用 Slurm 申请 `h200` 分区和指定 `node=h200-ali-01/02`。因此 H200 配置应满足：
 
-- `ssh h200-ali-01` / `ssh h200-ali-02` 可非交互登录；或
-- 你手动在 H200 节点上部署等价环境，然后改配置走可用认证方式。
+- `submit_host=login-server`；
+- `partition=h200`；
+- `node=h200-ali-01` 或 `h200-ali-02`；
+- H200 本地 `/DATA/sync/$USER` 下已提前准备好项目、环境、数据集和模型，或通过 staging/setup Slurm 作业准备。
 
 否则任务会失败并在日志里显示 SSH 认证错误。
 
@@ -568,7 +570,7 @@ curl -sS -H "Authorization: Bearer $SIM_TOKEN" \
 常见问题：
 
 - SSH alias 不存在或不能非交互登录。
-- H200 仍需密码，后台无法输入。
+- H200 被当成 Slurm-only 节点，不要要求 Dashboard 直接 SSH H200；检查 `submit_host=login-server`、`partition=h200`、`node=h200-ali-01/02`。
 - 远端没有 `/DATA/sync/sunny/bimanual-vla` 或代码版本不一致。
 - 远端没有数据集、base checkpoint、训练 checkpoint。
 - 远端 conda env 路径不对。
@@ -695,7 +697,7 @@ h200-ali-01
 h200-ali-02
 ```
 
-这些位置来自 `config.simulation.json` 的 `dataset_root` 和 `cluster_targets.*.dataset_root`。
+这些位置来自 `config.simulation.json` 的 `dataset_root` 和 `cluster_targets.*.dataset_root`。H200 若配置为 `access_mode=slurm_only`，Dashboard 不会直接 SSH 扫描/传输该节点；需要先通过 login-server 提交 staging/setup Slurm 作业，或经 NAS 中转到 H200 本地 `/DATA/sync/$USER`。
 
 ### 14.1 查询所有位置并去重
 
@@ -732,9 +734,9 @@ curl -sS -H "Authorization: Bearer $SIM_TOKEN" \
 说明：
 
 - local_4090 直接扫描本地文件系统。
-- H100/H200 只通过 `ssh <target> python3 ...` 执行只读扫描。
+- H100 可通过 `login-server` 共享文件系统做只读扫描。
+- H200 配置为 `access_mode=slurm_only` 时不做直接 SSH 扫描；数据位置接口会在 `errors` 中提示需要 staging/setup Slurm 作业或 NAS 中转。
 - 不在 H100/H200 开 HTTP 服务，也不监听端口。
-- 如果 H200 密码 SSH 不能非交互登录，会在 `errors` 中显示 SSH 失败。
 
 ### 14.2 跨服务器同步数据集
 
@@ -890,7 +892,7 @@ curl -sS -H "Authorization: Bearer $SIM_TOKEN" \
 H100/H200 的远端 eval_video_roots
 ```
 
-Dashboard 不能也不应该在 H100/H200 上开端口提供视频服务。远端视频统一通过 SSH 同步回 4×4090，然后由 8091 播放。
+Dashboard 不能也不应该在 H100/H200 上开端口提供视频服务。H100 可通过 `login-server` 共享文件系统扫描/同步；H200 为 Slurm-only 时需先由 staging/setup Slurm 作业或 NAS 把视频同步回 4×4090，然后由 8091 播放。
 
 ### 17.1 扫描本地 + 远端视频
 
@@ -907,7 +909,7 @@ curl -sS -H "Authorization: Bearer $SIM_TOKEN" \
 页面“评估视频”里：
 
 - “刷新本地视频”只扫 4×4090。
-- “扫描 H100/H200 并同步”会显示远端视频条目，每个远端视频有“同步到 4×4090 后播放”按钮。
+- “扫描 H100/H200 并同步”会显示可直接扫描的远端视频条目；H200 Slurm-only 节点会显示提示，需要先用 staging/NAS 回传视频。
 
 ### 17.2 同步远端视频到本地
 
@@ -939,8 +941,8 @@ ssh <source> 'tar -C <remote_root> -cf - <relative_path>' | tar -C <local_eval_v
 
 注意：
 
-- H100/H200 只通过 SSH 读文件，不开 HTTP/WebSocket 端口。
-- `root` 必须在 `config.simulation.json` 的 `cluster_targets.<target>.eval_video_roots` 中。
+- H100 通过 login-server 读共享文件；H200 Slurm-only 不直接 SSH 读文件；任何节点都不开 HTTP/WebSocket 端口。
+- `root` 必须在 `config.simulation.json` 的 `cluster_targets.<target>.eval_video_roots` 中。H200 Slurm-only 节点上的视频需要先通过 Slurm staging/NAS 同步回 4×4090，Dashboard 不直接 SSH 读取 H200 计算节点。
 - `relative_path` 不能是绝对路径，不能包含 `..`。
 - `overwrite=false` 时，本地已存在同名文件会失败，避免误覆盖。
 
@@ -948,7 +950,7 @@ ssh <source> 'tar -C <remote_root> -cf - <relative_path>' | tar -C <local_eval_v
 
 所有 Dashboard 托管的跨服务器传输默认采用并行流式传输：
 
-- 数据集同步 `/api/datasets/<dataset_id>/sync`：先在源端按文件大小做均衡分片，然后同时启动多个 `tar` 流，经由 4×4090 控制端并行抽取/写入目标位置；H100/H200 仍只通过 SSH/Slurm 相关账号访问，不在远端开启端口。
+- 数据集同步 `/api/datasets/<dataset_id>/sync`：对可 SSH 访问的位置，先在源端按文件大小做均衡分片，然后同时启动多个 `tar` 流，经由 4×4090 控制端并行抽取/写入目标位置；H200 Slurm-only 不走该直传接口，需要 staging/setup Slurm 作业或 NAS 中转。
 - 远端评估视频同步 `/api/eval-videos/sync`：按 64MiB 分片并行从远端读取，全部分片校验大小后再在 4×4090 合并为可播放文件。
 - 默认并行度来自 `config.simulation.json` 的 `transfer_parallelism`，建议 4；接口也可在 JSON body 里临时覆盖：
 
@@ -962,7 +964,7 @@ curl -X POST "$SIM_DASHBOARD/api/eval-videos/sync" \
   -d '{"source":"h100","root":"/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/outputs","relative_path":"eval/run.mp4","parallelism":8}'
 ```
 
-并行度上限为 16。若目标是 H200 且当前 SSH 无法非交互认证，任务会快速失败并在任务日志里给出 SSH 错误，而不会在 H200 上启动任何监听服务。
+并行度上限为 16。若源/目标是 H200 Slurm-only，接口会直接拒绝直传并提示使用 staging/setup Slurm 作业或 NAS；不会在 H200 上启动任何监听服务。
 
 ## 15. 仿真 joint 数据集训练兼容
 
@@ -972,3 +974,50 @@ curl -X POST "$SIM_DASHBOARD/api/eval-videos/sync" \
 - `dataset_origin=real/unknown` 的同类模糊 joint 数据集仍保持不兼容，需要显式写入合同元数据后才能训练。
 
 这保证仿真数据可直接走训练/评测链路，同时不放松实机数据的安全约束。
+
+## 18. 当前已探测的数据集位置（2026-08-05）
+
+按 `SERVER_PATHS_ENV_TRAIN_EVAL.md` 重新核验后，仿真 Dashboard 的远端路径应使用 `/DATA/disk0/sunny`，不是旧模板里的 `/DATA/sync/sunny`。
+
+### 18.1 H100 / login-server 共享路径
+
+Dashboard 可在 `login-server` 轻量扫描：
+
+```text
+/DATA/disk0/sunny/.cache/huggingface/lerobot
+```
+
+当前探测到：
+
+| dataset_id | episodes | frames | fps | root |
+|---|---:|---:|---:|---|
+| `lift_pot_piper` | 150 | 12385 | 50 | `/DATA/disk0/sunny/.cache/huggingface/lerobot` |
+
+文档中的 Put Bottles v3 norm_stats 已在 H100 assets 下存在，但 H100 的 LeRobot dataset root 当前未探测到该 dataset 目录；训练前需按准备脚本重新 staging 数据。
+
+### 18.2 H200-ali-01 Slurm 探测结果
+
+H200 不由 Dashboard 直接 SSH 扫描；通过 login-server 提交 CPU-only Slurm probe，并把 inventory 写入：
+
+```text
+/DATA/NAS/GPUServer/sunny/dashboard_probe/h200-ali-01_inventory.json
+```
+
+当前探测到：
+
+| dataset_id | episodes | frames | fps | root |
+|---|---:|---:|---:|---|
+| `lift_pot_piper` | 150 | 12385 | 50 | `/DATA/disk0/sunny/.cache/huggingface/lerobot` |
+| `put_bottles_dustbin_piper_100_25hz_realqpos_v2` | 100 | 59798 | 25 | `/DATA/disk0/sunny/.cache/huggingface/lerobot` |
+| `put_bottles_dustbin_piper_100_25hz_realqpos_v3_order_aligned` | 100 | 59798 | 25 | `/DATA/disk0/sunny/.cache/huggingface/lerobot` |
+| `put_single_bottle_dustbin_piper_200` | 200 | 42489 | 50 | `/DATA/disk0/sunny/.cache/huggingface/lerobot` |
+
+### 18.3 H200-ali-02 Slurm 探测结果
+
+Inventory cache：
+
+```text
+/DATA/NAS/GPUServer/sunny/dashboard_probe/h200-ali-02_inventory.json
+```
+
+当前探测结果：`/DATA/disk0/sunny/.cache/huggingface/lerobot` 不存在或无 LeRobot 数据集。若要在 h200-ali-02 训练，需要先单独 staging 数据、项目、环境和 checkpoint。
