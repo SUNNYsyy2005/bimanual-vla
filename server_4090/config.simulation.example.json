@@ -64,7 +64,7 @@
       "cache_root": "/DATA/sync/sunny/.cache"
     },
     "h200-ali-01": {
-      "submit_host": "h200-ali-01",
+      "submit_host": "sunny@47.116.14.100",
       "partition": "h200",
       "node": "h200-ali-01",
       "gpu_type": "h200",
@@ -89,7 +89,7 @@
       "cache_root": "/DATA/sync/sunny/.cache"
     },
     "h200-ali-02": {
-      "submit_host": "h200-ali-02",
+      "submit_host": "sunny@120.55.15.209",
       "partition": "h200",
       "node": "h200-ali-02",
       "gpu_type": "h200",
