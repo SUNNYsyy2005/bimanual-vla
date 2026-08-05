@@ -511,6 +511,25 @@ class DatasetSchemaDescriptionTest(unittest.TestCase):
         self.assertFalse(result["training_supported"])
 
 
+    def test_simulation_joint_without_contract_defaults_to_v3_but_real_stays_closed(self):
+        base = self.info(
+            "observation.state", 14, "action", 14,
+            [
+                ("observation.images.cam_high", "video"),
+                ("observation.images.cam_left_wrist", "video"),
+                ("observation.images.cam_right_wrist", "video"),
+            ],
+        )
+        real = describe_dataset_schema(base)
+        self.assertFalse(real["training_supported"])
+        self.assertIn("requires contract_version", real["contract_error"])
+
+        sim = describe_dataset_schema({**base, "dataset_origin": "simulation"})
+        self.assertTrue(sim["training_supported"])
+        self.assertEqual(sim["contract_version"], 3)
+        self.assertEqual(sim["raw_gripper_semantics"], "absolute_opening_fraction_0_closed_1_open")
+        self.assertEqual(sim["model_action_dim"], 14)
+
 class AsyncPolicyDashboardContractTest(unittest.TestCase):
     def test_horizon_gate_is_fail_closed(self):
         ready = policy_horizon_status({"action_horizon": 50, "client_action_horizon": 50})

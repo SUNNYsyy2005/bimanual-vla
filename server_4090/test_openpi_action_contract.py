@@ -662,5 +662,50 @@ class OpenPiDatasetContractTest(unittest.TestCase):
             )
 
 
+    def test_simulation_joint_without_contract_defaults_to_v3_fraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_info(
+                root,
+                "sim_joint",
+                {
+                    "dataset_origin": "simulation",
+                    "features": {
+                        "observation.state": {"shape": [14]},
+                        "action": {"shape": [14]},
+                        "observation.images.cam_high": {"dtype": "video"},
+                        "observation.images.cam_left_wrist": {"dtype": "video"},
+                        "observation.images.cam_right_wrist": {"dtype": "video"},
+                    },
+                },
+            )
+            with mock.patch.dict(os.environ, {"HF_LEROBOT_HOME": str(root)}):
+                contract = HELPER.resolve_dataset_contract(self.args("sim_joint"))
+
+            self.assertEqual(contract.schema, "joint")
+            self.assertEqual(contract.arm_mode, "bimanual")
+            self.assertEqual(contract.contract_version, 3)
+            self.assertEqual(contract.raw_gripper_semantics, "absolute_opening_fraction_0_closed_1_open")
+            self.assertEqual(contract.model_action_dim, 14)
+
+    def test_real_joint_without_contract_still_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_info(
+                root,
+                "real_joint",
+                {
+                    "features": {
+                        "observation.state": {"shape": [7]},
+                        "action": {"shape": [7]},
+                        "observation.images.cam_high": {"dtype": "video"},
+                        "observation.images.cam_right_wrist": {"dtype": "video"},
+                    },
+                },
+            )
+            with mock.patch.dict(os.environ, {"HF_LEROBOT_HOME": str(root)}):
+                with self.assertRaisesRegex(ValueError, "ambiguous without contract_version"):
+                    HELPER.resolve_dataset_contract(self.args("real_joint"))
+
 if __name__ == "__main__":
     unittest.main()

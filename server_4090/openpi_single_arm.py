@@ -643,6 +643,28 @@ def _dataset_info(dataset_id: str) -> dict[str, Any]:
     return value
 
 
+def _dataset_origin(dataset_id: str, info: dict[str, Any]) -> str:
+    marker_path = _dataset_root() / dataset_id / "meta" / "dashboard_dataset_origin.json"
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        marker = None
+    if isinstance(marker, dict) and marker.get("origin") in {"real", "simulation", "unknown"}:
+        return str(marker["origin"])
+    for key in ("dataset_origin", "data_origin", "source_domain"):
+        value = info.get(key) if isinstance(info, dict) else None
+        if value is None:
+            continue
+        normalized = str(value).strip().lower()
+        if normalized in {"simulation", "sim", "synthetic", "synthetic_sim"}:
+            return "simulation"
+        if normalized in {"real", "robot", "hardware", "real_robot"}:
+            return "real"
+    if isinstance(info.get("simulation") if isinstance(info, dict) else None, bool):
+        return "simulation" if info["simulation"] else "real"
+    return "unknown"
+
+
 def _dataset_contract_metadata(info: dict[str, Any]) -> dict[str, Any]:
     nested: dict[str, Any] = {}
     for key in ("data_contract", "contract", "piper_contract"):
@@ -809,6 +831,9 @@ def _validate_requested_contract(args: argparse.Namespace, contract: DatasetCont
 def resolve_dataset_contract(args: argparse.Namespace) -> DatasetContract:
     info = _dataset_info(args.dataset_id)
     metadata = _dataset_contract_metadata(info)
+    dataset_origin = _dataset_origin(args.dataset_id, info)
+    is_simulation_dataset = dataset_origin == "simulation"
+    metadata.setdefault("dataset_origin", dataset_origin)
     features = info.get("features", {}) if isinstance(info.get("features", {}), dict) else {}
     if "observation.state" in features and "action" in features:
         layout = "canonical"
@@ -907,7 +932,7 @@ def resolve_dataset_contract(args: argparse.Namespace) -> DatasetContract:
                 declared_gripper = GRIPPER_OPENING_METERS
             elif "gripper_opening_fraction" in joined_names:
                 declared_gripper = GRIPPER_OPENING_FRACTION
-            elif contract_version_metadata is None:
+            elif contract_version_metadata is None and not is_simulation_dataset:
                 raise ValueError(
                     "7D/14D joint data is ambiguous without contract_version or explicit "
                     "gripper_semantics (legacy v2 uses gripper_opening_m; v3 uses opening_fraction)"

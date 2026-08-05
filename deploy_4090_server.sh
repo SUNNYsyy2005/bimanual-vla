@@ -13,6 +13,8 @@ rsync -av --relative \
   "$LOCAL_ROOT/./server_4090/openpi_single_arm.py" \
   "$LOCAL_ROOT/./server_4090/eval_heldout_loss.py" \
   "$LOCAL_ROOT/./server_4090/slurm_job_runner.py" \
+  "$LOCAL_ROOT/./server_4090/dataset_transfer_runner.py" \
+  "$LOCAL_ROOT/./server_4090/video_transfer_runner.py" \
   "$LOCAL_ROOT/./server_4090/validate_lerobot.py" \
   "$LOCAL_ROOT/./server_4090/config.example.json" \
   "$LOCAL_ROOT/./server_4090/config.simulation.example.json" \
@@ -23,6 +25,7 @@ rsync -av --relative \
   "$LOCAL_ROOT/./server_4090/stop_server.sh" \
   "$LOCAL_ROOT/./server_4090/templates/index.html" \
   "$LOCAL_ROOT/./server_4090/README.md" \
+  "$LOCAL_ROOT/./server_4090/SIMULATION_DASHBOARD.md" \
   "$LOCAL_ROOT/./check_pi05_dataset.py" \
   "$LOCAL_ROOT/./download_openpi_checkpoint.py" \
   "$LOCAL_ROOT/./upload_dataset_4090.py" \
@@ -31,6 +34,7 @@ rsync -av --relative \
   "$LOCAL_ROOT/./piper_data_contract.py" \
   "$LOCAL_ROOT/./camera.py" \
   "$LOCAL_ROOT/./pi0_dataset.py" \
+  "$LOCAL_ROOT/./scripts/query_h100_h200_resources.sh" \
   "$REMOTE_HOST:$REMOTE_ROOT/"
 
 ssh "$REMOTE_HOST" "REMOTE_ROOT='$REMOTE_ROOT' bash -s" <<'REMOTE'
@@ -45,6 +49,7 @@ mkdir -p "$HOME/.config/systemd/user" "$HOME/.local/share/bimanual-vla-server"
 install -m 0644 \
   server_4090/bimanual-vla-dashboard.service \
   "$HOME/.config/systemd/user/bimanual-vla-dashboard.service"
+chmod +x server_4090/slurm_job_runner.py server_4090/dataset_transfer_runner.py server_4090/video_transfer_runner.py server_4090/run_server_foreground.sh scripts/query_h100_h200_resources.sh
 
 systemctl --user daemon-reload
 systemctl --user stop bimanual-vla-dashboard.service 2>/dev/null || true

@@ -155,7 +155,8 @@
           <p class="muted">Dashboard 仅管理进程、GPU、checkpoint、训练和短时执行授权。真实 state / 图像不经 Dashboard HTTP 转发。</p>
           <div id="serverInfo" class="muted">输入 Token 后刷新。</div>
         </div>
-        <div class="card half"><h2>GPU 资源</h2><div id="gpuList"><span class="muted">等待状态数据。</span></div></div>
+        <div class="card half"><h2>4×4090 GPU 资源</h2><div id="gpuList"><span class="muted">等待状态数据。</span></div></div>
+        <div class="card"><h2>H100 / H200 Slurm 资源</h2><p class="muted">只通过 SSH + Slurm 只读查询，不在 H100/H200 上开启 Dashboard 端口。</p><pre id="clusterResources">等待状态数据。</pre></div>
       </div>
     </section>
 
@@ -247,7 +248,7 @@
 
     <section id="module-eval-videos" class="dashboard-module" data-module="eval-videos" hidden>
       <div class="module-heading"><div><h2>评估视频</h2><p>直接在服务器上查看仿真评测录制结果，无需同步到本地。</p></div></div>
-      <div class="grid"><div class="card"><div class="toolbar"><button class="inline secondary" onclick="loadEvalVideos()">刷新视频</button><span id="evalVideoSummary" class="muted">尚未加载。</span></div><div id="evalVideoList" class="preview-grid"></div></div></div>
+      <div class="grid"><div class="card"><div class="toolbar"><button class="inline secondary" onclick="loadEvalVideos(false)">刷新本地视频</button><button class="inline secondary" onclick="loadEvalVideos(true)">扫描 H100/H200 并同步</button><span id="evalVideoSummary" class="muted">尚未加载。</span></div><div id="evalVideoList" class="preview-grid"></div></div></div>
     </section>
 
     <section id="module-policy" class="dashboard-module" data-module="policy" hidden>
@@ -366,26 +367,48 @@ async function apiBlob(path) {
   return response.blob();
 }
 
-async function loadEvalVideos() {
+async function loadEvalVideos(includeRemote = false) {
   if (!tokenInput.value) return;
   const summary = document.getElementById('evalVideoSummary');
   const list = document.getElementById('evalVideoList');
   if (!summary || !list) return;
   summary.textContent = '正在扫描评估视频…';
   try {
-    const data = await api('/api/eval-videos?limit=200');
+    const data = await api(`/api/eval-videos?limit=200${includeRemote ? '&include_remote=true' : ''}`);
     const videos = data.videos || [];
     document.getElementById('navEvalVideoCount').textContent = String(videos.length);
     summary.textContent = videos.length
       ? `${videos.length} 个视频 · roots=${(data.roots || []).join(', ') || '-'}`
       : `暂无视频 · roots=${(data.roots || []).join(', ') || '-'}`;
-    list.innerHTML = videos.map(video => `
-      <figure>
+    list.innerHTML = videos.map(video => {
+      if (video.remote) {
+        return `<figure>
+          <figcaption>${esc(video.source)} · ${esc(video.relative_path)}<br><span class="muted">${esc(video.updated_at)} · ${esc(video.size_mib)} MiB · 远端待同步</span></figcaption>
+          <button class="inline" type="button" onclick="syncEvalVideo('${esc(video.source)}','${esc(video.root)}','${esc(video.relative_path)}')">同步到 4×4090 后播放</button>
+        </figure>`;
+      }
+      return `<figure>
         <figcaption>${esc(video.relative_path)}<br><span class="muted">${esc(video.updated_at)} · ${esc(video.size_mib)} MiB</span></figcaption>
         <video controls preload="metadata" style="width:100%;max-height:360px;border-radius:10px;background:#000" src="${esc(video.url)}?token=${encodeURIComponent(tokenInput.value)}&cache=${Date.now()}"></video>
-      </figure>`).join('') || '<div class="muted">没有找到 mp4/webm/mov/mkv/avi/gif 文件。</div>';
+      </figure>`;
+    }).join('') || '<div class="muted">没有找到 mp4/webm/mov/mkv/avi/gif 文件。</div>';
   } catch (error) {
     summary.textContent = `视频加载失败：${error.message}`;
+    show(error.message);
+  }
+}
+
+async function syncEvalVideo(source, root, relativePath) {
+  try {
+    const task = await api('/api/eval-videos/sync', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({source, root, relative_path: relativePath, overwrite: false}),
+    });
+    show(`视频同步任务已启动：${task.id}`, false);
+    showModule('training');
+    refreshAll();
+  } catch (error) {
     show(error.message);
   }
 }
@@ -996,6 +1019,19 @@ function fillEvalCheckpoints(items) {
     && (!variant || c.model_variant === variant));
   select.innerHTML = matches.map(c => `<option value="${esc(c.path)}">${esc(checkpointLabel(c))}</option>`).join('') || '<option value="" disabled>暂无匹配 checkpoint</option>';
   if (matches.some(c => c.path === old)) select.value = old;
+}
+
+async function loadClusterResources(options = {}) {
+  const output = document.getElementById('clusterResources');
+  if (!output || !tokenInput.value) return;
+  if (!options.quiet) output.textContent = '正在通过 SSH/Slurm 查询 H100/H200 资源…';
+  try {
+    const data = await api('/api/cluster-resources');
+    output.textContent = data.output || '(empty output)';
+    if (!data.ok) output.textContent = `查询失败 rc=${data.returncode}\n` + output.textContent;
+  } catch (error) {
+    output.textContent = `H100/H200 资源查询失败：${error.message}`;
+  }
 }
 
 function fillGpus(items) {
@@ -1819,6 +1855,7 @@ async function refreshAll() {
     fillExecutionTargets(data.config || {});
     fillCheckpoints(data.checkpoints || []);
     fillGpus(data.gpus || []);
+    loadClusterResources({quiet: true});
     fillTasks(data.tasks || []);
     fillTrainingTasks(data.tasks || []);
     fillObservation(data.robot_observation);

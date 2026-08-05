@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -131,7 +132,7 @@ APP_DIR = Path(__file__).resolve().parent
 REPO_DIR = APP_DIR.parent
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-TASK_TYPES = {"norm", "train", "eval", "policy"}
+TASK_TYPES = {"norm", "train", "eval", "policy", "transfer"}
 PROCESS_STATES = {"starting", "running", "stopping"}
 WAITING_STATES = {"waiting_norm", "waiting_gpu"}
 TERMINAL_STATES = {"completed", "failed", "lost", "stopped", "skipped"}
@@ -737,6 +738,11 @@ def dataset_origin_info(
 
 def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
     """Describe and validate raw/model Piper action contracts for the UI."""
+    try:
+        dataset_origin = normalize_dataset_origin(info.get("dataset_origin", "unknown"))
+    except ValueError:
+        dataset_origin = "unknown"
+    is_simulation_dataset = dataset_origin == "simulation"
     features = info.get("features", {})
     if not isinstance(features, dict):
         features = {}
@@ -952,6 +958,18 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
                         if contract_version == LEGACY_CONTRACT_VERSION
                         else JOINT_RAW_ACTION_SEMANTICS
                     )
+                )
+            elif is_simulation_dataset:
+                # RoboTwin / sim LeRobot exports commonly contain canonical joint
+                # 7D/14D rows without the real-robot action-contract metadata.
+                # Keep real datasets fail-closed, but allow simulation datasets to
+                # default to the current v3 opening-fraction joint convention.
+                contract_version = CURRENT_CONTRACT_VERSION
+                raw_gripper_semantics = NEW_GRIPPER_SEMANTICS
+                raw_action_semantics = str(
+                    metadata.get("raw_action_semantics")
+                    or metadata.get("action_semantics")
+                    or JOINT_RAW_ACTION_SEMANTICS
                 )
             else:
                 errors.append(
@@ -1260,6 +1278,8 @@ def load_config(path: Path) -> dict[str, Any]:
         "enable_policy": True,
         "cluster_targets": {},
         "eval_video_roots": [],
+        "cluster_resources_script": str(REPO_DIR / "scripts" / "query_h100_h200_resources.sh"),
+        "transfer_parallelism": 4,
     }
     defaults.update(config)
     profile = str(defaults.get("dashboard_profile") or "real").lower()
@@ -1287,6 +1307,13 @@ def load_config(path: Path) -> dict[str, Any]:
     defaults["eval_video_roots"] = [
         str(Path(item).expanduser().resolve()) for item in defaults.get("eval_video_roots", [])
     ]
+    defaults["cluster_resources_script"] = str(
+        Path(defaults["cluster_resources_script"]).expanduser().resolve()
+    )
+    try:
+        defaults["transfer_parallelism"] = max(1, min(16, int(defaults.get("transfer_parallelism", 4))))
+    except (TypeError, ValueError):
+        defaults["transfer_parallelism"] = 4
     normalized_targets = {}
     for name, target in dict(defaults.get("cluster_targets", {})).items():
         if not isinstance(target, dict):
@@ -1300,9 +1327,13 @@ def load_config(path: Path) -> dict[str, Any]:
             "assets_base_dir",
             "checkpoint_base_dir",
             "base_checkpoint",
+            "eval_video_roots",
         ):
             if item.get(path_key):
-                item[path_key] = str(item[path_key])
+                if path_key == "eval_video_roots" and isinstance(item[path_key], list):
+                    item[path_key] = [str(value) for value in item[path_key]]
+                else:
+                    item[path_key] = str(item[path_key])
         normalized_targets[str(name)] = item
     defaults["cluster_targets"] = normalized_targets
     return defaults
@@ -2865,7 +2896,7 @@ def create_app(config_path: Path) -> Flask:
             visible_origins = set(config.get("visible_dataset_origins", ["real", "unknown"]))
             if origin.get("dataset_origin") not in visible_origins:
                 continue
-            schema = describe_dataset_schema(info)
+            schema = describe_dataset_schema({**info, **origin})
             split_info = read_json(directory / "meta" / "train_test_split.json")
             norm_ready_by_model: dict[str, bool] = {}
             norm_config_by_model: dict[str, dict[str, Any] | None] = {}
@@ -2926,6 +2957,37 @@ def create_app(config_path: Path) -> Flask:
             )
         return datasets
 
+    def visible_dataset_origin_set() -> set[str]:
+        return set(config.get("visible_dataset_origins", ["real", "unknown"]))
+
+    def dataset_origin_for_id(dataset_id: str) -> str:
+        dataset_path = dataset_root / dataset_id
+        info = read_json(dataset_path / "meta" / "info.json")
+        if isinstance(info, dict):
+            return dataset_origin_info(dataset_id, dataset_path, info).get("dataset_origin", "unknown")
+        return "unknown"
+
+    def checkpoint_dataset_ids(step_dir: Path) -> list[str]:
+        return sorted(
+            path.parent.name
+            for path in (step_dir / "assets").glob("*/norm_stats.json")
+            if path.is_file()
+        )
+
+    def checkpoint_dataset_origins(dataset_ids: list[str]) -> dict[str, str]:
+        return {dataset_id: dataset_origin_for_id(dataset_id) for dataset_id in dataset_ids}
+
+    def checkpoint_matches_visible_datasets(step_dir: Path) -> tuple[bool, list[str], dict[str, str]]:
+        dataset_ids = checkpoint_dataset_ids(step_dir)
+        origins = checkpoint_dataset_origins(dataset_ids)
+        visible = visible_dataset_origin_set()
+        # A checkpoint without embedded norm assets has unknown provenance.  Keep
+        # it only on dashboards that explicitly show unknown-origin datasets;
+        # simulation dashboards therefore won't show real/unknown legacy weights.
+        if not dataset_ids:
+            return "unknown" in visible, dataset_ids, origins
+        return any(origin in visible for origin in origins.values()), dataset_ids, origins
+
     def list_base_models() -> list[dict[str, Any]]:
         candidates: set[Path] = {Path(config["base_checkpoint"]).resolve()}
         for root in checkpoint_roots:
@@ -2951,6 +3013,12 @@ def create_app(config_path: Path) -> Flask:
                 path == default_path
                 or path.is_relative_to(Path.home() / ".cache/openpi")
             )
+            dataset_ids: list[str] = []
+            dataset_origins: dict[str, str] = {}
+            if not foundation:
+                visible_checkpoint, dataset_ids, dataset_origins = checkpoint_matches_visible_datasets(path)
+                if not visible_checkpoint:
+                    continue
             models.append(
                 {
                     "path": str(path),
@@ -2963,6 +3031,8 @@ def create_app(config_path: Path) -> Flask:
                     "checkpoint_step": identity.get("checkpoint_step") if identity else None,
                     "arm_mode": identity.get("arm_mode") if identity else None,
                     "config_name": identity.get("config_name") if identity else None,
+                    "dataset_ids": dataset_ids,
+                    "dataset_origins": dataset_origins,
                 }
             )
         return sorted(
@@ -2989,6 +3059,15 @@ def create_app(config_path: Path) -> Flask:
             raise ValueError(
                 f"base checkpoint {path} appears to be {inferred}, but model_variant={model_variant}"
             )
+        default_path = Path(config["base_checkpoint"]).resolve()
+        foundation = bool(path == default_path or path.is_relative_to(Path.home() / ".cache/openpi"))
+        if not foundation:
+            visible_checkpoint, dataset_ids, dataset_origins = checkpoint_matches_visible_datasets(path)
+            if not visible_checkpoint:
+                raise ValueError(
+                    "checkpoint provenance is hidden on this Dashboard: "
+                    f"datasets={dataset_ids or ['unknown']} origins={dataset_origins or {'unknown': 'unknown'}}"
+                )
         return path, model_variant
 
     def list_checkpoints() -> list[dict[str, Any]]:
@@ -3007,11 +3086,9 @@ def create_app(config_path: Path) -> Flask:
                             continue
                         if not (step_dir / "params").is_dir() or not (step_dir / "_CHECKPOINT_METADATA").is_file():
                             continue
-                        dataset_ids = sorted(
-                            path.parent.name
-                            for path in (step_dir / "assets").glob("*/norm_stats.json")
-                            if path.is_file()
-                        )
+                        visible_checkpoint, dataset_ids, dataset_origins = checkpoint_matches_visible_datasets(step_dir)
+                        if not visible_checkpoint:
+                            continue
                         mtime = step_dir.stat().st_mtime
                         cache_key = str(step_dir.resolve())
                         cached = checkpoint_size_cache.get(cache_key)
@@ -3040,6 +3117,7 @@ def create_app(config_path: Path) -> Flask:
                                 "experiment": exp_dir.name,
                                 "step": int(step_dir.name),
                                 "dataset_ids": dataset_ids,
+                                "dataset_origins": dataset_origins,
                                 "mtime": mtime,
                                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)),
                                 "size_gib": round(size_bytes / (1024**3), 3),
@@ -3073,13 +3151,16 @@ def create_app(config_path: Path) -> Flask:
                     pass
         latest_observation = observations.latest(task_list)
         checkpoints = list_checkpoints()
+        visible_experiments = {item.get("experiment") for item in checkpoints if item.get("experiment")}
+        experiments = [
+            item for item in training_experiment_catalog(Path(config["checkpoint_base_dir"]))
+            if item.get("name") in visible_experiments
+        ]
         return jsonify(
             {
                 "datasets": list_datasets(),
                 "checkpoints": checkpoints,
-                "experiments": training_experiment_catalog(
-                    Path(config["checkpoint_base_dir"])
-                ),
+                "experiments": experiments,
                 "base_models": list_base_models(),
                 "robot_observation": latest_observation,
                 "tasks": task_list,
@@ -3242,7 +3323,8 @@ def create_app(config_path: Path) -> Flask:
         info = read_json(dataset_path / "meta" / "info.json")
         if not isinstance(info, dict):
             raise ValueError(f"dataset is not installed: {dataset_id}")
-        contract = describe_dataset_schema(info)
+        origin = dataset_origin_info(dataset_id, dataset_path, info)
+        contract = describe_dataset_schema({**info, **origin})
         if not contract["training_supported"]:
             raise ValueError(
                 "unsupported dataset contract: "
@@ -3607,9 +3689,101 @@ def create_app(config_path: Path) -> Flask:
             raise FileNotFoundError("video not found")
         return path
 
+    REMOTE_EVAL_VIDEO_INVENTORY_SCRIPT = r'''
+import json, os
+from pathlib import Path
+suffixes = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".gif"}
+roots = [Path(item).expanduser() for item in json.loads(os.environ.get("EVAL_VIDEO_ROOTS", "[]"))]
+rows = []
+for root in roots:
+    if not root.exists():
+        continue
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in suffixes:
+            continue
+        stat = path.stat()
+        try:
+            rel = path.relative_to(root).as_posix()
+        except ValueError:
+            rel = path.name
+        rows.append({
+            "name": path.name,
+            "relative_path": rel,
+            "path": str(path),
+            "root": str(root),
+            "size_mib": round(stat.st_size / (1024**2), 2),
+            "mtime": stat.st_mtime,
+        })
+print(json.dumps(rows, ensure_ascii=False))
+'''
+
+    def remote_eval_video_roots(target: dict[str, Any]) -> list[str]:
+        roots = target.get("eval_video_roots")
+        if isinstance(roots, list) and roots:
+            return [str(item) for item in roots]
+        candidates = []
+        if target.get("openpi_repo"):
+            candidates.append(str(PurePosixPath(str(target["openpi_repo"])) / "outputs"))
+        if target.get("workdir"):
+            candidates.append(str(PurePosixPath(str(target["workdir"])) / "eval_videos"))
+        return candidates
+
+    def list_remote_eval_videos() -> tuple[list[dict[str, Any]], dict[str, str]]:
+        videos: list[dict[str, Any]] = []
+        errors: dict[str, str] = {}
+        for name, target in config.get("cluster_targets", {}).items():
+            host = target.get("submit_host")
+            roots = remote_eval_video_roots(target)
+            if not host or not roots:
+                continue
+            command = (
+                "EVAL_VIDEO_ROOTS="
+                + shlex.quote(json.dumps(roots, ensure_ascii=False))
+                + " python3 - <<'REMOTE_EVAL_VIDEO_PY'\n"
+                + REMOTE_EVAL_VIDEO_INVENTORY_SCRIPT
+                + "\nREMOTE_EVAL_VIDEO_PY"
+            )
+            try:
+                result = subprocess.run(
+                    ["ssh", "-o", "BatchMode=yes", str(host), command],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=30,
+                )
+            except Exception as exc:
+                errors[name] = str(exc)
+                continue
+            if result.returncode != 0:
+                errors[name] = (result.stderr or result.stdout)[-2000:]
+                continue
+            try:
+                rows = json.loads(result.stdout or "[]")
+            except json.JSONDecodeError as exc:
+                errors[name] = f"invalid JSON: {exc}: {(result.stdout or '')[-500:]}"
+                continue
+            for row in rows if isinstance(rows, list) else []:
+                root = str(row.get("root", ""))
+                rel = str(row.get("relative_path", ""))
+                if root not in roots or not rel or PurePosixPath(rel).is_absolute() or ".." in PurePosixPath(rel).parts:
+                    continue
+                videos.append({
+                    **row,
+                    "id": base64.urlsafe_b64encode(f"{name}\0{root}\0{rel}".encode()).decode().rstrip("="),
+                    "source": name,
+                    "host": host,
+                    "remote": True,
+                    "playable": False,
+                    "syncable": True,
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(row.get("mtime") or 0))),
+                    "sync_url": "/api/eval-videos/sync",
+                })
+        return videos, errors
+
     @app.get("/api/eval-videos")
     def list_eval_videos():
         limit = safe_int(request.args.get("limit", 200), "limit", 1, 1000)
+        include_remote = str(request.args.get("include_remote", "")).lower() in {"1", "true", "yes"}
         videos = []
         for root in eval_video_roots():
             if not root.exists():
@@ -3631,13 +3805,386 @@ def create_app(config_path: Path) -> Flask:
                     "mtime": stat.st_mtime,
                     "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
                     "url": f"/api/eval-videos/{encode_video_id(path)}",
+                    "remote": False,
+                    "playable": True,
+                    "syncable": False,
                 })
+        remote_errors = {}
+        if include_remote:
+            remote_videos, remote_errors = list_remote_eval_videos()
+            videos.extend(remote_videos)
         videos.sort(key=lambda item: item["mtime"], reverse=True)
-        return jsonify({"videos": videos[:limit], "roots": [str(root) for root in eval_video_roots()]})
+        return jsonify({
+            "videos": videos[:limit],
+            "roots": [str(root) for root in eval_video_roots()],
+            "remote_errors": remote_errors,
+        })
 
     @app.get("/api/eval-videos/<video_id>")
     def get_eval_video(video_id: str):
         return send_file(decode_video_id(video_id), conditional=True, max_age=0)
+
+    @app.post("/api/eval-videos/sync")
+    def sync_eval_video():
+        payload = request.get_json(force=True)
+        source = str(payload.get("source", ""))
+        root = str(payload.get("root", ""))
+        relative_path = str(payload.get("relative_path", ""))
+        overwrite = bool(payload.get("overwrite", False))
+        parallelism = safe_int(payload.get("parallelism", config.get("transfer_parallelism", 4)), "parallelism", 1, 16)
+        targets = config.get("cluster_targets", {})
+        if source not in targets:
+            raise ValueError(f"unknown video source target: {source}")
+        target = targets[source]
+        roots = remote_eval_video_roots(target)
+        rel = PurePosixPath(relative_path)
+        if root not in roots:
+            raise ValueError("remote video root is not configured")
+        if rel.is_absolute() or ".." in rel.parts or Path(rel.name).suffix.lower() not in VIDEO_SUFFIXES:
+            raise ValueError("invalid remote video relative_path")
+        local_roots = eval_video_roots()
+        if not local_roots:
+            raise ValueError("no local eval_video_roots configured")
+        command = [
+            config["openpi_python"],
+            str(APP_DIR / "video_transfer_runner.py"),
+            "--source-name", source,
+            "--source-host", str(target.get("submit_host")),
+            "--source-root", root,
+            "--relative-path", relative_path,
+            "--target-root", str(local_roots[0]),
+            "--parallelism", str(parallelism),
+        ]
+        if overwrite:
+            command.append("--overwrite")
+        task = tasks.start(
+            "transfer",
+            command,
+            env=build_environment(config, None),
+            metadata={
+                "transfer_kind": "eval_video",
+                "source": source,
+                "target": "local_4090",
+                "source_path": str(PurePosixPath(root) / rel),
+                "target_path": str(local_roots[0] / source / Path(*rel.parts)),
+                "overwrite": overwrite,
+                "parallelism": parallelism,
+            },
+        )
+        return jsonify(task), 201
+
+    def dataset_location_configs() -> dict[str, dict[str, Any]]:
+        locations = {
+            "local_4090": {
+                "name": "local_4090",
+                "kind": "local",
+                "host": None,
+                "dataset_root": config["dataset_root"],
+                "available": True,
+            }
+        }
+        for name, target in config.get("cluster_targets", {}).items():
+            if not target.get("dataset_root"):
+                continue
+            locations[name] = {
+                "name": name,
+                "kind": "ssh",
+                "host": target.get("submit_host"),
+                "partition": target.get("partition"),
+                "node": target.get("node"),
+                "gpu_type": target.get("gpu_type"),
+                "dataset_root": target.get("dataset_root"),
+                "available": True,
+            }
+        return locations
+
+    def local_dataset_inventory(location: dict[str, Any]) -> list[dict[str, Any]]:
+        root = Path(str(location["dataset_root"])).expanduser()
+        rows = []
+        for directory in sorted(root.iterdir() if root.exists() else []):
+            if not directory.is_dir() or directory.name.startswith("."):
+                continue
+            info = read_json(directory / "meta" / "info.json")
+            if not isinstance(info, dict):
+                continue
+            marker = read_json(directory / "meta" / "dashboard_dataset_origin.json")
+            origin = dataset_origin_info(directory.name, directory, info).get("dataset_origin", "unknown")
+            rows.append({
+                "id": directory.name,
+                "origin": origin,
+                "path": str(directory),
+                "episodes": info.get("total_episodes"),
+                "frames": info.get("total_frames"),
+                "fps": info.get("fps"),
+                "robot_type": info.get("robot_type"),
+                "mtime": directory.stat().st_mtime,
+                "marker": marker if isinstance(marker, dict) else None,
+            })
+        return rows
+
+    REMOTE_DATASET_INVENTORY_SCRIPT = r'''
+import json, os
+from pathlib import Path
+root = Path(os.environ["DATASET_ROOT"]).expanduser()
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
+def origin_for(dataset_id, info, marker):
+    if isinstance(marker, dict) and marker.get("origin") in {"real", "simulation", "unknown"}:
+        return marker.get("origin")
+    for key in ("dataset_origin", "data_origin", "source_domain"):
+        value = str(info.get(key, "")).lower() if isinstance(info, dict) else ""
+        if value in {"real", "robot", "real_robot", "physical"}: return "real"
+        if value in {"simulation", "sim", "synthetic", "synthetic_sim"}: return "simulation"
+    if isinstance(info, dict) and isinstance(info.get("simulation"), bool):
+        return "simulation" if info["simulation"] else "real"
+    name = dataset_id.lower(); robot_type = str((info or {}).get("robot_type") or "").lower()
+    if any(token in name for token in ("sim", "synth", "cube", "dustbin", "bottle", "lift_pot")) or robot_type in {"aloha", "sim", "simulation"}:
+        return "simulation"
+    if "piper" in robot_type or "real" in name or "my_dataset" in name:
+        return "real"
+    return "unknown"
+rows=[]
+if root.exists():
+    for directory in sorted(root.iterdir(), key=lambda path: path.name):
+        if not directory.is_dir() or directory.name.startswith("."): continue
+        info = read_json(directory / "meta" / "info.json")
+        if not isinstance(info, dict): continue
+        marker = read_json(directory / "meta" / "dashboard_dataset_origin.json")
+        stat = directory.stat()
+        rows.append({
+            "id": directory.name,
+            "origin": origin_for(directory.name, info, marker),
+            "path": str(directory),
+            "episodes": info.get("total_episodes"),
+            "frames": info.get("total_frames"),
+            "fps": info.get("fps"),
+            "robot_type": info.get("robot_type"),
+            "mtime": stat.st_mtime,
+            "marker": marker if isinstance(marker, dict) else None,
+        })
+print(json.dumps(rows, ensure_ascii=False))
+'''
+
+    def remote_dataset_inventory(location: dict[str, Any], *, timeout: int = 30) -> tuple[list[dict[str, Any]], str | None]:
+        if location.get("kind") == "local":
+            return local_dataset_inventory(location), None
+        host = location.get("host")
+        if not host:
+            return [], "missing ssh host"
+        env = f"DATASET_ROOT={shlex.quote(str(location['dataset_root']))}"
+        command = f"{env} python3 - <<'REMOTE_DATASET_PY'\n{REMOTE_DATASET_INVENTORY_SCRIPT}\nREMOTE_DATASET_PY"
+        try:
+            result = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", str(host), command],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            return [], str(exc)
+        if result.returncode != 0:
+            return [], (result.stderr or result.stdout)[-2000:]
+        try:
+            rows = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            return [], f"invalid JSON from {host}: {exc}: {(result.stdout or '')[-500:]}"
+        return rows if isinstance(rows, list) else [], None
+
+    def grouped_dataset_locations(*, origin_filter: str | None = None) -> dict[str, Any]:
+        locations = dataset_location_configs()
+        groups: dict[str, dict[str, Any]] = {}
+        errors = {}
+        for name, location in locations.items():
+            rows, error = remote_dataset_inventory(location)
+            if error:
+                errors[name] = error
+            for row in rows:
+                origin = normalize_dataset_origin(row.get("origin", "unknown"))
+                if origin_filter and origin != origin_filter:
+                    continue
+                dataset_id = str(row.get("id"))
+                entry = groups.setdefault(dataset_id, {"id": dataset_id, "locations": []})
+                entry["locations"].append({
+                    **row,
+                    "origin": origin,
+                    "target": name,
+                    "host": location.get("host"),
+                    "root": location.get("dataset_root"),
+                    "kind": location.get("kind"),
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(row.get("mtime") or 0))),
+                })
+        datasets = []
+        for item in groups.values():
+            item["duplicate_count"] = len(item["locations"])
+            item["origins"] = sorted({loc.get("origin", "unknown") for loc in item["locations"]})
+            item["targets"] = sorted({loc.get("target") for loc in item["locations"] if loc.get("target")})
+            datasets.append(item)
+        datasets.sort(key=lambda item: item["id"])
+        return {"datasets": datasets, "locations": locations, "errors": errors}
+
+    @app.get("/api/dataset-locations")
+    def dataset_locations():
+        origin = request.args.get("origin")
+        if origin:
+            origin = normalize_dataset_origin(origin)
+        return jsonify(grouped_dataset_locations(origin_filter=origin))
+
+    @app.get("/api/cluster-resources")
+    def cluster_resources():
+        """Return a read-only H100/H200 Slurm resource snapshot.
+
+        This never starts a service or opens a port on H100/H200.  It runs the
+        existing query helper locally on 4x4090, which itself uses SSH to the
+        Slurm login node when needed.
+        """
+        script = Path(config.get("cluster_resources_script", ""))
+        if not script.is_file():
+            raise FileNotFoundError(f"cluster resources script not found: {script}")
+        show_all = str(request.args.get("all_jobs", "")).lower() in {"1", "true", "yes"}
+        native = str(request.args.get("native", "")).lower() in {"1", "true", "yes"}
+        command = [str(script), "--compact"]
+        if show_all:
+            command.append("--all-jobs")
+        if native:
+            command.append("--native")
+        started = time.time()
+        result = subprocess.run(
+            command,
+            cwd=str(REPO_DIR),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+        )
+        return jsonify({
+            "command": command,
+            "returncode": result.returncode,
+            "ok": result.returncode == 0,
+            "elapsed_s": round(time.time() - started, 3),
+            "output": result.stdout[-64_000:],
+            "note": "H100/H200 are queried via SSH/Slurm only; no remote Dashboard port is opened.",
+        })
+
+    @app.post("/api/datasets/<dataset_id>/sync")
+    def sync_dataset(dataset_id: str):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        payload = request.get_json(force=True)
+        source_name = str(payload.get("source", "local_4090"))
+        target_name = str(payload.get("target", ""))
+        if not target_name:
+            raise ValueError("target is required")
+        overwrite = bool(payload.get("overwrite", False))
+        parallelism = safe_int(payload.get("parallelism", config.get("transfer_parallelism", 4)), "parallelism", 1, 16)
+        locations = dataset_location_configs()
+        if source_name not in locations:
+            raise ValueError(f"unknown source location: {source_name}")
+        if target_name not in locations:
+            raise ValueError(f"unknown target location: {target_name}")
+        if source_name == target_name:
+            raise ValueError("source and target must differ")
+        command = [
+            config["openpi_python"],
+            str(APP_DIR / "dataset_transfer_runner.py"),
+            "--dataset-id", dataset_id,
+            "--source-json", json_arg(locations[source_name]),
+            "--target-json", json_arg(locations[target_name]),
+            "--parallelism", str(parallelism),
+        ]
+        if overwrite:
+            command.append("--overwrite")
+        task = tasks.start(
+            "transfer",
+            command,
+            env=build_environment(config, None),
+            metadata={
+                "dataset_id": dataset_id,
+                "source": source_name,
+                "target": target_name,
+                "overwrite": overwrite,
+                "source_path": str(PurePosixPath(str(locations[source_name]["dataset_root"])) / dataset_id),
+                "target_path": str(PurePosixPath(str(locations[target_name]["dataset_root"])) / dataset_id),
+                "parallelism": parallelism,
+            },
+        )
+        return jsonify(task), 201
+
+    def collection_root() -> Path:
+        path = Path(config["workspace_root"]) / "collection_sessions"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def collection_path(session_id: str) -> Path:
+        return collection_root() / f"{safe_name(session_id, 'collection session id')}.json"
+
+    def list_collection_sessions() -> list[dict[str, Any]]:
+        rows = []
+        for path in collection_root().glob("*.json"):
+            value = read_json(path)
+            if isinstance(value, dict):
+                rows.append(value)
+        return sorted(rows, key=lambda item: item.get("created_at", ""), reverse=True)
+
+    @app.get("/api/collection-sessions")
+    def get_collection_sessions():
+        return jsonify({"sessions": list_collection_sessions()})
+
+    @app.post("/api/collection-sessions")
+    def create_collection_session():
+        payload = request.get_json(force=True)
+        dataset_id = safe_name(payload.get("dataset_id") or payload.get("name"), "dataset id")
+        target = str(payload.get("target", "local_4090"))
+        locations = dataset_location_configs()
+        if target not in locations:
+            raise ValueError(f"unknown collection target: {target}")
+        origin = normalize_dataset_origin(payload.get("dataset_origin", config.get("upload_default_origin", "simulation")), allow_unknown=False)
+        session_id = f"collect-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        server_url = payload.get("server") or f"http://192.168.101.9:{config['port']}"
+        upload_command = (
+            f"python upload_dataset_4090.py LEROBOT_OR_GUI_NPZ_DIR --name {dataset_id} "
+            f"--dataset-origin {origin} --server {server_url} --token TOKEN --workers 4 --merge"
+        )
+        session = {
+            "id": session_id,
+            "dataset_id": dataset_id,
+            "dataset_origin": origin,
+            "target": target,
+            "target_path": str(PurePosixPath(str(locations[target]["dataset_root"])) / dataset_id),
+            "status": str(payload.get("status", "created")),
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+            "metadata": payload.get("metadata", {}) if isinstance(payload.get("metadata", {}), dict) else {},
+            "upload_command": upload_command,
+        }
+        atomic_json(collection_path(session_id), session)
+        return jsonify(session), 201
+
+    @app.get("/api/collection-sessions/<session_id>")
+    def get_collection_session(session_id: str):
+        value = read_json(collection_path(session_id))
+        if not isinstance(value, dict):
+            raise FileNotFoundError(session_id)
+        return jsonify(value)
+
+    @app.patch("/api/collection-sessions/<session_id>")
+    def update_collection_session(session_id: str):
+        path = collection_path(session_id)
+        value = read_json(path)
+        if not isinstance(value, dict):
+            raise FileNotFoundError(session_id)
+        payload = request.get_json(force=True)
+        for key in ("status", "upload_task_id", "notes", "dataset_id"):
+            if key in payload:
+                value[key] = payload[key]
+        if isinstance(payload.get("metadata"), dict):
+            value["metadata"] = {**value.get("metadata", {}), **payload["metadata"]}
+        value["updated_at"] = now_iso()
+        atomic_json(path, value)
+        return jsonify(value)
 
     @app.post("/api/tasks/norm")
     def start_norm():
@@ -4464,6 +5011,143 @@ def create_app(config_path: Path) -> Flask:
     @app.delete("/api/tasks/<task_id>")
     def delete_task(task_id: str):
         return jsonify(tasks.delete(task_id))
+
+    def task_status_summary(task: dict[str, Any], *, include_metrics: bool = False) -> dict[str, Any]:
+        metadata = task.get("metadata", {}) if isinstance(task.get("metadata"), dict) else {}
+        state = str(task.get("state", "unknown"))
+        summary = {
+            "id": task.get("id"),
+            "type": task.get("type"),
+            "state": state,
+            "active": state in PROCESS_STATES or state in WAITING_STATES,
+            "terminal": state in TERMINAL_STATES,
+            "pid": task.get("pid"),
+            "created_at": task.get("created_at"),
+            "queued_at": task.get("queued_at"),
+            "started_at": task.get("started_at"),
+            "finished_at": task.get("finished_at"),
+            "returncode": task.get("returncode"),
+            "waiting_reason": task.get("waiting_reason"),
+            "skip_reason": task.get("skip_reason"),
+            "start_error": task.get("start_error"),
+            "lost_reason": task.get("lost_reason"),
+            "dependency": task.get("dependency"),
+            "dependency_state": task.get("dependency_state"),
+            "result": task.get("result") if task.get("type") == "eval" else None,
+            "metadata": {
+                key: metadata.get(key)
+                for key in (
+                    "dataset_id",
+                    "exp_name",
+                    "model_variant",
+                    "arm_mode",
+                    "arm_side",
+                    "schema",
+                    "execution_target",
+                    "runtime",
+                    "cluster_target",
+                    "slurm_target",
+                    "slurm_submit_host",
+                    "slurm_partition",
+                    "slurm_node",
+                    "gpu_ids",
+                    "batch_size",
+                    "fsdp_devices",
+                    "steps",
+                    "save_interval",
+                    "checkpoint",
+                    "checkpoint_step",
+                    "checkpoint_dir",
+                    "base_checkpoint",
+                    "result_path",
+                    "source",
+                    "target",
+                    "source_path",
+                    "target_path",
+                    "overwrite",
+                    "test_ratio",
+                    "split_seed",
+                    "train_episodes",
+                    "test_episodes",
+                )
+                if key in metadata
+            },
+        }
+        if include_metrics and task.get("type") == "train":
+            metrics = parse_training_metrics(
+                tasks.log_tail(str(task["id"]), 16 * 1024 * 1024),
+                max_points=1200,
+            )
+            planned_steps = metadata.get("steps")
+            latest_step = int(metrics["points"][-1]["step"]) if metrics.get("points") else 0
+            summary["metrics"] = {
+                "summary": metrics.get("summary", {}),
+                "latest_step": latest_step,
+                "planned_steps": planned_steps,
+                "progress": (
+                    min(1.0, latest_step / int(planned_steps))
+                    if planned_steps and int(planned_steps) > 0
+                    else None
+                ),
+            }
+        return summary
+
+    @app.get("/api/tasks")
+    def list_task_statuses():
+        task_type = request.args.get("type")
+        state = request.args.get("state")
+        dataset_id = request.args.get("dataset_id")
+        exp_name = request.args.get("exp_name")
+        active_only = str(request.args.get("active", "")).lower() in {"1", "true", "yes"}
+        terminal_only = str(request.args.get("terminal", "")).lower() in {"1", "true", "yes"}
+        include_metrics = str(request.args.get("include_metrics", "")).lower() in {"1", "true", "yes"}
+        limit = safe_int(request.args.get("limit", 200), "limit", 1, 1000)
+        task_list = tasks.list()
+        filtered = []
+        for task in task_list:
+            metadata = task.get("metadata", {}) if isinstance(task.get("metadata"), dict) else {}
+            if task_type and task.get("type") != task_type:
+                continue
+            if state and task.get("state") != state:
+                continue
+            if dataset_id and metadata.get("dataset_id") != dataset_id:
+                continue
+            if exp_name and metadata.get("exp_name") != exp_name:
+                continue
+            is_active = task.get("state") in PROCESS_STATES or task.get("state") in WAITING_STATES
+            is_terminal = task.get("state") in TERMINAL_STATES
+            if active_only and not is_active:
+                continue
+            if terminal_only and not is_terminal:
+                continue
+            filtered.append(task)
+        filtered = filtered[:limit]
+        counts: dict[str, int] = {}
+        state_counts: dict[str, int] = {}
+        for task in filtered:
+            counts[str(task.get("type", "unknown"))] = counts.get(str(task.get("type", "unknown")), 0) + 1
+            state_counts[str(task.get("state", "unknown"))] = state_counts.get(str(task.get("state", "unknown")), 0) + 1
+        return jsonify({
+            "tasks": [task_status_summary(task, include_metrics=include_metrics) for task in filtered],
+            "count": len(filtered),
+            "counts_by_type": counts,
+            "counts_by_state": state_counts,
+            "filters": {
+                "type": task_type,
+                "state": state,
+                "dataset_id": dataset_id,
+                "exp_name": exp_name,
+                "active": active_only,
+                "terminal": terminal_only,
+                "limit": limit,
+                "include_metrics": include_metrics,
+            },
+        })
+
+    @app.get("/api/tasks/<task_id>/status")
+    def get_task_status(task_id: str):
+        include_metrics = str(request.args.get("include_metrics", "")).lower() in {"1", "true", "yes"}
+        return jsonify({"task": task_status_summary(tasks.get(task_id), include_metrics=include_metrics)})
 
     @app.get("/api/tasks/<task_id>")
     def get_task(task_id: str):
