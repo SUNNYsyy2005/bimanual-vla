@@ -112,6 +112,32 @@ def classify_dataset_source(source: Path) -> str:
     )
 
 
+def dataset_episode_count(root: Path) -> int | None:
+    """Return the number of episodes represented by a dataset directory.
+
+    LeRobot exports keep the authoritative value in ``meta/info.json``.  The
+    parquet fallback also handles older exports whose metadata did not include
+    ``total_episodes``.  This is deliberately separate from archive-part
+    counting: upload parts are determined by tar size, not by episode count.
+    """
+    root = Path(root)
+    info_path = root / "meta" / "info.json"
+    if info_path.is_file():
+        try:
+            value = json.loads(info_path.read_text(encoding="utf-8")).get("total_episodes")
+            if value is not None:
+                value = int(value)
+                if value >= 0:
+                    return value
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    parquet_count = len(list((root / "data").glob("chunk-*/episode_*.parquet")))
+    if parquet_count:
+        return parquet_count
+    raw_count = len(list(root.glob("ep_*.npz"))) + len(list(root.glob("episode_*.npz")))
+    return raw_count or None
+
+
 def _raw_export_key(
     source: Path,
     *,
@@ -647,7 +673,7 @@ def upload_one(
         source.seek(offset)
         body = source.read(expected)
     if len(body) != expected:
-        raise RuntimeError(f"short read for chunk {index}: {len(body)} != {expected}")
+        raise RuntimeError(f"short read for archive part {index}: {len(body)} != {expected}")
     chunk_sha = hashlib.sha256(body).hexdigest()
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
@@ -667,7 +693,7 @@ def upload_one(
             last_error = exc
             if attempt < attempts:
                 time.sleep(min(30, 2 ** (attempt - 1)))
-    raise RuntimeError(f"chunk {index} failed after {attempts} attempts: {last_error}")
+    raise RuntimeError(f"archive part {index} failed after {attempts} attempts: {last_error}")
 
 
 def main() -> int:
@@ -730,6 +756,8 @@ def main() -> int:
         parser.error("workers, chunk-mib, attempts, and fps must be positive")
     source = args.dataset.expanduser().resolve()
     dataset_name = safe_dataset_name(args.name or source.stem if args.archive else args.name or source.name)
+    source_episode_count: int | None = None
+    episode_count: int | None = None
 
     if args.archive:
         if not source.is_file() or source.suffix != ".tar":
@@ -740,6 +768,13 @@ def main() -> int:
     else:
         cache_dir = args.cache_dir.expanduser().resolve()
         try:
+            source_kind = classify_dataset_source(source)
+            if source_kind == "raw_npz":
+                source_episode_count = sum(
+                    1
+                    for path in (*source.glob("ep_*.npz"), *source.glob("episode_*.npz"))
+                    if path.is_file()
+                )
             dataset_root, _ = prepare_dataset_directory(
                 source,
                 dataset_name,
@@ -748,6 +783,14 @@ def main() -> int:
                 allow_incomplete_gripper_coverage=args.allow_incomplete_gripper_coverage,
                 rebuild=args.rebuild,
             )
+            episode_count = dataset_episode_count(dataset_root)
+            counts = []
+            if source_episode_count is not None:
+                counts.append(f"source NPZ={source_episode_count}")
+            if episode_count is not None:
+                counts.append(f"prepared LeRobot={episode_count}")
+            if counts:
+                print("Episode counts: " + ", ".join(counts), flush=True)
         except (OSError, RuntimeError, ValueError, SystemExit) as exc:
             parser.error(str(exc))
         if args.prepare_only:
@@ -763,6 +806,11 @@ def main() -> int:
 
     chunk_size = args.chunk_mib * 1024 * 1024
     client = Client(args.server, args.token, args.timeout)
+    mode = "overwrite" if args.overwrite else "merge" if args.merge else "install"
+    print(
+        f"Upload mode: {mode} (archive parts are transport chunks, not episodes)",
+        flush=True,
+    )
     initialized = client.json(
         "POST",
         "/api/uploads/init",
@@ -782,8 +830,27 @@ def main() -> int:
     missing = [index for index in range(chunk_count) if index not in received]
     completed_bytes = sum(min(chunk_size, size - index * chunk_size) for index in received)
     print(
-        f"Upload {upload_id}: {len(received)}/{chunk_count} chunks already present, "
-        f"remaining={len(missing)}, archive={size / 1024**3:.2f} GiB",
+        (
+            "Episode counts: "
+            + ", ".join(
+                value
+                for value in (
+                    f"source NPZ={source_episode_count}"
+                    if source_episode_count is not None
+                    else None,
+                    f"prepared LeRobot={episode_count}"
+                    if episode_count is not None
+                    else None,
+                )
+                if value is not None
+            )
+            + "\n"
+            if source_episode_count is not None or episode_count is not None
+            else ""
+        )
+        + f"Upload {upload_id}: {len(received)}/{chunk_count} archive parts already present, "
+        f"remaining={len(missing)}, archive={size / 1024**3:.2f} GiB "
+        f"(part size={args.chunk_mib} MiB)",
         flush=True,
     )
 
@@ -804,21 +871,23 @@ def main() -> int:
                 done_chunks += 1
                 with PRINT_LOCK:
                     print(
-                        f"[{done_chunks}/{chunk_count}] chunk {index} OK · "
+                        f"[{done_chunks}/{chunk_count}] archive part {index} OK · "
                         f"{completed_bytes / size:.1%}",
                         flush=True,
                     )
             except Exception as exc:
                 failures.append((index, str(exc)))
-                print(f"[FAIL] chunk {index}: {exc}", file=sys.stderr, flush=True)
+                print(f"[FAIL] archive part {index}: {exc}", file=sys.stderr, flush=True)
     if failures:
         print("Upload incomplete. Re-run the same command to resume.", file=sys.stderr)
         return 1
 
-    print("All chunks uploaded; server is assembling, validating, and atomically installing...", flush=True)
+    print("All archive parts uploaded; server is assembling, validating, and atomically installing...", flush=True)
     result = complete_upload(client, upload_id)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     operation = result.get("operation", "install")
+    if result.get("episodes") is not None:
+        print(f"Server dataset episodes after {operation}: {result['episodes']}", flush=True)
     print(f"Dataset {operation} complete: {dataset_name} ({args.dataset_origin})")
     return 0
 

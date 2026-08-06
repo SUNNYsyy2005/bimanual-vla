@@ -46,6 +46,7 @@ from collect_output_arm import (
     DEFAULT_RIGHT_CAN,
     DEFAULT_RIGHT_WRIST_DEVICE,
     DEFAULT_WRIST_DEVICE,
+    CAMERA_SOURCE_HW,
     next_episode_index,
     reset_robot_arms,
 )
@@ -54,8 +55,19 @@ from upload_dataset_4090 import DEFAULT_SERVER, safe_dataset_name
 
 
 JOINT_NAMES = tuple(f"J{i}" for i in range(1, 7)) + ("Gripper",)
-SINGLE_PREVIEW_SIZE = (480, 360)
-BIMANUAL_PREVIEW_SIZE = (360, 270)
+# ``CameraCapture`` keeps the model/data contract at 256x256 by letterboxing
+# the requested camera stream into a square. Recover each source stream's
+# aspect ratio before resizing so the live view is not stretched. Each camera
+# is rendered into a square tile; the unused area inside that tile is letterboxed.
+CAMERA_PREVIEW_ASPECT = CAMERA_SOURCE_HW[1] / CAMERA_SOURCE_HW[0]
+PREVIEW_SLOTS = (
+    ("high", "Overhead camera"),
+    ("primary_wrist", "Single-arm wrist camera"),
+    ("right_wrist", "Right wrist camera"),
+    ("reserved", "Reserved camera slot"),
+)
+PREVIEW_TILE_SIZE = 500
+PREVIEW_IMAGE_SIZE = 440
 EPISODE_FILE_RE = re.compile(r"ep_\d+\.npz")
 
 
@@ -92,6 +104,27 @@ def move_episodes_to_trash(
         shutil.move(str(source), str(destination))
         moved.append(destination)
     return moved
+
+
+def summarize_dataset_directory(directory: str | pathlib.Path) -> dict[str, int]:
+    """Return lightweight episode/frame counts for the active dataset folder."""
+    root = pathlib.Path(directory).expanduser()
+    summary = {"episodes": 0, "frames": 0, "success": 0, "failure": 0, "invalid": 0}
+    if not root.is_dir():
+        return summary
+    for path in sorted(root.glob("ep_*.npz")):
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                state = np.asarray(data["state"])
+                if state.ndim != 2:
+                    raise ValueError("state is not a matrix")
+                summary["episodes"] += 1
+                summary["frames"] += max(0, int(state.shape[0]) - 1)
+                success = bool(np.asarray(data["success"]).reshape(()))
+                summary["success" if success else "failure"] += 1
+        except (OSError, KeyError, ValueError, TypeError):
+            summary["invalid"] += 1
+    return summary
 
 
 def build_dataset_tool_command(
@@ -189,6 +222,66 @@ def ask_english_yes_no(parent: tk.Misc, title: str, message: str) -> bool:
     return bool(result["confirmed"])
 
 
+def prepare_preview_frame(
+    frame: np.ndarray,
+    *,
+    target_aspect: float = CAMERA_PREVIEW_ASPECT,
+) -> np.ndarray | None:
+    """Convert a camera frame to HWC RGB and remove capture letterboxing.
+
+    The collector stores every observation as a square image for the model
+    contract. ``CameraCapture`` preserves the camera content inside that
+    square and pads the remaining area with black pixels. Cropping the square
+    back to the configured source aspect ratio gives the operator an
+    undistorted live view without changing the recorded data.
+    """
+    rgb = np.asarray(frame)
+    if rgb.ndim == 3 and rgb.shape[0] in (1, 3, 4) and rgb.shape[-1] not in (1, 3, 4):
+        rgb = rgb.transpose(1, 2, 0)
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        return None
+    if not np.isfinite(target_aspect) or target_aspect <= 0:
+        raise ValueError("target_aspect must be positive and finite")
+
+    height, width = rgb.shape[:2]
+    current_aspect = width / height
+    if current_aspect > target_aspect:
+        # Wider than the source stream: trim the side padding.
+        cropped_width = max(1, round(height * target_aspect))
+        left = (width - cropped_width) // 2
+        rgb = rgb[:, left : left + cropped_width]
+    elif current_aspect < target_aspect:
+        # Taller than the source stream: trim the top/bottom padding.
+        cropped_height = max(1, round(width / target_aspect))
+        top = (height - cropped_height) // 2
+        rgb = rgb[top : top + cropped_height, :]
+    return np.ascontiguousarray(rgb.astype(np.uint8, copy=False))
+
+
+def letterbox_preview_frame(
+    frame: np.ndarray,
+    *,
+    tile_size: int = PREVIEW_IMAGE_SIZE,
+    source_aspect: float = CAMERA_PREVIEW_ASPECT,
+) -> np.ndarray | None:
+    """Render a camera frame into a square tile without changing its aspect."""
+    if tile_size <= 0:
+        raise ValueError("tile_size must be positive")
+    rgb = prepare_preview_frame(frame, target_aspect=source_aspect)
+    if rgb is None:
+        return None
+    height, width = rgb.shape[:2]
+    scale = min(tile_size / width, tile_size / height)
+    resized_width = max(1, round(width * scale))
+    resized_height = max(1, round(height * scale))
+    resized = cv2.resize(rgb, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
+    tile = np.zeros((tile_size, tile_size, 3), dtype=np.uint8)
+    y0 = (tile_size - resized_height) // 2
+    x0 = (tile_size - resized_width) // 2
+    tile[y0 : y0 + resized_height, x0 : x0 + resized_width] = resized
+    return tile
+
+
 def check_initial_pose(
     qpos: np.ndarray,
     start_qpos: np.ndarray,
@@ -242,8 +335,8 @@ class CollectorGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Piper - pi0.5 Data Collection")
-        self.root.geometry("1450x980")
-        self.root.minsize(1100, 780)
+        self.root.geometry("1800x1200")
+        self.root.minsize(1350, 950)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         self.session: CollectionSession | None = None
@@ -268,6 +361,7 @@ class CollectorGUI:
         self.latest_pose_reason = "Waiting for robot feedback"
         self.messages: queue.Queue = queue.Queue()
         self.recording = False
+        self._space_pressed = False
         self.episode_index = 0
         self.capture_fps = 20
         self.camera_fps = DEFAULT_CAMERA_FPS
@@ -319,12 +413,17 @@ class CollectorGUI:
         self.dataset_rebuild_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Disconnected")
         self.progress_var = tk.StringVar(value="No episode started")
+        self.dataset_stats_var = tk.StringVar(value="Dataset: no episodes")
         self.pose_check_var = tk.StringVar(value="Waiting for robot feedback")
         self.eef_var = tk.StringVar(value="EEF: --")
         self.live_var = tk.StringVar(value="Live telemetry: --")
         self._build_ui()
         self._configure_mode_ui()
         self.refresh_files()
+        self.root.bind_all("<KeyPress-space>", self._handle_space_key, add="+")
+        self.root.bind_all("<KeyPress-KP_Space>", self._handle_space_key, add="+")
+        self.root.bind_all("<KeyRelease-space>", self._handle_space_release, add="+")
+        self.root.bind_all("<KeyRelease-KP_Space>", self._handle_space_release, add="+")
         self.root.after(100, self._poll_messages)
 
     def _build_ui(self):
@@ -353,7 +452,9 @@ class CollectorGUI:
         left.columnconfigure(0, weight=1)
         left.rowconfigure(4, weight=1)
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(0, weight=1)
+        # The camera grid has a fixed square layout; telemetry follows it
+        # instead of stretching the preview area vertically.
+        right.rowconfigure(0, weight=0)
 
         config = ttk.LabelFrame(left, text="Devices and Task", padding=10)
         config.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -363,7 +464,10 @@ class CollectorGUI:
             (
                 "Training schema",
                 self.schema_var,
-                (("Joint", JOINT_SCHEMA), ("End-effector delivery", DELIVERY_SCHEMA)),
+                (
+                    ("Joint 7D (6 joints + gripper)", JOINT_SCHEMA),
+                    ("End-effector delivery", DELIVERY_SCHEMA),
+                ),
             ),
             ("Single-arm side", self.arm_side_var, (("right", "right"), ("left", "left"))),
         ]
@@ -401,7 +505,8 @@ class CollectorGUI:
             ("Right wrist camera", self.right_wrist_var, "bimanual"),
             ("Collection rate (Hz)", self.fps_var),
             ("Camera source rate (Hz)", self.camera_fps_var),
-            ("Output directory", self.out_var),
+            ("Dataset root directory", self.out_var),
+            ("Dataset name", self.dataset_name_var, "dataset"),
             ("Task name", self.task_var),
             ("Instruction", self.instruction_var),
         ]
@@ -410,14 +515,21 @@ class CollectorGUI:
         for offset, item in enumerate(rows, start=len(selectors)):
             label, var, *mode = item
             label_widget = ttk.Label(config, text=label, width=22)
-            entry = ttk.Entry(config, textvariable=var, width=36)
+            entry = ttk.Entry(
+                config,
+                textvariable=var,
+                width=36,
+                state="readonly" if mode and mode[0] == "dataset" else "normal",
+            )
             label_widget.grid(row=offset, column=0, sticky="w", pady=3)
             entry.grid(
                 row=offset, column=1, sticky="ew", pady=3, padx=(8, 0)
             )
             if mode and mode[0] in self.device_rows:
                 self.device_rows[mode[0]].extend((label_widget, entry))
-            if label not in {"Task name", "Instruction"}:
+            if mode and mode[0] == "dataset":
+                self.dataset_name_entry = entry
+            if label not in {"Task name", "Instruction", "Dataset name"}:
                 self.connection_entries.append(entry)
         self.device_entries = [
             widget
@@ -480,7 +592,24 @@ class CollectorGUI:
             text="Swap Camera Roles",
             command=self.swap_camera_roles,
         )
-        self.swap_camera_button.grid(row=2, column=0, columnspan=3, padx=3, pady=3, sticky="ew")
+        self.swap_camera_button.grid(row=2, column=2, padx=3, pady=3, sticky="ew")
+        self.edit_dataset_button = ttk.Button(
+            controls,
+            text="Edit dataset name",
+            command=self.edit_dataset_name,
+        )
+        self.edit_dataset_button.grid(row=2, column=0, columnspan=2, padx=3, pady=3, sticky="ew")
+        self.exit_button = ttk.Button(
+            controls,
+            text="Exit program",
+            command=self.close,
+        )
+        self.exit_button.grid(row=3, column=0, columnspan=3, padx=3, pady=(3, 0), sticky="ew")
+        ttk.Label(
+            controls,
+            text="Space: start / stop episode",
+            foreground="#52606d",
+        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=3, pady=(5, 0))
         for col in range(3):
             controls.columnconfigure(col, weight=1)
 
@@ -537,8 +666,15 @@ class CollectorGUI:
         scrollbar = ttk.Scrollbar(files, orient="vertical", command=self.listbox.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.listbox.configure(yscrollcommand=scrollbar.set)
+        ttk.Label(
+            files,
+            textvariable=self.dataset_stats_var,
+            foreground="#52606d",
+            justify="left",
+            wraplength=520,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 0))
         file_actions = ttk.Frame(files)
-        file_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        file_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(7, 0))
         file_actions.columnconfigure(0, weight=1)
         file_actions.columnconfigure(1, weight=1)
         self.delete_episode_button = ttk.Button(
@@ -556,20 +692,31 @@ class CollectorGUI:
 
         preview = ttk.LabelFrame(right, text="Live camera views", padding=8)
         preview.grid(row=0, column=0, sticky="nsew")
-        preview.columnconfigure(0, weight=1)
-        preview.columnconfigure(1, weight=1)
-        preview.columnconfigure(2, weight=1)
-        preview.rowconfigure(0, weight=1)
-        for col, (slot, title) in enumerate(
-            (
-                ("high", "Overhead camera"),
-                ("primary_wrist", "Single-arm wrist camera"),
-                ("right_wrist", "Right wrist camera"),
+        for index, (slot, title) in enumerate(PREVIEW_SLOTS):
+            row, col = divmod(index, 2)
+            preview.columnconfigure(
+                col,
+                weight=1,
+                minsize=PREVIEW_TILE_SIZE + 16,
+                uniform="preview-column",
             )
-        ):
-            card = tk.Frame(preview, bg="#18232f", bd=0, highlightthickness=0)
-            card.grid(row=0, column=col, sticky="nsew", padx=5)
-            preview.columnconfigure(col, weight=1)
+            preview.rowconfigure(
+                row,
+                weight=0,
+                minsize=PREVIEW_TILE_SIZE + 16,
+                uniform="preview-row",
+            )
+            card = tk.Frame(
+                preview,
+                width=PREVIEW_TILE_SIZE,
+                height=PREVIEW_TILE_SIZE,
+                bg="#18232f",
+                bd=0,
+                highlightthickness=0,
+            )
+            card.grid(row=row, column=col, sticky="", padx=8, pady=8)
+            card.grid_propagate(False)
+            card.pack_propagate(False)
             title_label = tk.Label(
                 card,
                 text=title,
@@ -583,8 +730,6 @@ class CollectorGUI:
                 text="Waiting for camera...",
                 bg="#0f1720",
                 fg="#aab7c4",
-                width=48,
-                height=20,
             )
             label.pack(fill="both", expand=True, padx=8, pady=(0, 8))
             self.preview_cards[slot] = card
@@ -601,10 +746,25 @@ class CollectorGUI:
         ).pack(anchor="w", pady=(5, 0))
 
     @property
-    def out_dir(self) -> pathlib.Path:
+    def dataset_root_dir(self) -> pathlib.Path:
         path = pathlib.Path(self.out_var.get()).expanduser()
         path.mkdir(parents=True, exist_ok=True)
-        return path
+        return path.resolve()
+
+    @property
+    def out_dir(self) -> pathlib.Path:
+        """Return the active named dataset directory, creating it if needed.
+
+        Keep the historical default layout compatible: when the root directory
+        already has the same name as the active dataset, use that directory
+        directly. Renaming the dataset creates a named child directory below
+        the configured root.
+        """
+        root = self.dataset_root_dir
+        name = safe_dataset_name(self.dataset_name_var.get().strip())
+        path = root if root.name == name else root / name
+        path.mkdir(parents=True, exist_ok=True)
+        return path.resolve()
 
     @property
     def arm_mode(self) -> str:
@@ -668,14 +828,12 @@ class CollectorGUI:
             )
 
         if bimanual:
-            self.preview_cards["right_wrist"].grid()
             self.preview_key_to_slot = {
                 "cam_high": "high",
                 "cam_left_wrist": "primary_wrist",
                 "cam_right_wrist": "right_wrist",
             }
         else:
-            self.preview_cards["right_wrist"].grid_remove()
             self.preview_key_to_slot = {
                 "cam_high": "high",
                 self.contract.camera_keys[1]: "primary_wrist",
@@ -686,8 +844,13 @@ class CollectorGUI:
             )
         for camera_key, slot in self.preview_key_to_slot.items():
             self.preview_title_labels[slot].configure(text=self._camera_role_title(camera_key))
-        for label in self.preview_labels.values():
-            label.configure(image="", text="Waiting for camera...")
+        active_slots = set(self.preview_key_to_slot.values())
+        for slot, label in self.preview_labels.items():
+            label.configure(
+                image="",
+                text="Waiting for camera..." if slot in active_slots else "Reserved slot",
+            )
+        self.preview_title_labels["reserved"].configure(text="Reserved camera slot")
         self.preview_photos.clear()
         if self.session is None:
             self.latest_qpos = None
@@ -700,6 +863,8 @@ class CollectorGUI:
             f"{self.arm_mode} / {self.schema} - "
             f"state={self.contract.state_dim}D action={self.contract.action_dim}D"
         )
+        if hasattr(self, "listbox"):
+            self.refresh_files()
 
     def _set_connection_config_enabled(self, enabled: bool) -> None:
         selector_state = "readonly" if enabled else "disabled"
@@ -708,10 +873,81 @@ class CollectorGUI:
             selector.configure(state=selector_state)
         for entry in self.connection_entries:
             entry.configure(state=entry_state)
+        if hasattr(self, "dataset_name_entry"):
+            self.dataset_name_entry.configure(state="readonly")
+        if hasattr(self, "edit_dataset_button"):
+            self.edit_dataset_button.configure(
+                state="normal" if enabled and self.session is None else "disabled"
+            )
         if hasattr(self, "swap_camera_button"):
             self.swap_camera_button.configure(
                 state=("normal" if enabled and self.arm_mode == SINGLE_ARM else "disabled")
             )
+
+    def edit_dataset_name(self) -> None:
+        """Select/create the named subdirectory used for the next episodes."""
+        if self.recording or self.session is not None or self.piper is not None:
+            messagebox.showwarning(
+                "Disconnect first",
+                "Stop the current episode and disconnect devices before changing the dataset name.",
+            )
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Edit dataset name")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        body = ttk.Frame(dialog, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text=(
+                f"Dataset folders are created below:\n{self.dataset_root_dir}\n\n"
+                "Use letters, numbers, dot, underscore, or dash."
+            ),
+            justify="left",
+        ).pack(anchor="w")
+        value = tk.StringVar(value=self.dataset_name_var.get().strip())
+        entry = ttk.Entry(body, textvariable=value, width=42)
+        entry.pack(fill="x", pady=(10, 0))
+        entry.focus_set()
+        entry.selection_range(0, tk.END)
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(12, 0))
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
+
+        def cancel() -> None:
+            dialog.destroy()
+
+        def confirm() -> None:
+            try:
+                name = safe_dataset_name(value.get().strip())
+                root = self.dataset_root_dir
+                target = root if root.name == name else root / name
+                target.mkdir(parents=True, exist_ok=True)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("Invalid dataset name", str(exc), parent=dialog)
+                return
+            self.dataset_name_var.set(name)
+            self.dataset_source_var.set(str(target.resolve()))
+            self.refresh_files()
+            self.episode_index = next_episode_index(self.out_dir)
+            self.status_var.set(
+                f"Active dataset: {name} | {self.out_dir} | next episode: {self.episode_index:04d}"
+            )
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Cancel", command=cancel).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(buttons, text="Use dataset", command=confirm).grid(
+            row=0, column=1, sticky="ew", padx=(4, 0)
+        )
+        dialog.bind("<Return>", lambda _event: confirm())
+        dialog.bind("<Escape>", lambda _event: cancel())
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
 
     def swap_camera_roles(self) -> None:
         """Swap the configured overhead and wrist camera for single-arm mode."""
@@ -863,6 +1099,7 @@ class CollectorGUI:
             self.status_var.set(
                 f"Connected {self.arm_mode}/{self.schema} ({can_status}) | "
                 f"state={self.contract.state_dim}D action={self.contract.action_dim}D | "
+                f"Dataset {self.dataset_name_var.get().strip()} | "
                 f"Collection {fps}Hz | {camera_status} | Next episode: {self.episode_index:04d}"
             )
             self._set_connection_config_enabled(False)
@@ -874,6 +1111,42 @@ class CollectorGUI:
             self._cleanup_devices()
             self._set_connection_config_enabled(True)
             messagebox.showerror("Connection failed", str(exc))
+
+    def _handle_space_key(self, event: tk.Event) -> str | None:
+        """Use Space as a start/stop shortcut without hijacking text fields."""
+        if self._space_pressed:
+            return "break"
+        self._space_pressed = True
+        if event.widget.winfo_toplevel()._w != self.root._w:
+            return None
+        widget_class = str(event.widget.winfo_class())
+        if widget_class in {
+            "Button",
+            "TButton",
+            "Entry",
+            "TEntry",
+            "Text",
+            "TCombobox",
+            "Spinbox",
+            "TSpinbox",
+        }:
+            # Let the focused control handle Space normally (button activation
+            # or text entry); the shortcut is active everywhere else.
+            return None
+        if self.recording:
+            self.stop_episode()
+        elif self.session is not None and self.session.state is SessionState.READY:
+            self.start_episode()
+        elif self.session is None:
+            self.status_var.set("Press Space after connecting devices to start an episode")
+        else:
+            self.status_var.set(
+                f"Cannot start an episode while session is {self.session.state.value}"
+            )
+        return "break"
+
+    def _handle_space_release(self, _event: tk.Event) -> None:
+        self._space_pressed = False
 
     def start_episode(self):
         if self.session is None or self.recording:
@@ -1116,10 +1389,10 @@ class CollectorGUI:
             elif self.schema == JOINT_SCHEMA:
                 order = "left + right" if self.arm_mode == BIMANUAL else self.arm_side
                 self.eef_var.set(
-                    f"Joint state: {self.contract.state_dim}D measured qpos ({order})"
+                    f"Joint state: {self.contract.state_dim}D = 6 joint angles + gripper ({order})"
                 )
                 self.live_var.set(
-                    f"pi0.5 joint action: {self.contract.action_dim}D absolute joint target"
+                    f"Joint action: {self.contract.action_dim}D absolute target (same 6+1 format)"
                 )
             else:
                 arm_summaries: list[str] = []
@@ -1192,22 +1465,24 @@ class CollectorGUI:
         self.root.after(100, self._poll_messages)
 
     def _show_preview(self, images: dict[str, np.ndarray]):
-        preview_size = BIMANUAL_PREVIEW_SIZE if self.arm_mode == BIMANUAL else SINGLE_PREVIEW_SIZE
         if Image is not None and ImageTk is not None:
             for key, frame in images.items():
                 slot = self.preview_key_to_slot.get(key)
                 label = None if slot is None else self.preview_labels.get(slot)
                 if label is None:
                     continue
-                rgb = np.asarray(frame)
-                if rgb.ndim == 3 and rgb.shape[0] in (1, 3, 4):
-                    rgb = rgb.transpose(1, 2, 0)
-                if rgb.ndim != 3 or rgb.shape[2] != 3:
+                source_aspect = CAMERA_PREVIEW_ASPECT
+                if self.cameras is not None:
+                    source_aspects = getattr(self.cameras, "source_aspects", {})
+                    source_aspect = source_aspects.get(key, source_aspect)
+                rgb = letterbox_preview_frame(
+                    frame,
+                    tile_size=PREVIEW_IMAGE_SIZE,
+                    source_aspect=source_aspect,
+                )
+                if rgb is None:
                     continue
-                rgb = np.ascontiguousarray(rgb.astype(np.uint8, copy=False))
                 image = Image.fromarray(rgb, mode="RGB")
-                resampling = getattr(Image, "Resampling", Image).BILINEAR
-                image = image.resize(preview_size, resampling)
                 photo = ImageTk.PhotoImage(image=image)
                 label.configure(image=photo, text="")
                 self.preview_photos[slot] = photo
@@ -1216,13 +1491,21 @@ class CollectorGUI:
         # Minimal-install fallback.  The normal project environment includes
         # Pillow, so this path is only used when Tk cannot embed PhotoImage.
         for key, frame in images.items():
-            rgb = np.asarray(frame)
-            if rgb.ndim == 3 and rgb.shape[0] in (1, 3, 4):
-                rgb = rgb.transpose(1, 2, 0)
-            if rgb.ndim != 3 or rgb.shape[2] != 3:
+            slot = self.preview_key_to_slot.get(key)
+            if slot is None:
+                continue
+            source_aspect = CAMERA_PREVIEW_ASPECT
+            if self.cameras is not None:
+                source_aspects = getattr(self.cameras, "source_aspects", {})
+                source_aspect = source_aspects.get(key, source_aspect)
+            rgb = letterbox_preview_frame(
+                frame,
+                tile_size=PREVIEW_IMAGE_SIZE,
+                source_aspect=source_aspect,
+            )
+            if rgb is None:
                 continue
             image = cv2.cvtColor(rgb.astype(np.uint8, copy=False), cv2.COLOR_RGB2BGR)
-            image = cv2.resize(image, preview_size, interpolation=cv2.INTER_NEAREST)
             title = key.replace("_", " ")
             cv2.putText(
                 image,
@@ -1302,7 +1585,7 @@ class CollectorGUI:
         self.dataset_source_var.set(str(self.out_dir.resolve()))
         rows = (
             ("NPZ source", self.dataset_source_var, "readonly"),
-            ("Dataset name", self.dataset_name_var, "normal"),
+            ("Dataset name", self.dataset_name_var, "readonly"),
             ("Server URL", self.dataset_server_var, "normal"),
             ("Server token", self.dataset_token_var, "token"),
             ("Upload workers", self.dataset_workers_var, "normal"),
@@ -1367,6 +1650,7 @@ class CollectorGUI:
         self.dataset_log_widget = log
         self._append_dataset_log(
             "Conversion uses successful ep_*.npz files and stores a reusable LeRobot cache.\n"
+            "Upload archive parts are transport chunks; their count is not the episode count.\n"
         )
         self._update_dataset_action_buttons()
 
@@ -1434,6 +1718,24 @@ class CollectorGUI:
         self.dataset_task_name = label
         self.status_var.set(f"Running {label}...")
         self._append_dataset_log(f"\n[{time.strftime('%H:%M:%S')}] Starting {label}")
+        source_episode_count = sum(
+            1
+            for path in (*source.glob("ep_*.npz"), *source.glob("episode_*.npz"))
+            if path.is_file()
+        )
+        if action == "upload":
+            install_mode = self.dataset_install_mode_var.get()
+            mode_hint = {
+                "merge": "merge 会保留服务器已有数据并追加本次 episode，服务器总数可能增加",
+                "overwrite": "overwrite 会替换服务器上同名数据集",
+                "install": "install 只允许安装尚不存在的同名数据集",
+            }.get(install_mode, install_mode)
+            self._append_dataset_log(
+                f"Source NPZ episodes: {source_episode_count}; upload mode: {install_mode}\n"
+                f"{mode_hint}。上传 archive parts 是传输分片，不是 episode 数。"
+            )
+        else:
+            self._append_dataset_log(f"Source NPZ episodes: {source_episode_count}")
 
         def worker():
             error: str | None = None
@@ -1485,10 +1787,23 @@ class CollectorGUI:
 
     def refresh_files(self):
         self.listbox.delete(0, tk.END)
-        if not self.out_dir.exists():
+        directory = self.out_dir
+        if not directory.exists():
+            self.dataset_stats_var.set(
+                f"Dataset: {self.dataset_name_var.get().strip()} | schema: {self.schema} | "
+                f"path: {directory} | no episodes"
+            )
             return
-        for path in sorted(self.out_dir.glob("ep_*.npz")):
+        for path in sorted(directory.glob("ep_*.npz")):
             self.listbox.insert(tk.END, str(path))
+        summary = summarize_dataset_directory(directory)
+        invalid = f" | invalid {summary['invalid']}" if summary["invalid"] else ""
+        self.dataset_stats_var.set(
+            f"Dataset: {self.dataset_name_var.get().strip()} | "
+            f"schema: {self.schema} | path: {directory} | "
+            f"episodes {summary['episodes']} | frames {summary['frames']} | "
+            f"success {summary['success']} / failed {summary['failure']}{invalid}"
+        )
 
     def replay_selected(self):
         selection = self.listbox.curselection()
@@ -1525,7 +1840,12 @@ class CollectorGUI:
         self.preview_photos.clear()
         for key, label in self.preview_labels.items():
             label.configure(image="", text="Waiting for camera...")
-        cv2.destroyAllWindows()
+        # Some headless/minimal OpenCV builds do not include GUI backends.
+        # Cleanup must still complete so the Exit button can destroy Tk.
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
 
     def disconnect(self):
         if self.recording:

@@ -4,8 +4,10 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import numpy as np
+
 from camera import resolve_video_device, select_video_device
-from collect_gui import build_dataset_tool_command, move_episodes_to_trash
+from collect_gui import build_dataset_tool_command, move_episodes_to_trash, summarize_dataset_directory
 
 
 class EpisodeTrashTest(unittest.TestCase):
@@ -64,6 +66,23 @@ class DatasetCommandTest(unittest.TestCase):
         self.assertIn("--rebuild", command)
         self.assertNotIn("--server", command)
         self.assertNotIn("--token", command)
+
+
+class DatasetSummaryTest(unittest.TestCase):
+    def test_summary_counts_real_frames_and_outcomes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, success in enumerate((True, False)):
+                np.savez(
+                    root / f"ep_{index:04d}.npz",
+                    state=np.zeros((4, 7), dtype=np.float32),
+                    success=np.asarray(success, dtype=np.bool_),
+                )
+            summary = summarize_dataset_directory(root)
+            self.assertEqual(summary["episodes"], 2)
+            self.assertEqual(summary["frames"], 6)
+            self.assertEqual(summary["success"], 1)
+            self.assertEqual(summary["failure"], 1)
 
     def test_upload_command_uses_merge_without_exposing_token(self):
         command = build_dataset_tool_command(

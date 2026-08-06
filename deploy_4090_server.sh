@@ -27,6 +27,7 @@ rsync -av --relative \
   "$LOCAL_ROOT/./server_4090/README.md" \
   "$LOCAL_ROOT/./server_4090/SIMULATION_DASHBOARD.md" \
   "$LOCAL_ROOT/./check_pi05_dataset.py" \
+  "$LOCAL_ROOT/./export_lerobot.py" \
   "$LOCAL_ROOT/./download_openpi_checkpoint.py" \
   "$LOCAL_ROOT/./upload_dataset_4090.py" \
   "$LOCAL_ROOT/./robot_observation_bridge.py" \
