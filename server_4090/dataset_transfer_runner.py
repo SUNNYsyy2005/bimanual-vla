@@ -110,6 +110,12 @@ def shard_files(files: list[tuple[str, int]], parallelism: int) -> list[list[tup
     return [shard for shard in shards if shard]
 
 
+def target_exists(location: dict[str, Any], dataset_id: str) -> bool:
+    target = str(PurePosixPath(location_root(location)) / dataset_id)
+    result = run_shell(location, f"test -e {q(target)}")
+    return result.returncode == 0
+
+
 def prepare_target(location: dict[str, Any], dataset_id: str, overwrite: bool) -> None:
     root = location_root(location)
     target = str(PurePosixPath(root) / dataset_id)
@@ -162,6 +168,7 @@ def main() -> int:
     parser.add_argument("--source-json", required=True)
     parser.add_argument("--target-json", required=True)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--skip-existing", action="store_true", help="Return success without copying when target already exists")
     parser.add_argument("--parallelism", type=int, default=4)
     args = parser.parse_args()
 
@@ -179,6 +186,9 @@ def main() -> int:
     print(f"[dashboard] source_path={dataset_path(source, args.dataset_id)}", flush=True)
     print(f"[dashboard] target_path={dataset_path(target, args.dataset_id)}", flush=True)
     started = time.time()
+    if args.skip_existing and not args.overwrite and target_exists(target, args.dataset_id):
+        print(f"[dashboard] target already exists; skip transfer: {dataset_path(target, args.dataset_id)}", flush=True)
+        return 0
     files = list_source_files(source, args.dataset_id)
     total_bytes = sum(size for _rel, size in files)
     shards = shard_files(files, parallelism)
