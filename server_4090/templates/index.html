@@ -163,7 +163,7 @@
           <div id="serverInfo" class="muted">输入 Token 后刷新。</div>
         </div>
         <div class="card half"><h2>4×4090 GPU 资源</h2><div id="gpuList"><span class="muted">等待状态数据。</span></div></div>
-        <div class="card"><h2>H100 / H200 Slurm 资源</h2><p class="muted">只通过 SSH + Slurm 只读查询，不在 H100/H200 上开启 Dashboard 端口。</p><pre id="clusterResources">等待状态数据。</pre></div>
+        {% if dashboard_profile == "simulation" %}<div class="card"><h2>H100 / H200 Slurm 资源</h2><p class="muted">只通过 SSH + Slurm 只读查询，不在 H100/H200 上开启 Dashboard 端口。</p><pre id="clusterResources">等待状态数据。</pre></div>{% endif %}
       </div>
     </section>
 
@@ -1186,7 +1186,7 @@ function fillGpus(items) {
   document.getElementById('gpuList').innerHTML = items.map(g => `
     <div><span class="pill">GPU ${g.index}</span> ${esc(g.name)} · ${g.memory_used_mib}/${g.memory_total_mib} MiB · ${g.compute_available === false ? '<span class="bad">CUDA unavailable</span>' : g.processes.length ? '<span class="warn">busy</span>' : '<span class="ok">free</span>'}
     ${g.health_issue ? `<div class="bad">${esc(g.health_issue)}</div>` : ''}
-    ${g.processes.map(p => `<div class="muted">PID ${p.pid} ${esc(p.name)} ${p.memory_mib} MiB</div>`).join('')}</div>`).join('') || '<div class="bad">nvidia-smi 不可用</div>';
+    ${g.processes.map(p => `<div class="muted">PID ${esc(p.pid)} · 用户 ${esc(p.user || 'unknown')} · ${esc(p.name || '-')} · ${esc(p.memory_mib == null ? '-' : p.memory_mib)} MiB</div>`).join('')}</div>`).join('') || '<div class="bad">nvidia-smi 不可用</div>';
 }
 
 function fillReplacePolicies(items) {
