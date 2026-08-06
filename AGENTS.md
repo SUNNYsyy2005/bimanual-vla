@@ -217,7 +217,8 @@ Connect from your local workstation. Host aliases are defined in `~/.ssh/config`
 
 | Alias | Address | Auth | Notes |
 |---|---|---|---|
-| `4x4090` | 192.168.101.9 | SSH key (`id_ed25519`) | standalone 4×RTX 4090 box; hostname observed as `GPUServer` |
+| `4x4090` | 192.168.101.9 | SSH key (`id_ed25519`) | standalone 4×RTX 4090 box; hostname observed as `GPUServer`; use on C107/company LAN |
+| `4x4090-wg` | 10.0.200.100 | SSH key (`id_ed25519`) | same C107 4×RTX 4090 box over WireGuard VPN; use when outside the LAN |
 | `4090-user` | 100.124.93.40 | password / Tailscale SSH check | standalone RTX 4090 box; login user `user`; do not store plaintext password in files |
 | `login-server` | 36.103.167.186 | SSH key (`id_ed25519`) | login / submit node; jump host for H100 |
 | `h100-ksy-01` | via `login-server` | SSH key (`id_ed25519`) | reached through `ProxyJump login-server` |
@@ -227,6 +228,11 @@ Connect from your local workstation. Host aliases are defined in `~/.ssh/config`
 ```bash
 # Standalone 4×4090 box (key auth)
 ssh 4x4090
+
+# Outside the C107/company LAN, first bring up the preconfigured WireGuard tunnel
+nmcli connection up wg0
+ssh 4x4090-wg
+# Optional after work: nmcli connection down wg0
 
 # Standalone RTX 4090 box (user/password or Tailscale SSH browser check)
 ssh 4090-user
@@ -249,6 +255,12 @@ Required `~/.ssh/config` entries:
 ```sshconfig
 Host 4x4090
     HostName 192.168.101.9
+    User sunny
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+
+Host 4x4090-wg
+    HostName 10.0.200.100
     User sunny
     IdentityFile ~/.ssh/id_ed25519
     IdentitiesOnly yes
@@ -284,6 +296,8 @@ Host h200-ali-02
 ```
 
 - `4x4090` and `4090-user` are standalone GPU workstations, not Slurm cluster nodes; Slurm-only rules do not apply there, but avoid disrupting existing processes.
+
+- C107 4×4090 remote access: when off LAN, enable the already configured WireGuard `wg0` tunnel before SSH/RDP (`nmcli connection up wg0` on this workstation), then use `ssh 4x4090-wg`; when on LAN, use `ssh 4x4090`. For deploy scripts outside LAN, run `REMOTE_HOST=4x4090-wg ./deploy_4090_server.sh`. Do not commit WireGuard `.conf` files, private keys, RDP passwords, Dashboard tokens, or Feishu/internal document auth URLs.
 - For `4090-user`, use the password provided out-of-band. Do **not** save plaintext passwords in `AGENTS.md`, shell scripts, Git, or logs. If Tailscale SSH displays a browser verification URL, complete that check first and retry SSH.
 - H100 is not directly reachable; connect only by jumping through `login-server` (`ProxyJump`). Its key lives on `login-server`.
 - H200 nodes use password authentication only — no SSH key is installed. Enter the account password when prompted.

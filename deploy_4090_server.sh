@@ -14,6 +14,7 @@ rsync -av --relative \
   "$LOCAL_ROOT/./server_4090/eval_heldout_loss.py" \
   "$LOCAL_ROOT/./server_4090/slurm_job_runner.py" \
   "$LOCAL_ROOT/./server_4090/dataset_transfer_runner.py" \
+  "$LOCAL_ROOT/./server_4090/slurm_dataset_sync_runner.py" \
   "$LOCAL_ROOT/./server_4090/video_transfer_runner.py" \
   "$LOCAL_ROOT/./server_4090/validate_lerobot.py" \
   "$LOCAL_ROOT/./server_4090/config.example.json" \
@@ -50,7 +51,7 @@ mkdir -p "$HOME/.config/systemd/user" "$HOME/.local/share/bimanual-vla-server"
 install -m 0644 \
   server_4090/bimanual-vla-dashboard.service \
   "$HOME/.config/systemd/user/bimanual-vla-dashboard.service"
-chmod +x server_4090/slurm_job_runner.py server_4090/dataset_transfer_runner.py server_4090/video_transfer_runner.py server_4090/run_server_foreground.sh scripts/query_h100_h200_resources.sh
+chmod +x server_4090/slurm_job_runner.py server_4090/dataset_transfer_runner.py server_4090/slurm_dataset_sync_runner.py server_4090/video_transfer_runner.py server_4090/run_server_foreground.sh scripts/query_h100_h200_resources.sh
 
 systemctl --user daemon-reload
 systemctl --user stop bimanual-vla-dashboard.service 2>/dev/null || true
