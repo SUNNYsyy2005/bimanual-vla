@@ -816,7 +816,7 @@ function clearEpisodeMedia() {
   for (const player of episodeMediaPlayers) {
     if (player.timer) clearInterval(player.timer);
     player.generation = (player.generation || 0) + 1;
-    if (player.url) URL.revokeObjectURL(player.url);
+    if (player.objectUrl) URL.revokeObjectURL(player.objectUrl);
   }
   episodeMediaPlayers = [];
 }
@@ -922,17 +922,28 @@ async function createVideoPlayer(container, datasetId, episode, media) {
   video.preload = 'metadata';
   card.append(header, video);
   container.appendChild(card);
-  const player = {type: 'video', timer: null, url: null, generation: 0};
+  const player = {type: 'video', timer: null, url: null, objectUrl: null, generation: 0};
   episodeMediaPlayers.push(player);
-  try {
-    const blob = await apiBlob(`/api/datasets/${encodeURIComponent(datasetId)}/episodes/${episode.episode_index}/video/${encodeURIComponent(media.key)}`);
-    if (!episodeMediaPlayers.includes(player)) return;
-    player.url = URL.createObjectURL(blob);
-    video.src = player.url;
-  } catch (error) {
-    status.textContent = `加载失败：${error.message}`;
+  if (!tokenInput.value) {
+    status.textContent = '加载失败：缺少 Token';
     status.className = 'bad';
+    return;
   }
+  // HTML <video> range requests cannot attach Authorization headers.  Put the
+  // current dashboard token in the media URL and let the server authenticate the
+  // read-only video stream via query token.  This also avoids fetching the whole
+  // MP4 into a Blob up front; the browser can request metadata/ranges lazily.
+  const url = `/api/datasets/${encodeURIComponent(datasetId)}/episodes/${episode.episode_index}/video/${encodeURIComponent(media.key)}?token=${encodeURIComponent(tokenInput.value)}&cache=${Date.now()}`;
+  player.url = url;
+  video.src = url;
+  video.addEventListener('loadedmetadata', () => {
+    status.textContent = `MP4 · ${media.fps || 20} fps · ${media.frames || episode.length || '-'} frames`;
+    status.className = 'muted';
+  });
+  video.addEventListener('error', () => {
+    status.textContent = '加载失败：视频请求未授权或浏览器无法解码';
+    status.className = 'bad';
+  });
 }
 
 async function editEpisode(index) {
