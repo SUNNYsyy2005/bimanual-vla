@@ -193,6 +193,7 @@ class CameraCapture:
         self._latest_condition = threading.Condition()
         self._latest_images: dict[str, np.ndarray] = {}
         self._latest_timestamps: dict[str, float] = {}
+        self._source_aspects: dict[str, float] = {}
         self._background_error: BaseException | None = None
 
     def open(self):
@@ -233,7 +234,14 @@ class CameraCapture:
         with self._latest_condition:
             self._latest_images.clear()
             self._latest_timestamps.clear()
+            self._source_aspects.clear()
             self._background_error = None
+
+    @property
+    def source_aspects(self) -> dict[str, float]:
+        """Return the latest native width/height ratio for each camera."""
+        with self._latest_condition:
+            return dict(self._source_aspects)
 
     @staticmethod
     def _read_frame(cap: cv2.VideoCapture) -> tuple[bool, np.ndarray | None, float]:
@@ -264,6 +272,8 @@ class CameraCapture:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             target_h, target_w = self._image_hw
             src_h, src_w = rgb.shape[:2]
+            with self._latest_condition:
+                self._source_aspects[key] = src_w / src_h
             scale = min(target_w / src_w, target_h / src_h)
             new_w = max(1, round(src_w * scale))
             new_h = max(1, round(src_h * scale))

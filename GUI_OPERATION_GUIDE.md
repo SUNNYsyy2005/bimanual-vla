@@ -87,6 +87,9 @@ bash start_gui.sh
 2. 点击 `Start Episode`。
 3. 完成一次完整、自然的任务操作。
 4. 点击 `Stop Episode`。
+
+也可以在主 GUI 中按空格键切换开始/停止；文字输入框、下拉框和弹窗中不会抢占这个快捷键。
+
 5. 根据结果选择：
 
    - `Save as Success`：任务成功，保存并用于后续导出。
@@ -225,6 +228,9 @@ Dataset merge complete: piper_v1
 ```
 
 `chunk ... 100.0%` 只表示文件传输完毕，不代表服务器校验和安装已经成功。
+
+日志中的 `archive parts` 是上传 tar 文件的传输分片，不是 episode 数量。GUI 会同时显示
+`source NPZ` 和 `prepared LeRobot` 的 episode 数；如果使用 `merge`，最后还会显示合并后服务器数据集的总 episode 数。
 
 上传完成后打开 Dashboard：
 

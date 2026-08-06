@@ -2964,6 +2964,10 @@ def build_environment(
     else:
         env.pop("JAX_PLATFORMS", None)
         env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices(gpu_ids)
+    # Validation scripts import repository-local helpers.  Do not depend on
+    # the service manager's working directory or inherited PYTHONPATH.
+    repo_path = str(REPO_DIR)
+    env["PYTHONPATH"] = repo_path + os.pathsep + env.get("PYTHONPATH", "")
     return env
 
 
@@ -2994,6 +2998,7 @@ def create_app(config_path: Path) -> Flask:
         checker = [config["openpi_python"], str(REPO_DIR / "check_pi05_dataset.py"), str(path)]
         result = subprocess.run(
             checker,
+            cwd=str(REPO_DIR),
             capture_output=True,
             text=True,
             timeout=3600,

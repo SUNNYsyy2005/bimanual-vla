@@ -12,12 +12,20 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 import cv2
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+# This checker is also launched as a standalone script by the 4x4090
+# dashboard.  Make sibling project modules importable even when the service
+# does not inherit a PYTHONPATH containing the repository root.
+REPO_ROOT = Path(__file__).resolve().parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from export_lerobot import inspect_npz_episode
 from pi0_dataset import (

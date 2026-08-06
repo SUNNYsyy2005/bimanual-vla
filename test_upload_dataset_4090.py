@@ -17,6 +17,7 @@ import pyarrow.parquet as pq
 from upload_dataset_4090 import (
     classify_dataset_source,
     classify_lerobot_contract,
+    dataset_episode_count,
     main,
     prepare_dataset_directory,
     prepare_lerobot_dataset,
@@ -48,6 +49,21 @@ class DatasetUploadInputTest(unittest.TestCase):
 
         self.assertEqual(kind, "lerobot")
         self.assertEqual(prepared, dataset)
+
+    def test_dataset_episode_count_uses_lerobot_metadata(self):
+        dataset = self.root / "lerobot"
+        (dataset / "meta").mkdir(parents=True)
+        (dataset / "meta" / "info.json").write_text(
+            json.dumps({"total_episodes": 20}), encoding="utf-8"
+        )
+        self.assertEqual(dataset_episode_count(dataset), 20)
+
+    def test_dataset_episode_count_falls_back_to_parquets(self):
+        dataset = self.root / "lerobot"
+        (dataset / "data" / "chunk-000").mkdir(parents=True)
+        for index in (0, 1, 2):
+            (dataset / "data" / "chunk-000" / f"episode_{index:06d}.parquet").touch()
+        self.assertEqual(dataset_episode_count(dataset), 3)
 
     def test_gui_npz_directory_is_exported_and_cached(self):
         dataset = self.root / "episodes"
