@@ -3,12 +3,14 @@
 
 The editor never changes frame payloads.  It may rewrite parquet index columns and
 optional raw NPZ metadata when episodes are merged, removed, or renumbered.
-Videos are hard-linked when possible and are never re-encoded.
+Dataset videos are hard-linked when possible.  A separate browser-preview cache
+may re-encode videos on demand without changing the dataset payload.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import math
@@ -17,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import threading
 import time
 from typing import Any, Callable, Iterator
@@ -329,6 +332,72 @@ def _image_mimetype(blob: bytes, stored_path: Any = None) -> str:
     return guessed or "application/octet-stream"
 
 
+def _ffmpeg_executable() -> str:
+    try:
+        import imageio_ffmpeg
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe:
+            return str(exe)
+    except Exception:
+        pass
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    raise RuntimeError("ffmpeg is not available for browser video preview transcoding")
+
+
+def _transcode_video_to_h264(source: Path, target: Path) -> None:
+    """Create a browser-compatible H.264/yuv420p MP4 preview."""
+    ffmpeg = _ffmpeg_executable()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(f".{target.name}.tmp-{uuid.uuid4().hex}.mp4")
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-an",
+        "-vf",
+        # H.264/yuv420p requires even dimensions.  The scale expression leaves
+        # even-sized videos unchanged and crops an odd edge by one pixel.
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-profile:v",
+        "baseline",
+        "-level",
+        "3.0",
+        "-movflags",
+        "+faststart",
+        str(temp),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "ffmpeg failed")[-4000:]
+            raise RuntimeError(detail)
+        if not temp.is_file() or temp.stat().st_size <= 0:
+            raise RuntimeError("encoded preview is empty")
+        os.replace(temp, target)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _format_episode_path(root: Path, info: dict[str, Any], key: str, episode_index: int, **extra: Any) -> Path:
     template = info.get(key)
     if not isinstance(template, str) or not template:
@@ -574,6 +643,7 @@ class DatasetEditor:
         self.validate_installed = validate_installed
         self.assert_idle = assert_idle or (lambda _dataset_id: None)
         self.dataset_root.mkdir(parents=True, exist_ok=True)
+        self.video_cache_root = self.dataset_root / ".dashboard_video_cache"
         self._locks: dict[str, threading.Lock] = {}
         self._global_lock = threading.Lock()
 
@@ -682,6 +752,37 @@ class DatasetEditor:
         if not path.is_file():
             raise FileNotFoundError(path)
         return path
+
+    def browser_video_path(self, dataset_id: str, episode_index: int, video_key: str) -> Path:
+        """Return a browser-playable MP4 without mutating the LeRobot dataset.
+
+        OpenCV's default ``mp4v`` output is readable by training/evaluation
+        code, but many browsers cannot decode MPEG-4 Part 2 in an MP4 container.
+        The dashboard therefore serves an on-demand H.264/yuv420p preview cache
+        while keeping the original dataset video untouched.
+        """
+
+        source = self.video_path(dataset_id, episode_index, video_key)
+        stat = source.stat()
+        digest = hashlib.sha256(
+            f"{source.resolve()}\0{stat.st_size}\0{stat.st_mtime_ns}\0{video_key}".encode("utf-8")
+        ).hexdigest()[:24]
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", video_key).strip("._") or "video"
+        target_dir = self.video_cache_root / dataset_id / f"episode_{episode_index:06d}"
+        target = target_dir / f"{safe_key}-{digest}.h264.mp4"
+        if target.is_file() and target.stat().st_size > 0:
+            return target
+        with self._lock(f"video-cache:{dataset_id}:{episode_index}:{safe_key}"):
+            if target.is_file() and target.stat().st_size > 0:
+                return target
+            _transcode_video_to_h264(source, target)
+            for stale in target_dir.glob(f"{safe_key}-*.h264.mp4"):
+                if stale != target:
+                    try:
+                        stale.unlink()
+                    except OSError:
+                        pass
+            return target
 
     def image_path(self, dataset_id: str, episode_index: int, image_key: str, frame_index: int) -> Path:
         source, _mimetype = self.image_source(dataset_id, episode_index, image_key, frame_index)

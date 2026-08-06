@@ -2930,6 +2930,84 @@ def discover_external_eval_candidates(
     return candidates
 
 
+def _nccl_version(path: Path) -> int | None:
+    try:
+        import ctypes
+
+        lib = ctypes.CDLL(str(path))
+        version = ctypes.c_int()
+        if lib.ncclGetVersion(ctypes.byref(version)) != 0:
+            return None
+        return int(version.value)
+    except Exception:
+        return None
+
+
+_NCCL_PRELOAD_CACHE: str | None | bool = False
+
+
+def _compatible_nccl_preload_path(config: dict[str, Any]) -> str | None:
+    """Pick an NCCL runtime new enough for JAX's ncclConfig_t usage.
+
+    The 4x4090 OpenPI env currently bundles NCCL 2.14.3.  JAX 0.5 calls
+    ``ncclCommInitRankConfig`` with newer config fields; NCCL 2.14 rejects the
+    unset blocking sentinel with ``Invalid config blocking attribute value``.
+    Prefer a user-space CUDA-12 NCCL from sibling envs/caches via LD_PRELOAD
+    instead of reinstalling the training environment.
+    """
+
+    global _NCCL_PRELOAD_CACHE
+    if _NCCL_PRELOAD_CACHE is not False:
+        return _NCCL_PRELOAD_CACHE or None
+
+    configured = config.get("nccl_preload_path")
+    candidate_paths: list[Path] = []
+    if configured:
+        candidate_paths.append(Path(str(configured)).expanduser())
+    openpi_env = Path(config["openpi_python"]).resolve().parents[1]
+    conda_root = openpi_env.parent
+    py_versions = ("python3.12", "python3.11", "python3.10", "python3.9")
+    preferred_envs = ("openpi_eval_cu121", "RoboTwin2", "tsq-pilot")
+    for env_name in preferred_envs:
+        for py_version in py_versions:
+            candidate_paths.append(
+                conda_root
+                / env_name
+                / "lib"
+                / py_version
+                / "site-packages"
+                / "nvidia"
+                / "nccl"
+                / "lib"
+                / "libnccl.so.2"
+            )
+    candidate_paths.extend(
+        sorted(Path.home().glob(".cache/uv/archive-v0/*/nvidia/nccl/lib/libnccl.so.2"))
+    )
+    candidate_paths.append(Path("/usr/local/lib/python3.10/dist-packages/nvidia/nccl/lib/libnccl.so.2"))
+
+    candidates: list[tuple[int, int, Path]] = []
+    seen: set[Path] = set()
+    for priority, path in enumerate(candidate_paths):
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not resolved.is_file():
+            continue
+        seen.add(resolved)
+        version = _nccl_version(resolved)
+        if version is not None and version >= 22000:
+            candidates.append((priority, version, resolved))
+    # Prefer earlier, known CUDA-12-era candidates (notably the CU121 eval env)
+    # over newer CUDA-13 cache/system libraries.  CUDA-13 NCCL may load on this
+    # host but has produced CUDA OOM in tiny JAX pmap smoke tests.
+    cuda12_candidates = [item for item in candidates if item[1] < 22900]
+    selected = min(cuda12_candidates or candidates, default=None, key=lambda item: item[0])
+    _NCCL_PRELOAD_CACHE = str(selected[2]) if selected else None
+    return _NCCL_PRELOAD_CACHE or None
+
+
 def build_environment(
     config: dict[str, Any],
     gpu_ids: list[int] | None,
@@ -2939,12 +3017,19 @@ def build_environment(
     env = os.environ.copy()
     openpi_env_lib = str(Path(config["openpi_python"]).resolve().parent.parent / "lib")
     inherited_ld = env.get("LD_LIBRARY_PATH", "")
+    nccl_preload = _compatible_nccl_preload_path(config)
+    ld_parts = []
+    if nccl_preload:
+        ld_parts.append(str(Path(nccl_preload).parent))
+    ld_parts.append(openpi_env_lib)
+    if inherited_ld:
+        ld_parts.append(inherited_ld)
     env.update(
         {
             "XDG_CACHE_HOME": str(Path.home() / ".cache"),
             "HF_HOME": str(Path.home() / ".cache" / "huggingface"),
             "HF_LEROBOT_HOME": config["dataset_root"],
-            "LD_LIBRARY_PATH": openpi_env_lib + ((":" + inherited_ld) if inherited_ld else ""),
+            "LD_LIBRARY_PATH": ":".join(ld_parts),
             "PYTHONUNBUFFERED": "1",
             "TOKENIZERS_PARALLELISM": "false",
             # UUID-based visibility below keeps Dashboard physical ids stable
@@ -2958,6 +3043,9 @@ def build_environment(
             ),
         }
     )
+    if nccl_preload and gpu_ids is not None:
+        inherited_preload = env.get("LD_PRELOAD", "")
+        env["LD_PRELOAD"] = str(nccl_preload) + ((":" + inherited_preload) if inherited_preload else "")
     if gpu_ids is None:
         env["JAX_PLATFORMS"] = "cpu"
         env["CUDA_VISIBLE_DEVICES"] = ""
@@ -3532,7 +3620,12 @@ def create_app(config_path: Path) -> Flask:
     @app.get("/api/datasets/<dataset_id>/episodes/<int:episode_index>/video/<video_key>")
     def dataset_episode_video(dataset_id: str, episode_index: int, video_key: str):
         dataset_id = safe_name(dataset_id, "dataset id")
-        path = dataset_editor.video_path(dataset_id, episode_index, video_key)
+        raw = str(request.args.get("raw", "")).lower() in {"1", "true", "yes", "on"}
+        path = (
+            dataset_editor.video_path(dataset_id, episode_index, video_key)
+            if raw
+            else dataset_editor.browser_video_path(dataset_id, episode_index, video_key)
+        )
         return send_file(path, mimetype="video/mp4", conditional=True, max_age=0)
 
     @app.get("/api/datasets/<dataset_id>/episodes/<int:episode_index>/image/<image_key>/<int:frame_index>")
