@@ -115,6 +115,76 @@ from openpi.training import config as training_config
 from openpi.training import data_loader
 from openpi.training import weight_loaders
 
+
+def _decode_lerobot_video_frames_cv2(video_path, timestamps, tolerance_s, backend=None):
+    """Decode LeRobot MP4 frames through OpenCV instead of torchcodec.
+
+    The 4x4090 OpenPI conda env is intentionally JAX-first.  Its installed
+    torchcodec currently imports symbols that do not exist in the pinned torch
+    build, so LeRobot's default ``torchcodec`` video backend fails inside
+    DataLoader workers during norm/training.  OpenCV is already required by the
+    collection/export path and is sufficient for timestamp-aligned LeRobot frame
+    reads.
+    """
+
+    import cv2
+    import torch
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"cannot open video {video_path}")
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = int(round(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+        if fps <= 0:
+            raise RuntimeError(f"cannot determine fps for video {video_path}")
+        frames = []
+        for timestamp in timestamps:
+            frame_index = int(round(float(timestamp) * fps))
+            if frame_count > 0:
+                frame_index = max(0, min(frame_count - 1, frame_index))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame_bgr = cap.read()
+            if not ok or frame_bgr is None:
+                raise RuntimeError(f"cannot decode frame {frame_index} from {video_path}")
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frames.append(
+                torch.from_numpy(frame_rgb.transpose(2, 0, 1).copy())
+                .to(dtype=torch.float32)
+                .div(255.0)
+            )
+        if not frames:
+            raise RuntimeError(f"no timestamps requested for {video_path}")
+        return torch.stack(frames, dim=0)
+    finally:
+        cap.release()
+
+
+def _install_lerobot_cv2_video_backend() -> None:
+    """Patch LeRobot video decoding in the main process and spawn workers."""
+
+    try:
+        from lerobot.common.datasets import lerobot_dataset as lerobot_dataset_module
+        from lerobot.common.datasets import video_utils as video_utils_module
+    except Exception:
+        logging.exception("failed to import LeRobot video modules for OpenCV backend patch")
+        return
+
+    def get_safe_default_codec() -> str:
+        return "opencv"
+
+    video_utils_module.decode_video_frames = _decode_lerobot_video_frames_cv2
+    video_utils_module.get_safe_default_codec = get_safe_default_codec
+    lerobot_dataset_module.decode_video_frames = _decode_lerobot_video_frames_cv2
+    lerobot_dataset_module.get_safe_default_codec = get_safe_default_codec
+    # `openpi.training.data_loader` imports the LeRobot module and exposes it as
+    # `data_loader.lerobot_dataset`; patch that reference too for clarity.
+    data_loader.lerobot_dataset.decode_video_frames = _decode_lerobot_video_frames_cv2
+    data_loader.lerobot_dataset.get_safe_default_codec = get_safe_default_codec
+
+
+_install_lerobot_cv2_video_backend()
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
