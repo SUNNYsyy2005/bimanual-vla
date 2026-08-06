@@ -26,17 +26,72 @@ import numpy as np
 from websockets.exceptions import ConnectionClosedError, InvalidMessage
 
 
-def _disable_broken_torchvision_for_transformers() -> None:
-    """Avoid importing an incompatible torchvision in lightweight OpenPI jobs.
+def _install_torchvision_stub_if_broken() -> None:
+    """Install a tiny torchvision.transforms fallback for the JAX OpenPI env.
 
-    The 4x4090 `openpi` env is JAX-first and currently has torch==2.0.1 plus
-    a newer torchvision.  Transformers 4.53 marks torch unavailable because it
-    requires torch>=2.1, but still detects torchvision and imports
-    `torchvision.transforms` while constructing AutoProcessor, which then fails
-    on `torch._custom_ops`.  Norm/train/serve do not need torchvision here, so
-    force Transformers to treat torchvision as unavailable before importing
-    OpenPI modules that import `transformers.AutoProcessor`.
+    The 4x4090 `openpi` env is intentionally JAX-first.  It currently has
+    torch==2.0.1 and a torchvision wheel that expects newer torch internals
+    (`torch._custom_ops`).  LeRobot only needs `torchvision.transforms.ToTensor`
+    at import/runtime for PIL images, so patching this small API avoids an env
+    reinstall while keeping the training path functional.
     """
+
+    try:
+        import torchvision  # noqa: F401
+        return
+    except Exception:
+        for name in list(sys.modules):
+            if name == "torchvision" or name.startswith("torchvision."):
+                sys.modules.pop(name, None)
+
+    import importlib.machinery
+    import types
+
+    class _InterpolationMode:
+        NEAREST = "nearest"
+        NEAREST_EXACT = "nearest_exact"
+        BILINEAR = "bilinear"
+        BICUBIC = "bicubic"
+        BOX = "box"
+        HAMMING = "hamming"
+        LANCZOS = "lanczos"
+
+    class _ToTensor:
+        def __call__(self, image):
+            import torch
+
+            array = np.array(image)
+            if array.ndim == 2:
+                array = array[:, :, None]
+            tensor = torch.from_numpy(array.transpose((2, 0, 1))).contiguous()
+            if tensor.dtype == torch.uint8:
+                tensor = tensor.to(dtype=torch.float32).div(255.0)
+            else:
+                tensor = tensor.to(dtype=torch.float32)
+            return tensor
+
+    transforms_module = types.ModuleType("torchvision.transforms")
+    transforms_module.__spec__ = importlib.machinery.ModuleSpec("torchvision.transforms", loader=None)
+    transforms_module.ToTensor = _ToTensor
+    transforms_module.InterpolationMode = _InterpolationMode
+
+    torchvision_module = types.ModuleType("torchvision")
+    torchvision_module.__spec__ = importlib.machinery.ModuleSpec("torchvision", loader=None, is_package=True)
+    torchvision_module.__path__ = []
+    torchvision_module.transforms = transforms_module
+    torchvision_module.__version__ = "0.0-dashboard-stub"
+
+    sys.modules["torchvision"] = torchvision_module
+    sys.modules["torchvision.transforms"] = transforms_module
+
+
+def _disable_broken_torchvision_for_transformers() -> None:
+    """Avoid Transformers importing a broken torchvision backend."""
+
+    # Transformers >=4.53 emits a warning and disables torch when torch<2.1.
+    # This helper only needs processor/tokenizer code, so avoid that backend
+    # probe without changing LeRobot's direct `import torch` usage.
+    os.environ.setdefault("USE_TORCH", "0")
 
     try:
         from transformers.utils import import_utils as _hf_import_utils
@@ -49,6 +104,7 @@ def _disable_broken_torchvision_for_transformers() -> None:
 
 
 _disable_broken_torchvision_for_transformers()
+_install_torchvision_stub_if_broken()
 
 from openpi import transforms
 from openpi.models import pi0_config
