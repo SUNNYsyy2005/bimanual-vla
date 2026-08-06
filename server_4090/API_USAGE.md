@@ -501,7 +501,8 @@ Content-Type: application/json
   "source":"local_4090",
   "target":"h100",
   "parallelism":8,
-  "overwrite":false
+  "overwrite":false,
+  "skip_existing":true
 }
 ```
 
@@ -518,6 +519,7 @@ h200-ali-02
 
 - local/H100 等 SSH 可访问位置：并行 tar 流；
 - 涉及 H200 Slurm-only：自动使用 NAS staging + CPU-only Slurm copy job；
+- `skip_existing=true` 时目标数据集已经存在会直接成功跳过，适合训练前幂等同步；
 - 返回 `transfer` task，可用 `/api/tasks/<task_id>/status` 和 `/api/tasks/<task_id>/log` 查询。
 
 示例：
@@ -525,7 +527,7 @@ h200-ali-02
 ```bash
 curl -X POST "$DASH/api/datasets/put_bottles_dustbin_piper_100_25hz_realqpos_v3_order_aligned/sync" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"source":"local_4090","target":"h200-ali-01","parallelism":8,"overwrite":false}'
+  -d '{"source":"local_4090","target":"h200-ali-01","parallelism":8,"overwrite":false,"skip_existing":true}'
 ```
 
 ---
@@ -700,6 +702,8 @@ H100/H200 Slurm 示例：
 - `fsdp_devices` 必须整除 GPU 数；
 - `eval_interval_steps` 必须能被 `save_interval` 整除，且当前要求是 5000 的倍数；
 - 若 norm 不存在，本地训练会自动先创建 norm task，并在 norm 完成后训练；Slurm 训练会在一个 Slurm job 内先 norm 后 train。
+- `execution_target` 为 H100/H200 时，Dashboard 会先根据远端 inventory 判断数据集是否存在；不存在或 inventory 不可用时，默认先执行一次幂等数据集同步（`auto_sync_dataset=true`，目标已存在则跳过），然后再提交 Slurm norm/train。
+- Policy 推理只能在 4×4090 启动；H100/H200 训练出的 checkpoint 需要同步/落回 4×4090 的本地 checkpoint root 后才能在实机 Policy 中选择。
 
 返回 `train` task。若自动 norm，返回的 train task 可能处于 `waiting_norm`。
 
@@ -739,7 +743,7 @@ Content-Type: application/json
 
 ## 8. Policy / 实机推理接口
 
-仿真 Dashboard 通常 `enable_policy=false`，实机 Dashboard 使用以下接口。
+仿真 Dashboard 通常 `enable_policy=false`，实机 Dashboard 使用以下接口。Policy 服务端只允许在 4×4090 本地启动，不支持在 H100/H200 上开端口或做实机推理。
 
 ### 8.1 启动或切换 policy
 

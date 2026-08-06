@@ -54,7 +54,7 @@ def run(command: list[str], *, label: str) -> None:
     print(f"[dashboard] done {label}", flush=True)
 
 
-def transfer(source: dict[str, Any], target: dict[str, Any], dataset_id: str, *, overwrite: bool, parallelism: int, label: str) -> None:
+def transfer(source: dict[str, Any], target: dict[str, Any], dataset_id: str, *, overwrite: bool, parallelism: int, label: str, skip_existing: bool = False) -> None:
     cmd = [
         sys.executable,
         str(APP_DIR / "dataset_transfer_runner.py"),
@@ -65,13 +65,15 @@ def transfer(source: dict[str, Any], target: dict[str, Any], dataset_id: str, *,
     ]
     if overwrite:
         cmd.append("--overwrite")
+    if skip_existing:
+        cmd.append("--skip-existing")
     run(cmd, label=label)
 
 
 def inventory_refresh_snippet(target: dict[str, Any]) -> str:
-    cache_path = target.get("inventory_cache_path")
+    cache_path = target.get("inventory_source_path") or target.get("inventory_cache_path")
     if not cache_path:
-        return "echo '[dashboard] no inventory_cache_path configured; skip inventory refresh'"
+        return "echo '[dashboard] no inventory cache path configured; skip inventory refresh'"
     root = str(target["dataset_root"])
     return textwrap.dedent(f"""
     python3 - <<'PY'
@@ -90,8 +92,11 @@ def inventory_refresh_snippet(target: dict[str, Any]) -> str:
             if value in {{'real','robot','real_robot','physical'}}: return 'real'
             if value in {{'simulation','sim','synthetic','synthetic_sim'}}: return 'simulation'
         name = dataset_id.lower(); robot_type = str((info or {{}}).get('robot_type') or '').lower()
-        if any(token in name for token in ('sim','synth','cube','dustbin','bottle','lift_pot')) or robot_type in {{'aloha','sim','simulation'}}: return 'simulation'
-        if 'piper' in robot_type or 'real' in name or 'my_dataset' in name: return 'real'
+        if robot_type == 'piper': return 'real'
+        if __import__('re').search(r'(?:^|[._-])real(?:[._-]|$)', name) or name == 'my_dataset': return 'real'
+        simulation_name = any(token in name for token in ('sim','synth','synthetic','smoke','robottwin'))
+        if simulation_name or robot_type in {{'aloha','sim','simulation'}} or (robot_type.startswith('piper_single_arm') and bool((info or {{}}).get('video_path'))): return 'simulation'
+        if 'piper' in robot_type: return 'real'
         return 'unknown'
     rows=[]
     if root.exists():
@@ -134,12 +139,17 @@ def slurm_copy_job(target: dict[str, Any], commands: list[list[str]], labels: li
     run(cmd, label=f"slurm {direction} copy")
 
 
-def copy_from_staging_command(staging: str, target: dict[str, Any], dataset_id: str, overwrite: bool) -> str:
+def copy_from_staging_command(staging: str, target: dict[str, Any], dataset_id: str, overwrite: bool, skip_existing: bool = False) -> str:
     src = str(PurePosixPath(staging) / dataset_id)
     root = str(target["dataset_root"]).rstrip("/")
     dst = str(PurePosixPath(root) / dataset_id)
     tmp = f"{dst}.incoming-$$"
-    overwrite_logic = f"rm -rf {q(dst)}" if overwrite else f"test ! -e {q(dst)}"
+    if overwrite:
+        overwrite_logic = f"rm -rf {q(dst)}"
+    elif skip_existing:
+        overwrite_logic = f"if test -e {q(dst)}; then echo '[dashboard] target already exists; skip import: {dst}'; exit 0; fi"
+    else:
+        overwrite_logic = f"test ! -e {q(dst)}"
     return "\n".join([
         "set -euo pipefail",
         f"test -d {q(src)}",
@@ -179,6 +189,7 @@ def main() -> int:
     parser.add_argument("--source-json", required=True)
     parser.add_argument("--target-json", required=True)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--skip-existing", action="store_true", help="Return success without copying when target already exists")
     parser.add_argument("--parallelism", type=int, default=4)
     parser.add_argument("--nas-staging-root", default="/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync")
     args = parser.parse_args()
@@ -188,7 +199,7 @@ def main() -> int:
     source_slurm = source.get("kind") == "slurm_only" or source.get("access_mode") == "slurm_only"
     target_slurm = target.get("kind") == "slurm_only" or target.get("access_mode") == "slurm_only"
     if not (source_slurm or target_slurm):
-        transfer(source, target, args.dataset_id, overwrite=args.overwrite, parallelism=args.parallelism, label="direct transfer")
+        transfer(source, target, args.dataset_id, overwrite=args.overwrite, parallelism=args.parallelism, label="direct transfer", skip_existing=args.skip_existing)
         return 0
 
     staging = staging_root(source, target, args.nas_staging_root)
@@ -218,13 +229,13 @@ def main() -> int:
     if target_slurm:
         slurm_copy_job(
             target,
-            [["bash", "-lc", copy_from_staging_command(staging, target, args.dataset_id, args.overwrite)]],
+            [["bash", "-lc", copy_from_staging_command(staging, target, args.dataset_id, args.overwrite, args.skip_existing)]],
             ["import_from_nas"],
             args.dataset_id,
             "import",
         )
     else:
-        transfer(staging_location, target, args.dataset_id, overwrite=args.overwrite, parallelism=args.parallelism, label="fetch from NAS")
+        transfer(staging_location, target, args.dataset_id, overwrite=args.overwrite, parallelism=args.parallelism, label="fetch from NAS", skip_existing=args.skip_existing)
 
     print("[dashboard] slurm-aware dataset sync complete", flush=True)
     return 0

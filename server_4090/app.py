@@ -718,6 +718,13 @@ def dataset_origin_info(
 
     name = dataset_id.lower()
     robot_type = str(info.get("robot_type", "")).strip().lower()
+    real_name = bool(re.search(r"(?:^|[._-])real(?:[._-]|$)", name) or name == "my_dataset")
+    if robot_type == "piper" or real_name:
+        return {
+            "dataset_origin": "real",
+            "dataset_origin_source": "heuristic",
+            "dataset_origin_marker": None,
+        }
     simulation_name = bool(
         re.search(r"(?:^|[._-])(sim|synth|synthetic|smoke|robottwin)(?:[._-]|$)", name)
     )
@@ -731,7 +738,7 @@ def dataset_origin_info(
             "dataset_origin_source": "heuristic",
             "dataset_origin_marker": None,
         }
-    if robot_type == "piper":
+    if "piper" in robot_type:
         return {
             "dataset_origin": "real",
             "dataset_origin_source": "heuristic",
@@ -1302,6 +1309,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "eval_video_roots": [],
         "cluster_resources_script": str(REPO_DIR / "scripts" / "query_h100_h200_resources.sh"),
         "transfer_parallelism": 4,
+        "auto_sync_cluster_dataset": True,
         "nas_dataset_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync",
     }
     defaults.update(config)
@@ -4262,9 +4270,14 @@ def origin_for(dataset_id, info, marker):
     if isinstance(info, dict) and isinstance(info.get("simulation"), bool):
         return "simulation" if info["simulation"] else "real"
     name = dataset_id.lower(); robot_type = str((info or {}).get("robot_type") or "").lower()
-    if any(token in name for token in ("sim", "synth", "cube", "dustbin", "bottle", "lift_pot")) or robot_type in {"aloha", "sim", "simulation"}:
+    if robot_type == "piper":
+        return "real"
+    if __import__("re").search(r"(?:^|[._-])real(?:[._-]|$)", name) or name == "my_dataset":
+        return "real"
+    simulation_name = any(token in name for token in ("sim", "synth", "synthetic", "smoke", "robottwin"))
+    if simulation_name or robot_type in {"aloha", "sim", "simulation"} or (robot_type.startswith("piper_single_arm") and bool((info or {}).get("video_path"))):
         return "simulation"
-    if "piper" in robot_type or "real" in name or "my_dataset" in name:
+    if "piper" in robot_type:
         return "real"
     return "unknown"
 rows=[]
@@ -4302,13 +4315,47 @@ print(json.dumps(rows, ensure_ascii=False))
                 )
             stdout = ""
             source_label = str(cache_path)
+
+            def read_inventory_source() -> tuple[str, str] | tuple[None, None]:
+                source_path = location.get("inventory_source_path")
+                source_host = location.get("inventory_source_host") or location.get("submit_host")
+                if not source_path:
+                    return None, None
+                if not source_host or str(source_host) in {"local", "local_4090", "4x4090"}:
+                    candidate = Path(str(source_path)).expanduser()
+                    if candidate.is_file() and candidate.stat().st_size > 0:
+                        return candidate.read_text(encoding="utf-8"), str(candidate)
+                    return None, None
+                command = f"test -s {shlex.quote(str(source_path))} && cat {shlex.quote(str(source_path))}"
+                try:
+                    result = subprocess.run(
+                        [*SSH_COMMAND, str(source_host), command],
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=min(timeout, 20),
+                    )
+                except Exception:
+                    return None, None
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout, f"{source_host}:{source_path}"
+                return None, None
+
             if not cache_host or str(cache_host) in {"local", "local_4090", "4x4090"}:
                 local_cache = Path(str(cache_path)).expanduser()
-                if not local_cache.is_file() or local_cache.stat().st_size <= 0:
-                    note = location.get("inventory_note") or "slurm-only local inventory cache is not ready"
-                    return [], f"{note}; cache={local_cache}"
-                stdout = local_cache.read_text(encoding="utf-8")
-                source_label = str(local_cache)
+                if local_cache.is_file() and local_cache.stat().st_size > 0:
+                    stdout = local_cache.read_text(encoding="utf-8")
+                    source_label = str(local_cache)
+                else:
+                    source_stdout, source_label_value = read_inventory_source()
+                    if source_stdout:
+                        local_cache.parent.mkdir(parents=True, exist_ok=True)
+                        local_cache.write_text(source_stdout, encoding="utf-8")
+                        stdout = source_stdout
+                        source_label = source_label_value or str(local_cache)
+                    else:
+                        note = location.get("inventory_note") or "slurm-only local inventory cache is not ready"
+                        return [], f"{note}; cache={local_cache}"
             else:
                 command = f"test -s {shlex.quote(str(cache_path))} && cat {shlex.quote(str(cache_path))}"
                 try:
@@ -4322,10 +4369,16 @@ print(json.dumps(rows, ensure_ascii=False))
                 except Exception as exc:
                     return [], str(exc)
                 if result.returncode != 0:
-                    note = location.get("inventory_note") or "slurm-only inventory cache is not ready"
-                    return [], f"{note}; cache={cache_path}; {(result.stderr or result.stdout)[-1000:]}"
-                stdout = result.stdout
-                source_label = f"{cache_host}:{cache_path}"
+                    source_stdout, source_label_value = read_inventory_source()
+                    if source_stdout:
+                        stdout = source_stdout
+                        source_label = source_label_value or f"{cache_host}:{cache_path}"
+                    else:
+                        note = location.get("inventory_note") or "slurm-only inventory cache is not ready"
+                        return [], f"{note}; cache={cache_path}; {(result.stderr or result.stdout)[-1000:]}"
+                else:
+                    stdout = result.stdout
+                    source_label = f"{cache_host}:{cache_path}"
             try:
                 payload = json.loads(stdout or "{}")
             except json.JSONDecodeError as exc:
@@ -4472,6 +4525,8 @@ print(json.dumps(rows, ensure_ascii=False))
             command += ["--nas-staging-root", str(config["nas_dataset_staging_root"])]
         if overwrite:
             command.append("--overwrite")
+        if bool(payload.get("skip_existing", False)):
+            command.append("--skip-existing")
         task = tasks.start(
             "transfer",
             command,
@@ -4827,7 +4882,48 @@ print(json.dumps(rows, ensure_ascii=False))
             effective_mode=effective_mode,
             wandb_enabled=bool(payload.get("wandb_enabled", False)),
         )
+        cluster_dataset_sync_command: list[str] | None = None
+        remote_checkpoint_dir: str | None = None
         if is_cluster_target:
+            auto_sync_raw = payload.get("auto_sync_dataset", config.get("auto_sync_cluster_dataset", True))
+            auto_sync_dataset = (
+                auto_sync_raw
+                if isinstance(auto_sync_raw, bool)
+                else str(auto_sync_raw).strip().lower() not in {"0", "false", "no", "off", ""}
+            )
+            if auto_sync_dataset:
+                locations = dataset_location_configs()
+                if execution_target not in locations:
+                    raise ValueError(f"dataset sync target is not configured: {execution_target}")
+                source_location = locations["local_4090"]
+                target_location = locations[execution_target]
+                target_rows, target_inventory_error = remote_dataset_inventory(target_location)
+                target_has_dataset = any(str(row.get("id")) == dataset_id for row in target_rows)
+                if not target_has_dataset:
+                    if target_inventory_error:
+                        app.logger.warning(
+                            "cluster dataset inventory failed for %s before train; will attempt sync: %s",
+                            execution_target,
+                            target_inventory_error,
+                        )
+                    slurm_sync = target_location.get("kind") == "slurm_only"
+                    sync_runner = "slurm_dataset_sync_runner.py" if slurm_sync else "dataset_transfer_runner.py"
+                    cluster_dataset_sync_command = [
+                        config["openpi_python"],
+                        str(APP_DIR / sync_runner),
+                        "--dataset-id", dataset_id,
+                        "--source-json", json_arg(source_location),
+                        "--target-json", json_arg(target_location),
+                        "--parallelism", str(config.get("transfer_parallelism", 4)),
+                        "--skip-existing",
+                    ]
+                    if slurm_sync and config.get("nas_dataset_staging_root"):
+                        cluster_dataset_sync_command += ["--nas-staging-root", str(config["nas_dataset_staging_root"])]
+            remote_checkpoint_dir = str(
+                PurePosixPath(str(cluster_target_config["checkpoint_base_dir"]).rstrip("/"))
+                / policy_config_name(arm_mode, model_variant)
+                / exp_name
+            )
             remote_base_checkpoint = translate_runtime_path(base_checkpoint, cluster_target_config)
             remote_norm_batch_size = safe_int(payload.get("norm_batch_size", 16), "norm_batch_size", 1, 1024)
             remote_norm_num_workers = safe_int(payload.get("norm_num_workers", 2), "norm_num_workers", 1, 64)
@@ -4863,7 +4959,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 effective_mode=effective_mode,
                 wandb_enabled=bool(payload.get("wandb_enabled", False)),
             )
-            command = slurm_runner_command(
+            slurm_command = slurm_runner_command(
                 target_name=execution_target,
                 target_config={
                     **cluster_target_config,
@@ -4871,8 +4967,19 @@ print(json.dumps(rows, ensure_ascii=False))
                 },
                 commands=[remote_norm_command, remote_train_command],
                 labels=["norm", "train"],
-                job_name=f"sim_train_{exp_name}",
+                job_name=f"{'sim' if config.get('dashboard_profile') == 'simulation' else 'real'}_train_{exp_name}",
             )
+            if cluster_dataset_sync_command is not None:
+                command = [
+                    "bash",
+                    "-lc",
+                    "set -euo pipefail; "
+                    + shlex.join([str(item) for item in cluster_dataset_sync_command])
+                    + " && "
+                    + shlex.join([str(item) for item in slurm_command]),
+                ]
+            else:
+                command = slurm_command
         metadata = {
             "dataset_id": dataset_id,
             "arm_mode": arm_mode,
@@ -4901,6 +5008,8 @@ print(json.dumps(rows, ensure_ascii=False))
             "mode": mode,
             "effective_mode": effective_mode,
             "checkpoint_dir": str(checkpoint_dir),
+            "remote_checkpoint_dir": remote_checkpoint_dir,
+            "auto_sync_dataset": bool(cluster_dataset_sync_command is not None),
             "test_ratio": split.test_ratio,
             "split_seed": split.seed,
             "split_source": split_source,
@@ -5156,6 +5265,9 @@ print(json.dumps(rows, ensure_ascii=False))
     @app.post("/api/tasks/policy")
     def start_policy():
         payload = request.get_json(force=True)
+        policy_target = str(payload.get("execution_target", "local_4090") or "local_4090")
+        if policy_target not in {"", "local", "local_4090", "4x4090"}:
+            raise ValueError("Policy serving is only supported on the 4×4090 host; train/sync checkpoints back before serving")
         dataset_id, arm_mode, arm_side, schema, dataset_contract = parse_dataset(payload)
         port = safe_int(payload.get("port", 8000), "port", config["policy_port_min"], config["policy_port_max"])
         checkpoint = resolve_under(payload.get("checkpoint", ""), checkpoint_roots)

@@ -615,11 +615,11 @@ async function loadDatasetLocations(forceRender = false) {
 async function syncDatasetTo(datasetId, selectId, source) {
   const target = document.getElementById(selectId)?.value;
   if (!target) { show('请选择同步目标。'); return; }
-  const overwrite = confirm(`同步 ${datasetId}: ${source} → ${target}\n如果目标已存在，是否覆盖？\n\n确定=覆盖；取消=不覆盖且目标存在时失败。`);
+  const overwrite = confirm(`同步 ${datasetId}: ${source} → ${target}\n如果目标已存在，是否覆盖？\n\n确定=覆盖；取消=不覆盖，且目标已存在时直接跳过。`);
   try {
     const task = await api(`/api/datasets/${encodeURIComponent(datasetId)}/sync`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({source, target, overwrite, parallelism: 4}),
+      body: JSON.stringify({source, target, overwrite, skip_existing: !overwrite, parallelism: 4}),
     });
     show(`数据集同步任务已启动：${task.id}（${source} → ${target}）`, false);
     showModule('training');
