@@ -3917,10 +3917,107 @@ def create_app(config_path: Path) -> Flask:
         return path
 
     REMOTE_EVAL_VIDEO_INVENTORY_SCRIPT = r'''
-import json, os
-from pathlib import Path
+import json, os, re
+from pathlib import Path, PurePosixPath
 suffixes = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".gif"}
 roots = [Path(item).expanduser() for item in json.loads(os.environ.get("EVAL_VIDEO_ROOTS", "[]"))]
+
+def infer_metadata(root, rel, path):
+    parts = list(PurePosixPath(rel).parts)
+    name = parts[-1] if parts else rel
+    experiment = next((part for part in parts if "eval" in part.lower() or "ckpt" in part.lower() or "cp" in part.lower()), None)
+    if experiment is None and len(parts) >= 2:
+        experiment = parts[-2]
+    task_name = parts[0] if parts else "-"
+    success = None
+    score = None
+    episode_status = None
+    episode_seed = None
+
+    episode_match = re.search(r"episode(\d+)\.mp4$", name)
+    if episode_match is not None:
+        episode_index = int(episode_match.group(1))
+        jsonl_path = path.parent / "_episode_results.jsonl"
+        if jsonl_path.is_file():
+            rows = []
+            try:
+                for line in jsonl_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except Exception:
+                        continue
+                    try:
+                        item_episode_index = int(item.get("episode_index", -1))
+                    except Exception:
+                        item_episode_index = -1
+                    if item_episode_index == episode_index and item.get("counted_in_success_rate", True):
+                        rows.append(item)
+            except Exception:
+                rows = []
+            if rows:
+                item = rows[-1]
+                score_value = item.get("stage_reward")
+                if isinstance(score_value, (int, float)):
+                    score = float(score_value)
+                episode_status = str(item.get("status", "")) or None
+                episode_seed = item.get("seed")
+                if bool(item.get("success")):
+                    success = "success"
+                else:
+                    status_value = str(item.get("status", "failure")).lower()
+                    if status_value == "success":
+                        success = "success"
+                    elif status_value in {"failure", "failed", "policy_error", "expert_failed", "expert_invalid", "expert_unstable"} or "success" in item:
+                        success = "failed"
+
+    if success is None:
+        root_resolved = root.resolve()
+        for parent in [path.parent, *path.parents]:
+            try:
+                parent_resolved = parent.resolve()
+                if root_resolved not in [parent_resolved, *parent_resolved.parents]:
+                    break
+            except Exception:
+                pass
+            result_file = parent / "_result.txt"
+            if not result_file.is_file():
+                continue
+            text = result_file.read_text(encoding="utf-8", errors="replace")[-4000:]
+            lowered = text.lower()
+            if "success" in lowered and "fail" not in lowered:
+                success = "success"
+            elif "fail" in lowered or "failure" in lowered:
+                success = "failed"
+            else:
+                for token in reversed(text.replace(",", " ").split()):
+                    try:
+                        score = float(token)
+                        success = "success" if score >= 0.5 else "failed"
+                        break
+                    except ValueError:
+                        continue
+            if success:
+                break
+    if success is None:
+        lowered = rel.lower()
+        if "success" in lowered:
+            success = "success"
+        elif "fail" in lowered or "failed" in lowered:
+            success = "failed"
+        else:
+            success = "unknown"
+    return {
+        "task": task_name,
+        "experiment": experiment or "-",
+        "success": success,
+        "score": score,
+        "episode_status": episode_status,
+        "episode_seed": episode_seed,
+    }
+
 rows = []
 for root in roots:
     if not root.exists():
@@ -3940,6 +4037,7 @@ for root in roots:
             "root": str(root),
             "size_mib": round(stat.st_size / (1024**2), 2),
             "mtime": stat.st_mtime,
+            **infer_metadata(root, rel, path),
         })
 print(json.dumps(rows, ensure_ascii=False))
 '''
@@ -3964,33 +4062,81 @@ print(json.dumps(rows, ensure_ascii=False))
         task_name = parts[0] if parts else "-"
         success: str | None = None
         score: float | None = None
+        episode_status: str | None = None
+        episode_seed: Any | None = None
         root_path = Path(root)
         path = root_path / relative_path
-        for parent in [path.parent, *path.parents]:
-            try:
-                if root_path.resolve() not in [parent.resolve(), *parent.resolve().parents]:
-                    break
-            except Exception:
-                pass
-            result_file = parent / "_result.txt"
-            if not result_file.is_file():
-                continue
-            text = result_file.read_text(encoding="utf-8", errors="replace")[-4000:]
-            lowered = text.lower()
-            if "success" in lowered and "fail" not in lowered:
-                success = "success"
-            elif "fail" in lowered or "failure" in lowered:
-                success = "failed"
-            else:
-                for token in reversed(text.replace(",", " ").split()):
-                    try:
-                        score = float(token)
-                        success = "success" if score >= 0.5 else "failed"
+
+        # Prefer per-episode RoboTwin jsonl metadata when available.  The old
+        # fallback below only inspected a run-level _result.txt, which is often
+        # absent until the whole eval finishes and cannot represent individual
+        # episode videos; that made running continuous eval videos show up as
+        # "unknown" even though _episode_results.jsonl already had statuses.
+        episode_match = re.search(r"episode(\d+)\.mp4$", name)
+        if episode_match is not None:
+            episode_index = int(episode_match.group(1))
+            jsonl_path = path.parent / "_episode_results.jsonl"
+            if jsonl_path.is_file():
+                try:
+                    rows = []
+                    for line in jsonl_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            item = json.loads(line)
+                        except Exception:
+                            continue
+                        try:
+                            item_episode_index = int(item.get("episode_index", -1))
+                        except Exception:
+                            item_episode_index = -1
+                        if item_episode_index == episode_index and item.get("counted_in_success_rate", True):
+                            rows.append(item)
+                    if rows:
+                        item = rows[-1]
+                        score_value = item.get("stage_reward")
+                        if isinstance(score_value, (int, float)):
+                            score = float(score_value)
+                        episode_status = str(item.get("status", "")) or None
+                        episode_seed = item.get("seed")
+                        if bool(item.get("success")):
+                            success = "success"
+                        else:
+                            status_value = str(item.get("status", "failure")).lower()
+                            if status_value in {"success"}:
+                                success = "success"
+                            elif status_value in {"failure", "failed", "policy_error", "expert_failed", "expert_invalid", "expert_unstable"} or "success" in item:
+                                success = "failed"
+                except Exception:
+                    pass
+
+        if success is None:
+            for parent in [path.parent, *path.parents]:
+                try:
+                    if root_path.resolve() not in [parent.resolve(), *parent.resolve().parents]:
                         break
-                    except ValueError:
-                        continue
-            if success:
-                break
+                except Exception:
+                    pass
+                result_file = parent / "_result.txt"
+                if not result_file.is_file():
+                    continue
+                text = result_file.read_text(encoding="utf-8", errors="replace")[-4000:]
+                lowered = text.lower()
+                if "success" in lowered and "fail" not in lowered:
+                    success = "success"
+                elif "fail" in lowered or "failure" in lowered:
+                    success = "failed"
+                else:
+                    for token in reversed(text.replace(",", " ").split()):
+                        try:
+                            score = float(token)
+                            success = "success" if score >= 0.5 else "failed"
+                            break
+                        except ValueError:
+                            continue
+                if success:
+                    break
         if success is None:
             lowered = relative_path.lower()
             if "success" in lowered:
@@ -4004,6 +4150,8 @@ print(json.dumps(rows, ensure_ascii=False))
             "experiment": experiment or "-",
             "success": success,
             "score": score,
+            "episode_status": episode_status,
+            "episode_seed": episode_seed,
             "source": source,
             "display_name": name,
         }
@@ -4053,9 +4201,17 @@ print(json.dumps(rows, ensure_ascii=False))
                 rel = str(row.get("relative_path", ""))
                 if root not in roots or not rel or PurePosixPath(rel).is_absolute() or ".." in PurePosixPath(rel).parts:
                     continue
+                metadata = eval_video_metadata(root, rel, source=name)
+                # For remote videos, per-episode jsonl/_result.txt lives on the
+                # remote host, so metadata inferred by the remote inventory
+                # script must override local path fallbacks.  Otherwise every
+                # remote episode without a local copy is shown as "unknown".
+                for key in ("task", "experiment", "success", "score", "episode_status", "episode_seed"):
+                    if key in row and row.get(key) is not None:
+                        metadata[key] = row.get(key)
                 videos.append({
                     **row,
-                    **eval_video_metadata(root, rel, source=name),
+                    **metadata,
                     "id": base64.urlsafe_b64encode(f"{name}\0{root}\0{rel}".encode()).decode().rstrip("="),
                     "source": name,
                     "host": host,
