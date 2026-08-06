@@ -24,7 +24,7 @@ import sys
 import tarfile
 import threading
 import time
-from typing import Any
+from typing import Any, Iterable
 from urllib.request import urlopen
 import uuid
 
@@ -2673,6 +2673,32 @@ def gpu_memory_shortfalls(
     return shortfalls
 
 
+def process_owner_map(pids: Iterable[int]) -> dict[int, str]:
+    unique_pids = sorted({int(pid) for pid in pids if int(pid) > 0})
+    if not unique_pids:
+        return {}
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", "pid=,user=", "-p", ",".join(str(pid) for pid in unique_pids)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+        return {}
+    owners: dict[int, str] = {}
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid = _nvidia_int(parts[0])
+        if pid is not None and parts[1].strip():
+            owners[pid] = parts[1].strip()
+    return owners
+
+
 def gpu_inventory() -> list[dict[str, Any]]:
     gpu_cmd = [
         "nvidia-smi",
@@ -2689,7 +2715,7 @@ def gpu_inventory() -> list[dict[str, Any]]:
         process_lines = subprocess.check_output(proc_cmd, text=True, timeout=10).splitlines()
     except (FileNotFoundError, subprocess.SubprocessError):
         return []
-    processes: dict[str, list[dict[str, Any]]] = {}
+    raw_processes: list[tuple[str, int, str | None, int | None]] = []
     unavailable_uuids: set[str] = set()
     for line in process_lines:
         parts = [part.strip() for part in line.split(",", 3)]
@@ -2702,11 +2728,23 @@ def gpu_inventory() -> list[dict[str, Any]]:
             # that physical GPU, so keep the Dashboard alive but mark it unsafe.
             unavailable_uuids.add(parts[0])
             continue
-        processes.setdefault(parts[0], []).append(
+        raw_processes.append(
+            (
+                parts[0],
+                pid,
+                None if parts[2] == "[N/A]" else parts[2],
+                _nvidia_int(parts[3]),
+            )
+        )
+    process_owners = process_owner_map(pid for _, pid, _, _ in raw_processes)
+    processes: dict[str, list[dict[str, Any]]] = {}
+    for uuid, pid, name, memory_mib in raw_processes:
+        processes.setdefault(uuid, []).append(
             {
                 "pid": pid,
-                "name": None if parts[2] == "[N/A]" else parts[2],
-                "memory_mib": _nvidia_int(parts[3]),
+                "user": process_owners.get(pid),
+                "name": name,
+                "memory_mib": memory_mib,
             }
         )
     gpus = []
