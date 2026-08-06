@@ -530,6 +530,40 @@ curl -X POST "$DASH/api/datasets/put_bottles_dustbin_piper_100_25hz_realqpos_v3_
   -d '{"source":"local_4090","target":"h200-ali-01","parallelism":8,"overwrite":false,"skip_existing":true}'
 ```
 
+
+### 5.3 同步 H100/H200 checkpoint 回 4×4090
+
+Policy 推理只能在 4×4090 本地启动。H100/H200 Slurm 训练完成后，可以把远端实验目录同步回 4×4090 checkpoint root：
+
+```http
+POST /api/checkpoints/sync
+Content-Type: application/json
+```
+
+请求：
+
+```json
+{
+  "source":"h100",
+  "target":"local_4090",
+  "config_name":"pi05_piper_single_arm_lora",
+  "exp_name":"my_real_exp",
+  "parallelism":8,
+  "overwrite":false,
+  "skip_existing":true
+}
+```
+
+也可以用 `arm_mode` + `model_variant` 代替 `config_name`。涉及 H200 Slurm-only 时同样通过 NAS staging + CPU-only Slurm copy job，不在 H100/H200 上开启服务端口。返回 `transfer` task，日志里会显示源/目标 checkpoint 路径。
+
+示例：
+
+```bash
+curl -X POST "$DASH/api/checkpoints/sync" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"source":"h100","target":"local_4090","config_name":"pi05_piper_single_arm_lora","exp_name":"my_real_exp","parallelism":8,"overwrite":false,"skip_existing":true}'
+```
+
 ---
 
 ## 6. 采集会话接口
@@ -703,7 +737,7 @@ H100/H200 Slurm 示例：
 - `eval_interval_steps` 必须能被 `save_interval` 整除，且当前要求是 5000 的倍数；
 - 若 norm 不存在，本地训练会自动先创建 norm task，并在 norm 完成后训练；Slurm 训练会在一个 Slurm job 内先 norm 后 train。
 - `execution_target` 为 H100/H200 时，Dashboard 会先根据远端 inventory 判断数据集是否存在；不存在或 inventory 不可用时，默认先执行一次幂等数据集同步（`auto_sync_dataset=true`，目标已存在则跳过），然后再提交 Slurm norm/train。
-- Policy 推理只能在 4×4090 启动；H100/H200 训练出的 checkpoint 需要同步/落回 4×4090 的本地 checkpoint root 后才能在实机 Policy 中选择。
+- Policy 推理只能在 4×4090 启动；H100/H200 训练出的 checkpoint 需要通过 `POST /api/checkpoints/sync` 同步回 4×4090 的本地 checkpoint root 后才能在实机 Policy 中选择。
 
 返回 `train` task。若自动 norm，返回的 train task 可能处于 `waiting_norm`。
 

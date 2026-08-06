@@ -1311,6 +1311,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "transfer_parallelism": 4,
         "auto_sync_cluster_dataset": True,
         "nas_dataset_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync",
+        "nas_checkpoint_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_checkpoint_sync",
     }
     defaults.update(config)
     profile = str(defaults.get("dashboard_profile") or "real").lower()
@@ -1343,6 +1344,8 @@ def load_config(path: Path) -> dict[str, Any]:
     )
     if defaults.get("nas_dataset_staging_root"):
         defaults["nas_dataset_staging_root"] = str(defaults["nas_dataset_staging_root"])
+    if defaults.get("nas_checkpoint_staging_root"):
+        defaults["nas_checkpoint_staging_root"] = str(defaults["nas_checkpoint_staging_root"])
     try:
         defaults["transfer_parallelism"] = max(1, min(16, int(defaults.get("transfer_parallelism", 4))))
     except (TypeError, ValueError):
@@ -4382,6 +4385,40 @@ print(json.dumps(rows, ensure_ascii=False))
             }
         return locations
 
+    def checkpoint_location_configs(config_name: str) -> dict[str, dict[str, Any]]:
+        config_name = safe_name(config_name, "checkpoint config name")
+        locations = {
+            "local_4090": {
+                "name": "local_4090",
+                "label": "4×4090",
+                "kind": "local",
+                "host": None,
+                "dataset_root": str(PurePosixPath(str(config["checkpoint_base_dir"]).rstrip("/")) / config_name),
+                "available": True,
+            }
+        }
+        for name, target in config.get("cluster_targets", {}).items():
+            if not target.get("checkpoint_base_dir"):
+                continue
+            locations[name] = {
+                "name": name,
+                "label": target.get("label") or name,
+                "kind": "slurm_only" if target.get("access_mode") == "slurm_only" else "ssh",
+                "access_mode": target.get("access_mode", "ssh"),
+                "host": target.get("submit_host"),
+                "submit_host": target.get("submit_host"),
+                "partition": target.get("partition"),
+                "node": target.get("node"),
+                "gpu_type": target.get("gpu_type"),
+                "workdir": target.get("workdir"),
+                "remote_job_dir": target.get("remote_job_dir"),
+                "log_dir": target.get("log_dir"),
+                "dataset_root": str(PurePosixPath(str(target["checkpoint_base_dir"]).rstrip("/")) / config_name),
+                "nas_dataset_staging_root": target.get("nas_checkpoint_staging_root") or config.get("nas_checkpoint_staging_root"),
+                "available": True,
+            }
+        return locations
+
     def local_dataset_inventory(location: dict[str, Any]) -> list[dict[str, Any]]:
         root = Path(str(location["dataset_root"])).expanduser()
         rows = []
@@ -4694,6 +4731,74 @@ print(json.dumps(rows, ensure_ascii=False))
                 "overwrite": overwrite,
                 "source_path": str(PurePosixPath(str(locations[source_name]["dataset_root"])) / dataset_id),
                 "target_path": str(PurePosixPath(str(locations[target_name]["dataset_root"])) / dataset_id),
+                "parallelism": parallelism,
+            },
+        )
+        return jsonify(task), 201
+
+    @app.post("/api/checkpoints/sync")
+    def sync_checkpoint():
+        payload = request.get_json(force=True)
+        source_name = str(payload.get("source", ""))
+        target_name = str(payload.get("target", "local_4090") or "local_4090")
+        if not source_name:
+            raise ValueError("source is required")
+        if target_name != "local_4090":
+            raise ValueError("checkpoint sync target must be local_4090 because Policy serving only runs on 4×4090")
+        if payload.get("config_name"):
+            config_name = safe_name(payload.get("config_name"), "checkpoint config name")
+        else:
+            arm_mode = str(payload.get("arm_mode", "single"))
+            model_variant = str(payload.get("model_variant", "pi05"))
+            if arm_mode not in {"single", "bimanual"}:
+                raise ValueError("arm_mode must be single or bimanual")
+            if model_variant not in MODEL_VARIANTS:
+                raise ValueError(f"model_variant must be one of {sorted(MODEL_VARIANTS)}")
+            config_name = policy_config_name(arm_mode, model_variant)
+        exp_name = safe_name(payload.get("exp_name"), "experiment name")
+        overwrite = bool(payload.get("overwrite", False))
+        skip_existing = bool(payload.get("skip_existing", not overwrite))
+        parallelism = safe_int(payload.get("parallelism", config.get("transfer_parallelism", 4)), "parallelism", 1, 16)
+        locations = checkpoint_location_configs(config_name)
+        if source_name not in locations:
+            raise ValueError(f"unknown checkpoint source location: {source_name}")
+        if target_name not in locations:
+            raise ValueError(f"unknown checkpoint target location: {target_name}")
+        if source_name == target_name:
+            raise ValueError("source and target must differ")
+        slurm_involved = (
+            locations[source_name].get("kind") == "slurm_only"
+            or locations[target_name].get("kind") == "slurm_only"
+        )
+        runner = "slurm_dataset_sync_runner.py" if slurm_involved else "dataset_transfer_runner.py"
+        command = [
+            config["openpi_python"],
+            str(APP_DIR / runner),
+            "--dataset-id", exp_name,
+            "--source-json", json_arg(locations[source_name]),
+            "--target-json", json_arg(locations[target_name]),
+            "--parallelism", str(parallelism),
+        ]
+        if slurm_involved and config.get("nas_checkpoint_staging_root"):
+            command += ["--nas-staging-root", str(config["nas_checkpoint_staging_root"])]
+        if overwrite:
+            command.append("--overwrite")
+        if skip_existing:
+            command.append("--skip-existing")
+        task = tasks.start(
+            "transfer",
+            command,
+            env=build_environment(config, None),
+            metadata={
+                "transfer_kind": "checkpoint",
+                "config_name": config_name,
+                "exp_name": exp_name,
+                "source": source_name,
+                "target": target_name,
+                "overwrite": overwrite,
+                "skip_existing": skip_existing,
+                "source_path": str(PurePosixPath(str(locations[source_name]["dataset_root"])) / exp_name),
+                "target_path": str(PurePosixPath(str(locations[target_name]["dataset_root"])) / exp_name),
                 "parallelism": parallelism,
             },
         )
@@ -5166,6 +5271,18 @@ print(json.dumps(rows, ensure_ascii=False))
             "checkpoint_dir": str(checkpoint_dir),
             "remote_checkpoint_dir": remote_checkpoint_dir,
             "auto_sync_dataset": bool(cluster_dataset_sync_command is not None),
+            "checkpoint_sync_payload": (
+                {
+                    "source": execution_target,
+                    "target": "local_4090",
+                    "config_name": policy_config_name(arm_mode, model_variant),
+                    "exp_name": exp_name,
+                    "overwrite": False,
+                    "skip_existing": True,
+                }
+                if is_cluster_target
+                else None
+            ),
             "test_ratio": split.test_ratio,
             "split_seed": split.seed,
             "split_source": split_source,
