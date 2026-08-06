@@ -586,10 +586,6 @@ class Pi0LeRobotDatasetWriter:
                     "timestamp": self._stat_dict(canonical_timestamps[:, None]),
                     "state_timestamp": self._stat_dict(state_timestamps[:, None]),
                     "action_timestamp": self._stat_dict(action_timestamps[:, None]),
-                    **{
-                        f"image_timestamp.{key}": self._stat_dict(values[:, None])
-                        for key, values in image_timestamps.items()
-                    },
                 },
             },
         )
