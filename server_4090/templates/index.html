@@ -140,7 +140,7 @@
       <button class="nav-button" data-module="training">训练 <span id="navTrainingCount" class="nav-count">-</span></button>
       {% if enable_policy %}<button class="nav-button" data-module="policy">Policy <span id="navPolicyCount" class="nav-count">-</span></button>
       <button class="nav-button" data-module="telemetry">实时遥测 <span id="navTelemetryCount" class="nav-count">-</span></button>{% endif %}
-      <button class="nav-button" data-module="eval-videos">评估视频 <span id="navEvalVideoCount" class="nav-count">-</span></button>
+      {% if dashboard_profile == "simulation" %}<button class="nav-button" data-module="eval-videos">评估视频 <span id="navEvalVideoCount" class="nav-count">-</span></button>{% endif %}
     </nav>
   </div>
 
@@ -258,6 +258,7 @@
       </div>
     </section>
 
+{% if dashboard_profile == "simulation" %}
     <section id="module-eval-videos" class="dashboard-module" data-module="eval-videos" hidden>
       <div class="module-heading"><div><h2>评估视频</h2><p>先显示列表，按实际任务/实验/成功状态筛选；点击某个视频后才加载播放器。</p></div></div>
       <div class="grid"><div class="card">
@@ -273,6 +274,7 @@
         <div id="evalVideoList" class="eval-video-list"></div>
       </div></div>
     </section>
+{% endif %}
 
     <section id="module-policy" class="dashboard-module" data-module="policy" hidden>
       <div class="module-heading"><div><h2>Policy 管理</h2><p>从 checkpoint 启动、切换、健康检测和实机执行授权。</p></div></div>
@@ -313,7 +315,11 @@ const DASHBOARD_PROFILE = {{ dashboard_profile|tojson }};
 const UPLOAD_DEFAULT_ORIGIN = {{ upload_default_origin|tojson }};
 const VISIBLE_DATASET_ORIGINS = new Set({{ visible_dataset_origins|tojson }});
 const ENABLE_POLICY = {{ enable_policy|tojson }};
-const MODULES = new Set(ENABLE_POLICY ? ['overview', 'datasets', 'training', 'policy', 'telemetry', 'eval-videos'] : ['overview', 'datasets', 'training', 'eval-videos']);
+const ENABLE_EVAL_VIDEOS = DASHBOARD_PROFILE === 'simulation';
+const MODULE_LIST = ['overview', 'datasets', 'training'];
+if (ENABLE_POLICY) MODULE_LIST.push('policy', 'telemetry');
+if (ENABLE_EVAL_VIDEOS) MODULE_LIST.push('eval-videos');
+const MODULES = new Set(MODULE_LIST);
 const METRIC_COLORS = ['#42c7ff', '#3ee6a8', '#ffd166', '#ff6f91', '#a78bfa', '#fb923c', '#67e8f9'];
 let latestStatus = null;
 let latestDatasetLocations = null;
@@ -2010,7 +2016,8 @@ async function refreshAll() {
     updateSummaries(data);
     document.getElementById('serverInfo').innerHTML = `管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>真机上传暂存: <code>${esc((data.config.upload_roots || {}).real || '-')}</code><br>仿真上传暂存: <code>${esc((data.config.upload_roots || {}).simulation || '-')}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>默认基础模型: <code>${esc(data.config.base_checkpoint)}</code><br>可选基础权重: ${esc((data.base_models || []).length)}<br>已有训练实验: ${esc((data.experiments || []).length)}`;
     if (!episodeDatasetData && document.getElementById('editorDataset').value) loadDatasetEpisodes(0);
-    if (!document.getElementById('module-eval-videos').hidden) loadEvalVideos();
+    const evalVideoModule = document.getElementById('module-eval-videos');
+    if (evalVideoModule && !evalVideoModule.hidden) loadEvalVideos();
     const trainingVisible = !document.getElementById('module-training').hidden;
     if (trainingVisible && document.getElementById('trainMetricsTask').value) loadTrainingMetrics({quiet: true});
   } catch (error) {

@@ -25,6 +25,31 @@ from typing import Any
 import numpy as np
 from websockets.exceptions import ConnectionClosedError, InvalidMessage
 
+
+def _disable_broken_torchvision_for_transformers() -> None:
+    """Avoid importing an incompatible torchvision in lightweight OpenPI jobs.
+
+    The 4x4090 `openpi` env is JAX-first and currently has torch==2.0.1 plus
+    a newer torchvision.  Transformers 4.53 marks torch unavailable because it
+    requires torch>=2.1, but still detects torchvision and imports
+    `torchvision.transforms` while constructing AutoProcessor, which then fails
+    on `torch._custom_ops`.  Norm/train/serve do not need torchvision here, so
+    force Transformers to treat torchvision as unavailable before importing
+    OpenPI modules that import `transformers.AutoProcessor`.
+    """
+
+    try:
+        from transformers.utils import import_utils as _hf_import_utils
+
+        _hf_import_utils._torchvision_available = False
+        _hf_import_utils._torchvision_version = "N/A"
+    except Exception:
+        # If transformers is not importable yet, keep the original error path.
+        return
+
+
+_disable_broken_torchvision_for_transformers()
+
 from openpi import transforms
 from openpi.models import pi0_config
 from openpi.policies import policy_config
