@@ -243,7 +243,7 @@ cd /home/sunny/bimanual-vla
    - 启动方式默认使用 `auto`：实验目录存在时等价于 `--resume`，不存在时创建新训练；只有明确选择 `overwrite` 才会删除原 checkpoint。
 4. “计算归一化统计”表单用于首次确定或主动修改 episode 划分，也可手动重算或限制帧数调试；训练提交时会复用已保存划分，缺少 norm 时自动补算。
 5. 训练模块集中展示 Norm / Train 进程管理、任务日志和指标曲线；从日志提取 `Step N: key=value`，绘制 `loss`、`loss_physical_14d`、`loss_padding_18d` 等曲线，并显示 step 进度、latest/min/max；图例按钮可切换 `grad_norm`、`param_norm` 等其他指标。
-6. 页面按模型系列和数据集臂模式扫描 `pi05_piper_*_lora/<experiment>/<step>` 与 `pi0_piper_*_lora/<experiment>/<step>`，过滤完整 checkpoint，并在训练模块列出 checkpoint 表。
+6. 页面按模型系列和数据集臂模式扫描 `pi05_piper_*_lora/<experiment>/<step>` 与 `pi0_piper_*_lora/<experiment>/<step>`，过滤完整 checkpoint，并在训练模块列出 checkpoint 表；可以按实验筛选，并批量删除选中的完整 checkpoint 目录（不会删除任务记录、日志或数据集）。
 7. 在“新建 / 切换 Policy 进程”中选择 GPU、端口和 checkpoint：
    - 留空“操作对象”：新建独立 Policy；
    - 选择运行中的 Policy：先停止旧进程，再从新 checkpoint 启动替代进程。
@@ -263,9 +263,10 @@ cd /home/sunny/bimanual-vla
 ```text
 GET    /api/tasks/<train_task_id>/metrics?max_points=1200
 DELETE /api/tasks/<task_id>
+POST   /api/tasks/batch-delete
 ```
 
-指标接口最多读取任务日志尾部 16 MiB，同一步的后出现记录覆盖前记录，并对返回曲线降采样；latest/min/max 汇总仍基于读取到的全部指标点。删除接口只接受终态任务，并拒绝删除仍被活动训练依赖的 norm；删除范围仅限 Dashboard 任务目录中的记录和日志。
+指标接口最多读取任务日志尾部 16 MiB，同一步的后出现记录覆盖前记录，并对返回曲线降采样；latest/min/max 汇总仍基于读取到的全部指标点。删除接口只接受终态任务，并拒绝删除仍被活动训练依赖的 norm；删除范围仅限 Dashboard 任务目录中的记录和日志。Dashboard 训练/Policy 任务表支持勾选多个终态任务，通过 `POST /api/tasks/batch-delete` 一次删除最多 200 条记录和日志；批次校验失败时不会部分删除。
 
 服务端只列出同时包含 `params/` 和 `_CHECKPOINT_METADATA` 的完整 checkpoint，并通过 `assets/<dataset_id>/norm_stats.json` 判断 checkpoint 所属数据集。启动 Policy 时会再次校验，防止 checkpoint 与数据集错配。
 

@@ -70,6 +70,42 @@ class TaskManagerDeleteTest(unittest.TestCase):
         self.assertEqual(result["task"]["id"], "train-history")
         self.assertFalse(task_dir.exists())
 
+    def test_deletes_multiple_terminal_task_records_and_logs(self):
+        first_dir = self.write_task("train-history-a", state="completed")
+        second_dir = self.write_task("eval-history-b", task_type="eval", state="failed")
+
+        result = self.manager.delete_many(["train-history-a", "eval-history-b", "train-history-a"])
+
+        self.assertTrue(result["deleted"])
+        self.assertEqual(result["deleted_count"], 2)
+        self.assertEqual(result["task_ids"], ["train-history-a", "eval-history-b"])
+        self.assertFalse(first_dir.exists())
+        self.assertFalse(second_dir.exists())
+
+    def test_batch_delete_validates_all_tasks_before_removing_anything(self):
+        history_dir = self.write_task("train-history", state="completed")
+        active_dir = self.write_task("train-active", state="running")
+        self.manager.processes["train-active"] = _RunningProcess()
+
+        with self.assertRaisesRegex(ValueError, "cannot delete active task train-active"):
+            self.manager.delete_many(["train-history", "train-active"])
+
+        self.assertTrue(history_dir.exists())
+        self.assertTrue(active_dir.exists())
+
+    def test_batch_delete_allows_terminal_dependency_in_same_batch(self):
+        norm_dir = self.write_task("norm-history", task_type="norm", state="completed")
+        train_dir = self.write_task(
+            "train-history",
+            state="failed",
+            metadata={"depends_on": "norm-history"},
+        )
+
+        self.manager.delete_many(["norm-history", "train-history"])
+
+        self.assertFalse(norm_dir.exists())
+        self.assertFalse(train_dir.exists())
+
     def test_rejects_task_with_live_process(self):
         task_dir = self.write_task("train-running", state="running")
         self.manager.processes["train-running"] = _RunningProcess()

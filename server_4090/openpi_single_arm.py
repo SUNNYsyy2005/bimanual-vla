@@ -23,6 +23,9 @@ import time
 from typing import Any
 
 import numpy as np
+import jax
+import jax.numpy as jnp
+from flax import nnx
 from websockets.exceptions import ConnectionClosedError, InvalidMessage
 
 
@@ -107,10 +110,12 @@ _disable_broken_torchvision_for_transformers()
 _install_torchvision_stub_if_broken()
 
 from openpi import transforms
+from openpi.models import model as _model
 from openpi.models import pi0_config
 from openpi.policies import policy_config
 from openpi.serving import websocket_policy_server
 from openpi.shared import normalize
+from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as training_config
 from openpi.training import data_loader
 from openpi.training import weight_loaders
@@ -1622,8 +1627,8 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
         save_interval=getattr(args, "save_interval", 1_000),
         log_interval=getattr(args, "log_interval", 100),
         fsdp_devices=getattr(args, "fsdp_devices", 1),
-        resume=getattr(args, "resume", False),
-        overwrite=getattr(args, "overwrite", False),
+        resume=bool(getattr(args, "resume", False) and not getattr(args, "resume_checkpoint", None)),
+        overwrite=bool(getattr(args, "overwrite", False) or getattr(args, "resume_checkpoint", None)),
         wandb_enabled=getattr(args, "wandb_enabled", False),
         policy_metadata={
             "robot_type": "piper_bimanual" if contract.arm_mode == "bimanual" else "piper_single_arm",
@@ -1788,7 +1793,7 @@ def _install_training_episode_subset(
     data_loader.create_torch_dataset = create_subset
 
 
-def _load_upstream_train_main(openpi_root: Path):
+def _load_upstream_train_module(openpi_root: Path):
     train_path = openpi_root / "scripts" / "train.py"
     if not train_path.exists():
         raise FileNotFoundError(train_path)
@@ -1798,7 +1803,95 @@ def _load_upstream_train_main(openpi_root: Path):
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return module.main
+    return module
+
+
+def _load_upstream_train_main(openpi_root: Path):
+    return _load_upstream_train_module(openpi_root).main
+
+
+class _ExternalResumeCheckpointManager:
+    """Restore one finalized source checkpoint, then save into the target run.
+
+    OpenPI's stock trainer assumes the resume checkpoint lives under the same
+    experiment directory that will receive new saves.  Dashboard runs need a
+    safe variant for recovering an interrupted experiment from a different
+    complete experiment.  This proxy keeps the upstream trainer unchanged:
+    ``restore``/``latest_step`` read the source manager, while ``save`` writes
+    the target manager.
+    """
+
+    def __init__(self, source_manager: Any, target_manager: Any, source_step: int):
+        self._source = source_manager
+        self._target = target_manager
+        self._source_step = int(source_step)
+
+    def latest_step(self) -> int:
+        return self._source_step
+
+    def restore(self, step=None, *args, **kwargs):
+        selected = self._source_step if step is None else int(step)
+        logging.info("Restoring external full-state checkpoint from %s (step %s)", self._source.directory, selected)
+        return self._source.restore(selected, *args, **kwargs)
+
+    def save(self, *args, **kwargs):
+        return self._target.save(*args, **kwargs)
+
+    def wait_until_finished(self, *args, **kwargs):
+        source_result = self._source.wait_until_finished(*args, **kwargs)
+        target_result = self._target.wait_until_finished(*args, **kwargs)
+        return target_result if target_result is not None else source_result
+
+    def __getattr__(self, name: str):
+        return getattr(self._target, name)
+
+
+def _install_external_full_state_resume(train_module: Any, config: Any, source_checkpoint: Path) -> None:
+    source_checkpoint = source_checkpoint.expanduser().resolve()
+    if not (source_checkpoint / "_CHECKPOINT_METADATA").is_file():
+        raise ValueError(f"external resume checkpoint is not finalized: {source_checkpoint}")
+    if not (source_checkpoint / "params" / "_METADATA").is_file():
+        raise ValueError(f"external resume checkpoint params are incomplete: {source_checkpoint}")
+    if not (source_checkpoint / "train_state" / "_METADATA").is_file():
+        raise ValueError(f"external resume checkpoint train_state is incomplete: {source_checkpoint}")
+    if not source_checkpoint.name.isdigit():
+        raise ValueError(f"external resume checkpoint must be a numeric step directory: {source_checkpoint}")
+
+    original_initialize = train_module._checkpoints.initialize_checkpoint_dir
+    target_dir = Path(config.checkpoint_dir).expanduser().resolve()
+    source_dir = source_checkpoint.parent
+    source_step = int(source_checkpoint.name)
+    installed = False
+
+    def initialize(checkpoint_dir, *, keep_period, overwrite, resume):
+        nonlocal installed
+        resolved = Path(checkpoint_dir).expanduser().resolve()
+        if installed or resolved != target_dir:
+            return original_initialize(
+                checkpoint_dir, keep_period=keep_period, overwrite=overwrite, resume=resume
+            )
+        # The target may contain only a failed temp save.  Explicit external
+        # resume is allowed to replace that directory; no unrelated complete
+        # checkpoint is deleted silently because the Dashboard rejects that
+        # case before launching.
+        target_manager, _ = original_initialize(
+            checkpoint_dir, keep_period=keep_period, overwrite=True, resume=False
+        )
+        source_manager, source_resuming = original_initialize(
+            source_dir, keep_period=keep_period, overwrite=False, resume=True
+        )
+        if not source_resuming:
+            raise RuntimeError(f"source checkpoint manager did not enter resume mode: {source_checkpoint}")
+        installed = True
+        logging.info(
+            "External full-state resume selected: source=%s step=%s target=%s",
+            source_checkpoint,
+            source_step,
+            target_dir,
+        )
+        return _ExternalResumeCheckpointManager(source_manager, target_manager, source_step), True
+
+    train_module._checkpoints.initialize_checkpoint_dir = initialize
 
 
 def _write_extended_contract_fields(
@@ -1861,8 +1954,12 @@ def run_train(args: argparse.Namespace) -> None:
         )
     marker = _write_action_convention_marker(config)
     print(f"Writing action contract marker to: {marker}", flush=True)
-    train_main = _load_upstream_train_main(Path.cwd())
-    train_main(config)
+    train_module = _load_upstream_train_module(Path.cwd())
+    if getattr(args, "resume_checkpoint", None):
+        _install_external_full_state_resume(
+            train_module, config, Path(args.resume_checkpoint)
+        )
+    train_module.main(config)
 
 
 def run_norm(args: argparse.Namespace) -> None:
@@ -2960,6 +3057,11 @@ def parse_args() -> argparse.Namespace:
     train = subparsers.add_parser("train")
     add_common(train)
     train.add_argument("--exp-name", required=True)
+    train.add_argument(
+        "--resume-checkpoint",
+        default=None,
+        help="finalized numeric Orbax checkpoint to restore full train_state from before saving into this experiment",
+    )
     train.add_argument("--batch-size", type=int, default=8)
     train.add_argument("--num-workers", type=int, default=2)
     train.add_argument("--num-train-steps", type=int, default=30_000)
