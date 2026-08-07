@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -28,6 +29,15 @@ def shell_join(command: list[str]) -> str:
     return " ".join(shlex.quote(str(item)) for item in command)
 
 
+def clean_transport_env() -> dict[str, str]:
+    # The Dashboard process uses the OpenPI conda environment for Python/JAX,
+    # but system OpenSSH must load the system OpenSSL ABI on login-server.
+    env = os.environ.copy()
+    for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "OPENSSL_CONF", "OPENSSL_MODULES"):
+        env.pop(key, None)
+    return env
+
+
 def run_ssh(host: str, command: str, *, input_text: str | None = None, timeout: int = 60) -> subprocess.CompletedProcess[str]:
     ssh_cmd = [
         "ssh",
@@ -39,14 +49,21 @@ def run_ssh(host: str, command: str, *, input_text: str | None = None, timeout: 
         host,
         command,
     ]
-    return subprocess.run(
-        ssh_cmd,
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout,
-    )
+    try:
+        return subprocess.run(
+            ssh_cmd,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            env=clean_transport_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or exc.stderr or ""
+        if isinstance(output, bytes):
+            output = output.decode(errors="replace")
+        return subprocess.CompletedProcess(ssh_cmd, 124, str(output))
 
 
 def slurm_header(target: dict[str, Any], job_name: str, log_dir: str) -> str:
@@ -81,6 +98,16 @@ def build_script(target: dict[str, Any], job_name: str, commands: list[list[str]
     cache_root = target.get("cache_root", f"/DATA/sync/$USER/.cache")
     conda_sh = target.get("conda_sh") or target.get("conda_init")
     conda_env = target.get("conda_env")
+    openpi_src = target.get("openpi_src", workdir.rstrip("/") + "/src")
+    openpi_client_src = target.get(
+        "openpi_client_src", workdir.rstrip("/") + "/packages/openpi-client/src"
+    )
+    # The H100 checkout keeps LeRobot as a sibling source checkout under
+    # <root>/src/lerobot_src/<revision>.  Add the conventional location as a
+    # fallback; nonexistent PYTHONPATH entries are harmless and this keeps
+    # the target config backward compatible.
+    inferred_lerobot_src = str(Path(workdir).parent / "lerobot_src/a445d9c")
+    lerobot_src = target.get("lerobot_src", inferred_lerobot_src)
     prelude = [
         slurm_header(target, job_name, log_dir),
         f"mkdir -p {shlex.quote(log_dir)}",
@@ -88,6 +115,13 @@ def build_script(target: dict[str, Any], job_name: str, commands: list[list[str]
         "command -v resources >/dev/null 2>&1 && resources || true",
         "command -v myquota >/dev/null 2>&1 && myquota || true",
         f"cd {shlex.quote(workdir)}",
+        # The H100 checkout is a src-layout project and is not necessarily
+        # installed editable in the compute-node environment.  Ensure the
+        # remote helper can import openpi, openpi_client, and LeRobot after
+        # `cd` without relying on a login-shell activation.
+        "export PYTHONPATH="
+        f"{shlex.quote(str(openpi_src))}:{shlex.quote(str(openpi_client_src))}:{shlex.quote(str(lerobot_src))}"
+        "${PYTHONPATH:+:$PYTHONPATH}",
         f"export XDG_CACHE_HOME={shlex.quote(target.get('xdg_cache_home', cache_root))}",
         f"export PIP_CACHE_DIR={shlex.quote(target.get('pip_cache_dir', cache_root + '/pip/cache'))}",
         f"export TMPDIR={shlex.quote(target.get('tmpdir', cache_root + '/pip/tmp'))}",
@@ -97,10 +131,23 @@ def build_script(target: dict[str, Any], job_name: str, commands: list[list[str]
         f"export TOKENIZERS_PARALLELISM=false",
         f"export XLA_PYTHON_CLIENT_MEM_FRACTION={target.get('xla_memory_fraction', 0.90)}",
     ]
+    # Some cluster compute nodes expose only the configured environment
+    # executable (for example /home/sunny/miniconda3/envs/openpi/bin/python)
+    # and do not mount the Conda root's profile.d/conda.sh.  The workload
+    # commands already use target["openpi_python"] directly, so activation is
+    # optional; never let a missing init script abort an otherwise valid job.
     if conda_sh:
-        prelude.append(f"source {shlex.quote(conda_sh)}")
+        quoted_conda_sh = shlex.quote(conda_sh)
+        prelude.append(
+            f"if [ -f {quoted_conda_sh} ]; then source {quoted_conda_sh}; "
+            "else echo '[dashboard] conda init script not present; using configured Python'; fi"
+        )
     if conda_env:
-        prelude.append(f"conda activate {shlex.quote(conda_env)}")
+        prelude.append(
+            "if command -v conda >/dev/null 2>&1; then "
+            f"conda activate {shlex.quote(conda_env)}; "
+            "else echo '[dashboard] conda command unavailable; using configured Python'; fi"
+        )
     body = []
     for idx, command in enumerate(commands):
         label = command_labels[idx] if idx < len(command_labels) else f"command_{idx + 1}"
@@ -154,29 +201,63 @@ def main() -> int:
     print(f"[dashboard] slurm_job_id={job_id}", flush=True)
 
     last_state = None
+    transport_failures = 0
     while True:
         q = run_ssh(host, f"squeue -h -j {shlex.quote(job_id)} -o '%T|%M|%R'", timeout=60)
         qout = q.stdout.strip()
         if q.returncode == 0 and qout:
+            transport_failures = 0
             if qout != last_state:
                 print(f"[dashboard] squeue {job_id}: {qout}", flush=True)
                 last_state = qout
             time.sleep(max(5.0, args.poll_interval))
             continue
+
+        # A job disappearing from squeue is normally terminal, but the SSH
+        # connection can transiently fail exactly at that boundary.  Query
+        # sacct and retry instead of converting one transport failure into an
+        # UNKNOWN/failed task.  This is especially important for long H100
+        # jobs, where login-server may briefly refuse a new SSH session.
+        if q.returncode != 0:
+            transport_failures += 1
+            print(
+                f"[dashboard] squeue status unavailable for {job_id} "
+                f"(attempt {transport_failures}): {qout[-500:]}",
+                flush=True,
+            )
+
         acct = run_ssh(
             host,
             f"sacct -j {shlex.quote(job_id)} --format=JobID,State,ExitCode,Elapsed -n -P",
             timeout=60,
         )
-        print(acct.stdout, end="", flush=True)
+        if acct.stdout:
+            print(acct.stdout, end="", flush=True)
         state_lines = [line.split("|") for line in acct.stdout.splitlines() if line.strip()]
         batch_line = next((parts for parts in state_lines if parts and parts[0].endswith(".batch")), None)
         main_line = next((parts for parts in state_lines if parts and parts[0] == job_id), None)
         chosen = batch_line or main_line
-        state = chosen[1] if chosen and len(chosen) > 1 else "UNKNOWN"
-        exit_code = chosen[2] if chosen and len(chosen) > 2 else ""
-        print(f"[dashboard] final_state={state} exit_code={exit_code}", flush=True)
-        return 0 if state.startswith("COMPLETED") else 1
+        if chosen and len(chosen) > 1:
+            # sacct can report RUNNING/PENDING while squeue is temporarily
+            # unavailable; keep monitoring those states instead of exiting.
+            state = chosen[1]
+            exit_code = chosen[2] if len(chosen) > 2 else ""
+            transport_failures = 0
+            print(f"[dashboard] sacct {job_id}: state={state} exit_code={exit_code}", flush=True)
+            if state.startswith("COMPLETED") or state not in {"PENDING", "RUNNING", "CONFIGURING", "COMPLETING"}:
+                print(f"[dashboard] final_state={state} exit_code={exit_code}", flush=True)
+                return 0 if state.startswith("COMPLETED") else 1
+            time.sleep(max(5.0, args.poll_interval))
+            continue
+
+        # No reliable answer yet.  Keep the runner alive through a bounded
+        # outage; only report UNKNOWN after repeated failed queries.
+        if transport_failures < 12:
+            print(f"[dashboard] Slurm status temporarily unavailable for {job_id}; retrying", flush=True)
+            time.sleep(max(5.0, args.poll_interval))
+            continue
+        print("[dashboard] final_state=UNKNOWN exit_code=", flush=True)
+        return 2
 
 
 if __name__ == "__main__":

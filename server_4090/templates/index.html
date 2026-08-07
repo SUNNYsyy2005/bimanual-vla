@@ -61,11 +61,16 @@
        their own column, so parameters and actions remain visible. */
     .training-jobs-wrap { overflow-x:hidden; }
     .training-jobs-table { table-layout:fixed; }
-    .training-jobs-table th:nth-child(1), .training-jobs-table td:nth-child(1) { width:21%; }
+    .training-jobs-table th:nth-child(1), .training-jobs-table td:nth-child(1) { width:42px; }
     .training-jobs-table th:nth-child(2), .training-jobs-table td:nth-child(2) { width:17%; }
-    .training-jobs-table th:nth-child(3), .training-jobs-table td:nth-child(3) { width:45%; }
-    .training-jobs-table th:nth-child(4), .training-jobs-table td:nth-child(4) { width:17%; }
+    .training-jobs-table th:nth-child(3), .training-jobs-table td:nth-child(3) { width:17%; }
+    .training-jobs-table th:nth-child(4), .training-jobs-table td:nth-child(4) { width:45%; }
+    .training-jobs-table th:nth-child(5), .training-jobs-table td:nth-child(5) { width:17%; }
     .training-jobs-table th, .training-jobs-table td { min-width:0; overflow-wrap:anywhere; word-break:break-word; }
+    .task-selection-cell, .checkpoint-selection-cell { width:42px; min-width:42px !important; padding-left:6px; padding-right:6px; text-align:center; }
+    .task-selection-cell input, .checkpoint-selection-cell input { display:block; width:17px; height:17px; margin:1px auto; padding:0; opacity:1; }
+    .task-selection-cell input:disabled, .checkpoint-selection-cell input:disabled { opacity:.55; }
+    .checkpoint-experiment-select { min-width:220px; }
     .training-jobs-table .task-ref { display:inline-block; max-width:100%; overflow-wrap:anywhere; word-break:break-all; }
     .training-jobs-table td:last-child .inline { white-space:normal; }
     code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; } code { color:#bfeaff; }
@@ -105,6 +110,10 @@
     .metric-toggle.off { opacity:.45; }
     .progress-track { height:8px; overflow:hidden; border-radius:999px; background:#07101c; }
     .progress-bar { height:100%; width:0; background:linear-gradient(90deg,var(--blue),var(--green)); }
+    .transfer-progress-cell { min-width:280px; }
+    .transfer-progress-meta { display:flex; justify-content:space-between; gap:8px; color:#cfe2f7; font-size:12px; }
+    .transfer-progress-meta + .progress-track { margin-top:6px; }
+    .transfer-detail { color:#9fb3cc; font-size:11px; line-height:1.45; }
     .section-note { padding:10px 12px; border-left:3px solid var(--blue); border-radius:7px; background:#0b1b2e; color:#aac0d8; }
     .dataset-origin-real { color:#bfffe5; border-color:#217a5f !important; background:#103529 !important; }
     .dataset-origin-simulation { color:#d9ccff; border-color:#624ca8 !important; background:#261f46 !important; }
@@ -115,8 +124,15 @@
     .location-pill { max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .eval-filter-grid { display:grid; grid-template-columns:1.2fr 1.2fr .8fr 1fr auto auto; gap:10px; align-items:end; margin-bottom:12px; }
     .eval-video-list { display:grid; gap:10px; margin-top:12px; }
+    .eval-video-toolbar { margin-top:8px; }
     .eval-video-card { padding:12px; border:1px solid #304b68; border-radius:11px; background:#07121f; }
+    .eval-video-card.remote { border-style:dashed; }
     .eval-video-card header { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
+    .eval-video-header { display:flex; gap:10px; align-items:flex-start; min-width:0; flex:1; }
+    .eval-video-select-cell { padding-top:3px; }
+    .eval-video-select-cell input { width:17px; height:17px; margin-top:3px; }
+    .eval-video-title { min-width:0; }
+    .eval-video-actions { display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap; justify-content:flex-end; }
     .eval-video-card video { display:block; width:100%; max-height:520px; margin-top:10px; border:1px solid #2e465f; border-radius:9px; background:#000; }
     @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid,.telemetry-latency-grid{grid-template-columns:repeat(2,1fr)}.episode-editor-grid{grid-template-columns:1fr}}
     @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid{grid-template-columns:1fr}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
@@ -141,6 +157,7 @@
       {% if enable_policy %}<button class="nav-button" data-module="policy">Policy <span id="navPolicyCount" class="nav-count">-</span></button>
       <button class="nav-button" data-module="telemetry">实时遥测 <span id="navTelemetryCount" class="nav-count">-</span></button>{% endif %}
       {% if dashboard_profile == "simulation" %}<button class="nav-button" data-module="eval-videos">评估视频 <span id="navEvalVideoCount" class="nav-count">-</span></button>{% endif %}
+
     </nav>
   </div>
 
@@ -173,6 +190,11 @@
         <div class="card half"><h2>上传数据集</h2><p>{{ "仿真数据上传执行：" if dashboard_profile == "simulation" else "真机采集机执行：" }}</p><pre id="uploadCommand">python upload_dataset_4090.py LEROBOT_OR_GUI_NPZ_DIR --name my_dataset --dataset-origin {{ upload_default_origin }} --server http://192.168.101.9:{{ server_port }} --token TOKEN --workers 4 --merge</pre><p class="muted">{{ "仿真 Dashboard 默认只接收并显示 --dataset-origin simulation 的数据；正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。" if dashboard_profile == "simulation" else "仿真数据上传时仍使用 --dataset-origin simulation，其暂存目录与真机数据隔离，并且不会出现在实机 Dashboard 列表或训练/Policy 数据集选择器中。正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。" }}</p></div>
         <div class="card half"><h2>格式与媒体说明</h2><div class="section-note">Dashboard 可识别单臂 7D / 10D、双臂 14D / 20D 和其他自定义维度，并显示所有 <code>dtype: video</code> / <code>dtype: image</code> 相机。{{ "这里只呈现仿真数据集；可从本页面统一提交 4×4090 本地训练/评测或 H100/H200 Slurm 训练/评测。" if dashboard_profile == "simulation" else "这里只呈现真机和未分类数据集；将来源标记为仿真后，该数据集会从 Dashboard 隐藏，但数据集 ID 和底层训练加载路径不会改变。" }}</div></div>
         <div class="card"><h2>{{ "已接收仿真数据集" if dashboard_profile == "simulation" else "已接收真机数据集" }}</h2><div class="toolbar"><label style="margin:0">来源筛选</label><select id="datasetOriginFilter" class="dataset-origin-select"><option value="all">全部</option>{% for origin in visible_dataset_origins %}<option value="{{ origin }}">{{ "真机" if origin == "real" else "仿真" if origin == "simulation" else "未分类" }}</option>{% endfor %}</select><button class="inline secondary" type="button" onclick="loadDatasetLocations(true)">刷新 4×4090/H100/H200 位置</button><span id="datasetOriginSummary" class="muted">等待状态数据。</span></div><div class="table-wrap"><table><thead><tr><th>ID / 来源</th><th>位置 / 同步</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div></div>
+        <div class="card">
+          <h2>数据传输任务</h2>
+          <p class="muted">显示数据集、checkpoint 和评估视频 transfer 的实时状态；进度来自传输 runner 的 sidecar，旧任务会用目标目录清单做保守估算。</p>
+          <div class="table-wrap"><table><thead><tr><th>任务</th><th>方向 / 路径</th><th>进度</th><th>状态 / 详情</th><th>操作</th></tr></thead><tbody id="transferJobs"></tbody></table></div>
+        </div>
         <div class="card">
           <h2>Episode 级数据集编辑与相机预览</h2>
           <p class="muted">参数编辑不修改 state/action/图像帧；合并、删除或编辑会先构造临时数据集并校验，成功后原子替换。已有 norm stats 将失效。</p>
@@ -224,7 +246,8 @@
         <div class="card two-third">
           <h2>训练进程管理</h2>
           <p class="muted">查看 Norm / Train / Eval 任务状态、PID、依赖关系；已结束任务可删除记录和日志，不会删除 checkpoint 或训练输出。</p>
-          <div class="table-wrap training-jobs-wrap"><table class="training-jobs-table"><thead><tr><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div>
+          <div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('training')" disabled data-bulk-delete-scope="training">批量删除已选日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束任务；不会删除 checkpoint、模型或训练输出。</span></div>
+          <div class="table-wrap training-jobs-wrap"><table class="training-jobs-table"><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="training" onchange="toggleTaskSelection('training', this.checked)" aria-label="全选训练历史任务"></th><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div>
         </div>
         <div class="card third" id="trainingTaskLogCard">
           <h2>训练任务日志</h2>
@@ -237,7 +260,17 @@
           <div id="trainMetricsSummary" class="muted">选择训练任务后加载指标。</div><div class="progress-track" style="margin:10px 0"><div id="trainProgressBar" class="progress-bar"></div></div>
           <div class="chart-shell"><canvas id="trainMetricsChart"></canvas></div><div id="trainMetricLegend" class="metric-legend"></div>
         </div>
-        <div class="card third"><h2>Checkpoint</h2><div class="table-wrap"><table><thead><tr><th>实验 / step</th><th>数据集</th><th>大小 / 时间</th></tr></thead><tbody id="checkpoints"></tbody></table></div></div>
+        <div class="card third">
+          <h2>Checkpoint</h2>
+          <div class="toolbar checkpoint-toolbar">
+            <label style="margin:0">实验筛选</label>
+            <select id="checkpointExperimentFilter" class="checkpoint-experiment-select"><option value="all">全部实验</option></select>
+            <button class="inline danger" type="button" onclick="batchDeleteSelectedCheckpoints()" disabled data-bulk-delete-checkpoint-scope="training">批量删除已选 checkpoint（<span data-selected-checkpoint-count>0</span>）</button>
+            <span id="checkpointSummary" class="muted">等待 checkpoint 数据。</span>
+          </div>
+          <p class="muted">按实验筛选完整 checkpoint；批量删除只会删除选中的 checkpoint 目录，不会删除任务日志、数据集或训练输出。</p>
+          <div class="table-wrap"><table><thead><tr><th class="checkpoint-selection-cell"><input type="checkbox" class="checkpoint-select-all" data-checkpoint-scope="training" onchange="toggleCheckpointSelection('training', this.checked)" aria-label="全选当前筛选的 checkpoint"></th><th>实验 / step</th><th>数据集</th><th>大小 / 时间</th></tr></thead><tbody id="checkpoints"></tbody></table></div>
+        </div>
         <div class="card two-third" id="manualEvalCard">
           <h2>手动评测</h2>
           <p class="muted">用于仿真模型 held-out loss / 安全阈值评测；可选择 4×4090 本地或 H100/H200 Slurm 目标。H100/H200 通过 SSH 提交 sbatch，实际 GPU 工作在 Slurm 节点执行。</p>
@@ -270,6 +303,11 @@
           <button class="inline secondary" onclick="loadEvalVideos(false)">刷新本地列表</button>
           <button class="inline secondary" onclick="loadEvalVideos(true)">扫描 H100/H200</button>
         </div>
+        <div class="toolbar eval-video-toolbar">
+          <label style="margin:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="evalVideoSelectAll" onchange="toggleEvalVideoSelection(this.checked)" aria-label="全选可删除的评估视频">全选本地视频</label>
+          <button class="inline danger" type="button" onclick="batchDeleteSelectedEvalVideos()" disabled data-bulk-delete-eval-scope="videos">批量删除已选视频（<span data-selected-eval-video-count>0</span>）</button>
+          <span class="muted">仅本地 4×4090 视频可删除；远端视频只能同步。</span>
+        </div>
         <span id="evalVideoSummary" class="muted">尚未加载。</span>
         <div id="evalVideoList" class="eval-video-list"></div>
       </div></div>
@@ -280,7 +318,7 @@
       <div class="module-heading"><div><h2>Policy 管理</h2><p>从 checkpoint 启动、切换、健康检测和实机执行授权。</p></div></div>
       <div class="grid">
         <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><input type="hidden" name="model_variant" id="policyModelVariant" value="pi05"><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div><div><label>默认 prompt</label><input name="default_prompt"></div></div><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
-        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code>、<code>action_horizon &gt;= 16</code> 和本地逐 20 Hz command 安全检查。异步客户端默认 4 Hz 启动推理（推理+传输通常约 200 ms），旧 chunk 在推理期间持续执行；新 chunk 到达后按实时 arrival 延迟动态过期 prefix，融合 2~4 步后切换 generation。已结束的历史进程可删除记录和日志。</p><div class="table-wrap"><table><thead><tr><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端状态 / 延迟摘要</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div></div>
+        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code>、<code>action_horizon &gt;= 16</code> 和本地逐 20 Hz command 安全检查。异步客户端默认 4 Hz 启动推理（推理+传输通常约 200 ms），旧 chunk 在推理期间持续执行；新 chunk 到达后按实时 arrival 延迟动态过期 prefix，融合 2~4 步后切换 generation。已结束的历史进程可删除记录和日志。</p><div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('policy')" disabled data-bulk-delete-scope="policy">批量删除已选日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束 Policy；不会删除模型或其他输出。</span></div><div class="table-wrap"><table><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="policy" onchange="toggleTaskSelection('policy', this.checked)" aria-label="全选 Policy 历史任务"></th><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端状态 / 延迟摘要</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div></div>
         <div class="card" id="policyTaskLogCard"><h2>Policy 进程日志</h2><p class="muted">从 Policy 进程表点击“日志”查看最近输出。</p><pre id="policyTaskLog">尚未选择 Policy 进程。</pre></div>
         <div class="card"><h2>机械臂客户端命令</h2><pre id="policyClientCommand">python robot_observation_bridge.py --host 192.168.101.9 --port 8000 --hz 4 --arm-mode single --arm-side right --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16 --instruction "pick up the cube"</pre></div>
       </div>
@@ -332,6 +370,9 @@ let trainingMetricsData = null;
 let enabledMetrics = new Set();
 let metricsRequestSerial = 0;
 const selectedTaskLogs = {training: null, eval: null, policy: null};
+const selectedTaskIds = new Set();
+const selectedEvalVideoIds = new Set();
+const selectedCheckpointPaths = new Set();
 const episodeLimit = 100;
 
 function saveToken() {
@@ -397,6 +438,95 @@ async function apiBlob(path) {
   return response.blob();
 }
 
+function updateEvalVideoBulkControls() {
+  const header = document.getElementById('evalVideoSelectAll');
+  const boxes = [...document.querySelectorAll('.eval-video-select')].filter(input => !input.disabled);
+  const checked = boxes.filter(input => input.checked);
+  if (header) {
+    header.disabled = boxes.length === 0;
+    header.checked = boxes.length > 0 && checked.length === boxes.length;
+    header.indeterminate = checked.length > 0 && checked.length < boxes.length;
+  }
+  document.querySelectorAll('[data-bulk-delete-eval-scope="videos"]').forEach(button => {
+    button.disabled = checked.length === 0;
+    const count = button.querySelector('[data-selected-eval-video-count]');
+    if (count) count.textContent = String(checked.length);
+  });
+}
+
+function onEvalVideoSelectionChange(input) {
+  const videoId = input.dataset.videoId;
+  if (!videoId) return;
+  if (input.checked) selectedEvalVideoIds.add(videoId);
+  else selectedEvalVideoIds.delete(videoId);
+  updateEvalVideoBulkControls();
+}
+
+function toggleEvalVideoSelection(checked) {
+  document.querySelectorAll('.eval-video-select').forEach(input => {
+    if (input.disabled) return;
+    input.checked = checked;
+    onEvalVideoSelectionChange(input);
+  });
+  updateEvalVideoBulkControls();
+}
+
+async function deleteEvalVideos(videoIds, labels = []) {
+  const unique = [];
+  const seen = new Set();
+  for (let index = 0; index < videoIds.length; index += 1) {
+    const videoId = String(videoIds[index] || '').trim();
+    if (!videoId || seen.has(videoId)) continue;
+    seen.add(videoId);
+    unique.push({id: videoId, label: String(labels[index] || '').trim()});
+  }
+  if (!unique.length) {
+    show('请先选择要删除的评估视频。');
+    return;
+  }
+  if (unique.length > 200) {
+    show('一次最多删除 200 个评估视频。');
+    return;
+  }
+  const preview = unique.map(item => item.label || item.id).slice(0, 12).join('\n');
+  const suffix = unique.length > 12 ? '\n…' : '';
+  if (!confirm(`确认批量删除 ${unique.length} 个评估视频？
+${preview}${suffix}
+将永久删除本地视频文件，不会删除任务记录、数据集或评测日志。`)) return;
+  try {
+    const result = await api('/api/eval-videos/batch-delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({video_ids: unique.map(item => item.id)}),
+    });
+    for (const item of unique) {
+      selectedEvalVideoIds.delete(item.id);
+    }
+    updateEvalVideoBulkControls();
+    show(`已批量删除 ${result.deleted_count || unique.length} 个评估视频。`, false);
+    await refreshAll();
+  } catch (error) {
+    show(error.message);
+  }
+}
+
+async function batchDeleteSelectedEvalVideos() {
+  const selectedInputs = [...document.querySelectorAll('.eval-video-select:checked')];
+  if (!selectedInputs.length) {
+    show('请先选择要删除的评估视频。');
+    return;
+  }
+  await deleteEvalVideos(
+    selectedInputs.map(input => input.dataset.videoId || ''),
+    selectedInputs.map(input => input.dataset.videoLabel || input.dataset.videoPath || input.dataset.videoId || ''),
+  );
+}
+
+async function deleteEvalVideo(videoId, label = '') {
+  if (!videoId) return;
+  await deleteEvalVideos([videoId], [label]);
+}
+
 async function loadEvalVideos(includeRemote = false) {
   if (!tokenInput.value) return;
   const summary = document.getElementById('evalVideoSummary');
@@ -416,11 +546,20 @@ async function loadEvalVideos(includeRemote = false) {
   try {
     const data = await api(`/api/eval-videos?${params.toString()}`);
     const videos = data.videos || [];
-    document.getElementById('navEvalVideoCount').textContent = String(data.total ?? videos.length);
+    const visibleIds = new Set(videos.filter(video => video.deletable).map(video => video.id));
+    for (const videoId of [...selectedEvalVideoIds]) {
+      if (!visibleIds.has(videoId)) selectedEvalVideoIds.delete(videoId);
+    }
+    if (document.getElementById('evalVideoSelectAll')) {
+      document.getElementById('evalVideoSelectAll').checked = false;
+    }
+    const navCount = document.getElementById('navEvalVideoCount');
+    if (navCount) navCount.textContent = String(data.total ?? videos.length);
     const success = (data.facets && data.facets.success) || {};
     const remoteErrors = Object.entries(data.remote_errors || {}).map(([k, v]) => `${k}: ${String(v).slice(0, 160)}`);
     summary.textContent = `${videos.length}/${data.total ?? videos.length} 个视频 · 成功 ${success.success || 0} · 失败 ${success.failed || 0} · 未知 ${success.unknown || 0}${remoteErrors.length ? ' · 远端提示: ' + remoteErrors.join(' ; ') : ''}`;
     list.innerHTML = videos.map(video => renderEvalVideoRow(video)).join('') || '<div class="muted">没有找到符合筛选条件的 mp4/webm/mov/mkv/avi/gif 文件。</div>';
+    updateEvalVideoBulkControls();
   } catch (error) {
     summary.textContent = `视频加载失败：${error.message}`;
     show(error.message);
@@ -432,11 +571,15 @@ function renderEvalVideoRow(video) {
   const statusLabel = video.success === 'success' ? '成功' : video.success === 'failed' ? '失败' : '未知';
   const meta = `${esc(video.source || (video.remote ? 'remote' : '4×4090'))} · task=${esc(video.task || '-')} · exp=${esc(video.experiment || '-')} · ${esc(video.updated_at)} · ${esc(video.size_mib)} MiB`;
   const holderId = `evalPlayer_${esc(video.id)}`;
+  const label = video.display_name || video.name || video.relative_path;
+  const checkbox = video.deletable
+    ? `<input type="checkbox" class="eval-video-select" data-video-id="${esc(video.id)}" data-video-label="${esc(label)}" data-video-path="${esc(video.relative_path)}" onchange="onEvalVideoSelectionChange(this)" ${selectedEvalVideoIds.has(video.id) ? 'checked' : ''} aria-label="选择评估视频 ${esc(video.relative_path)}">`
+    : `<span class="muted" title="远端视频请先同步到 4×4090">远端</span>`;
   const action = video.remote
-    ? `<button class="inline" type="button" onclick="syncEvalVideo('${esc(video.source)}','${esc(video.root)}','${esc(video.relative_path)}')">同步到 4×4090</button>`
-    : `<button class="inline" type="button" onclick="playEvalVideo('${esc(video.id)}')">加载 / 播放</button>`;
-  return `<div class="eval-video-card">
-    <header><div><strong>${esc(video.display_name || video.name || video.relative_path)}</strong> <span class="${statusClass}">${statusLabel}</span><br><code class="path">${esc(video.relative_path)}</code><br><span class="muted">${meta}${video.score == null ? '' : ` · score=${esc(video.score)}`}</span></div><div>${action}</div></header>
+    ? `<button class="inline" type="button" data-source="${esc(video.source)}" data-root="${esc(video.root)}" data-relative-path="${esc(video.relative_path)}" onclick="syncEvalVideo(this.dataset.source, this.dataset.root, this.dataset.relativePath)">同步到 4×4090</button>`
+    : `<button class="inline" type="button" data-video-id="${esc(video.id)}" onclick="playEvalVideo(this.dataset.videoId)">加载 / 播放</button><button class="inline danger" type="button" data-video-id="${esc(video.id)}" data-video-label="${esc(label)}" onclick="deleteEvalVideo(this.dataset.videoId, this.dataset.videoLabel)">删除</button>`;
+  return `<div class="eval-video-card${video.remote ? ' remote' : ''}" data-video-id="${esc(video.id)}">
+    <header><div class="eval-video-header"><div class="eval-video-select-cell">${checkbox}</div><div class="eval-video-title"><strong>${esc(video.display_name || video.name || video.relative_path)}</strong> <span class="${statusClass}">${statusLabel}</span><br><code class="path">${esc(video.relative_path)}</code><br><span class="muted">${meta}${video.score == null ? '' : ` · score=${esc(video.score)}`}</span></div></div><div class="eval-video-actions">${action}</div></header>
     <div id="${holderId}"></div>
   </div>`;
 }
@@ -1067,6 +1210,87 @@ function updateTrainingExperimentInfo() {
   }
 }
 
+function fillCheckpointExperimentFilter(items) {
+  const select = document.getElementById('checkpointExperimentFilter');
+  if (!select) return 'all';
+  const old = select.value || 'all';
+  const experiments = [];
+  const counts = new Map();
+  for (const checkpoint of items) {
+    if (!checkpoint || !checkpoint.experiment) continue;
+    const name = String(checkpoint.experiment);
+    if (!counts.has(name)) experiments.push(name);
+    counts.set(name, (counts.get(name) || 0) + 1);
+  }
+  select.innerHTML = ['<option value="all">全部实验</option>', ...experiments.map(name => `<option value="${esc(name)}">${esc(name)}（${counts.get(name)}）</option>`)].join('');
+  if (old !== 'all' && experiments.includes(old)) select.value = old;
+  else select.value = 'all';
+  return select.value || 'all';
+}
+
+function updateCheckpointBulkControls() {
+  document.querySelectorAll('.checkpoint-select-all').forEach(header => {
+    const scope = header.dataset.checkpointScope;
+    const boxes = [...document.querySelectorAll(`.checkpoint-select[data-checkpoint-scope="${scope}"]`)]
+      .filter(input => !input.disabled);
+    const checked = boxes.filter(input => input.checked);
+    header.disabled = boxes.length === 0;
+    header.checked = boxes.length > 0 && checked.length === boxes.length;
+    header.indeterminate = checked.length > 0 && checked.length < boxes.length;
+
+    document.querySelectorAll(`[data-bulk-delete-checkpoint-scope="${scope}"]`).forEach(button => {
+      button.disabled = checked.length === 0;
+      const count = button.querySelector('[data-selected-checkpoint-count]');
+      if (count) count.textContent = String(checked.length);
+    });
+  });
+}
+
+function onCheckpointSelectionChange(input) {
+  const checkpointPath = input.dataset.checkpointPath;
+  if (!checkpointPath) return;
+  if (input.checked) selectedCheckpointPaths.add(checkpointPath);
+  else selectedCheckpointPaths.delete(checkpointPath);
+  updateCheckpointBulkControls();
+}
+
+function toggleCheckpointSelection(scope, checked) {
+  document.querySelectorAll(`.checkpoint-select[data-checkpoint-scope="${scope}"]`).forEach(input => {
+    if (input.disabled) return;
+    input.checked = checked;
+    onCheckpointSelectionChange(input);
+  });
+  updateCheckpointBulkControls();
+}
+
+async function batchDeleteSelectedCheckpoints() {
+  const checkpointPaths = [...document.querySelectorAll('.checkpoint-select[data-checkpoint-scope="training"]:checked')]
+    .map(input => input.dataset.checkpointPath)
+    .filter(Boolean);
+  if (!checkpointPaths.length) {
+    show('请先选择要删除的 checkpoint。');
+    return;
+  }
+  if (!confirm(`确认批量删除 ${checkpointPaths.length} 个 checkpoint？
+将永久删除完整 checkpoint 目录，不会删除任务记录、日志、数据集或训练输出。`)) return;
+  try {
+    const result = await api('/api/checkpoints/batch-delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({checkpoint_paths: checkpointPaths}),
+    });
+    const deletedPaths = result.checkpoint_paths || checkpointPaths;
+    for (const checkpointPath of deletedPaths) {
+      selectedCheckpointPaths.delete(checkpointPath);
+    }
+    updateCheckpointBulkControls();
+    show(`已批量删除 ${result.deleted_count || deletedPaths.length} 个 checkpoint。`, false);
+    await refreshAll();
+  } catch (error) {
+    show(error.message);
+  }
+}
+
 function fillBaseModels(items) {
   document.querySelectorAll('.base-model-select').forEach(select => {
     const form = select.closest('form');
@@ -1123,26 +1347,54 @@ function checkpointLabel(c) {
 }
 
 function fillCheckpoints(items) {
-  document.getElementById('checkpoints').innerHTML = items.map(c => `
-    <tr><td><strong>${esc(c.experiment)}</strong><br>step ${esc(c.step)} · <span class="pill">${esc(modelVariantLabel(c.model_variant))}</span> <span class="pill">${esc(c.arm_mode || '-')}</span><br><span class="muted">contract v${esc(c.contract_version || '?')} · raw/model ${esc(c.raw_action_dim || '?')}D/${esc(c.model_action_dim || '?')}D · ${esc(c.model_action_convention || 'unmarked')} · ${esc(c.gripper_semantics || '-')}</span></td>
-    <td>${(c.dataset_ids || []).map(id => `<span class="pill">${esc(id)}</span>`).join('') || '<span class="muted">-</span>'}<br><span class="muted">${esc(c.config_name || '-')}</span></td>
-    <td>${c.size_gib == null ? '-' : `${Number(c.size_gib).toFixed(1)} GiB`}<br><span class="muted">${esc(c.updated_at || '-')}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">暂无完整 checkpoint</td></tr>';
+  const filterValue = fillCheckpointExperimentFilter(items);
+  const filtered = filterValue === 'all'
+    ? items.slice()
+    : items.filter(c => c.experiment === filterValue).sort((left, right) => Number(right.step || 0) - Number(left.step || 0) || Number(right.mtime || 0) - Number(left.mtime || 0));
+  const visiblePaths = new Set(filtered.map(c => c.path));
+  for (const checkpointPath of [...selectedCheckpointPaths]) {
+    if (!visiblePaths.has(checkpointPath)) selectedCheckpointPaths.delete(checkpointPath);
+  }
+
+  const checkpointRows = document.getElementById('checkpoints');
+  if (checkpointRows) {
+    const emptyRow = filterValue === 'all'
+      ? '<tr><td colspan="4" class="muted">暂无完整 checkpoint</td></tr>'
+      : `<tr><td colspan="4" class="muted">实验 ${esc(filterValue)} 暂无匹配 checkpoint</td></tr>`;
+    checkpointRows.innerHTML = filtered.map(c => {
+      const checkbox = `<input type="checkbox" class="checkpoint-select" data-checkpoint-scope="training" data-checkpoint-path="${esc(c.path)}" onchange="onCheckpointSelectionChange(this)" ${selectedCheckpointPaths.has(c.path) ? 'checked' : ''} aria-label="选择 checkpoint ${esc(c.experiment)} step ${esc(c.step)}">`;
+      return `<tr data-checkpoint-path="${esc(c.path)}"><td class="checkpoint-selection-cell">${checkbox}</td><td><strong>${esc(c.experiment)}</strong><br>step ${esc(c.step)} · <span class="pill">${esc(modelVariantLabel(c.model_variant))}</span> <span class="pill">${esc(c.arm_mode || '-')}</span><br><span class="muted">contract v${esc(c.contract_version || '?')} · raw/model ${esc(c.raw_action_dim || '?')}D/${esc(c.model_action_dim || '?')}D · ${esc(c.model_action_convention || 'unmarked')} · ${esc(c.gripper_semantics || '-')}</span></td><td>${(c.dataset_ids || []).map(id => `<span class="pill">${esc(id)}</span>`).join('') || '<span class="muted">-</span>'}<br><span class="muted">${esc(c.config_name || '-')}</span></td><td>${c.size_gib == null ? '-' : `${Number(c.size_gib).toFixed(1)} GiB`}<br><span class="muted">${esc(c.updated_at || '-')}</span></td></tr>`;
+    }).join('') || emptyRow;
+  }
+
+  const summary = document.getElementById('checkpointSummary');
+  if (summary) {
+    summary.textContent = filtered.length
+      ? (filterValue === 'all'
+          ? `显示 ${filtered.length} 个 checkpoint`
+          : `实验 ${filterValue} · 显示 ${filtered.length} / ${items.length} 个 checkpoint`)
+      : (items.length ? `实验 ${filterValue} 没有匹配 checkpoint` : '暂无完整 checkpoint');
+  }
+  updateCheckpointBulkControls();
 
   const select = document.getElementById('checkpointSelect');
-  const dataset = document.getElementById('policyDataset').value;
-  const datasetInfo = datasetById(dataset);
-  const old = select.value;
-  const matches = items.filter(c => Array.isArray(c.dataset_ids)
-    && c.dataset_ids.includes(dataset)
-    && (!datasetInfo || c.arm_mode === datasetInfo.arm_mode));
-  select.innerHTML = matches.map(c => `<option value="${esc(c.path)}">${esc(checkpointLabel(c))}</option>`).join('');
-  if (matches.some(c => c.path === old)) select.value = old;
-  const selected = matches.find(c => c.path === select.value);
-  document.getElementById('policyModelVariant').value = selected ? selected.model_variant : 'pi05';
-  document.getElementById('checkpointInfo').textContent = selected
-    ? `${modelVariantLabel(selected.model_variant)} 完整 checkpoint；当前：${selected.path}`
-    : `数据集 ${dataset || '-'} 暂无完整 checkpoint，请先完成训练。`;
-  document.getElementById('policySubmit').disabled = !selected;
+  if (select) {
+    const datasetSelect = document.getElementById('policyDataset');
+    const dataset = datasetSelect ? datasetSelect.value : '';
+    const datasetInfo = datasetById(dataset);
+    const old = select.value;
+    const matches = items.filter(c => Array.isArray(c.dataset_ids)
+      && c.dataset_ids.includes(dataset)
+      && (!datasetInfo || c.arm_mode === datasetInfo.arm_mode));
+    select.innerHTML = matches.map(c => `<option value="${esc(c.path)}">${esc(checkpointLabel(c))}</option>`).join('');
+    if (matches.some(c => c.path === old)) select.value = old;
+    const selected = matches.find(c => c.path === select.value);
+    document.getElementById('policyModelVariant').value = selected ? selected.model_variant : 'pi05';
+    document.getElementById('checkpointInfo').textContent = selected
+      ? `${modelVariantLabel(selected.model_variant)} 完整 checkpoint；当前：${selected.path}`
+      : `数据集 ${dataset || '-'} 暂无完整 checkpoint，请先完成训练。`;
+    document.getElementById('policySubmit').disabled = !selected;
+  }
   fillEvalCheckpoints(items);
 }
 
@@ -1693,7 +1945,78 @@ function jobDependencySummary(task) {
   return `<br><span class="ok">由 norm 自动串联</span><br><code class="task-ref" title="${esc(id)}">${esc(shortTaskId(id))}</code>`;
 }
 
+
+function formatBytes(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '-';
+  if (number < 1024) return `${number} B`;
+  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+  let scaled = number;
+  for (const unit of units) {
+    scaled /= 1024;
+    if (scaled < 1024 || unit === units[units.length - 1]) return `${scaled.toFixed(scaled >= 10 ? 1 : 2)} ${unit}`;
+  }
+  return `${number} B`;
+}
+
+function formatDuration(seconds) {
+  const number = Number(seconds);
+  if (!Number.isFinite(number) || number < 0) return '-';
+  const total = Math.round(number);
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  const secs = total % 60;
+  if (minutes < 60) return `${minutes}m ${secs}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+function transferProgressValue(task) {
+  const p = task.progress || {};
+  const direct = Number(p.progress);
+  if (Number.isFinite(direct)) return Math.max(0, Math.min(1, direct));
+  const done = Number(p.completed_bytes);
+  const total = Number(p.total_bytes);
+  return Number.isFinite(done) && Number.isFinite(total) && total > 0 ? Math.max(0, Math.min(1, done / total)) : null;
+}
+
+function fillTransferTasks(items) {
+  const target = document.getElementById('transferJobs');
+  if (!target) return;
+  const transfers = items.filter(task => task.type === 'transfer');
+  target.innerHTML = transfers.map(task => {
+    const metadata = task.metadata || {};
+    const progress = task.progress || {};
+    const fraction = transferProgressValue(task);
+    const percent = fraction == null ? '-' : `${(fraction * 100).toFixed(fraction >= 0.995 ? 1 : 2)}%`;
+    const done = formatBytes(progress.completed_bytes);
+    const total = formatBytes(progress.total_bytes);
+    const speed = Number(progress.speed_bytes_per_sec) > 0 ? `${formatBytes(progress.speed_bytes_per_sec)}/s` : '-';
+    const eta = formatDuration(progress.eta_seconds);
+    const active = ACTIVE_STATES.has(task.state);
+    const terminal = TERMINAL_STATES.has(task.state);
+    const kind = metadata.transfer_kind || 'dataset';
+    const source = metadata.source || progress.source || '-';
+    const targetName = metadata.target || progress.target || '-';
+    const path = metadata.dataset_id || metadata.exp_name || progress.dataset_id || '-';
+    const width = fraction == null ? 0 : fraction * 100;
+    const files = progress.total_files ? `${progress.completed_files || 0}/${progress.total_files} files` : 'files -';
+    const shards = progress.total_shards ? `${progress.completed_shards || 0}/${progress.total_shards} lanes` : 'lanes -';
+    const error = progress.error || progress.scan_error || task.start_error || '';
+    return `<tr><td><code class="task-ref" title="${esc(task.id)}">${esc(shortTaskId(task.id))}</code><br><span class="pill">${esc(kind)}</span><br><span class="muted">${esc(path)}</span></td>`
+      + `<td><strong>${esc(source)} → ${esc(targetName)}</strong><br><code class="path" title="${esc(metadata.target_path || progress.target_path || '')}">${esc(shortPath(metadata.target_path || progress.target_path || '-'))}</code></td>`
+      + `<td class="transfer-progress-cell"><div class="transfer-progress-meta"><span>${esc(percent)}</span><span>${esc(done)} / ${esc(total)}</span></div><div class="progress-track"><div class="progress-bar" style="width:${width.toFixed(3)}%"></div></div><div class="transfer-detail">${esc(files)} · ${esc(shards)} · ${esc(speed)} · ETA ${esc(eta)}</div></td>`
+      + `<td class="${stateClass(task.state)}">${esc(task.state)}${progress.updated_at ? `<br><span class="muted">${esc(progress.updated_at)}</span>` : ''}${error ? `<br><span class="bad">${esc(error)}</span>` : ''}</td>`
+      + `<td><button class="inline secondary" onclick="loadLog('${esc(task.id)}','training')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(task.id)}',false)">停止</button>` : ''}${terminal ? `<button class="inline danger" onclick="deleteTask('${esc(task.id)}','training')">删除记录</button>` : ''}</td></tr>`;
+  }).join('') || '<tr><td colspan="5" class="muted">暂无 transfer 任务</td></tr>';
+}
+
 function fillTasks(items) {
+  const terminalIds = new Set(items.filter(t => TERMINAL_STATES.has(t.state)).map(t => t.id));
+  for (const taskId of selectedTaskIds) {
+    if (!terminalIds.has(taskId)) selectedTaskIds.delete(taskId);
+  }
+
   const policies = items.filter(t => t.type === 'policy');
   document.getElementById('policies').innerHTML = policies.map(t => {
     const m = t.metadata || {};
@@ -1701,14 +2024,16 @@ function fillTasks(items) {
     const health = t.policy_healthy === true ? '<span class="ok">/healthz OK</span>' : t.state === 'running' ? '<span class="bad">/healthz FAIL</span>' : '<span class="muted">未运行</span>';
     const badge = m.external ? '<br><span class="pill warn">外部进程已接管</span>' : '';
     const deletable = TERMINAL_STATES.has(t.state);
-    return `<tr><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid || '-')}${badge}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal ? `<br>${esc(t.stop_signal)}` : ''}</td><td>GPU ${esc((m.gpu_ids || []).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.arm_mode || '-')}</span> <span class="pill">${esc(m.schema || '-')}</span></td><td>dataset=${esc(m.dataset_id)} · <span class="pill">${esc(modelVariantLabel(m.model_variant))}</span><br>contract v${esc(m.contract_version || '?')} · raw/model ${esc(m.raw_action_dim || '?')}D/${esc(m.model_action_dim || '?')}D · offset ${esc(m.action_offset ?? '-')}/+${esc(m.model_action_start_offset ?? 1)}<br>${esc(m.model_action_convention || '-')} · gripper ${esc(m.raw_gripper_semantics || '-')} → ${esc(m.gripper_semantics || m.wire_gripper_semantics || '-')}<br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}','policy')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','policy')">删除记录</button>` : ''}</td></tr>`;
-  }).join('') || '<tr><td colspan="6" class="muted">暂无 Policy 进程；可在上方创建。</td></tr>';
+    const checkbox = `<input type="checkbox" class="task-select" data-task-scope="policy" data-task-id="${esc(t.id)}" onchange="onTaskSelectionChange(this)" ${deletable ? '' : 'disabled title="运行中的 Policy 不能批量删除"'} ${selectedTaskIds.has(t.id) ? 'checked' : ''} aria-label="选择任务 ${esc(t.id)}">`;
+    return `<tr><td class="task-selection-cell">${checkbox}</td><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid || '-')}${badge}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal ? `<br>${esc(t.stop_signal)}` : ''}</td><td>GPU ${esc((m.gpu_ids || []).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.arm_mode || '-')}</span> <span class="pill">${esc(m.schema || '-')}</span></td><td>dataset=${esc(m.dataset_id)} · <span class="pill">${esc(modelVariantLabel(m.model_variant))}</span><br>contract v${esc(m.contract_version || '?')} · raw/model ${esc(m.raw_action_dim || '?')}D/${esc(m.model_action_dim || '?')}D · offset ${esc(m.action_offset ?? '-')}/+${esc(m.model_action_start_offset ?? 1)}<br>${esc(m.model_action_convention || '-')} · gripper ${esc(m.raw_gripper_semantics || '-')} → ${esc(m.gripper_semantics || m.wire_gripper_semantics || '-')}<br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}','policy')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','policy')">删除记录</button>` : ''}</td></tr>`;
+  }).join('') || '<tr><td colspan="7" class="muted">暂无 Policy 进程；可在上方创建。</td></tr>';
 
-  const jobs = items.filter(t => t.type !== 'policy');
+  const jobs = items.filter(t => t.type !== 'policy' && t.type !== 'transfer');
   document.getElementById('jobs').innerHTML = jobs.map(t => {
     const m = t.metadata || {};
     const active = ACTIVE_STATES.has(t.state);
     const deletable = TERMINAL_STATES.has(t.state);
+    const checkbox = `<input type="checkbox" class="task-select" data-task-scope="training" data-task-id="${esc(t.id)}" onchange="onTaskSelectionChange(this)" ${deletable ? '' : 'disabled title="运行中的任务不能批量删除"'} ${selectedTaskIds.has(t.id) ? 'checked' : ''} aria-label="选择任务 ${esc(t.id)}">`;
     let params = '';
     if (t.type === 'eval') {
       const result = t.result || {};
@@ -1729,8 +2054,10 @@ function fillTasks(items) {
     const stateDetails = `${jobDependencySummary(t)}${t.skip_reason ? `<br><span class="warn">${esc(t.skip_reason)}</span>` : ''}${t.start_error ? `<br><span class="bad">${esc(t.start_error)}</span>` : ''}`;
     const logModule = t.type === 'eval' ? 'eval' : 'training';
     const logLabel = t.type === 'eval' ? '评测日志' : '日志';
-    return `<tr><td><code class="task-ref" title="${esc(t.id)}">${esc(shortTaskId(t.id))}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${stateDetails}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}','${logModule}')">${logLabel}</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','${logModule}')">删除记录</button>` : ''}</td></tr>`;
-  }).join('') || '<tr><td colspan="4" class="muted">暂无 Norm / Train / Eval 任务</td></tr>';
+    return `<tr><td class="task-selection-cell">${checkbox}</td><td><code class="task-ref" title="${esc(t.id)}">${esc(shortTaskId(t.id))}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${stateDetails}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}','${logModule}')">${logLabel}</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','${logModule}')">删除记录</button>` : ''}</td></tr>`;
+  }).join('') || '<tr><td colspan="5" class="muted">暂无 Norm / Train / Eval 任务</td></tr>';
+  updateTaskBulkControls();
+  fillTransferTasks(items);
   fillReplacePolicies(items);
   updateClientCommand();
 }
@@ -1745,7 +2072,8 @@ function updateSummaries(data) {
   const trainTasks = tasks.filter(task => task.type === 'train');
   const normTasks = tasks.filter(task => task.type === 'norm');
   const evalTasks = tasks.filter(task => task.type === 'eval');
-  const activeTraining = [...trainTasks, ...normTasks, ...evalTasks].filter(task => ACTIVE_STATES.has(task.state));
+  const transferTasks = tasks.filter(task => task.type === 'transfer');
+  const activeTraining = [...trainTasks, ...normTasks, ...evalTasks, ...transferTasks].filter(task => ACTIVE_STATES.has(task.state));
   const policies = tasks.filter(task => task.type === 'policy');
   const activePolicies = policies.filter(task => ['starting', 'running', 'stopping'].includes(task.state));
   const observation = data.robot_observation;
@@ -1755,7 +2083,7 @@ function updateSummaries(data) {
   document.getElementById('summaryDatasets').textContent = String(datasets.length);
   document.getElementById('summaryFrames').textContent = `${frames.toLocaleString()} frames`;
   document.getElementById('summaryTraining').textContent = String(activeTraining.length);
-  document.getElementById('summaryTrainingDetail').textContent = `${trainTasks.length} train · ${normTasks.length} norm`;
+  document.getElementById('summaryTrainingDetail').textContent = `${trainTasks.length} train · ${normTasks.length} norm · ${transferTasks.length} transfer`;
   document.getElementById('summaryPolicies').textContent = String(activePolicies.length);
   document.getElementById('summaryPolicyDetail').textContent = observation && observation.fresh ? 'telemetry 新鲜' : '暂无新鲜 telemetry';
   document.getElementById('navOverviewCount').textContent = String(activeTraining.length + activePolicies.length);
@@ -2022,6 +2350,7 @@ async function refreshAll() {
     loadClusterResources({quiet: true});
     fillTasks(data.tasks || []);
     fillTrainingTasks(data.tasks || []);
+    fillTransferTasks(data.tasks || []);
     refreshSelectedLogs();
     fillObservation(data.robot_observation);
     updateSummaries(data);
@@ -2098,15 +2427,85 @@ async function refreshSelectedLogs() {
   }
 }
 
+function updateTaskBulkControls() {
+  document.querySelectorAll('.task-select-all').forEach(header => {
+    const scope = header.dataset.taskScope;
+    const boxes = [...document.querySelectorAll(`.task-select[data-task-scope="${scope}"]`)]
+      .filter(input => !input.disabled);
+    const checked = boxes.filter(input => input.checked);
+    header.disabled = boxes.length === 0;
+    header.checked = boxes.length > 0 && checked.length === boxes.length;
+    header.indeterminate = checked.length > 0 && checked.length < boxes.length;
+
+    document.querySelectorAll(`[data-bulk-delete-scope="${scope}"]`).forEach(button => {
+      button.disabled = checked.length === 0;
+      const count = button.querySelector('[data-selected-task-count]');
+      if (count) count.textContent = String(checked.length);
+    });
+  });
+}
+
+function onTaskSelectionChange(input) {
+  const taskId = input.dataset.taskId;
+  if (!taskId) return;
+  if (input.checked) selectedTaskIds.add(taskId);
+  else selectedTaskIds.delete(taskId);
+  updateTaskBulkControls();
+}
+
+function toggleTaskSelection(scope, checked) {
+  document.querySelectorAll(`.task-select[data-task-scope="${scope}"]`).forEach(input => {
+    if (input.disabled) return;
+    input.checked = checked;
+    onTaskSelectionChange(input);
+  });
+  updateTaskBulkControls();
+}
+
+async function batchDeleteSelectedTasks(scope) {
+  const taskIds = [...document.querySelectorAll(`.task-select[data-task-scope="${scope}"]:checked`)]
+    .map(input => input.dataset.taskId)
+    .filter(Boolean);
+  if (!taskIds.length) {
+    show('请先选择要删除的历史日志。');
+    return;
+  }
+  if (!confirm(`确认批量删除 ${taskIds.length} 条历史任务日志？\n将删除 Dashboard 任务记录和日志，但不会删除 checkpoint、模型或训练输出。`)) return;
+  try {
+    const result = await api('/api/tasks/batch-delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({task_ids: taskIds}),
+    });
+    const deletedIds = result.task_ids || taskIds;
+    for (const taskId of deletedIds) {
+      selectedTaskIds.delete(taskId);
+      for (const moduleName of Object.keys(selectedTaskLogs)) {
+        if (selectedTaskLogs[moduleName] !== taskId) continue;
+        const target = taskLogTarget(moduleName);
+        document.getElementById(target.logId).textContent = target.empty;
+        selectedTaskLogs[moduleName] = null;
+      }
+    }
+    updateTaskBulkControls();
+    show(`已批量删除 ${deletedIds.length} 条历史任务日志。`, false);
+    await refreshAll();
+  } catch (error) {
+    show(error.message);
+  }
+}
+
 async function deleteTask(id, moduleName = 'training') {
   const target = taskLogTarget(moduleName);
   if (!confirm(`删除历史${target.kind}任务 ${id}？\n将删除 Dashboard 任务记录和日志，但不会删除 checkpoint、模型或训练输出。`)) return;
   try {
     await api(`/api/tasks/${encodeURIComponent(id)}`, {method: 'DELETE'});
+    selectedTaskIds.delete(id);
     if (selectedTaskLogs[target.module] === id) {
       document.getElementById(target.logId).textContent = target.empty;
       selectedTaskLogs[target.module] = null;
     }
+    updateTaskBulkControls();
     show(`历史任务 ${id} 已删除。`, false);
     await refreshAll();
   } catch (error) {
@@ -2167,6 +2566,7 @@ const trainExperimentInput = document.getElementById('trainExperimentName');
 }));
 document.getElementById('replacePolicy').addEventListener('change', () => updatePolicyOperation(true));
 document.getElementById('checkpointSelect').addEventListener('change', syncPolicyCheckpointVariant);
+document.getElementById('checkpointExperimentFilter').addEventListener('change', () => fillCheckpoints((latestStatus && latestStatus.checkpoints) || []));
 document.getElementById('policyPort').addEventListener('input', updateClientCommand);
 document.getElementById('editorDataset').addEventListener('change', () => {
   episodeDatasetData = null;

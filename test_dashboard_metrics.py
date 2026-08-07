@@ -404,9 +404,9 @@ class DatasetSchemaDescriptionTest(unittest.TestCase):
                 [("image", "image"), ("wrist_image", "image")],
             )
         )
-        self.assertFalse(legacy["training_supported"])
+        self.assertTrue(legacy["training_supported"])
         self.assertTrue(legacy["model_contract_supported"])
-        self.assertIn("canonical v3", legacy["training_error"])
+        self.assertIsNone(legacy["training_error"])
         self.assertEqual(legacy["contract_version"], 2)
         self.assertTrue(legacy["legacy_delivery_v2"])
         self.assertEqual(legacy["raw_action_convention"], "step")

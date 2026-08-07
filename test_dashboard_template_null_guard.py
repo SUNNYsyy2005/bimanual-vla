@@ -32,6 +32,27 @@ class DashboardTemplateNullGuardTest(unittest.TestCase):
         app_source = (Path(__file__).parent / "server_4090/app.py").read_text(encoding="utf-8")
         self.assertIn('visible_dataset_origins', app_source)
 
+    def test_batch_task_log_delete_controls_and_endpoint_are_present(self):
+        template = (
+            Path(__file__).parent / "server_4090/templates/index.html"
+        ).read_text(encoding="utf-8")
+        app_source = (Path(__file__).parent / "server_4090/app.py").read_text(encoding="utf-8")
+
+        self.assertGreaterEqual(template.count("batchDeleteSelectedTasks("), 2)
+        self.assertIn('class="task-select-all"', template)
+        self.assertIn('class="task-select"', template)
+        self.assertGreaterEqual(
+            template.count('<td class="task-selection-cell">${checkbox}</td>'),
+            2,
+        )
+        self.assertIn(
+            '.training-jobs-table th:nth-child(1), .training-jobs-table td:nth-child(1) { width:42px; }',
+            template,
+        )
+        self.assertIn("/api/tasks/batch-delete", template)
+        self.assertIn('@app.post("/api/tasks/batch-delete")', app_source)
+        self.assertIn("def delete_many", app_source)
+
     def test_timed_target_helpers_guard_null_object_values(self):
         template = (
             Path(__file__).parent / "server_4090/templates/index.html"

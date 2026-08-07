@@ -519,8 +519,11 @@ h200-ali-02
 
 - local/H100 等 SSH 可访问位置：并行 tar 流；
 - 涉及 H200 Slurm-only：自动使用 NAS staging + CPU-only Slurm copy job；
-- `skip_existing=true` 时目标数据集已经存在会直接成功跳过，适合训练前幂等同步；
-- 返回 `transfer` task，可用 `/api/tasks/<task_id>/status` 和 `/api/tasks/<task_id>/log` 查询。
+- 4×4090→H100 的多路 rsync 使用单个 SSH multiplex master 复用连接，避免 login-server 的多次 SSH 握手触发 `kex_exchange_identification`；默认/推荐 `parallelism=4`，中断后可安全重试并通过 `--partial/--append-verify` 续传；
+- `skip_existing=true` 时完整且 manifest 一致的目标会直接跳过；若检测到中断留下的部分数据，则原地续传并在结束后重新校验 manifest，适合训练前幂等同步；
+- 返回 `transfer` task，可用 `/api/tasks/<task_id>/status` 和 `/api/tasks/<task_id>/log` 查询；Dashboard 的“数据传输任务”表会自动刷新进度。
+- 新版 dataset transfer runner 会在任务目录写入 `progress.json`，字段包括 `progress`、`completed_bytes` / `total_bytes`、`completed_files` / `total_files`、`completed_shards` / `total_shards`、`speed_bytes_per_sec` 和 `eta_seconds`。
+- 旧版 transfer 若没有 sidecar，Dashboard 会根据传输日志和目标目录 manifest 给出节流后的保守估算；这类估算可能按完整文件跳变，不应当解释为精确的 rsync 当前块进度。
 
 示例：
 
@@ -562,6 +565,37 @@ Content-Type: application/json
 curl -X POST "$DASH/api/checkpoints/sync" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"source":"h100","target":"local_4090","config_name":"pi05_piper_single_arm_lora","exp_name":"my_real_exp","parallelism":8,"overwrite":false,"skip_existing":true}'
+```
+
+### 5.4 批量删除 checkpoint
+
+Dashboard 训练页里的 checkpoint 表支持按实验筛选后的多选批量删除；后端接口仅删除完整训练 checkpoint 目录，不会删除任务记录、日志、数据集或训练输出。
+
+```http
+POST /api/checkpoints/batch-delete
+Content-Type: application/json
+```
+
+请求：
+
+```json
+{
+  "checkpoint_paths": [
+    "/.../pi05_piper_single_arm_lora/exp_a/5000",
+    "/.../pi05_piper_single_arm_lora/exp_a/10000"
+  ]
+}
+```
+
+返回：
+
+```json
+{
+  "deleted": true,
+  "deleted_count": 2,
+  "checkpoint_paths": [...],
+  "deleted_checkpoints": [...]
+}
 ```
 
 ---
@@ -732,6 +766,9 @@ H100/H200 Slurm 示例：
 - `gpu_ids`：本地 4×4090 用，如 `"0,1"`；
 - `cluster_gpus` / `gpu_count`：Slurm 目标用，表示申请卡数；
 - `mode`：`auto` / `new` / `resume` / `overwrite`；
+- `resume_checkpoint`：可选的、已完成的数字 Orbax checkpoint 路径；仅用于 `mode=resume` 或 `mode=auto`，语义是 **full-state resume**（恢复 params、optimizer、EMA 和 step），不是基础模型权重；
+- 当目标实验只有 `*.orbax-checkpoint-tmp-*` 临时目录时，必须显式传 `resume_checkpoint`；Dashboard 不会把 norm 配置里的 `base_checkpoint` 或 `pi05_base` 静默当成恢复源；
+- `resume_checkpoint` 必须包含 `_CHECKPOINT_METADATA`、`params/_METADATA`、`train_state/_METADATA`，并且必须有与目标实机数据集完全匹配的 action-contract marker；不同 schema/动作语义（例如 EEF 7D 与 joint 7D）会被拒绝；
 - `batch_size` 必须能被 GPU 数整除；
 - `fsdp_devices` 必须整除 GPU 数；
 - `eval_interval_steps` 必须能被 `save_interval` 整除，且当前要求是 5000 的倍数；
@@ -941,6 +978,34 @@ Content-Type: application/json
 
 返回 `transfer` task。H200 Slurm-only 视频不能直接通过该接口扫描/拉取，需要先通过 Slurm staging/NAS 发布到 4×4090 可访问位置。
 
+### 9.4 批量删除评估视频
+
+训练/评估页面的评估视频模块支持勾选多个**本地**视频并批量删除；远端视频只允许同步，不支持直接删除。
+
+```http
+POST /api/eval-videos/batch-delete
+Content-Type: application/json
+```
+
+请求：
+
+```json
+{
+  "video_ids": ["base64id1", "base64id2"]
+}
+```
+
+返回：
+
+```json
+{
+  "deleted": true,
+  "deleted_count": 2,
+  "video_ids": [...],
+  "deleted_videos": [...]
+}
+```
+
 ---
 
 ## 10. 资源查询
@@ -988,7 +1053,34 @@ GET /api/tasks
 GET /api/tasks/<task_id>/status
 ```
 
-轻量状态接口，适合 AI 轮询。
+轻量状态接口，适合 AI 轮询。transfer 任务会额外返回：
+
+```json
+{
+  "task": {
+    "id": "transfer-...",
+    "type": "transfer",
+    "state": "running",
+    "progress": {
+      "progress": 0.526663,
+      "completed_bytes": 11266863540,
+      "total_bytes": 21392916007,
+      "completed_files": 52,
+      "total_files": 105,
+      "completed_shards": 0,
+      "total_shards": 4,
+      "parallelism": 4,
+      "speed_bytes_per_sec": 460303700.26,
+      "eta_seconds": 22,
+      "source": "local_4090",
+      "target": "h100",
+      "updated_at": "2026-08-07T11:22:25+0800"
+    }
+  }
+}
+```
+
+`progress` 是 0–1 的比例；文件数和字节数以目标端已经可见的完整文件为准。由于 rsync 的临时文件可能尚未改名，传输中的进度是保守值，完成某个大文件时可能一次跳升。
 
 ### 11.3 查询任务完整信息
 
@@ -1034,6 +1126,21 @@ DELETE /api/tasks/<task_id>
 ```
 
 只能删除终态任务记录；不会删除 checkpoint 或数据集。
+
+### 11.8 批量删除任务记录和日志
+
+```http
+POST /api/tasks/batch-delete
+Content-Type: application/json
+```
+
+请求体：
+
+```json
+{"task_ids":["train-20260801-120000-ab12cd34","eval-20260801-120500-ef56gh78"]}
+```
+
+一次最多删除 200 条任务。所有任务必须处于终态；如果某个任务仍在运行、仍被活动依赖，或任一任务校验失败，则整个批次不会删除任何记录。批量删除允许同时选择已结束的依赖任务和被依赖任务。删除范围仅限 Dashboard 任务目录中的任务记录和日志，不会删除 checkpoint、模型、数据集、训练输出或外部日志路径。
 
 ---
 
@@ -1132,6 +1239,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 | POST | `/api/tasks/<task_id>/execution-control` | 设置 policy 执行安全门 |
 | POST | `/api/tasks/<task_id>/stop` | 停止任务 |
 | DELETE | `/api/tasks/<task_id>` | 删除终态任务记录 |
+| POST | `/api/tasks/batch-delete` | 批量删除终态任务记录和日志 |
 | GET | `/api/tasks` | 列任务 |
 | GET | `/api/tasks/<task_id>/status` | 查任务轻量状态 |
 | GET | `/api/tasks/<task_id>` | 查任务完整信息 |

@@ -197,6 +197,38 @@ def parse_training_metrics(log_text: str, *, max_points: int = 1200) -> dict[str
     }
 
 
+def is_complete_checkpoint(path: Path | str) -> bool:
+    """Return whether *path* has finalized parameter-checkpoint markers.
+
+    This deliberately keeps the historical Dashboard definition used for
+    listing/evaluation: some weight-only checkpoints do not contain optimizer
+    state.  Full-state resume uses :func:`is_full_state_checkpoint` below.
+    """
+    path = Path(path).expanduser()
+    return bool(
+        path.is_dir()
+        and path.name.isdigit()
+        and (path / "_CHECKPOINT_METADATA").is_file()
+        and (path / "params" / "_METADATA").is_file()
+    )
+
+
+def is_full_state_checkpoint(path: Path | str) -> bool:
+    path = Path(path).expanduser()
+    return bool(is_complete_checkpoint(path) and (path / "train_state" / "_METADATA").is_file())
+
+
+def full_state_checkpoint_steps(checkpoint_dir: Path) -> list[tuple[int, Path]]:
+    checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.is_dir():
+        return []
+    return sorted(
+        (int(child.name), child.resolve())
+        for child in checkpoint_dir.iterdir()
+        if is_full_state_checkpoint(child)
+    )
+
+
 def complete_checkpoint_steps(checkpoint_dir: Path) -> list[tuple[int, Path]]:
     """Return complete numeric Orbax checkpoints without expensive size scans."""
     checkpoint_dir = Path(checkpoint_dir)
@@ -204,11 +236,7 @@ def complete_checkpoint_steps(checkpoint_dir: Path) -> list[tuple[int, Path]]:
         return []
     checkpoints: list[tuple[int, Path]] = []
     for child in checkpoint_dir.iterdir():
-        if not child.is_dir() or not child.name.isdigit():
-            continue
-        if not (child / "_CHECKPOINT_METADATA").is_file():
-            continue
-        if not (child / "params" / "_METADATA").is_file():
+        if not is_complete_checkpoint(child):
             continue
         checkpoints.append((int(child.name), child.resolve()))
     return sorted(checkpoints)
@@ -1040,12 +1068,14 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
         key.removeprefix("observation.images.") for key in sorted(media_keys)
     ]
     model_contract_supported = not errors and contract_fingerprint is not None
-    training_supported = model_contract_supported and not legacy_delivery
-    training_error = (
-        "旧版 Delivery v2 仅保留预览/迁移兼容；请迁移为 canonical v3 后再训练"
-        if legacy_delivery and model_contract_supported
-        else None
-    )
+    # Legacy Delivery v2 (raw 7D step deltas) is still a valid real-robot
+    # training contract.  It uses the explicit step/chunk-origin compatibility
+    # path below; only datasets whose dimensions/metadata cannot form a
+    # contract should be blocked.  Canonical v3 remains the preferred format,
+    # but v2 must not be mislabeled as preview-only because 8_3_64eps is an
+    # intentionally supported training dataset.
+    training_supported = model_contract_supported
+    training_error = None
     return {
         "schema": schema,
         "schema_label": schema_label,
@@ -1202,10 +1232,20 @@ def pid_alive(pid: int) -> bool:
         return False
 
 
+def _process_match_command(task: dict[str, Any]) -> list[Any] | None:
+    launch_command = task.get("launch_command")
+    if isinstance(launch_command, list) and len(launch_command) >= 3:
+        return launch_command
+    command = task.get("command")
+    if isinstance(command, list) and len(command) >= 3:
+        return command
+    return None
+
+
 def process_matches_task(pid: int, task: dict[str, Any]) -> bool:
     """Prevent stale task files from targeting an unrelated reused PID."""
-    command = task.get("command")
-    if not isinstance(command, list) or len(command) < 3:
+    command = _process_match_command(task)
+    if command is None:
         return False
     try:
         running = [
@@ -1454,6 +1494,124 @@ class TaskManager:
         atomic_json(task_dir / "task.json", task)
         return task
 
+    def _exit_path(self, task_id: str) -> Path:
+        return self.root / safe_name(task_id, "task id") / "exit.json"
+
+    def _runner_command(self, task: dict[str, Any]) -> list[str]:
+        return [
+            sys.executable,
+            str(APP_DIR / "task_runner.py"),
+            "--exit-json",
+            str(self._exit_path(task["id"])),
+            "--cwd",
+            str(self.config["openpi_repo"]),
+            "--",
+            *[str(item) for item in task["command"]],
+        ]
+
+    def _systemd_task_backend_enabled(self) -> bool:
+        backend = str(self.config.get("task_launch_backend", "auto") or "auto").lower()
+        if backend in {"direct", "popen", "subprocess"}:
+            return False
+        if backend in {"systemd", "systemd_user", "systemd-user"}:
+            return True
+        return bool(os.environ.get("INVOCATION_ID") and shutil.which("systemd-run") and shutil.which("systemctl"))
+
+    def _systemd_unit_name(self, task_id: str) -> str:
+        safe = safe_name(task_id, "task id").replace("_", "-").replace(".", "-")
+        return f"bimanual-vla-task-{safe}.service"
+
+    @staticmethod
+    def _systemd_show(unit: str) -> dict[str, str]:
+        if not unit:
+            return {}
+        try:
+            result = subprocess.run(
+                [
+                    "systemctl", "--user", "show", unit,
+                    "-p", "LoadState",
+                    "-p", "ActiveState",
+                    "-p", "SubState",
+                    "-p", "Result",
+                    "-p", "ExecMainCode",
+                    "-p", "ExecMainStatus",
+                    "-p", "MainPID",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception as exc:
+            return {"_query_error": repr(exc)}
+        values: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value
+        if result.returncode != 0 and not values:
+            detail = (result.stderr or result.stdout or "systemctl show failed").strip()
+            return {"_query_error": detail}
+        return values
+
+    def _launch_direct_runner(
+        self,
+        task: dict[str, Any],
+        *,
+        env: dict[str, str],
+    ) -> subprocess.Popen:
+        log_handle = self._log_path(task["id"]).open("ab", buffering=0)
+        try:
+            return subprocess.Popen(
+                task["launch_command"],
+                cwd=self.config["openpi_repo"],
+                env=env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            log_handle.close()
+
+    def _launch_systemd_runner(
+        self,
+        task: dict[str, Any],
+        *,
+        env: dict[str, str],
+    ) -> int:
+        unit = self._systemd_unit_name(task["id"])
+        task["systemd_unit"] = unit
+        log_path = str(self._log_path(task["id"]))
+        command = [
+            "systemd-run",
+            "--user",
+            f"--unit={unit[:-8] if unit.endswith('.service') else unit}",
+            f"--property=WorkingDirectory={self.config['openpi_repo']}",
+            f"--property=StandardOutput=append:{log_path}",
+            f"--property=StandardError=append:{log_path}",
+            "--property=KillMode=control-group",
+            "--property=ManagedOOMPreference=omit",
+        ]
+        for key, value in sorted(env.items()):
+            if "=" in key or "\x00" in key or "\x00" in str(value):
+                continue
+            command.append(f"--setenv={key}={value}")
+        command.extend(task["launch_command"])
+        result = subprocess.run(
+            command,
+            cwd=self.config["openpi_repo"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "systemd-run failed").strip()
+            raise RuntimeError(detail)
+        status = self._systemd_show(unit)
+        try:
+            return int(status.get("MainPID", "0") or 0)
+        except ValueError:
+            return 0
+
     def _launch(
         self,
         task: dict[str, Any],
@@ -1464,18 +1622,40 @@ class TaskManager:
         task_id = task["id"]
         task["state"] = "starting"
         task["launch_attempted_at"] = now_iso()
+        task["exit_path"] = str(self._exit_path(task_id))
+        task["launch_command"] = self._runner_command(task)
         task.pop("waiting_reason", None)
-        atomic_json(self._path(task_id), task)
-        log_handle = self._log_path(task_id).open("ab", buffering=0)
+        if task.get("type") == "transfer":
+            progress_path = self.root / safe_name(task_id, "task id") / "progress.json"
+            task["progress_path"] = str(progress_path)
+            env = dict(env)
+            env["DASHBOARD_TASK_PROGRESS_PATH"] = str(progress_path)
+            env["DASHBOARD_TASK_ID"] = task_id
+        task.pop("start_error", None)
         try:
-            process = subprocess.Popen(
-                task["command"],
-                cwd=self.config["openpi_repo"],
-                env=env,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+            self._exit_path(task_id).unlink(missing_ok=True)
+        except OSError:
+            pass
+        atomic_json(self._path(task_id), task)
+
+        try:
+            if self._systemd_task_backend_enabled():
+                try:
+                    pid = self._launch_systemd_runner(task, env=env)
+                    task.update({
+                        "state": "running",
+                        "pid": pid,
+                        "started_at": now_iso(),
+                        "launch_backend": "systemd_user_service",
+                    })
+                    atomic_json(self._path(task_id), task)
+                    self.monitor_wakeup.set()
+                    return task
+                except Exception as exc:
+                    self._append_log(task, f"systemd task launch failed; falling back to direct runner: {exc}")
+
+            task["launch_backend"] = "direct_runner"
+            process = self._launch_direct_runner(task, env=env)
         except Exception as exc:
             task.update(
                 {
@@ -1489,8 +1669,6 @@ class TaskManager:
             if raise_on_error:
                 raise
             return task
-        finally:
-            log_handle.close()
         task.update({"state": "running", "pid": process.pid, "started_at": now_iso()})
         atomic_json(self._path(task_id), task)
         self.processes[task_id] = process
@@ -1648,26 +1826,206 @@ class TaskManager:
             raise_on_error=False,
         )
 
+    def _read_exit_info(self, task: dict[str, Any]) -> dict[str, Any] | None:
+        exit_path = task.get("exit_path")
+        if not exit_path:
+            return None
+        value = read_json(Path(str(exit_path)))
+        if isinstance(value, dict) and isinstance(value.get("returncode"), int):
+            return value
+        return None
+
+    def _finish_from_returncode(
+        self,
+        task: dict[str, Any],
+        returncode: int,
+        *,
+        exit_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        was_stopping = task.get("state") == "stopping"
+        task["state"] = "stopped" if was_stopping else ("completed" if returncode == 0 else "failed")
+        task["returncode"] = int(returncode)
+        if exit_info:
+            task["exit_info"] = exit_info
+            task["finished_at"] = exit_info.get("finished_at") or now_iso()
+            if exit_info.get("child_pid"):
+                task["child_pid"] = exit_info.get("child_pid")
+        else:
+            task["finished_at"] = now_iso()
+        atomic_json(self._path(task["id"]), task)
+        self.processes.pop(task["id"], None)
+        return task
+
+    @staticmethod
+    def _systemd_status_snapshot(status: dict[str, str]) -> dict[str, str]:
+        return {
+            key: str(status[key])
+            for key in (
+                "LoadState",
+                "ActiveState",
+                "SubState",
+                "Result",
+                "ExecMainCode",
+                "ExecMainStatus",
+                "MainPID",
+            )
+            if status.get(key) not in (None, "")
+        }
+
+    def _remember_systemd_status(self, task: dict[str, Any], status: dict[str, str]) -> bool:
+        """Persist the small, stable subset needed to explain unit ownership."""
+        snapshot = self._systemd_status_snapshot(status)
+        if not snapshot:
+            return False
+        changed = task.get("systemd_status") != snapshot
+        if changed:
+            task["systemd_status"] = snapshot
+            task["systemd_status_updated_at"] = now_iso()
+        result = status.get("Result")
+        if task.get("systemd_result") != result:
+            task["systemd_result"] = result
+            changed = True
+        return changed
+
+    @staticmethod
+    def _systemd_returncode(status: dict[str, str]) -> int:
+        """Convert systemd's ExecMainCode/ExecMainStatus into a task rc."""
+        try:
+            code = int(status.get("ExecMainStatus", "") or 0)
+        except (TypeError, ValueError):
+            code = 0
+        # systemctl show commonly exposes CLD_KILLED/CLD_DUMPED as the
+        # numeric values 2/3 rather than the symbolic names.  Normalize both
+        # forms to the subprocess convention (negative signal number).
+        exec_code = str(status.get("ExecMainCode", "") or "").lower()
+        if exec_code in {"killed", "dumped", "2", "3"} and code > 0:
+            return -code
+        if status.get("Result") == "success" and code == 0:
+            return 0
+        return code or 1
+
+    def _systemd_terminal_reason(self, task: dict[str, Any], status: dict[str, str]) -> str:
+        details = []
+        for key in ("Result", "ActiveState", "SubState", "ExecMainCode", "ExecMainStatus"):
+            value = status.get(key)
+            if value not in (None, ""):
+                details.append(f"{key}={value}")
+        detail = ", ".join(details) or "no terminal status fields"
+        return (
+            f"systemd unit {task.get('systemd_unit')} ended without exit.json; "
+            f"{detail}"
+        )
+
+    def _finish_from_systemd_status(
+        self,
+        task: dict[str, Any],
+        status: dict[str, str],
+    ) -> dict[str, Any]:
+        """Finish an adopted systemd task when the runner could not write exit.json."""
+        self._remember_systemd_status(task, status)
+        exit_info = self._read_exit_info(task)
+        if exit_info is not None:
+            return self._finish_from_returncode(
+                task,
+                int(exit_info["returncode"]),
+                exit_info=exit_info,
+            )
+
+        active = status.get("ActiveState")
+        result = status.get("Result")
+        failed = active == "failed" or result not in (None, "", "success")
+        returncode = self._systemd_returncode(status)
+        was_stopping = task.get("state") == "stopping"
+        task["state"] = "stopped" if was_stopping else ("failed" if failed else "completed")
+        task["returncode"] = int(returncode)
+        task["finished_at"] = now_iso()
+        task["lost_reason"] = self._systemd_terminal_reason(task, status)
+        task["systemd_exit_json_missing"] = True
+        atomic_json(self._path(task["id"]), task)
+        self.processes.pop(task["id"], None)
+        return task
+
+    def _refresh_systemd_task(self, task: dict[str, Any]) -> dict[str, Any] | None:
+        unit = str(task.get("systemd_unit") or "")
+        if not unit:
+            return None
+        status = self._systemd_show(unit)
+        if status.get("_query_error"):
+            # A transient systemctl/user-bus failure is not evidence that the
+            # task disappeared.  Keep the durable record adoptable on the
+            # next refresh instead of incorrectly changing it to ``lost``.
+            reason = str(status["_query_error"])
+            if task.get("systemd_status_error") != reason:
+                task["systemd_status_error"] = reason
+                atomic_json(self._path(task["id"]), task)
+            return task
+        if not status:
+            return None
+        status_changed = self._remember_systemd_status(task, status)
+        active = status.get("ActiveState")
+        try:
+            main_pid = int(status.get("MainPID", "0") or 0)
+        except ValueError:
+            main_pid = 0
+        if main_pid > 0 and task.get("pid") != main_pid:
+            task["pid"] = main_pid
+            status_changed = True
+        if active in {"active", "activating", "reloading"}:
+            previous_state = task.get("state")
+            task["state"] = "running" if previous_state != "stopping" else "stopping"
+            if previous_state == "lost":
+                task["systemd_recovered_at"] = now_iso()
+                task["systemd_recovered_from"] = "lost"
+                task.pop("finished_at", None)
+                task.pop("returncode", None)
+                task.pop("lost_reason", None)
+                task.pop("systemd_exit_json_missing", None)
+                status_changed = True
+            if status_changed:
+                atomic_json(self._path(task["id"]), task)
+            return task
+        if active in {"inactive", "failed"}:
+            return self._finish_from_systemd_status(task, status)
+        if status.get("LoadState") in {"not-found", "bad-setting", "error"}:
+            # The unit is known to systemd but no longer exists/is loadable.
+            # Treat this as a terminal systemd outcome rather than falling
+            # through to PID heuristics and calling it an unexplained loss.
+            return self._finish_from_systemd_status(task, status)
+        if status_changed:
+            atomic_json(self._path(task["id"]), task)
+        return None
+
     def _refresh(self, task: dict[str, Any]) -> dict[str, Any]:
         if task.get("state") in WAITING_STATES:
             return self._refresh_waiting(task)
-        if task.get("state") not in PROCESS_STATES:
-            return task
         task_id = task["id"]
+        state = task.get("state")
+        if task.get("type") == "transfer":
+            progress_path = task.get("progress_path") or (self.root / safe_name(task_id, "task id") / "progress.json")
+            task["progress_path"] = str(progress_path)
+            progress = read_json(Path(progress_path))
+            if isinstance(progress, dict):
+                task["progress"] = progress
+        systemd_unit = str(task.get("systemd_unit") or "")
+        can_recover_systemd = bool(systemd_unit and (state in PROCESS_STATES or state == "lost"))
+        if can_recover_systemd:
+            systemd_result = self._refresh_systemd_task(task)
+            if systemd_result is not None:
+                return systemd_result
+        if state not in PROCESS_STATES:
+            return task
+        exit_info = self._read_exit_info(task)
+        if exit_info is not None:
+            return self._finish_from_returncode(task, int(exit_info["returncode"]), exit_info=exit_info)
+
         process = self.processes.get(task_id)
         if process is not None:
             rc = process.poll()
             if rc is None:
                 task["state"] = "running" if task["state"] != "stopping" else "stopping"
                 return task
-            was_stopping = task["state"] == "stopping"
-            task["state"] = "stopped" if was_stopping else ("completed" if rc == 0 else "failed")
-            task["returncode"] = rc
-            task["finished_at"] = now_iso()
-            atomic_json(self._path(task_id), task)
-            self.processes.pop(task_id, None)
-            return task
-        pid = int(task.get("pid", 0))
+            return self._finish_from_returncode(task, int(rc), exit_info=self._read_exit_info(task))
+        pid = int(task.get("pid", 0) or 0)
         if pid and pid_alive(pid) and process_matches_task(pid, task):
             return task
         if task.get("metadata", {}).get("external") and task.get("type") == "eval" and not (pid and pid_alive(pid)):
@@ -1677,6 +2035,8 @@ class TaskManager:
             task["state"] = "stopped" if task.get("state") == "stopping" else "lost"
         if pid and pid_alive(pid):
             task["lost_reason"] = "PID is alive but no longer matches the recorded task command"
+        elif task.get("launch_backend"):
+            task["lost_reason"] = "task runner disappeared before writing an exit status"
         task["finished_at"] = now_iso()
         atomic_json(self._path(task_id), task)
         return task
@@ -2098,6 +2458,21 @@ class TaskManager:
                 return task
             if task["state"] not in PROCESS_STATES:
                 return task
+            unit = str(task.get("systemd_unit") or "")
+            if unit:
+                sig = "SIGKILL" if force else "SIGTERM"
+                cmd = ["systemctl", "--user", "kill", "--kill-who=all", "-s", sig, unit]
+                if not force:
+                    cmd = ["systemctl", "--user", "stop", unit]
+                try:
+                    subprocess.run(cmd, check=False, timeout=30)
+                except Exception as exc:
+                    task["stop_signal_error"] = str(exc)
+                task["state"] = "stopping"
+                task["stop_requested_at"] = now_iso()
+                task["stop_signal"] = "SIGKILL" if force else "SIGTERM"
+                atomic_json(self._path(task_id), task)
+                return task
             pid = int(task["pid"])
             process = self.processes.get(task_id)
             if process is None and not process_matches_task(pid, task):
@@ -2153,6 +2528,88 @@ class TaskManager:
             self.processes.pop(task_id, None)
             shutil.rmtree(task_dir)
             return {"deleted": True, "task": task}
+
+    def delete_many(self, task_ids: list[str]) -> dict[str, Any]:
+        """Delete multiple terminal task records and their logs as one validated batch.
+
+        Outputs, checkpoints, and any external log paths are intentionally left
+        untouched, matching :meth:`delete`.  Validate the complete selection
+        before removing anything so a batch containing an active task or an
+        active dependency cannot result in a partially deleted selection.
+        """
+        if not isinstance(task_ids, list):
+            raise ValueError("task_ids must be a list")
+        if not task_ids:
+            raise ValueError("task_ids must not be empty")
+        if len(task_ids) > 200:
+            raise ValueError("cannot delete more than 200 tasks at once")
+
+        normalized_ids: list[str] = []
+        seen: set[str] = set()
+        for raw_task_id in task_ids:
+            if not isinstance(raw_task_id, str) or not raw_task_id.strip():
+                raise ValueError("task_ids must contain non-empty strings")
+            task_id = raw_task_id
+            if task_id in seen:
+                continue
+            seen.add(task_id)
+            normalized_ids.append(task_id)
+
+        with self.lock:
+            selected_ids = set(normalized_ids)
+            selected_tasks: dict[str, dict[str, Any]] = {}
+            for task_id in normalized_ids:
+                task = self.get(task_id)
+                state = task.get("state")
+                if state not in TERMINAL_STATES:
+                    raise ValueError(f"cannot delete active task {task_id} in state {state}")
+
+                process = self.processes.get(task_id)
+                if process is not None and process.poll() is None:
+                    raise ValueError(f"cannot delete task {task_id} while its process is still alive")
+                selected_tasks[task_id] = task
+
+            active_dependents: dict[str, list[str]] = {}
+            for path in self.root.glob("*/task.json"):
+                dependent = read_json(path)
+                if not isinstance(dependent, dict):
+                    continue
+                dependent_id = str(dependent.get("id", path.parent.name))
+                if dependent_id in selected_ids:
+                    continue
+                dependency_id = (
+                    dependent.get("metadata", {}).get("depends_on")
+                    or dependent.get("dependency", {}).get("task_id")
+                )
+                if dependency_id not in selected_ids:
+                    continue
+                if dependent.get("state") not in TERMINAL_STATES:
+                    active_dependents.setdefault(str(dependency_id), []).append(dependent_id)
+            if active_dependents:
+                details = "; ".join(
+                    f"{task_id}: {', '.join(sorted(dependents))}"
+                    for task_id, dependents in sorted(active_dependents.items())
+                )
+                raise ValueError(f"cannot delete selected tasks; active dependent task(s): {details}")
+
+            task_dirs = {
+                task_id: self._path(task_id).parent
+                for task_id in normalized_ids
+            }
+            for task_id, task_dir in task_dirs.items():
+                if not task_dir.is_dir():
+                    raise FileNotFoundError(task_id)
+
+            for task_id, task_dir in task_dirs.items():
+                self.processes.pop(task_id, None)
+                shutil.rmtree(task_dir)
+
+            return {
+                "deleted": True,
+                "deleted_count": len(normalized_ids),
+                "task_ids": normalized_ids,
+                "tasks": [selected_tasks[task_id] for task_id in normalized_ids],
+            }
 
     def log_tail(self, task_id: str, max_bytes: int = 64 * 1024) -> str:
         task = read_json(self._path(task_id))
@@ -3015,6 +3472,8 @@ def build_environment(
     xla_memory_fraction: float | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
+    for sensitive_key in ("BIMANUAL_VLA_SERVER_TOKEN", "BIMANUAL_VLA_LOGIN_PASSWORD"):
+        env.pop(sensitive_key, None)
     openpi_env_lib = str(Path(config["openpi_python"]).resolve().parent.parent / "lib")
     inherited_ld = env.get("LD_LIBRARY_PATH", "")
     nccl_preload = _compatible_nccl_preload_path(config)
@@ -3421,6 +3880,50 @@ def create_app(config_path: Path) -> Flask:
                 )
         return path, model_variant
 
+    def resolve_complete_resume_checkpoint(value: Any) -> Path:
+        """Resolve an exact checkpoint step or the latest complete step in an experiment."""
+        path = resolve_under(value, checkpoint_roots)
+        if is_full_state_checkpoint(path):
+            return path.resolve()
+        steps = full_state_checkpoint_steps(path)
+        if steps:
+            return steps[-1][1]
+        raise ValueError(
+            f"resume checkpoint is not a finalized Orbax checkpoint and contains no complete steps: {path}"
+        )
+
+    def validate_resume_checkpoint_variant(path: Path, model_variant: str) -> None:
+        inferred = infer_model_variant(path)
+        if inferred is not None and inferred != model_variant:
+            raise ValueError(
+                f"resume checkpoint {path} appears to be {inferred}, but model_variant={model_variant}"
+            )
+        visible_checkpoint, dataset_ids, dataset_origins = checkpoint_matches_visible_datasets(path)
+        if not visible_checkpoint:
+            raise ValueError(
+                "resume checkpoint provenance is hidden on this Dashboard: "
+                f"datasets={dataset_ids or ['unknown']} origins={dataset_origins or {'unknown': 'unknown'}}"
+            )
+
+    def validate_resume_checkpoint_contract(path: Path, model_contract: dict[str, Any]) -> None:
+        marker = checkpoint_action_contract(path)
+        if marker is None:
+            raise ValueError(
+                "resume checkpoint has no action-contract marker; refusing full-state "
+                f"resume because its dataset/action semantics are unverified: {path}"
+            )
+        expected = model_contract["contract_fingerprint"].items()
+        mismatches = {
+            key: {"checkpoint": marker.get(key), "training": value}
+            for key, value in expected
+            if marker.get(key) != value
+        }
+        if mismatches:
+            raise ValueError(
+                "resume checkpoint action contract does not match the requested real dataset: "
+                + json.dumps(mismatches, ensure_ascii=False, sort_keys=True)
+            )
+
     def list_checkpoints() -> list[dict[str, Any]]:
         checkpoints = []
         for model_variant in ("pi05", "pi0"):
@@ -3467,6 +3970,8 @@ def create_app(config_path: Path) -> Flask:
                                 "arm_mode": arm_mode,
                                 "experiment": exp_dir.name,
                                 "step": int(step_dir.name),
+                                "full_state_available": is_full_state_checkpoint(step_dir),
+                                "restore_capabilities": (["full_state"] if is_full_state_checkpoint(step_dir) else ["weights_only"]),
                                 "dataset_ids": dataset_ids,
                                 "dataset_origins": dataset_origins,
                                 "mtime": mtime,
@@ -3476,12 +3981,64 @@ def create_app(config_path: Path) -> Flask:
                         )
         return sorted(checkpoints, key=lambda item: (item["mtime"], item["step"]), reverse=True)
 
+    def checkpoint_active_references(path: Path) -> list[dict[str, Any]]:
+        path = Path(path).expanduser().resolve()
+        references: list[dict[str, Any]] = []
+        for task in tasks.list():
+            if task.get("state") in TERMINAL_STATES:
+                continue
+            metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+            task_references: list[dict[str, Any]] = []
+            for key in ("checkpoint", "base_checkpoint", "resume_checkpoint"):
+                value = metadata.get(key)
+                if not value:
+                    continue
+                try:
+                    ref_path = Path(str(value)).expanduser().resolve()
+                except Exception:
+                    continue
+                if ref_path == path:
+                    task_references.append({"kind": key, "path": str(ref_path)})
+            checkpoint_dir = metadata.get("checkpoint_dir")
+            if checkpoint_dir:
+                try:
+                    checkpoint_dir_path = Path(str(checkpoint_dir)).expanduser().resolve()
+                except Exception:
+                    checkpoint_dir_path = None
+                if checkpoint_dir_path is not None and (path == checkpoint_dir_path or path.is_relative_to(checkpoint_dir_path)):
+                    task_references.append({"kind": "checkpoint_dir", "path": str(checkpoint_dir_path)})
+            if task_references:
+                references.append(
+                    {
+                        "task_id": str(task.get("id", "")),
+                        "type": task.get("type"),
+                        "state": task.get("state"),
+                        "references": task_references,
+                    }
+                )
+        return references
+
+    def prune_empty_checkpoint_parents(path: Path) -> None:
+        checkpoint_root = Path(config["checkpoint_base_dir"]).expanduser().resolve()
+        current = Path(path).expanduser().resolve().parent
+        while current != checkpoint_root and checkpoint_root in current.parents:
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
+
 
     @app.get("/api/status")
     def status():
         tasks.discover_external_policies()
         tasks.discover_external_evals()
         task_list = tasks.list()
+        for task in task_list:
+            if task.get("type") == "transfer":
+                progress = transfer_progress_for_task(task)
+                if progress is not None:
+                    task["progress"] = progress
         for task in task_list:
             if task["type"] != "policy":
                 continue
@@ -3828,6 +4385,7 @@ def create_app(config_path: Path) -> Flask:
         split: EpisodeSplit,
         model_contract: dict[str, Any],
         effective_mode: str,
+        resume_checkpoint: str | Path | None = None,
         wandb_enabled: bool = False,
     ) -> list[str]:
         command = [
@@ -3849,7 +4407,9 @@ def create_app(config_path: Path) -> Flask:
             "--test-ratio", str(split.test_ratio),
             "--split-seed", str(split.seed),
         ] + action_contract_command_args(model_contract)
-        if effective_mode != "new":
+        if resume_checkpoint is not None:
+            command += ["--resume-checkpoint", str(resume_checkpoint)]
+        elif effective_mode != "new":
             command.append(f"--{effective_mode}")
         if wandb_enabled:
             command.append("--wandb-enabled")
@@ -4047,6 +4607,18 @@ def create_app(config_path: Path) -> Flask:
         if not path.is_file() or path.suffix.lower() not in VIDEO_SUFFIXES:
             raise FileNotFoundError("video not found")
         return path
+
+    def prune_empty_eval_video_parents(path: Path) -> None:
+        roots = [root.resolve() for root in eval_video_roots()]
+        if not roots:
+            return
+        current = Path(path).expanduser().resolve().parent
+        while current not in roots:
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
 
     REMOTE_EVAL_VIDEO_INVENTORY_SCRIPT = r'''
 import json, os, re
@@ -4352,6 +4924,7 @@ print(json.dumps(rows, ensure_ascii=False))
                     "syncable": True,
                     "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(row.get("mtime") or 0))),
                     "sync_url": "/api/eval-videos/sync",
+                    "deletable": False,
                 })
         return videos, errors
 
@@ -4388,6 +4961,7 @@ print(json.dumps(rows, ensure_ascii=False))
                     "remote": False,
                     "playable": True,
                     "syncable": False,
+                    "deletable": True,
                 })
         remote_errors = {}
         if include_remote:
@@ -4423,6 +4997,70 @@ print(json.dumps(rows, ensure_ascii=False))
     @app.get("/api/eval-videos/<video_id>")
     def get_eval_video(video_id: str):
         return send_file(decode_video_id(video_id), conditional=True, max_age=0)
+
+    @app.post("/api/eval-videos/batch-delete")
+    def delete_eval_videos_batch():
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        raw_video_ids = payload.get("video_ids")
+        if not isinstance(raw_video_ids, list) or not raw_video_ids:
+            raise ValueError("video_ids must be a non-empty list")
+        if len(raw_video_ids) > 200:
+            raise ValueError("cannot delete more than 200 videos at once")
+
+        selected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        roots = [root.resolve() for root in eval_video_roots()]
+        for raw_video_id in raw_video_ids:
+            if not isinstance(raw_video_id, str) or not raw_video_id.strip():
+                raise ValueError("video_ids must contain non-empty strings")
+            video_id = raw_video_id.strip()
+            if video_id in seen:
+                continue
+            seen.add(video_id)
+            path = decode_video_id(video_id)
+            root = next((root for root in roots if path == root or root in path.parents), None)
+            if root is None:
+                raise FileNotFoundError(f"video root not found for {path}")
+            relative_path = path.relative_to(root).as_posix()
+            selected.append(
+                {
+                    "video_id": video_id,
+                    "path": path,
+                    "root": root,
+                    "relative_path": relative_path,
+                    "metadata": eval_video_metadata(root, relative_path),
+                }
+            )
+
+        for item in selected:
+            if not item["path"].is_file():
+                raise FileNotFoundError(str(item["path"]))
+
+        deleted: list[dict[str, Any]] = []
+        for item in selected:
+            path = item["path"]
+            path.unlink()
+            prune_empty_eval_video_parents(path)
+            deleted.append(
+                {
+                    "id": item["video_id"],
+                    "path": str(path),
+                    "root": str(item["root"]),
+                    "relative_path": item["relative_path"],
+                    **item["metadata"],
+                }
+            )
+
+        return jsonify(
+            {
+                "deleted": True,
+                "deleted_count": len(deleted),
+                "video_ids": [item["id"] for item in deleted],
+                "deleted_videos": deleted,
+            }
+        )
 
     @app.post("/api/eval-videos/sync")
     def sync_eval_video():
@@ -4914,6 +5552,12 @@ print(json.dumps(rows, ensure_ascii=False))
             command.append("--overwrite")
         if skip_existing:
             command.append("--skip-existing")
+        # Action-contract markers live beside the experiment directory rather
+        # than inside the numeric Orbax step.  Direct transfers can copy the
+        # small marker after the checkpoint manifest; Slurm/NAS transfers use
+        # their own staging path and are handled by the Slurm sync runner.
+        if not slurm_involved:
+            command += ["--marker-name", exp_name]
         task = tasks.start(
             "transfer",
             command,
@@ -4932,6 +5576,92 @@ print(json.dumps(rows, ensure_ascii=False))
             },
         )
         return jsonify(task), 201
+
+    @app.post("/api/checkpoints/batch-delete")
+    def delete_checkpoints_batch():
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        raw_paths = payload.get("checkpoint_paths")
+        if not isinstance(raw_paths, list) or not raw_paths:
+            raise ValueError("checkpoint_paths must be a non-empty list")
+        if len(raw_paths) > 200:
+            raise ValueError("cannot delete more than 200 checkpoints at once")
+
+        checkpoint_root = Path(config["checkpoint_base_dir"]).expanduser().resolve()
+        selected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw_path in raw_paths:
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                raise ValueError("checkpoint_paths must contain non-empty strings")
+            path = Path(raw_path).expanduser().resolve()
+            try:
+                path.relative_to(checkpoint_root)
+            except ValueError:
+                raise ValueError(f"checkpoint is outside checkpoint_base_dir: {path}")
+            if not path.is_dir():
+                raise FileNotFoundError(str(path))
+            if not is_complete_checkpoint(path):
+                raise ValueError(f"checkpoint is not complete: {path}")
+            identity = training_checkpoint_identity(path, checkpoint_root)
+            if identity is None:
+                raise ValueError(f"checkpoint is not a standard training checkpoint: {path}")
+            visible_checkpoint, dataset_ids, dataset_origins = checkpoint_matches_visible_datasets(path)
+            if not visible_checkpoint:
+                raise ValueError(f"checkpoint is hidden on this dashboard and cannot be deleted here: {path}")
+            cache_key = str(path)
+            if cache_key in seen:
+                continue
+            seen.add(cache_key)
+            selected.append({
+                **identity,
+                "path": path,
+                "path_str": cache_key,
+                "dataset_ids": dataset_ids,
+                "dataset_origins": dataset_origins,
+            })
+
+        with tasks.lock:
+            active_references: dict[str, list[dict[str, Any]]] = {}
+            for item in selected:
+                references = checkpoint_active_references(item["path"])
+                if references:
+                    active_references[item["path_str"]] = references
+            if active_references:
+                details = "; ".join(
+                    f"{path}: " + ", ".join(
+                        f"{ref['task_id']}[{ref['type']}:{ref['state']}]({', '.join(r['kind'] for r in ref['references'])})"
+                        for ref in refs
+                    )
+                    for path, refs in sorted(active_references.items())
+                )
+                raise ValueError(f"cannot delete selected checkpoints; active task(s) still reference them: {details}")
+
+            deleted: list[dict[str, Any]] = []
+            for item in selected:
+                path = item["path"]
+                if not path.is_dir():
+                    raise FileNotFoundError(str(path))
+                shutil.rmtree(path)
+                checkpoint_size_cache.pop(item["path_str"], None)
+                prune_empty_checkpoint_parents(path)
+                deleted.append(
+                    {
+                        "path": item["path_str"],
+                        "experiment": item["experiment"],
+                        "step": item["checkpoint_step"],
+                        "model_variant": item["model_variant"],
+                        "arm_mode": item["arm_mode"],
+                        "dataset_ids": item["dataset_ids"],
+                    }
+                )
+
+        return jsonify({
+            "deleted": True,
+            "deleted_count": len(deleted),
+            "checkpoint_paths": [item["path"] for item in deleted],
+            "deleted_checkpoints": deleted,
+        })
 
     def collection_root() -> Path:
         path = Path(config["workspace_root"]) / "collection_sessions"
@@ -5082,11 +5812,16 @@ print(json.dumps(rows, ensure_ascii=False))
                 f"checkpoint directory already exists: {checkpoint_dir}; "
                 "choose auto/resume to continue it, or overwrite to replace it"
             )
-        effective_mode = "resume" if mode == "auto" else mode
-        saved_steps = any(
-            child.is_dir() and child.name.isdigit() and (child / "params").is_dir()
-            for child in checkpoint_dir.iterdir()
-        ) if checkpoint_dir.is_dir() else False
+        target_complete_steps = full_state_checkpoint_steps(checkpoint_dir)
+        saved_steps = bool(target_complete_steps)
+        target_has_artifacts = checkpoint_dir.is_dir() and any(checkpoint_dir.iterdir())
+        # ``auto`` must not turn an empty/incomplete experiment into a silent
+        # foundation-model run.  We decide between new/in-place/external resume
+        # after reading the dataset norm manifest below.
+        effective_mode = ("resume" if saved_steps else "new") if mode == "auto" else mode
+        resume_checkpoint: Path | None = None
+        resume_kind = "none"
+        requested_resume_checkpoint = payload.get("resume_checkpoint")
 
         # Auto-resume is allowed to recover old checkpoints only through an
         # explicit compatibility choice. The generated command still carries
@@ -5174,6 +5909,63 @@ print(json.dumps(rows, ensure_ascii=False))
         )
         if not norm_ready:
             saved_norm_config = None
+
+        # A resume request must name a finalized checkpoint.  If the target
+        # experiment only contains an interrupted Orbax temp directory, use an
+        # explicitly requested checkpoint or the complete checkpoint recorded
+        # when this dataset was normalized.  Never fall back to pi05_base for a
+        # resume request.
+        if effective_mode == "resume" and not saved_steps:
+            candidate = requested_resume_checkpoint
+            if candidate in (None, ""):
+                raise ValueError(
+                    f"experiment {exp_name!r} has no complete checkpoint; "
+                    "resume_checkpoint is required. The interrupted Orbax temp save "
+                    "cannot be used as a full-state source."
+                )
+            resume_checkpoint = resolve_complete_resume_checkpoint(candidate)
+            validate_resume_checkpoint_variant(resume_checkpoint, model_variant)
+            resume_kind = "external_full_state"
+            # The base checkpoint argument is still required by the OpenPI
+            # config schema, but it is only a structural fallback; the helper
+            # restores train_state/params from resume_checkpoint before any
+            # training step.
+            base_checkpoint = resume_checkpoint
+            effective_mode = "resume_external"
+        elif requested_resume_checkpoint not in (None, ""):
+            if effective_mode != "resume":
+                raise ValueError("resume_checkpoint can only be used with mode=resume or mode=auto")
+            resume_checkpoint = resolve_complete_resume_checkpoint(requested_resume_checkpoint)
+            validate_resume_checkpoint_variant(resume_checkpoint, model_variant)
+            resume_kind = "external_full_state"
+            base_checkpoint = resume_checkpoint
+            effective_mode = "resume_external"
+        elif saved_steps:
+            resume_checkpoint = target_complete_steps[-1][1]
+            resume_kind = "in_place_full_state"
+
+        # Resolve the external source before validating its action contract.
+        # The old ordering checked ``resume_kind`` before the external branch
+        # assigned it, so an explicitly supplied checkpoint could bypass the
+        # schema/action-semantic compatibility check entirely.
+        if resume_kind == "external_full_state" and resume_checkpoint is not None:
+            validate_resume_checkpoint_contract(resume_checkpoint, model_contract)
+
+        # An auto request against an interrupted directory is treated as the
+        # same explicit external-resume flow above.  A genuinely new directory
+        # remains a new run and may use the selected foundation/weight checkpoint.
+        if mode == "auto" and target_has_artifacts and not saved_steps and resume_checkpoint is None:
+            raise ValueError(
+                f"experiment {exp_name!r} contains artifacts but no complete checkpoint; "
+                "provide resume_checkpoint or remove/archive the interrupted run"
+            )
+        if resume_kind == "external_full_state" and target_has_artifacts and not saved_steps:
+            raise ValueError(
+                f"target experiment {exp_name!r} contains an incomplete checkpoint; "
+                "use a new target experiment name for external full-state resume "
+                "so the failed run remains available for audit"
+            )
+
         execution_target = str(payload.get("execution_target", "local_4090") or "local_4090")
         cluster_target_config = runtime_config_for_target(execution_target)
         is_cluster_target = cluster_target_config is not None
@@ -5269,7 +6061,8 @@ print(json.dumps(rows, ensure_ascii=False))
             fsdp_devices=fsdp_devices,
             split=split,
             model_contract=model_contract,
-            effective_mode=effective_mode,
+            effective_mode=("resume" if resume_kind == "in_place_full_state" else effective_mode),
+            resume_checkpoint=(resume_checkpoint if resume_kind == "external_full_state" else None),
             wandb_enabled=bool(payload.get("wandb_enabled", False)),
         )
         cluster_dataset_sync_command: list[str] | None = None
@@ -5346,7 +6139,12 @@ print(json.dumps(rows, ensure_ascii=False))
                 fsdp_devices=fsdp_devices,
                 split=split,
                 model_contract=model_contract,
-                effective_mode=effective_mode,
+                effective_mode=("resume" if resume_kind == "in_place_full_state" else effective_mode),
+                resume_checkpoint=(
+                    translate_runtime_path(resume_checkpoint, cluster_target_config)
+                    if resume_kind == "external_full_state" and resume_checkpoint is not None
+                    else None
+                ),
                 wandb_enabled=bool(payload.get("wandb_enabled", False)),
             )
             slurm_command = slurm_runner_command(
@@ -5397,6 +6195,9 @@ print(json.dumps(rows, ensure_ascii=False))
             "minimum_free_gpu_mib": minimum_free_gpu_mib,
             "mode": mode,
             "effective_mode": effective_mode,
+            "resume_kind": resume_kind,
+            "resume_checkpoint": str(resume_checkpoint) if resume_checkpoint is not None else None,
+            "resume_step": int(resume_checkpoint.name) if resume_checkpoint is not None and resume_checkpoint.name.isdigit() else None,
             "checkpoint_dir": str(checkpoint_dir),
             "remote_checkpoint_dir": remote_checkpoint_dir,
             "auto_sync_dataset": bool(cluster_dataset_sync_command is not None),
@@ -5901,6 +6702,128 @@ print(json.dumps(rows, ensure_ascii=False))
     def delete_task(task_id: str):
         return jsonify(tasks.delete(task_id))
 
+    @app.post("/api/tasks/batch-delete")
+    def delete_tasks_batch():
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        return jsonify(tasks.delete_many(payload.get("task_ids")))
+
+
+    transfer_progress_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+    def transfer_progress_for_task(task: dict[str, Any]) -> dict[str, Any] | None:
+        """Return runner progress, with a conservative legacy-task fallback.
+
+        New transfer runners publish ``progress.json`` and TaskManager attaches
+        it to the task.  A transfer created by an older Dashboard build has no
+        sidecar, so while it is still running we derive a read-only estimate
+        from the durable transfer log and the target manifest.  The fallback
+        is throttled to one scan per task every four seconds and never affects
+        the transfer process itself.
+        """
+        if task.get("type") != "transfer":
+            return None
+        existing = task.get("progress")
+        if isinstance(existing, dict):
+            return existing
+        task_id = str(task.get("id") or "")
+        if not task_id:
+            return None
+        now = time.time()
+        cached = transfer_progress_cache.get(task_id)
+        if cached and now - cached[0] < 4.0:
+            return cached[1]
+        metadata = task.get("metadata", {}) if isinstance(task.get("metadata"), dict) else {}
+        total_bytes = 0
+        total_files = 0
+        total_shards = 0
+        try:
+            log = tasks.log_tail(task_id, 256 * 1024)
+            match = re.search(r"files=(\d+)\s+bytes=(\d+)\s+shards=(\d+)", log)
+            if match:
+                total_files, total_bytes, total_shards = (int(item) for item in match.groups())
+        except Exception:
+            log = ""
+        target_path = str(metadata.get("target_path") or "")
+        target_name = str(metadata.get("target") or "")
+        target_cfg = dataset_location_configs().get(target_name, {})
+        completed_bytes = 0
+        completed_files = 0
+        scan_error = None
+        if target_path:
+            command = f"test -d {shlex.quote(target_path)} && cd {shlex.quote(target_path)} && find . -type f -printf '%s\\t%P\\0' | sort -z"
+            host = target_cfg.get("host") or target_cfg.get("submit_host")
+            try:
+                if host:
+                    result = subprocess.run(
+                        [*SSH_COMMAND, str(host), command],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=20,
+                    )
+                else:
+                    result = subprocess.run(
+                        ["bash", "-lc", command],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=20,
+                    )
+                if result.returncode != 0:
+                    raise RuntimeError((result.stderr or result.stdout).decode(errors="replace")[-1000:])
+                rows = 0
+                for entry in result.stdout.split(b"\\0"):
+                    if not entry:
+                        continue
+                    size_text, sep, rel_bytes = entry.partition(b"\\t")
+                    if not sep:
+                        continue
+                    rel = rel_bytes.decode(errors="replace")
+                    if any(part.startswith(".") for part in rel.split("/")):
+                        continue
+                    try:
+                        completed_bytes += max(0, int(size_text.decode()))
+                        rows += 1
+                    except ValueError:
+                        continue
+                completed_files = rows
+            except Exception as exc:
+                scan_error = str(exc)[-1000:]
+        previous = cached[1] if cached else None
+        previous_bytes = int(previous.get("completed_bytes", 0)) if previous else completed_bytes
+        previous_at = float(previous.get("_sampled_at", now)) if previous else now
+        elapsed = max(0.001, now - previous_at)
+        speed = max(0.0, (completed_bytes - previous_bytes) / elapsed)
+        if previous:
+            old_speed = float(previous.get("speed_bytes_per_sec", 0) or 0)
+            speed = speed if not old_speed else (0.7 * old_speed + 0.3 * speed)
+        remaining = max(0, total_bytes - completed_bytes)
+        progress = (completed_bytes / total_bytes) if total_bytes else None
+        payload: dict[str, Any] = {
+            "state": str(task.get("state", "unknown")),
+            "progress": None if progress is None else round(min(1.0, progress), 6),
+            "completed_bytes": completed_bytes,
+            "total_bytes": total_bytes,
+            "completed_files": completed_files,
+            "total_files": total_files,
+            "completed_shards": 0,
+            "total_shards": total_shards,
+            "parallelism": int(metadata.get("parallelism", 1) or 1),
+            "speed_bytes_per_sec": round(speed, 2),
+            "eta_seconds": round(remaining / speed, 1) if speed > 0 and remaining else (0.0 if remaining == 0 and total_bytes else None),
+            "dataset_id": metadata.get("dataset_id") or metadata.get("exp_name"),
+            "source": metadata.get("source"),
+            "target": target_name,
+            "source_path": metadata.get("source_path"),
+            "target_path": target_path,
+            "updated_at": now_iso(),
+            "_sampled_at": now,
+        }
+        if scan_error:
+            payload["scan_error"] = scan_error
+        transfer_progress_cache[task_id] = (now, payload)
+        return payload
+
     def task_status_summary(task: dict[str, Any], *, include_metrics: bool = False) -> dict[str, Any]:
         metadata = task.get("metadata", {}) if isinstance(task.get("metadata"), dict) else {}
         state = str(task.get("state", "unknown"))
@@ -5922,6 +6845,7 @@ print(json.dumps(rows, ensure_ascii=False))
             "lost_reason": task.get("lost_reason"),
             "dependency": task.get("dependency"),
             "dependency_state": task.get("dependency_state"),
+            "progress": transfer_progress_for_task(task),
             "result": task.get("result") if task.get("type") == "eval" else None,
             "metadata": {
                 key: metadata.get(key)
@@ -5965,6 +6889,9 @@ print(json.dumps(rows, ensure_ascii=False))
                     "source_path",
                     "target_path",
                     "overwrite",
+                    "skip_existing",
+                    "parallelism",
+                    "transfer_kind",
                     "test_ratio",
                     "split_seed",
                     "train_episodes",
