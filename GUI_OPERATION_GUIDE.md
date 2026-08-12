@@ -25,17 +25,18 @@ http://192.168.101.9:8090
 ### 1.1 检查机械臂 CAN
 
 ```bash
-ip -br link show can0
+ip -br link show can0 can1
 timeout 2 candump -L can0
+timeout 2 candump -L can1
 ```
 
 正常要求：
 
-- `can0` 状态为 `UP`。
-- `candump` 能持续收到机械臂反馈。
+- `can0`、`can1` 状态均为 `UP`。
+- 两个 `candump` 都能持续收到对应机械臂反馈。
 - CAN 波特率为 `1000000`。
 
-如果 `can0` 未启动，使用当前 Piper SDK 的激活脚本重新激活，再重复检查。没有实时 CAN 反馈时不要开始采集或复位机械臂。
+GUI 中先点击 `Activate CAN`，输入管理员密码后会激活并验证两个接口。当前固定映射为左臂 `can0`、右臂 `can1`；即使系统枚举顺序变化，激活流程也会按 USB 物理端口恢复映射。没有双臂实时反馈时不要开始采集。
 
 ### 1.2 检查相机
 
@@ -45,8 +46,9 @@ v4l2-ctl --list-devices
 
 USB 重新插拔后 `/dev/videoN` 编号可能变化。GUI 会使用稳定的设备路径，并在连接成功后显示其实际解析到的 `/dev/videoN`：
 
-- `Third-Person Camera`：外部全局视角。
-- `Wrist Camera`：机械臂末端视角。
+- `Overhead camera`：外部全局视角。
+- `Left wrist camera`：左臂末端视角。
+- `Right wrist camera`：右臂末端视角。
 
 最终以 GUI 实时画面和标题中显示的编号为准，不要只记住上一次的 `video8`、`video16` 等编号。
 
@@ -57,29 +59,40 @@ cd /home/user/dual_ARM_project/arm_collect/bimanual-vla
 bash start_gui.sh
 ```
 
+主界面保留 Arm mode、Collection format、Dataset、Task name 和 Instruction。CAN、相机、采集频率及数据集根目录集中在 `Device settings` 弹窗中。
+
 建议配置：
 
 | GUI 字段 | 建议值 | 说明 |
 |---|---|---|
-| `CAN Interface` | `can0` | 当前执行臂 CAN 接口 |
-| `Capture Rate (Hz)` | `20` | 数据采集频率 |
-| `Camera Rate (Hz)` | `30` | 相机原始流频率 |
-| `Output Directory` | `.../episodes_piper_v21` 或新的批次目录 | NPZ 保存位置 |
-| `Task Name` | 例如 `pick_cube` | 任务标识 |
+| `Left-arm CAN` / `Right-arm CAN` | `can0` / `can1` | 左右臂 CAN 接口 |
+| `Collection rate (Hz)` | `20` | 数据采集频率 |
+| `Camera rate (Hz)` | `30` | 相机原始流频率 |
+| `Dataset root` | `.../episodes_piper_v21` | 数据集父目录 |
+| `Dataset` | 从下拉列表选择已有目录 | 当前 NPZ 保存目录 |
+| `Task name` | 例如 `pick_cube` | 任务标识 |
 | `Instruction` | 例如 `pick up the cube` | 训练使用的指令 |
 
 ## 3. 采集 episode
 
 ### 3.1 连接设备
 
-1. 确认 CAN、相机、输出目录、任务和 instruction。
-2. 点击 `Connect`。
-3. 检查两路实时画面没有颠倒、冻结或黑屏。
-4. 检查画面标题或状态栏显示的实际 `/dev/videoN`。
-5. 检查 `Live Robot Pose` 持续更新。
-6. 检查机械臂是否位于本次任务的安全起始位姿。
+1. 点击 `Device settings`，确认左右 CAN、三路相机和两个 rate。
+2. 点击 `Activate CAN`，确认 `can0`、`can1` 激活成功。
+3. 从 Dataset 下拉列表选择已有目录。需要新建时选择 `Add new dataset...`，在弹窗中输入文件夹名称并点击 `Create and use`。新建完成后，它会继续保留在 Dataset 下拉列表中。
+4. 点击 `Connect devices`。
+5. 检查三路实时画面没有颠倒、冻结或黑屏。
+6. 检查画面标题显示的实际 `/dev/videoN`。
+7. 检查左右臂数据行持续更新。
 
-相机画面不正确时先断开连接，再调整相机选择，不能在正在采集时更换设备配置。
+Arm data 的显示由 `Collection format` 决定：
+
+- `End-effector`：每侧显示 `x y z rx ry rz gripper`，旋转为 XYZ 欧拉角弧度。
+- `Joint`：每侧显示 `j1 j2 j3 j4 j5 j6 gripper`。
+
+如果左右腕部画面对调，勾选 `Swap wrist cameras`；取消勾选会恢复原分配。设备已经连接时，GUI 会自动断开并按新分配重新连接。采集和待保存阶段不能切换。
+
+连接设备后 Dataset 仍可切换。切换后下一个 episode 会保存到新目录并按该目录已有编号继续；正在录制或等待保存/丢弃时会锁定 Dataset。
 
 ### 3.2 开始和停止
 
@@ -88,7 +101,7 @@ bash start_gui.sh
 3. 完成一次完整、自然的任务操作。
 4. 点击 `Stop Episode`。
 
-也可以在主 GUI 中按空格键切换开始/停止；文字输入框、下拉框和弹窗中不会抢占这个快捷键。
+也可以在主 GUI 中按空格键切换开始/停止。焦点停留在按钮或下拉框上时仍然有效；正在文字输入框中输入或打开弹窗时不会触发。
 
 5. 根据结果选择：
 
@@ -100,7 +113,7 @@ bash start_gui.sh
 
 - 每个 episode 只做一次完整任务。
 - 开始和结束可以保留短暂稳定画面，但不要长时间静止。
-- 确认夹爪开合、机械臂运动和两路图像都被记录。
+- 确认夹爪开合、双臂运动和三路图像都被记录。
 - 不要在一个 episode 中途修改 instruction。
 - 保存后的文件名为 `ep_XXXX.npz`。
 
@@ -108,7 +121,7 @@ bash start_gui.sh
 
 ### 4.1 回放检查
 
-在 `Saved Episodes` 中选择文件，然后点击 `Replay Selected`。至少检查：
+在 `Saved Episodes` 中选择文件，然后点击 `Replay episode`。回放器会自动识别旧版双相机数据和新版双臂三相机数据。至少检查：
 
 - 第三视角与腕部视角是否正确。
 - 图像是否连续，是否存在长时间冻结。
@@ -307,10 +320,10 @@ unset BIMANUAL_VLA_SERVER_TOKEN
 
 采集前：
 
-- [ ] `can0` 为 `UP` 且有实时反馈。
-- [ ] 两路 RGB 相机画面和实际 `/dev/videoN` 正确。
-- [ ] Capture Rate 为 `20 Hz`。
-- [ ] Output Directory、Task Name 和 Instruction 正确。
+- [ ] `can0`、`can1` 均为 `UP` 且有实时反馈。
+- [ ] 三路 RGB 相机画面和实际 `/dev/videoN` 正确。
+- [ ] Collection rate 为 `20 Hz`。
+- [ ] Dataset、Task name 和 Instruction 正确。
 - [ ] 机械臂和场景位于安全起始状态。
 
 采集后：

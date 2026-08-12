@@ -5,10 +5,9 @@ single-arm 7D/10D with two cameras, or bimanual 14D/20D in fixed left+right
 order with three cameras.  It reads measured output-arm feedback only; for
 same-step master-arm joint commands use :mod:`teleop_single` or :mod:`teleop`.
 
-The live view stays in the Tk window and shows every active RGB camera, all
-measured joints, schema-specific state, and the initial-pose check.  Pose
-mismatches are visible warnings rather than collection blockers; missing or
-stale hardware feedback is still rejected before and during recording.
+The live view stays in the Tk window and shows every active RGB camera plus one
+compact seven-value state row per arm. Missing or stale hardware feedback is
+still rejected before and during recording.
 """
 
 from __future__ import annotations
@@ -24,10 +23,12 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import messagebox, ttk
+from dataclasses import replace
+from tkinter import messagebox, simpledialog, ttk
 
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 try:
     from PIL import Image, ImageTk
@@ -48,27 +49,268 @@ from collect_output_arm import (
     DEFAULT_WRIST_DEVICE,
     CAMERA_SOURCE_HW,
     next_episode_index,
-    reset_robot_arms,
 )
 from piper_data_contract import BIMANUAL, DELIVERY_SCHEMA, JOINT_SCHEMA, SINGLE_ARM, EpisodeContract
+from piper_action_conventions import rotation6d_to_matrix
 from upload_dataset_4090 import DEFAULT_SERVER, safe_dataset_name
 
 
-JOINT_NAMES = tuple(f"J{i}" for i in range(1, 7)) + ("Gripper",)
 # ``CameraCapture`` keeps the model/data contract at 256x256 by letterboxing
 # the requested camera stream into a square. Recover each source stream's
-# aspect ratio before resizing so the live view is not stretched. Each camera
-# is rendered into a square tile; the unused area inside that tile is letterboxed.
+# aspect ratio before resizing so the live view is not stretched.
 CAMERA_PREVIEW_ASPECT = CAMERA_SOURCE_HW[1] / CAMERA_SOURCE_HW[0]
 PREVIEW_SLOTS = (
     ("high", "Overhead camera"),
-    ("primary_wrist", "Single-arm wrist camera"),
+    ("primary_wrist", "Left wrist camera"),
     ("right_wrist", "Right wrist camera"),
-    ("reserved", "Reserved camera slot"),
 )
-PREVIEW_TILE_SIZE = 500
-PREVIEW_IMAGE_SIZE = 440
+PREVIEW_DEFAULT_HW = (320, 560)
+ADD_DATASET_OPTION = "Add new dataset..."
 EPISODE_FILE_RE = re.compile(r"ep_\d+\.npz")
+CAN_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+")
+CAN_BITRATE = 1_000_000
+CAN_ACTIVATE_SCRIPT = pathlib.Path(
+    "/home/user/dual_ARM_project/piper_sdk/piper_sdk/can_activate.sh"
+)
+BIMANUAL_CAN_USB_PORTS = ("3-1.4:1.0", "3-1.3:1.0")
+
+
+def validate_can_name(can_name: str) -> str:
+    """Validate a SocketCAN interface name before passing it to system tools."""
+    name = can_name.strip()
+    if not CAN_NAME_RE.fullmatch(name):
+        raise ValueError(f"invalid CAN interface name: {can_name!r}")
+    return name
+
+
+def parse_can_bus_info(output: str) -> str:
+    """Extract one USB bus-info value from ``ethtool -i`` output."""
+    match = re.search(r"^bus-info:\s*(\S+)\s*$", output, flags=re.MULTILINE)
+    if match is None:
+        raise RuntimeError("ethtool output does not contain bus-info")
+    return match.group(1)
+
+
+def parse_can_link_status(output: str, can_name: str) -> dict[str, object]:
+    """Parse operational state and bitrate from ``ip -details link`` output."""
+    name = validate_can_name(can_name)
+    header = re.search(
+        rf"^\d+:\s+{re.escape(name)}:\s+<([^>]*)>",
+        output,
+        flags=re.MULTILINE,
+    )
+    bitrate = re.search(r"\bbitrate\s+(\d+)\b", output)
+    flags = set() if header is None else set(header.group(1).split(","))
+    return {
+        "name": name,
+        "up": "UP" in flags,
+        "bitrate": None if bitrate is None else int(bitrate.group(1)),
+    }
+
+
+def build_can_activation_command(
+    can_name: str,
+    bus_info: str,
+    *,
+    helper_path: str | pathlib.Path = CAN_ACTIVATE_SCRIPT,
+) -> list[str]:
+    """Build a password-free command for activating one physical CAN adapter."""
+    name = validate_can_name(can_name)
+    address = bus_info.strip()
+    if not address or any(character.isspace() for character in address):
+        raise ValueError(f"invalid CAN USB bus-info: {bus_info!r}")
+    return [
+        "sudo",
+        "-S",
+        "-p",
+        "",
+        "bash",
+        str(pathlib.Path(helper_path)),
+        name,
+        str(CAN_BITRATE),
+        address,
+    ]
+
+
+def activate_can_interfaces(
+    can_names: list[str] | tuple[str, ...],
+    password: str,
+    *,
+    expected_bus_info: dict[str, str] | None = None,
+    helper_path: str | pathlib.Path = CAN_ACTIVATE_SCRIPT,
+    runner=subprocess.run,
+) -> dict[str, dict[str, object]]:
+    """Activate and verify one or two SocketCAN interfaces at Piper bitrate."""
+    names = tuple(validate_can_name(value) for value in can_names)
+    if not names:
+        raise ValueError("at least one CAN interface is required")
+    if len(set(names)) != len(names):
+        raise ValueError("CAN interface names must be distinct")
+    helper = pathlib.Path(helper_path)
+    if not helper.is_file():
+        raise FileNotFoundError(f"CAN activation helper not found: {helper}")
+
+    list_result = runner(
+        ["ip", "-brief", "link", "show", "type", "can"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+    )
+    if list_result.returncode != 0:
+        detail = (list_result.stderr or list_result.stdout).strip()
+        raise RuntimeError(f"cannot list CAN interfaces: {detail or 'ip link failed'}")
+    current_names = tuple(
+        validate_can_name(line.split()[0])
+        for line in list_result.stdout.splitlines()
+        if line.strip()
+    )
+    if not current_names:
+        raise RuntimeError("no SocketCAN interfaces were detected")
+
+    current_bus_info: dict[str, str] = {}
+    for name in current_names:
+        result = runner(
+            ["ethtool", "-i", name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(f"cannot inspect {name}: {detail or 'ethtool failed'}")
+        current_bus_info[name] = parse_can_bus_info(result.stdout)
+
+    desired_bus_info = (
+        {name: current_bus_info[name] for name in names}
+        if expected_bus_info is None
+        else {name: expected_bus_info[name].strip() for name in names}
+    )
+    if any(not address for address in desired_bus_info.values()):
+        raise ValueError("expected CAN USB bus-info must not be empty")
+    if len(set(desired_bus_info.values())) != len(desired_bus_info):
+        raise ValueError("expected CAN USB bus-info values must be distinct")
+
+    current_name_by_bus = {address: name for name, address in current_bus_info.items()}
+    missing = [
+        f"{name} expected at {address}"
+        for name, address in desired_bus_info.items()
+        if address not in current_name_by_bus
+    ]
+    if missing:
+        raise RuntimeError("missing CAN adapter: " + "; ".join(missing))
+
+    desired_buses = set(desired_bus_info.values())
+    for desired_name in names:
+        occupying_bus = current_bus_info.get(desired_name)
+        if occupying_bus is not None and occupying_bus not in desired_buses:
+            raise RuntimeError(
+                f"cannot use {desired_name}: it is occupied by an unexpected adapter at {occupying_bus}"
+            )
+
+    # Kernel CAN names are enumeration-dependent. Move every misnamed adapter
+    # to a temporary name first so a complete can0/can1 swap has no collision.
+    temporary_by_bus: dict[str, str] = {}
+    used_names = set(current_names) | set(names)
+    for index, (desired_name, address) in enumerate(desired_bus_info.items()):
+        current_name = current_name_by_bus[address]
+        if current_name == desired_name:
+            continue
+        temporary_name = f"pcan_tmp{index}"
+        suffix = 0
+        while temporary_name in used_names:
+            suffix += 1
+            temporary_name = f"pcan_t{index}_{suffix}"
+        used_names.add(temporary_name)
+        for command in (
+            ["sudo", "-S", "-p", "", "ip", "link", "set", current_name, "down"],
+            [
+                "sudo",
+                "-S",
+                "-p",
+                "",
+                "ip",
+                "link",
+                "set",
+                current_name,
+                "name",
+                temporary_name,
+            ],
+        ):
+            result = runner(
+                command,
+                input=password + "\n",
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10.0,
+            )
+            if result.returncode != 0:
+                detail = "\n".join(
+                    part.strip() for part in (result.stdout, result.stderr) if part.strip()
+                )
+                raise RuntimeError(
+                    f"failed to normalize {current_name} for {desired_name}: "
+                    f"{detail or 'ip link failed'}"
+                )
+        temporary_by_bus[address] = temporary_name
+
+    for name in names:
+        command = build_can_activation_command(
+            name,
+            desired_bus_info[name],
+            helper_path=helper,
+        )
+        result = runner(
+            command,
+            input=password + "\n",
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
+        if result.returncode != 0:
+            detail = "\n".join(
+                part.strip() for part in (result.stdout, result.stderr) if part.strip()
+            )
+            raise RuntimeError(f"failed to activate {name}: {detail or 'activation helper failed'}")
+
+    statuses: dict[str, dict[str, object]] = {}
+    for name in names:
+        result = runner(
+            ["ip", "-details", "link", "show", name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(f"cannot verify {name}: {detail or 'ip link failed'}")
+        status = parse_can_link_status(result.stdout, name)
+        inspect_result = runner(
+            ["ethtool", "-i", name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if inspect_result.returncode != 0:
+            raise RuntimeError(f"cannot verify USB mapping for {name}")
+        status["bus_info"] = parse_can_bus_info(inspect_result.stdout)
+        if not status["up"] or status["bitrate"] != CAN_BITRATE:
+            raise RuntimeError(
+                f"{name} activation verification failed: "
+                f"up={status['up']} bitrate={status['bitrate']}"
+            )
+        if status["bus_info"] != desired_bus_info[name]:
+            raise RuntimeError(
+                f"{name} USB mapping verification failed: "
+                f"expected {desired_bus_info[name]}, got {status['bus_info']}"
+            )
+        statuses[name] = status
+    return statuses
 
 
 def move_episodes_to_trash(
@@ -125,6 +367,33 @@ def summarize_dataset_directory(directory: str | pathlib.Path) -> dict[str, int]
         except (OSError, KeyError, ValueError, TypeError):
             summary["invalid"] += 1
     return summary
+
+
+def discover_dataset_names(root: str | pathlib.Path) -> tuple[str, ...]:
+    """List existing raw dataset directories available below a dataset root."""
+    path = pathlib.Path(root).expanduser()
+    names: list[str] = []
+    if path.is_dir() and any(path.glob("ep_*.npz")):
+        names.append(path.name)
+    if path.is_dir():
+        for child in sorted(path.iterdir()):
+            if child.is_dir() and not child.name.startswith("."):
+                try:
+                    names.append(safe_dataset_name(child.name))
+                except ValueError:
+                    continue
+    return tuple(dict.fromkeys(names))
+
+
+def episode_list_values(
+    path: str | pathlib.Path,
+    dataset_name: str,
+) -> tuple[str, str]:
+    """Return concise table values while keeping the episode path out of the UI."""
+    episode_path = pathlib.Path(path)
+    match = re.search(r"(\d+)$", episode_path.stem)
+    episode = f"Episode {int(match.group(1)):04d}" if match else episode_path.stem
+    return dataset_name, episode
 
 
 def build_dataset_tool_command(
@@ -261,74 +530,54 @@ def prepare_preview_frame(
 def letterbox_preview_frame(
     frame: np.ndarray,
     *,
-    tile_size: int = PREVIEW_IMAGE_SIZE,
+    target_hw: tuple[int, int] = PREVIEW_DEFAULT_HW,
     source_aspect: float = CAMERA_PREVIEW_ASPECT,
 ) -> np.ndarray | None:
-    """Render a camera frame into a square tile without changing its aspect."""
-    if tile_size <= 0:
-        raise ValueError("tile_size must be positive")
+    """Render a camera frame into a fixed rectangle without distortion."""
+    target_h, target_w = (int(value) for value in target_hw)
+    if target_h <= 0 or target_w <= 0:
+        raise ValueError("target_hw values must be positive")
     rgb = prepare_preview_frame(frame, target_aspect=source_aspect)
     if rgb is None:
         return None
     height, width = rgb.shape[:2]
-    scale = min(tile_size / width, tile_size / height)
+    scale = min(target_w / width, target_h / height)
     resized_width = max(1, round(width * scale))
     resized_height = max(1, round(height * scale))
     resized = cv2.resize(rgb, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
-    tile = np.zeros((tile_size, tile_size, 3), dtype=np.uint8)
-    y0 = (tile_size - resized_height) // 2
-    x0 = (tile_size - resized_width) // 2
+    tile = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    y0 = (target_h - resized_height) // 2
+    x0 = (target_w - resized_width) // 2
     tile[y0 : y0 + resized_height, x0 : x0 + resized_width] = resized
     return tile
 
 
-def check_initial_pose(
-    qpos: np.ndarray,
-    start_qpos: np.ndarray,
-    joint_tolerance_rad: float,
-    gripper_tolerance_m: float,
-) -> tuple[bool, str, np.ndarray]:
-    """Check measured qpos against the configured home pose.
-
-    Each arm contributes six Piper joint angles in radians followed by one
-    gripper position in metres.  Bimanual vectors use fixed ``left + right``
-    order.  The returned error vector uses the same units.  This is a pure
-    helper so it can be tested without hardware or a Tk display.
-    """
-    measured = np.asarray(qpos, dtype=np.float64).reshape(-1)
-    target = np.asarray(start_qpos, dtype=np.float64).reshape(-1)
-    if measured.shape != target.shape or measured.size not in {7, 14}:
-        size = target.size if target.size in {7, 14} else measured.size
-        return (
-            False,
-            "invalid qpos shape (expected matching 7 or 14 values)",
-            np.full(size if size in {7, 14} else 7, np.nan),
-        )
-    if not np.all(np.isfinite(measured)) or not np.all(np.isfinite(target)):
-        return False, "robot feedback contains NaN/Inf", np.full(measured.shape, np.nan)
-    if joint_tolerance_rad <= 0 or gripper_tolerance_m <= 0:
-        return False, "pose tolerances must be positive", np.full(measured.shape, np.nan)
-
-    errors = measured - target
-    details: list[str] = []
-    arm_sides = ("",) if measured.size == 7 else ("L-", "R-")
-    for arm_index, side_prefix in enumerate(arm_sides):
-        start = arm_index * 7
-        bad_joints = np.flatnonzero(
-            np.abs(errors[start : start + 6]) > joint_tolerance_rad
-        )
-        details.extend(
-            f"{side_prefix}J{index + 1}={np.degrees(errors[start + index]):+.1f} deg"
-            for index in bad_joints
-        )
-        if abs(float(errors[start + 6])) > gripper_tolerance_m:
-            details.append(
-                f"{side_prefix}Gripper={errors[start + 6] * 1000:+.1f} mm"
-            )
-    if not details:
-        arm_text = "both robots are" if measured.size == 14 else "robot is"
-        return True, f"OK: {arm_text} at the home pose", errors.astype(np.float32)
-    return False, "outside tolerance: " + ", ".join(details), errors.astype(np.float32)
+def format_arm_state_rows(
+    state: np.ndarray | None,
+    *,
+    schema: str,
+    arm_mode: str,
+    arm_side: str,
+) -> tuple[tuple[str, tuple[float, ...]], ...]:
+    """Return one seven-value display row per arm from the collected state."""
+    if state is None:
+        return ()
+    values = np.asarray(state, dtype=np.float64).reshape(-1)
+    sides = ("left", "right") if arm_mode == BIMANUAL else (arm_side,)
+    block_size = 10 if schema == DELIVERY_SCHEMA else 7
+    if values.shape != (block_size * len(sides),) or not np.isfinite(values).all():
+        return ()
+    rows = []
+    for index, side in enumerate(sides):
+        block = values[index * block_size : (index + 1) * block_size]
+        if schema == DELIVERY_SCHEMA:
+            rotation = rotation6d_to_matrix(block[3:9])
+            rpy = Rotation.from_matrix(rotation).as_euler("xyz")
+            display = tuple(float(value) for value in (*block[:3], *rpy, block[9]))
+        else:
+            display = tuple(float(value) for value in block)
+        rows.append((side, display))
+    return tuple(rows)
 
 
 class CollectorGUI:
@@ -344,7 +593,7 @@ class CollectorGUI:
         self.cameras = None
         self.capture_thread: threading.Thread | None = None
         self.capture_stop: threading.Event | None = None
-        self.reset_thread: threading.Thread | None = None
+        self.can_activation_thread: threading.Thread | None = None
         self.dataset_task_thread: threading.Thread | None = None
         self.dataset_task_process: subprocess.Popen | None = None
         self.dataset_task_name: str | None = None
@@ -356,9 +605,6 @@ class CollectorGUI:
         self.latest_images: dict[str, np.ndarray] = {}
         self.latest_qpos: np.ndarray | None = None
         self.latest_state: np.ndarray | None = None
-        self.latest_pose_errors = np.zeros(7, dtype=np.float32)
-        self.latest_pose_ok: bool | None = None
-        self.latest_pose_reason = "Waiting for robot feedback"
         self.messages: queue.Queue = queue.Queue()
         self.recording = False
         self._space_pressed = False
@@ -366,21 +612,16 @@ class CollectorGUI:
         self.capture_fps = 20
         self.camera_fps = DEFAULT_CAMERA_FPS
 
-        # The existing reset command uses the all-zero Piper joint pose.  Keep
-        # the same reference for the pre-episode safety check.
-        self.start_qpos = np.zeros(7, dtype=np.float32)
-        self.joint_tolerance_rad = float(np.deg2rad(5.0))
-        self.gripper_tolerance_m = 0.005
-
         # PhotoImage references must be retained for Tk to keep them alive.
         self.preview_photos: dict[str, object] = {}
-        self.preview_labels: dict[str, tk.Label] = {}
+        self.preview_labels: dict[str, tk.Canvas] = {}
         self.preview_cards: dict[str, tk.Frame] = {}
         self.preview_title_labels: dict[str, tk.Label] = {}
+        self.preview_image_items: dict[str, int] = {}
+        self.preview_text_items: dict[str, int] = {}
+        self.episode_paths: dict[str, pathlib.Path] = {}
         self.preview_key_to_slot: dict[str, str] = {}
-        self.joint_rows: dict[str, str] = {}
-
-        self.arm_mode_var = tk.StringVar(value=SINGLE_ARM)
+        self.arm_mode_var = tk.StringVar(value=BIMANUAL)
         self.schema_var = tk.StringVar(value=DELIVERY_SCHEMA)
         self.arm_side_var = tk.StringVar(value="right")
         self.can_var = tk.StringVar(value=DEFAULT_CAN)
@@ -392,8 +633,6 @@ class CollectorGUI:
         self.right_wrist_var = tk.StringVar(value=DEFAULT_RIGHT_WRIST_DEVICE)
         self.fps_var = tk.StringVar(value="20")
         self.camera_fps_var = tk.StringVar(value=str(DEFAULT_CAMERA_FPS))
-        self.joint_tol_var = tk.StringVar(value="5.0")
-        self.gripper_tol_var = tk.StringVar(value="5.0")
         self.out_var = tk.StringVar(value="episodes_piper_v21")
         self.task_var = tk.StringVar(value="pick_cube")
         self.instruction_var = tk.StringVar(value="pick up the cube")
@@ -401,6 +640,7 @@ class CollectorGUI:
             value=str(pathlib.Path(self.out_var.get()).expanduser().resolve())
         )
         self.dataset_name_var = tk.StringVar(value="episodes_piper_v21")
+        self._dataset_before_add = self.dataset_name_var.get()
         self.dataset_server_var = tk.StringVar(
             value=os.environ.get("BIMANUAL_VLA_SERVER", DEFAULT_SERVER)
         )
@@ -414,76 +654,150 @@ class CollectorGUI:
         self.status_var = tk.StringVar(value="Disconnected")
         self.progress_var = tk.StringVar(value="No episode started")
         self.dataset_stats_var = tk.StringVar(value="Dataset: no episodes")
-        self.pose_check_var = tk.StringVar(value="Waiting for robot feedback")
-        self.eef_var = tk.StringVar(value="EEF: --")
-        self.live_var = tk.StringVar(value="Live telemetry: --")
+        self.device_summary_var = tk.StringVar(value="")
+        self.arm_state_header_var = tk.StringVar(value="Arm data")
+        self.arm_state_vars = {
+            "left": tk.StringVar(value="Waiting for data"),
+            "right": tk.StringVar(value="Waiting for data"),
+        }
+        self.swap_wrist_cameras_var = tk.BooleanVar(value=False)
+        self.device_settings_window: tk.Toplevel | None = None
         self._build_ui()
         self._configure_mode_ui()
         self.refresh_files()
-        self.root.bind_all("<KeyPress-space>", self._handle_space_key, add="+")
-        self.root.bind_all("<KeyPress-KP_Space>", self._handle_space_key, add="+")
-        self.root.bind_all("<KeyRelease-space>", self._handle_space_release, add="+")
-        self.root.bind_all("<KeyRelease-KP_Space>", self._handle_space_release, add="+")
+        self._install_space_shortcut()
         self.root.after(100, self._poll_messages)
 
     def _build_ui(self):
-        # Use the native ttk theme but make the important controls readable on
-        # a 1080p field monitor.
-        tkfont.nametofont("TkDefaultFont").configure(size=12)
-        tkfont.nametofont("TkTextFont").configure(size=12)
-        tkfont.nametofont("TkHeadingFont").configure(size=14, weight="bold")
+        colors = {
+            "window": "#eef1f5",
+            "surface": "#ffffff",
+            "surface_alt": "#f7f8fa",
+            "border": "#d9dde5",
+            "text": "#202124",
+            "secondary": "#68707d",
+            "accent": "#1a73e8",
+            "camera": "#16181c",
+        }
+        self.root.configure(bg=colors["window"])
+        tkfont.nametofont("TkDefaultFont").configure(family="DejaVu Sans", size=10)
+        tkfont.nametofont("TkTextFont").configure(family="DejaVu Sans", size=10)
+        tkfont.nametofont("TkHeadingFont").configure(family="DejaVu Sans", size=12, weight="bold")
         style = ttk.Style()
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("TButton", font=("Sans", 12), padding=(11, 6))
-        style.configure("TLabel", font=("Sans", 12))
-        style.configure("TLabelframe.Label", font=("Sans", 13, "bold"))
-        style.configure("Treeview", rowheight=29, font=("Sans", 11))
-        style.configure("Treeview.Heading", font=("Sans", 11, "bold"))
+        style.configure(".", background=colors["window"], foreground=colors["text"])
+        style.configure("TFrame", background=colors["window"])
+        style.configure("TLabel", background=colors["window"], foreground=colors["text"])
+        style.configure("TButton", font=("DejaVu Sans", 10), padding=(13, 8), relief="flat")
+        style.configure("Accent.TButton", foreground="#ffffff", background=colors["accent"])
+        style.map(
+            "Accent.TButton",
+            background=[("active", "#1769d2"), ("disabled", "#a8c7ea")],
+            foreground=[("disabled", "#f3f3f3")],
+        )
+        style.configure(
+            "Card.TLabelframe",
+            background=colors["surface"],
+            bordercolor=colors["border"],
+            relief="flat",
+            borderwidth=1,
+        )
+        style.configure(
+            "Card.TLabelframe.Label",
+            background=colors["window"],
+            foreground=colors["text"],
+            font=("DejaVu Sans", 11, "bold"),
+        )
+        style.configure("Card.TFrame", background=colors["surface"])
+        style.configure("Card.TLabel", background=colors["surface"], foreground=colors["text"])
+        style.configure("Secondary.Card.TLabel", background=colors["surface"], foreground=colors["secondary"])
+        style.configure("TCombobox", padding=(6, 5))
+        style.configure("TEntry", padding=(6, 5))
+        style.configure(
+            "Episodes.Treeview",
+            background=colors["surface"],
+            fieldbackground=colors["surface"],
+            foreground=colors["text"],
+            rowheight=30,
+            borderwidth=0,
+            relief="flat",
+            font=("DejaVu Sans", 9),
+        )
+        style.configure(
+            "Episodes.Treeview.Heading",
+            background=colors["surface_alt"],
+            foreground=colors["secondary"],
+            relief="flat",
+            padding=(8, 7),
+            font=("DejaVu Sans", 9, "bold"),
+        )
+        style.map(
+            "Episodes.Treeview",
+            background=[("selected", colors["accent"])],
+            foreground=[("selected", "#ffffff")],
+        )
 
-        main = ttk.Panedwindow(self.root, orient="horizontal")
-        main.pack(fill="both", expand=True, padx=10, pady=10)
-        left = ttk.Frame(main, padding=(2, 0, 8, 0))
-        right = ttk.Frame(main, padding=(8, 0, 2, 0))
-        main.add(left, weight=1)
-        main.add(right, weight=2)
+        def make_card(parent: tk.Misc, title: str) -> tuple[tk.Frame, ttk.Frame]:
+            card = tk.Frame(
+                parent,
+                bg=colors["surface"],
+                highlightthickness=1,
+                highlightbackground=colors["border"],
+                bd=0,
+            )
+            tk.Label(
+                card,
+                text=title,
+                bg=colors["surface"],
+                fg=colors["text"],
+                font=("DejaVu Sans", 11, "bold"),
+                anchor="w",
+            ).pack(fill="x", padx=14, pady=(12, 7))
+            body = ttk.Frame(card, style="Card.TFrame", padding=(14, 0, 14, 12))
+            body.pack(fill="both", expand=True)
+            return card, body
+
+        main = ttk.Frame(self.root, padding=16)
+        main.pack(fill="both", expand=True)
+        main.columnconfigure(0, weight=0, minsize=570)
+        main.columnconfigure(1, weight=1)
+        main.rowconfigure(0, weight=1)
+        left = ttk.Frame(main, padding=(0, 0, 8, 0))
+        right = ttk.Frame(main, padding=(8, 0, 0, 0))
+        left.grid(row=0, column=0, sticky="nsew")
+        right.grid(row=0, column=1, sticky="nsew")
         left.columnconfigure(0, weight=1)
-        left.rowconfigure(4, weight=1)
+        left.rowconfigure(3, weight=1)
         right.columnconfigure(0, weight=1)
-        # The camera grid has a fixed square layout; telemetry follows it
-        # instead of stretching the preview area vertically.
-        right.rowconfigure(0, weight=0)
+        right.rowconfigure(0, weight=1)
 
-        config = ttk.LabelFrame(left, text="Devices and Task", padding=10)
-        config.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        config.columnconfigure(1, weight=1)
+        task_card, task = make_card(left, "Task and dataset")
+        task_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        task.columnconfigure(1, weight=1)
         selectors = [
             ("Arm mode", self.arm_mode_var, (("Single arm", SINGLE_ARM), ("Bimanual", BIMANUAL))),
             (
-                "Training schema",
+                "Collection format",
                 self.schema_var,
-                (
-                    ("Joint 7D (6 joints + gripper)", JOINT_SCHEMA),
-                    ("End-effector delivery", DELIVERY_SCHEMA),
-                ),
+                (("Joint", JOINT_SCHEMA), ("End-effector", DELIVERY_SCHEMA)),
             ),
             ("Single-arm side", self.arm_side_var, (("right", "right"), ("left", "left"))),
         ]
-        self.mode_selectors: list[ttk.Combobox] = []
-        self.mode_display_vars: list[tk.StringVar] = []
+        self.mode_selectors = []
+        self.mode_display_vars = []
         for row, (label, variable, values) in enumerate(selectors):
-            ttk.Label(config, text=label, width=22).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Label(task, text=label, width=18, style="Card.TLabel").grid(row=row, column=0, sticky="w", pady=4)
             display_to_value = dict(values)
             value_to_display = {value: display for display, value in values}
             display_var = tk.StringVar(value=value_to_display[variable.get()])
             selector = ttk.Combobox(
-                config,
+                task,
                 textvariable=display_var,
                 values=tuple(display_to_value),
                 state="readonly",
-                width=34,
             )
             selector.grid(row=row, column=1, sticky="ew", pady=3, padx=(8, 0))
 
@@ -495,255 +809,211 @@ class CollectorGUI:
             self.mode_selectors.append(selector)
             self.mode_display_vars.append(display_var)
 
-        rows = [
-            ("Single arm CAN", self.can_var, "single"),
-            ("Left-arm CAN", self.left_can_var, "bimanual"),
-            ("Right-arm CAN", self.right_can_var, "bimanual"),
-            ("Overhead camera", self.high_var, "all"),
-            ("Single-arm wrist camera", self.wrist_var, "single"),
-            ("Left wrist camera", self.left_wrist_var, "bimanual"),
-            ("Right wrist camera", self.right_wrist_var, "bimanual"),
-            ("Collection rate (Hz)", self.fps_var),
-            ("Camera source rate (Hz)", self.camera_fps_var),
-            ("Dataset root directory", self.out_var),
-            ("Dataset name", self.dataset_name_var, "dataset"),
-            ("Task name", self.task_var),
-            ("Instruction", self.instruction_var),
-        ]
-        self.device_rows: dict[str, list[tk.Widget]] = {"single": [], "bimanual": []}
-        self.connection_entries: list[ttk.Entry] = []
-        for offset, item in enumerate(rows, start=len(selectors)):
-            label, var, *mode = item
-            label_widget = ttk.Label(config, text=label, width=22)
-            entry = ttk.Entry(
-                config,
-                textvariable=var,
-                width=36,
-                state="readonly" if mode and mode[0] == "dataset" else "normal",
-            )
-            label_widget.grid(row=offset, column=0, sticky="w", pady=3)
-            entry.grid(
-                row=offset, column=1, sticky="ew", pady=3, padx=(8, 0)
-            )
-            if mode and mode[0] in self.device_rows:
-                self.device_rows[mode[0]].extend((label_widget, entry))
-            if mode and mode[0] == "dataset":
-                self.dataset_name_entry = entry
-            if label not in {"Task name", "Instruction", "Dataset name"}:
-                self.connection_entries.append(entry)
-        self.device_entries = [
-            widget
-            for widgets in self.device_rows.values()
-            for widget in widgets
-            if isinstance(widget, ttk.Entry)
-        ]
-
-        pose_config = ttk.LabelFrame(left, text="Initial pose check", padding=10)
-        pose_config.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        pose_config.columnconfigure(1, weight=1)
-        ttk.Label(pose_config, text="Joint tolerance").grid(
-            row=0, column=0, sticky="w", pady=3
+        ttk.Label(task, text="Dataset", width=18).grid(row=3, column=0, sticky="w", pady=3)
+        self.dataset_name_entry = ttk.Combobox(
+            task,
+            textvariable=self.dataset_name_var,
+            values=(),
+            state="readonly",
         )
-        ttk.Entry(pose_config, textvariable=self.joint_tol_var, width=9).grid(
-            row=0, column=1, sticky="w", padx=(8, 0), pady=3
-        )
-        ttk.Label(pose_config, text="deg (J1-J6)").grid(
-            row=0, column=2, sticky="w", padx=(5, 0)
-        )
-        ttk.Label(pose_config, text="Gripper tolerance").grid(
-            row=1, column=0, sticky="w", pady=3
-        )
-        ttk.Entry(pose_config, textvariable=self.gripper_tol_var, width=9).grid(
-            row=1, column=1, sticky="w", padx=(8, 0), pady=3
-        )
-        ttk.Label(pose_config, text="mm").grid(
-            row=1, column=2, sticky="w", padx=(5, 0)
-        )
+        self.dataset_name_entry.grid(row=3, column=1, sticky="ew", pady=3, padx=(8, 0))
+        self.dataset_name_entry.bind("<<ComboboxSelected>>", self._dataset_selection_changed)
+        ttk.Label(task, text="Task name", width=18, style="Card.TLabel").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Entry(task, textvariable=self.task_var).grid(row=4, column=1, sticky="ew", pady=3, padx=(8, 0))
+        ttk.Label(task, text="Instruction", width=18, style="Card.TLabel").grid(row=5, column=0, sticky="w", pady=4)
+        ttk.Entry(task, textvariable=self.instruction_var).grid(row=5, column=1, sticky="ew", pady=3, padx=(8, 0))
+        device_bar = ttk.Frame(task, style="Card.TFrame")
+        device_bar.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        device_bar.columnconfigure(0, weight=1)
         ttk.Label(
-            pose_config,
-            text="Reference pose: all-zero joint pose used by Reset to Home",
-            foreground="#65717d",
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            device_bar,
+            textvariable=self.device_summary_var,
+            style="Secondary.Card.TLabel",
+            justify="left",
+            wraplength=360,
+        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+        self.device_settings_button = ttk.Button(
+            device_bar,
+            text="Device settings...",
+            command=self.open_device_settings,
+        )
+        self.device_settings_button.grid(row=0, column=1, sticky="e")
+        self.connection_entries = []
+        self.device_rows = {"single": [], "bimanual": []}
+        self.device_entries = []
 
-        controls = ttk.LabelFrame(left, text="Collection controls", padding=8)
-        controls.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        self.connect_button = ttk.Button(
-            controls, text="Connect devices", command=self.toggle_connection
-        )
-        self.connect_button.grid(row=0, column=0, padx=3, pady=3, sticky="ew")
-        self.start_button = ttk.Button(
-            controls, text="Start episode", command=self.start_episode, state="disabled"
-        )
-        self.start_button.grid(row=0, column=1, padx=3, pady=3, sticky="ew")
-        self.stop_button = ttk.Button(
-            controls, text="Stop episode", command=self.stop_episode, state="disabled"
-        )
-        self.stop_button.grid(row=0, column=2, padx=3, pady=3, sticky="ew")
-        self.reset_button = ttk.Button(controls, text="Reset to Home", command=self.reset_arm, state="disabled")
-        self.reset_button.grid(row=1, column=0, padx=3, pady=3, sticky="ew")
-        ttk.Button(controls, text="Refresh files", command=self.refresh_files).grid(
-            row=1, column=1, padx=3, pady=3, sticky="ew"
-        )
-        ttk.Button(controls, text="Replay selected episode", command=self.replay_selected).grid(
-            row=1, column=2, padx=3, pady=3, sticky="ew"
-        )
-        self.swap_camera_button = ttk.Button(
+        controls_card, controls = make_card(left, "Collection controls")
+        controls_card.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        for column in range(3):
+            controls.columnconfigure(column, weight=1)
+        self.activate_can_button = ttk.Button(controls, text="Activate CAN", command=self.activate_can, style="Accent.TButton")
+        self.activate_can_button.grid(row=0, column=0, padx=3, pady=3, sticky="ew")
+        self.connect_button = ttk.Button(controls, text="Connect devices", command=self.toggle_connection, style="Accent.TButton")
+        self.connect_button.grid(row=0, column=1, padx=3, pady=3, sticky="ew")
+        self.start_button = ttk.Button(controls, text="Start episode", command=self.start_episode, state="disabled")
+        self.start_button.grid(row=0, column=2, padx=3, pady=3, sticky="ew")
+        self.stop_button = ttk.Button(controls, text="Stop episode", command=self.stop_episode, state="disabled")
+        self.stop_button.grid(row=1, column=0, padx=3, pady=3, sticky="ew")
+        self.swap_camera_button = ttk.Checkbutton(
             controls,
-            text="Swap Camera Roles",
+            text="Swap wrist cameras",
+            variable=self.swap_wrist_cameras_var,
             command=self.swap_camera_roles,
         )
-        self.swap_camera_button.grid(row=2, column=2, padx=3, pady=3, sticky="ew")
-        self.edit_dataset_button = ttk.Button(
-            controls,
-            text="Edit dataset name",
-            command=self.edit_dataset_name,
+        self.swap_camera_button.grid(row=1, column=1, padx=3, pady=3, sticky="ew")
+        ttk.Button(controls, text="Refresh files", command=self.refresh_files).grid(
+            row=1, column=2, padx=3, pady=3, sticky="ew"
         )
-        self.edit_dataset_button.grid(row=2, column=0, columnspan=2, padx=3, pady=3, sticky="ew")
-        self.exit_button = ttk.Button(
-            controls,
-            text="Exit program",
-            command=self.close,
+        ttk.Button(controls, text="Replay episode", command=self.replay_selected).grid(
+            row=2, column=0, padx=3, pady=3, sticky="ew"
         )
-        self.exit_button.grid(row=3, column=0, columnspan=3, padx=3, pady=(3, 0), sticky="ew")
+        self.edit_dataset_button = ttk.Button(controls, text="Add dataset...", command=self.edit_dataset_name)
+        self.edit_dataset_button.grid(row=2, column=1, padx=3, pady=3, sticky="ew")
+        self.exit_button = ttk.Button(controls, text="Exit", command=self.close)
+        self.exit_button.grid(row=2, column=2, padx=3, pady=3, sticky="ew")
+        ttk.Label(controls, text="Space starts or stops an episode", foreground=colors["secondary"]).grid(
+            row=3, column=0, columnspan=3, sticky="w", padx=3, pady=(5, 0)
+        )
+
+        arm_data_card, arm_data = make_card(left, "Robot and collection status")
+        arm_data_card.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        arm_data.columnconfigure(1, weight=1)
+        status_line = ttk.Frame(arm_data, style="Card.TFrame")
+        status_line.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 7))
+        status_line.columnconfigure(0, weight=1)
         ttk.Label(
-            controls,
-            text="Space: start / stop episode",
-            foreground="#52606d",
-        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=3, pady=(5, 0))
-        for col in range(3):
-            controls.columnconfigure(col, weight=1)
-
-        status = ttk.LabelFrame(left, text="Status", padding=10)
-        status.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-        ttk.Label(status, textvariable=self.status_var, wraplength=520).pack(anchor="w")
-        ttk.Label(status, textvariable=self.progress_var, foreground="#52606d").pack(anchor="w", pady=(5, 0))
-        self.pose_status_label = tk.Label(
-            status,
-            textvariable=self.pose_check_var,
-            anchor="w",
-            justify="left",
-            wraplength=520,
-            font=("Sans", 12, "bold"),
-            fg="#65717d",
+            status_line,
+            textvariable=self.status_var,
+            style="Card.TLabel",
+            font=("DejaVu Sans", 10, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            status_line,
+            textvariable=self.progress_var,
+            style="Secondary.Card.TLabel",
+        ).grid(row=0, column=1, sticky="e")
+        ttk.Separator(arm_data).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        self.arm_state_dimension_label = ttk.Label(
+            arm_data,
+            textvariable=self.arm_state_header_var,
+            style="Secondary.Card.TLabel",
+            font=("DejaVu Sans", 9),
         )
-        self.pose_status_label.pack(fill="x", pady=(7, 0))
-        ttk.Label(status, textvariable=self.live_var, foreground="#52606d").pack(anchor="w", pady=(5, 0))
+        self.arm_state_dimension_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.arm_state_labels = {}
+        for row, side in enumerate(("left", "right"), start=3):
+            side_label = ttk.Label(arm_data, text=side.capitalize(), width=7, style="Card.TLabel", font=("DejaVu Sans", 10, "bold"))
+            side_label.grid(row=row, column=0, sticky="nw", pady=4)
+            value_label = ttk.Label(
+                arm_data,
+                textvariable=self.arm_state_vars[side],
+                justify="left",
+                wraplength=410,
+            )
+            value_label.grid(row=row, column=1, sticky="ew", pady=4)
+            self.arm_state_labels[side] = (side_label, value_label)
 
-        joints = ttk.LabelFrame(left, text="Live robot pose", padding=8)
-        joints.grid(row=4, column=0, sticky="nsew", pady=(0, 8))
-        joints.columnconfigure(0, weight=1)
-        joints.rowconfigure(0, weight=1)
-        self.joint_table = ttk.Treeview(
-            joints,
-            columns=("joint", "position", "error", "limit"),
-            show="headings",
-            height=8,
-        )
-        headings = {"joint": "Joint", "position": "Current", "error": "Relative to Home", "limit": "Status"}
-        widths = {"joint": 95, "position": 130, "error": 130, "limit": 100}
-        for column in headings:
-            self.joint_table.heading(column, text=headings[column])
-            self.joint_table.column(column, width=widths[column], anchor="center")
-        self.joint_table.tag_configure("ok", foreground="#137333")
-        self.joint_table.tag_configure("bad", foreground="#b3261e")
-        self.joint_table.tag_configure("waiting", foreground="#65717d")
-        self.joint_table.grid(row=0, column=0, sticky="nsew")
-        ttk.Label(joints, textvariable=self.eef_var, foreground="#34495e").grid(
-            row=1, column=0, sticky="w", pady=(8, 0)
-        )
-
-        files = ttk.LabelFrame(left, text="Saved episodes", padding=8)
-        files.grid(row=5, column=0, sticky="nsew")
+        files_card, files = make_card(left, "Saved episodes")
+        files_card.grid(row=3, column=0, sticky="nsew")
         files.columnconfigure(0, weight=1)
         files.rowconfigure(0, weight=1)
-        self.listbox = tk.Listbox(
+        self.listbox = ttk.Treeview(
             files,
-            height=7,
-            font=("Sans", 11),
-            selectmode=tk.EXTENDED,
+            columns=("dataset", "episode"),
+            show="headings",
+            selectmode="extended",
+            style="Episodes.Treeview",
         )
+        headings = {"dataset": "Dataset", "episode": "Episode"}
+        widths = {"dataset": 300, "episode": 170}
+        for column, heading in headings.items():
+            self.listbox.heading(column, text=heading)
+            self.listbox.column(column, width=widths[column], minwidth=90, anchor="w", stretch=True)
         self.listbox.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(files, orient="vertical", command=self.listbox.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.listbox.configure(yscrollcommand=scrollbar.set)
+        self.listbox.bind("<Double-1>", lambda _event: self.replay_selected())
         ttk.Label(
             files,
             textvariable=self.dataset_stats_var,
             foreground="#52606d",
             justify="left",
-            wraplength=520,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 0))
+            wraplength=480,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
         file_actions = ttk.Frame(files)
-        file_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        file_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         file_actions.columnconfigure(0, weight=1)
         file_actions.columnconfigure(1, weight=1)
         self.delete_episode_button = ttk.Button(
             file_actions,
-            text="Delete selected data",
+            text="Delete selected",
             command=self.delete_selected_episodes,
         )
         self.delete_episode_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
         self.dataset_tools_button = ttk.Button(
             file_actions,
-            text="Convert / upload dataset",
+            text="Convert / upload",
             command=self.open_dataset_tools,
         )
         self.dataset_tools_button.grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
-        preview = ttk.LabelFrame(right, text="Live camera views", padding=8)
-        preview.grid(row=0, column=0, sticky="nsew")
-        for index, (slot, title) in enumerate(PREVIEW_SLOTS):
-            row, col = divmod(index, 2)
-            preview.columnconfigure(
-                col,
-                weight=1,
-                minsize=PREVIEW_TILE_SIZE + 16,
-                uniform="preview-column",
-            )
-            preview.rowconfigure(
-                row,
-                weight=0,
-                minsize=PREVIEW_TILE_SIZE + 16,
-                uniform="preview-row",
-            )
-            card = tk.Frame(
-                preview,
-                width=PREVIEW_TILE_SIZE,
-                height=PREVIEW_TILE_SIZE,
-                bg="#18232f",
-                bd=0,
-                highlightthickness=0,
-            )
-            card.grid(row=row, column=col, sticky="", padx=8, pady=8)
-            card.grid_propagate(False)
-            card.pack_propagate(False)
+        preview_card, preview = make_card(right, "Live cameras")
+        preview_card.grid(row=0, column=0, sticky="nsew")
+        preview.columnconfigure(0, weight=1, uniform="wrist")
+        preview.columnconfigure(1, weight=1, uniform="wrist")
+        # A 2:1 row ratio gives the full-width overhead view and the two
+        # half-width wrist views approximately the same 16:9 content area.
+        preview.rowconfigure(0, weight=2, minsize=360)
+        preview.rowconfigure(1, weight=1, minsize=240)
+        placements = {
+            "high": (0, 0, 2),
+            "primary_wrist": (1, 0, 1),
+            "right_wrist": (1, 1, 1),
+        }
+        for slot, title in PREVIEW_SLOTS:
+            row, column, span = placements[slot]
+            card = tk.Frame(preview, bg=colors["camera"], bd=0, highlightthickness=1, highlightbackground="#303034")
+            card.grid(row=row, column=column, columnspan=span, sticky="nsew", padx=5, pady=5)
             title_label = tk.Label(
                 card,
                 text=title,
-                bg="#18232f",
+                bg=colors["camera"],
                 fg="#f5f7fa",
-                font=("Sans", 13, "bold"),
+                font=("DejaVu Sans", 10, "bold"),
             )
-            title_label.pack(fill="x", padx=8, pady=(8, 5))
-            label = tk.Label(
+            title_label.pack(fill="x", padx=7, pady=(6, 4))
+            label = tk.Canvas(
                 card,
-                text="Waiting for camera...",
-                bg="#0f1720",
-                fg="#aab7c4",
+                bg="#0b0b0d",
+                highlightthickness=0,
+                bd=0,
+                width=560,
+                height=315,
             )
-            label.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+            label.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+            image_item = label.create_image(0, 0, anchor="nw")
+            text_item = label.create_text(
+                280,
+                158,
+                text="Waiting for camera...",
+                fill="#8e8e93",
+                font=("DejaVu Sans", 10),
+            )
+            label.bind(
+                "<Configure>",
+                lambda event, item=text_item: event.widget.coords(
+                    item,
+                    event.width // 2,
+                    event.height // 2,
+                ),
+            )
             self.preview_cards[slot] = card
             self.preview_title_labels[slot] = title_label
             self.preview_labels[slot] = label
+            self.preview_image_items[slot] = image_item
+            self.preview_text_items[slot] = text_item
 
-        telemetry = ttk.LabelFrame(right, text="Live schema telemetry", padding=10)
-        telemetry.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        ttk.Label(telemetry, textvariable=self.eef_var, font=("Sans", 12, "bold")).pack(anchor="w")
-        ttk.Label(
-            telemetry,
-            text="Pose checks use measured output-arm joint feedback. Bimanual state/action order is fixed to left + right.",
-            foreground="#65717d",
-        ).pack(anchor="w", pady=(5, 0))
 
     @property
     def dataset_root_dir(self) -> pathlib.Path:
@@ -786,13 +1056,6 @@ class CollectorGUI:
             arm_side=self.arm_side,
         )
 
-    def _joint_display_names(self) -> tuple[str, ...]:
-        if self.arm_mode == BIMANUAL:
-            return tuple(f"L-{name}" for name in JOINT_NAMES) + tuple(
-                f"R-{name}" for name in JOINT_NAMES
-            )
-        return JOINT_NAMES
-
     def _camera_role_title(self, key: str) -> str:
         if key == "cam_high":
             return "Overhead camera"
@@ -802,31 +1065,30 @@ class CollectorGUI:
             return "Right wrist camera"
         return f"{self.arm_side.capitalize()} wrist camera"
 
+    def _update_device_summary(self) -> None:
+        if self.arm_mode == BIMANUAL:
+            can_text = f"CAN {self.left_can_var.get()} / {self.right_can_var.get()}"
+            camera_text = "3 cameras"
+        else:
+            can_text = f"CAN {self.can_var.get()}"
+            camera_text = "2 cameras"
+        self.device_summary_var.set(
+            f"{can_text}   |   {camera_text}\n"
+            f"{self.fps_var.get()} Hz collection   |   {self.camera_fps_var.get()} Hz camera"
+        )
+
+    def _set_preview_message(self, slot: str, message: str) -> None:
+        canvas = self.preview_labels[slot]
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        canvas.itemconfigure(self.preview_image_items[slot], image="")
+        canvas.coords(self.preview_text_items[slot], width // 2, height // 2)
+        canvas.itemconfigure(self.preview_text_items[slot], text=message, state="normal")
+
     def _configure_mode_ui(self):
-        if not hasattr(self, "joint_table"):
+        if not hasattr(self, "preview_labels"):
             return
         bimanual = self.arm_mode == BIMANUAL
-        for widget in self.device_rows.get("single", []):
-            if bimanual:
-                widget.grid_remove()
-            else:
-                widget.grid()
-        for widget in self.device_rows.get("bimanual", []):
-            if bimanual:
-                widget.grid()
-            else:
-                widget.grid_remove()
-
-        self.start_qpos = np.zeros(14 if bimanual else 7, dtype=np.float32)
-        self.latest_pose_errors = np.zeros_like(self.start_qpos)
-        self.joint_rows.clear()
-        for item in self.joint_table.get_children():
-            self.joint_table.delete(item)
-        for name in self._joint_display_names():
-            self.joint_rows[name] = self.joint_table.insert(
-                "", "end", values=(name, "--", "--", "Waiting")
-            )
-
         if bimanual:
             self.preview_key_to_slot = {
                 "cam_high": "high",
@@ -838,80 +1100,219 @@ class CollectorGUI:
                 "cam_high": "high",
                 self.contract.camera_keys[1]: "primary_wrist",
             }
-        if hasattr(self, "swap_camera_button"):
-            self.swap_camera_button.configure(
-                state="disabled" if bimanual or self.session is not None else "normal"
-            )
         for camera_key, slot in self.preview_key_to_slot.items():
             self.preview_title_labels[slot].configure(text=self._camera_role_title(camera_key))
         active_slots = set(self.preview_key_to_slot.values())
-        for slot, label in self.preview_labels.items():
-            label.configure(
-                image="",
-                text="Waiting for camera..." if slot in active_slots else "Reserved slot",
+        for slot in self.preview_labels:
+            self._set_preview_message(
+                slot,
+                "Waiting for camera..." if slot in active_slots else "Inactive",
             )
-        self.preview_title_labels["reserved"].configure(text="Reserved camera slot")
         self.preview_photos.clear()
+        self.arm_state_header_var.set(
+            "Arm data: x y z rx ry rz gripper"
+            if self.schema == DELIVERY_SCHEMA
+            else "Arm data: j1 j2 j3 j4 j5 j6 gripper"
+        )
+        for side, widgets in self.arm_state_labels.items():
+            visible = bimanual or side == self.arm_side
+            for widget in widgets:
+                widget.grid() if visible else widget.grid_remove()
+            self.arm_state_vars[side].set("Waiting for data")
+        if len(self.mode_selectors) >= 3:
+            side_state = "disabled" if bimanual or self.session is not None else "readonly"
+            self.mode_selectors[2].configure(state=side_state)
         if self.session is None:
             self.latest_qpos = None
             self.latest_state = None
-            self.latest_pose_ok = None
-            self.latest_pose_reason = "Waiting for robot feedback"
-            self.pose_check_var.set("Waiting for robot feedback")
-        self.eef_var.set("State: --")
-        self.live_var.set(
-            f"{self.arm_mode} / {self.schema} - "
-            f"state={self.contract.state_dim}D action={self.contract.action_dim}D"
+        self.swap_camera_button.configure(
+            state="normal" if bimanual and not self.recording else "disabled"
         )
+        self._update_device_summary()
+        self._refresh_dataset_choices()
         if hasattr(self, "listbox"):
             self.refresh_files()
 
     def _set_connection_config_enabled(self, enabled: bool) -> None:
         selector_state = "readonly" if enabled else "disabled"
-        entry_state = "normal" if enabled else "disabled"
         for selector in self.mode_selectors:
             selector.configure(state=selector_state)
-        for entry in self.connection_entries:
-            entry.configure(state=entry_state)
-        if hasattr(self, "dataset_name_entry"):
-            self.dataset_name_entry.configure(state="readonly")
-        if hasattr(self, "edit_dataset_button"):
-            self.edit_dataset_button.configure(
-                state="normal" if enabled and self.session is None else "disabled"
-            )
-        if hasattr(self, "swap_camera_button"):
-            self.swap_camera_button.configure(
-                state=("normal" if enabled and self.arm_mode == SINGLE_ARM else "disabled")
-            )
+        self.device_settings_button.configure(state="normal" if enabled else "disabled")
+        dataset_state = "disabled" if self.recording else "readonly"
+        self.dataset_name_entry.configure(state=dataset_state)
+        self.edit_dataset_button.configure(state=dataset_state)
+        self.swap_camera_button.configure(
+            state="normal"
+            if self.arm_mode == BIMANUAL and not self.recording
+            else "disabled"
+        )
 
-    def edit_dataset_name(self) -> None:
-        """Select/create the named subdirectory used for the next episodes."""
-        if self.recording or self.session is not None or self.piper is not None:
+    def _refresh_dataset_choices(self) -> None:
+        if hasattr(self, "dataset_name_entry"):
+            names = discover_dataset_names(self.dataset_root_dir)
+            self.dataset_name_entry.configure(values=(*names, ADD_DATASET_OPTION))
+
+    def _apply_dataset_name(self, value: str, *, parent: tk.Misc | None = None) -> bool:
+        if self.recording or (self.session is not None and self.session.state is SessionState.REVIEW):
             messagebox.showwarning(
-                "Disconnect first",
-                "Stop the current episode and disconnect devices before changing the dataset name.",
+                "Dataset locked",
+                "Save or discard the current episode before changing datasets.",
+                parent=parent,
             )
+            return False
+        try:
+            name = safe_dataset_name(value.strip())
+            root = self.dataset_root_dir
+            target = root if root.name == name else root / name
+            target.mkdir(parents=True, exist_ok=True)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Invalid dataset name", str(exc), parent=parent)
+            return False
+        self.dataset_name_var.set(name)
+        self._dataset_before_add = name
+        self.dataset_source_var.set(str(target.resolve()))
+        self.episode_index = next_episode_index(target)
+        if self.session is not None:
+            self.session.config = replace(self.session.config, output_dir=target)
+            self.session.episode_index = self.episode_index
+        self._refresh_dataset_choices()
+        self.refresh_files()
+        self.status_var.set(f"Ready: dataset {name}, next episode {self.episode_index:04d}")
+        return True
+
+    def _dataset_selection_changed(self, _event=None) -> None:
+        value = self.dataset_name_var.get()
+        if value == ADD_DATASET_OPTION:
+            current = getattr(self, "_dataset_before_add", "")
+            self.dataset_name_var.set(current)
+            self.edit_dataset_name()
+            return
+        self._dataset_before_add = value
+        self._apply_dataset_name(value, parent=self.root)
+
+    def open_device_settings(self) -> None:
+        if self.device_settings_window is not None and self.device_settings_window.winfo_exists():
+            self.device_settings_window.lift()
+            self.device_settings_window.focus_force()
+            return
+        if self.session is not None:
+            messagebox.showinfo("Device settings", "Disconnect devices before changing hardware settings.")
             return
         dialog = tk.Toplevel(self.root)
-        dialog.title("Edit dataset name")
+        self.device_settings_window = dialog
+        dialog.title("Device settings")
         dialog.transient(self.root)
         dialog.resizable(False, False)
         dialog.grab_set()
         body = ttk.Frame(dialog, padding=14)
         body.pack(fill="both", expand=True)
-        ttk.Label(
+        body.columnconfigure(1, weight=1)
+
+        rows = []
+        if self.arm_mode == BIMANUAL:
+            rows.extend(
+                (
+                    ("Left-arm CAN", self.left_can_var),
+                    ("Right-arm CAN", self.right_can_var),
+                    ("Left wrist camera", self.left_wrist_var),
+                    ("Right wrist camera", self.right_wrist_var),
+                )
+            )
+        else:
+            rows.extend(
+                (
+                    ("Robot CAN", self.can_var),
+                    ("Wrist camera", self.wrist_var),
+                )
+            )
+        rows.extend(
+            (
+                ("Overhead camera", self.high_var),
+                ("Collection rate (Hz)", self.fps_var),
+                ("Camera rate (Hz)", self.camera_fps_var),
+                ("Dataset root", self.out_var),
+            )
+        )
+        pending = {label: tk.StringVar(value=variable.get()) for label, variable in rows}
+        for row, (label, _variable) in enumerate(rows):
+            ttk.Label(body, text=label, width=20).grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Entry(body, textvariable=pending[label], width=58).grid(
+                row=row,
+                column=1,
+                sticky="ew",
+                padx=(8, 0),
+                pady=4,
+            )
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=len(rows), column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
+
+        def close_dialog() -> None:
+            self.device_settings_window = None
+            dialog.destroy()
+
+        def apply_settings() -> None:
+            try:
+                fps = int(pending["Collection rate (Hz)"].get())
+                camera_fps = int(pending["Camera rate (Hz)"].get())
+                if fps <= 0 or camera_fps <= 0 or fps > camera_fps:
+                    raise ValueError("rates must be positive and collection rate cannot exceed camera rate")
+                can_values = (
+                    (pending["Left-arm CAN"].get(), pending["Right-arm CAN"].get())
+                    if self.arm_mode == BIMANUAL
+                    else (pending["Robot CAN"].get(),)
+                )
+                names = tuple(validate_can_name(value) for value in can_values)
+                if len(set(names)) != len(names):
+                    raise ValueError("left and right CAN names must be distinct")
+                root = pathlib.Path(pending["Dataset root"].get()).expanduser()
+                root.mkdir(parents=True, exist_ok=True)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("Invalid device settings", str(exc), parent=dialog)
+                return
+            for label, variable in rows:
+                variable.set(pending[label].get().strip())
+            self.capture_fps = fps
+            self.camera_fps = camera_fps
+            self._update_device_summary()
+            self._refresh_dataset_choices()
+            self._apply_dataset_name(self.dataset_name_var.get(), parent=dialog)
+            self.status_var.set("Device settings updated")
+            close_dialog()
+
+        ttk.Button(buttons, text="Cancel", command=close_dialog).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(buttons, text="Apply", command=apply_settings).grid(
+            row=0, column=1, sticky="ew", padx=(4, 0)
+        )
+        dialog.bind("<Escape>", lambda _event: close_dialog())
+        dialog.bind("<Return>", lambda _event: apply_settings())
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+
+    def edit_dataset_name(self) -> None:
+        """Choose an existing dataset or create a new named directory."""
+        if self.recording or (self.session is not None and self.session.state is SessionState.REVIEW):
+            messagebox.showwarning("Dataset locked", "Finish the current episode first.")
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add new dataset")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        body = ttk.Frame(dialog, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=f"Create a folder under {self.dataset_root_dir}").pack(anchor="w")
+        value = tk.StringVar(value="")
+        entry = ttk.Entry(
             body,
-            text=(
-                f"Dataset folders are created below:\n{self.dataset_root_dir}\n\n"
-                "Use letters, numbers, dot, underscore, or dash."
-            ),
-            justify="left",
-        ).pack(anchor="w")
-        value = tk.StringVar(value=self.dataset_name_var.get().strip())
-        entry = ttk.Entry(body, textvariable=value, width=42)
+            textvariable=value,
+            width=42,
+        )
         entry.pack(fill="x", pady=(10, 0))
         entry.focus_set()
-        entry.selection_range(0, tk.END)
 
         buttons = ttk.Frame(body)
         buttons.pack(fill="x", pady=(12, 0))
@@ -922,27 +1323,13 @@ class CollectorGUI:
             dialog.destroy()
 
         def confirm() -> None:
-            try:
-                name = safe_dataset_name(value.get().strip())
-                root = self.dataset_root_dir
-                target = root if root.name == name else root / name
-                target.mkdir(parents=True, exist_ok=True)
-            except (OSError, ValueError) as exc:
-                messagebox.showerror("Invalid dataset name", str(exc), parent=dialog)
-                return
-            self.dataset_name_var.set(name)
-            self.dataset_source_var.set(str(target.resolve()))
-            self.refresh_files()
-            self.episode_index = next_episode_index(self.out_dir)
-            self.status_var.set(
-                f"Active dataset: {name} | {self.out_dir} | next episode: {self.episode_index:04d}"
-            )
-            dialog.destroy()
+            if self._apply_dataset_name(value.get(), parent=dialog):
+                dialog.destroy()
 
         ttk.Button(buttons, text="Cancel", command=cancel).grid(
             row=0, column=0, sticky="ew", padx=(0, 4)
         )
-        ttk.Button(buttons, text="Use dataset", command=confirm).grid(
+        ttk.Button(buttons, text="Create and use", command=confirm, style="Accent.TButton").grid(
             row=0, column=1, sticky="ew", padx=(4, 0)
         )
         dialog.bind("<Return>", lambda _event: confirm())
@@ -950,64 +1337,32 @@ class CollectorGUI:
         dialog.protocol("WM_DELETE_WINDOW", cancel)
 
     def swap_camera_roles(self) -> None:
-        """Swap the configured overhead and wrist camera for single-arm mode."""
-        if self.arm_mode != SINGLE_ARM:
-            messagebox.showinfo(
-                "Swap Camera Roles",
-                "For bimanual mode, configure the left and right wrist cameras separately.",
-            )
+        """Toggle left/right wrist-camera assignments, reconnecting if needed."""
+        if self.arm_mode != BIMANUAL:
+            self.swap_wrist_cameras_var.set(False)
             return
-        if self.session is not None or self.piper is not None or self.cameras is not None:
-            messagebox.showwarning(
-                "Disconnect first",
-                "Disconnect devices before swapping camera roles. Do not change camera semantics during an episode.",
-            )
+        if self.recording or (self.session is not None and self.session.state is SessionState.REVIEW):
+            self.swap_wrist_cameras_var.set(not self.swap_wrist_cameras_var.get())
+            messagebox.showwarning("Camera roles locked", "Finish the current episode first.")
             return
-        wrist_key = "cam_left_wrist" if self.arm_side == "left" else "cam_right_wrist"
-        try:
-            overhead = select_video_device("cam_high", self.high_var.get().strip())
-            wrist = select_video_device(wrist_key, self.wrist_var.get().strip())
-        except Exception as exc:
-            messagebox.showerror("Cannot resolve cameras", str(exc))
-            return
-        self.high_var.set(str(wrist))
-        self.wrist_var.set(str(overhead))
-        self.status_var.set(
-            f"Camera roles swapped: overhead={self.high_var.get()} | wrist={self.wrist_var.get()}"
-        )
-
-    def _load_pose_check_config(self):
-        joint_tol_deg = float(self.joint_tol_var.get())
-        gripper_tol_mm = float(self.gripper_tol_var.get())
-        if not np.isfinite(joint_tol_deg) or joint_tol_deg <= 0:
-            raise ValueError("Joint tolerance must be positive")
-        if not np.isfinite(gripper_tol_mm) or gripper_tol_mm <= 0:
-            raise ValueError("Gripper tolerance must be positive")
-        self.joint_tolerance_rad = float(np.deg2rad(joint_tol_deg))
-        self.gripper_tolerance_m = float(gripper_tol_mm / 1000.0)
-
-    def _check_initial_pose(self, qpos: np.ndarray):
-        return check_initial_pose(
-            qpos,
-            self.start_qpos,
-            self.joint_tolerance_rad,
-            self.gripper_tolerance_m,
-        )
+        left = self.left_wrist_var.get()
+        right = self.right_wrist_var.get()
+        self.left_wrist_var.set(right)
+        self.right_wrist_var.set(left)
+        self.status_var.set("Wrist cameras swapped" if self.swap_wrist_cameras_var.get() else "Wrist cameras restored")
+        if self.session is not None:
+            self.disconnect()
+            self.root.after(100, self.toggle_connection)
 
     def _update_start_button(self):
         if (
             self.piper is None
             or self.cameras is None
             or self.recording
-            or self.reset_thread is not None
             or self._dataset_task_running()
         ):
             state = "disabled"
         else:
-            # Keep the home-pose check as an operator warning only. Requiring
-            # an all-zero pose here prevented valid teleoperation episodes
-            # from starting; freshness checks still fail closed on missing or
-            # stale Piper feedback.
             state = "normal"
         self.start_button.configure(state=state)
 
@@ -1023,12 +1378,108 @@ class CollectorGUI:
         for button in getattr(self, "dataset_action_buttons", []):
             button.configure(state=state)
 
+    def _can_activation_running(self) -> bool:
+        thread = self.can_activation_thread
+        return thread is not None and thread.is_alive()
+
+    def _configured_can_names(self) -> tuple[str, ...]:
+        if self.arm_mode == BIMANUAL:
+            return (
+                validate_can_name(self.left_can_var.get()),
+                validate_can_name(self.right_can_var.get()),
+            )
+        return (validate_can_name(self.can_var.get()),)
+
+    def activate_can(self) -> None:
+        if self.piper is not None:
+            messagebox.showwarning(
+                "Cannot activate CAN",
+                "Disconnect robot devices before reconfiguring CAN interfaces.",
+            )
+            return
+        if self._can_activation_running():
+            return
+        try:
+            can_names = self._configured_can_names()
+            if len(set(can_names)) != len(can_names):
+                raise ValueError("Left and right CAN interface names must be distinct")
+        except ValueError as exc:
+            messagebox.showerror("Invalid CAN configuration", str(exc))
+            return
+        password = simpledialog.askstring(
+            "Activate CAN",
+            f"Administrator password for activating {', '.join(can_names)}:",
+            parent=self.root,
+            show="*",
+        )
+        if password is None:
+            return
+        if not password:
+            messagebox.showerror("Activate CAN", "Administrator password must not be empty")
+            return
+
+        self.status_var.set(f"Activating CAN interfaces: {', '.join(can_names)}...")
+        self.activate_can_button.configure(state="disabled")
+        self.connect_button.configure(state="disabled")
+        self._set_connection_config_enabled(False)
+
+        def worker(secret: str) -> None:
+            try:
+                expected_bus_info = None
+                if len(can_names) == 2:
+                    expected_bus_info = dict(zip(can_names, BIMANUAL_CAN_USB_PORTS))
+                statuses = activate_can_interfaces(
+                    can_names,
+                    secret,
+                    expected_bus_info=expected_bus_info,
+                )
+                self.messages.put(("can_activation_done", statuses))
+            except Exception as exc:
+                self.messages.put(("can_activation_error", str(exc)))
+            finally:
+                # Drop the only long-lived worker reference to the password.
+                secret = ""
+
+        self.can_activation_thread = threading.Thread(
+            target=worker,
+            args=(password,),
+            name="can-activation",
+            daemon=True,
+        )
+        password = ""
+        self.can_activation_thread.start()
+
+    def _finish_can_activation(
+        self,
+        success: bool,
+        payload: dict[str, dict[str, object]] | str,
+    ) -> None:
+        self.can_activation_thread = None
+        self._set_connection_config_enabled(True)
+        self.connect_button.configure(state="normal")
+        self.activate_can_button.configure(state="normal")
+        if success:
+            assert isinstance(payload, dict)
+            summary = ", ".join(f"{name}=UP" for name in payload)
+            detail = ", ".join(
+                f"{name}=UP/{status['bitrate']} ({status['bus_info']})"
+                for name, status in payload.items()
+            )
+            self.status_var.set(f"CAN ready: {summary}")
+            messagebox.showinfo("CAN activated", detail)
+            return
+        message = str(payload)
+        self.status_var.set(f"CAN activation failed: {message}")
+        messagebox.showerror("CAN activation failed", message)
+
     def toggle_connection(self):
+        if self._can_activation_running():
+            messagebox.showwarning("CAN activation", "Wait for CAN activation to finish")
+            return
         if self.piper is not None:
             self.disconnect()
             return
         try:
-            self._load_pose_check_config()
             fps = int(self.fps_var.get())
             camera_fps = int(self.camera_fps_var.get())
             if fps <= 0:
@@ -1039,8 +1490,8 @@ class CollectorGUI:
                 raise ValueError("Collection rate cannot exceed camera source rate")
             self.capture_fps = fps
             self.camera_fps = camera_fps
-            self.status_var.set("Connecting to robot and cameras...")
-            self.pose_check_var.set("Waiting for robot feedback; starting initial pose check...")
+            self.status_var.set("Connecting devices...")
+            self.activate_can_button.configure(state="disabled")
             self.root.update_idletasks()
             self.session = CollectionSession(
                 CollectionConfig(
@@ -1067,12 +1518,9 @@ class CollectorGUI:
                 self.latest_images = {}
                 self.latest_qpos = None
                 self.latest_state = None
-                self.latest_pose_ok = None
-                self.latest_pose_reason = "Waiting for robot feedback"
             self.capture_stop = threading.Event()
             self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
             self.capture_thread.start()
-            camera_status_parts = []
             for key, info in checks.items():
                 video_device = str(info.get("video_device") or info.get("configured_device") or "?")
                 selected_device = str(info.get("selected_device") or video_device)
@@ -1084,36 +1532,25 @@ class CollectorGUI:
                     self.left_wrist_var.set(selected_device)
                 elif key == "cam_right_wrist":
                     self.right_wrist_var.set(selected_device)
-                camera_status_parts.append(f"{key}={video_device} ({info['fps']:.0f}FPS)")
                 slot = self.preview_key_to_slot.get(key)
                 if slot is not None:
                     self.preview_title_labels[slot].configure(
                         text=f"{self._camera_role_title(key)}\n{video_device}"
                     )
-            camera_status = ", ".join(camera_status_parts)
-            can_status = (
-                self.can_var.get().strip()
-                if self.arm_mode == SINGLE_ARM
-                else f"left={self.left_can_var.get().strip()}, right={self.right_can_var.get().strip()}"
-            )
-            self.status_var.set(
-                f"Connected {self.arm_mode}/{self.schema} ({can_status}) | "
-                f"state={self.contract.state_dim}D action={self.contract.action_dim}D | "
-                f"Dataset {self.dataset_name_var.get().strip()} | "
-                f"Collection {fps}Hz | {camera_status} | Next episode: {self.episode_index:04d}"
-            )
+            self.status_var.set(f"Ready: next episode {self.episode_index:04d}")
             self._set_connection_config_enabled(False)
             self.connect_button.configure(text="Disconnect devices")
-            self.reset_button.configure(state="normal")
+            self.activate_can_button.configure(state="disabled")
             self._update_start_button()
         except Exception as exc:
             self.status_var.set(f"Connection failed: {exc}")
             self._cleanup_devices()
             self._set_connection_config_enabled(True)
+            self.activate_can_button.configure(state="normal")
             messagebox.showerror("Connection failed", str(exc))
 
     def _handle_space_key(self, event: tk.Event) -> str | None:
-        """Use Space as a start/stop shortcut without hijacking text fields."""
+        """Use Space as start/stop even when a selector or button owns focus."""
         if self._space_pressed:
             return "break"
         self._space_pressed = True
@@ -1121,17 +1558,13 @@ class CollectorGUI:
             return None
         widget_class = str(event.widget.winfo_class())
         if widget_class in {
-            "Button",
-            "TButton",
             "Entry",
             "TEntry",
             "Text",
-            "TCombobox",
             "Spinbox",
             "TSpinbox",
         }:
-            # Let the focused control handle Space normally (button activation
-            # or text entry); the shortcut is active everywhere else.
+            # Preserve spaces while the operator is typing task/instruction.
             return None
         if self.recording:
             self.stop_episode()
@@ -1148,34 +1581,34 @@ class CollectorGUI:
     def _handle_space_release(self, _event: tk.Event) -> None:
         self._space_pressed = False
 
+    def _install_space_shortcut(self) -> None:
+        """Run the collection shortcut before focused widget class bindings."""
+        shortcut_tag = "CollectorSpaceShortcut"
+        self.root.bind_class(shortcut_tag, "<KeyPress-space>", self._handle_space_key)
+        self.root.bind_class(shortcut_tag, "<KeyPress-KP_Space>", self._handle_space_key)
+        self.root.bind_class(shortcut_tag, "<KeyRelease-space>", self._handle_space_release)
+        self.root.bind_class(shortcut_tag, "<KeyRelease-KP_Space>", self._handle_space_release)
+
+        def add_tag(widget: tk.Misc) -> None:
+            tags = widget.bindtags()
+            if shortcut_tag not in tags:
+                widget.bindtags((shortcut_tag, *tags))
+            for child in widget.winfo_children():
+                add_tag(child)
+
+        add_tag(self.root)
+
     def start_episode(self):
         if self.session is None or self.recording:
             return
-        try:
-            self._load_pose_check_config()
-        except ValueError as exc:
-            messagebox.showwarning("Initial pose configuration error", str(exc))
-            return
         with self.data_lock:
             qpos = None if self.latest_qpos is None else self.latest_qpos.copy()
-            state = None if self.latest_state is None else self.latest_state.copy()
         if qpos is None:
             messagebox.showwarning(
                 "Cannot start collection",
                 "No robot state feedback received yet; wait a few seconds and try again.",
             )
             return
-        pose_ok, reason, errors = self._check_initial_pose(qpos)
-        with self.data_lock:
-            self.latest_pose_ok = pose_ok
-            self.latest_pose_reason = reason
-            self.latest_pose_errors = errors
-        # Pose mismatch is intentionally non-blocking. The red telemetry
-        # warning remains visible so the operator can decide whether the
-        # episode starts from the intended task pose. A missing/stale Piper
-        # stream is rejected separately by the hardware reader.
-        self._update_telemetry(qpos, state, pose_ok, reason, errors)
-
         task_name = self.task_var.get().strip()
         instruction = self.instruction_var.get().strip() or task_name.replace("_", " ")
         try:
@@ -1189,10 +1622,10 @@ class CollectorGUI:
         self.instruction_var.set(label.instruction)
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
-        self.reset_button.configure(state="disabled")
-        self.status_var.set(
-            f"Recording episode {self.episode_index:04d} | Instruction: {label.instruction}"
-        )
+        self.dataset_name_entry.configure(state="disabled")
+        self.edit_dataset_button.configure(state="disabled")
+        self.swap_camera_button.configure(state="disabled")
+        self.status_var.set(f"Recording episode {self.episode_index:04d}")
         self.progress_var.set("Frames: 0")
         self._update_dataset_action_buttons()
 
@@ -1209,15 +1642,11 @@ class CollectorGUI:
                     sample = self.session.capture_once()
                     state = np.asarray(sample.state).copy()
                     qpos = np.asarray(sample.joint_qpos).copy()
-                    pose_ok, pose_reason, pose_errors = self._check_initial_pose(qpos)
                     self.latest_images = {
                         key: np.asarray(value).copy() for key, value in sample.images.items()
                     }
                     self.latest_state = state
                     self.latest_qpos = qpos
-                    self.latest_pose_ok = pose_ok
-                    self.latest_pose_reason = pose_reason
-                    self.latest_pose_errors = pose_errors.copy()
                     is_recording = self.recording
                     count = self.session.frame_count if is_recording else 0
                 if is_recording:
@@ -1241,7 +1670,9 @@ class CollectorGUI:
     def _finish_stop(self):
         self._update_start_button()
         self._update_dataset_action_buttons()
-        self.reset_button.configure(state="normal" if self.piper is not None else "disabled")
+        self.dataset_name_entry.configure(state="readonly")
+        self.edit_dataset_button.configure(state="normal")
+        self.swap_camera_button.configure(state="normal")
         if self.session is None or self.session.frame_count == 0:
             if self.session is not None and self.session.state is SessionState.REVIEW:
                 self.session.discard_episode()
@@ -1280,9 +1711,7 @@ class CollectorGUI:
                 return
             self.episode_index = self.session.episode_index
             dialog.destroy()
-            self.status_var.set(
-                f"Saved and validated: {path} | FPS={stats.actual_fps:.2f}"
-            )
+            self.status_var.set(f"Saved {path.name} ({stats.actual_fps:.1f} FPS)")
             self.refresh_files()
             self._update_start_button()
 
@@ -1296,140 +1725,30 @@ class CollectorGUI:
             side="left", padx=5
         )
 
-    def reset_arm(self):
-        if self.session is None or self.recording or self.reset_thread is not None:
-            return
-        confirmed = messagebox.askyesno(
-            "Reset to Home",
-            "Smoothly move the connected robot to the all-zero joint reference "
-            "pose and close the gripper. Continue?",
+    def _update_telemetry(self, state: np.ndarray | None) -> None:
+        rows = format_arm_state_rows(
+            state,
+            schema=self.schema,
+            arm_mode=self.arm_mode,
+            arm_side=self.arm_side,
         )
-        if not confirmed:
-            return
-        self.start_button.configure(state="disabled")
-        self.reset_button.configure(state="disabled")
-        self.status_var.set("Resetting robot to Home...")
-        self.pose_check_var.set("Resetting: starting an episode is temporarily disabled")
-        self.reset_thread = threading.Thread(target=self._reset_worker, daemon=True)
-        self.reset_thread.start()
-
-    def _reset_worker(self):
-        try:
-            reset_robot_arms(self.piper, arm_mode=self.arm_mode)
-            self.messages.put(("reset_done",))
-        except Exception as exc:
-            self.messages.put(("reset_error", str(exc)))
-
-    def _finish_reset(self, success: bool, error: str | None = None):
-        self.reset_thread = None
-        if success:
-            self.status_var.set("Home reset command completed; waiting for the pose check")
-        else:
-            self.status_var.set(f"Reset failed: {error}")
-            messagebox.showerror("Reset failed", error or "Unknown error")
-        if self.piper is not None and not self.recording:
-            self.reset_button.configure(state="normal")
-        self._update_start_button()
-
-    def _update_telemetry(
-        self,
-        qpos: np.ndarray | None,
-        state: np.ndarray | None,
-        pose_ok: bool | None,
-        pose_reason: str,
-        pose_errors: np.ndarray | None,
-    ):
-        expected_joint_dim = self.contract.joint_dim
-        display_names = self._joint_display_names()
-        qpos_array = None if qpos is None else np.asarray(qpos, dtype=np.float64)
-        if qpos_array is None or qpos_array.shape != (expected_joint_dim,):
-            for name in display_names:
-                row = self.joint_rows.get(name)
-                if row is not None:
-                    self.joint_table.item(
-                        row,
-                        values=(name, "--", "--", "Waiting"),
-                        tags=("waiting",),
-                    )
-            self.eef_var.set("State: --")
-            self.live_var.set(
-                f"Live telemetry: waiting for {expected_joint_dim}D robot joint feedback"
-            )
-        else:
-            errors = (
-                qpos_array - self.start_qpos
-                if pose_errors is None
-                else np.asarray(pose_errors, dtype=np.float64)
-            )
-            if errors.shape != qpos_array.shape:
-                errors = qpos_array - self.start_qpos
-            for index, name in enumerate(display_names):
-                local_index = index % 7
-                if local_index < 6:
-                    position = f"{np.degrees(qpos_array[index]):+.2f} deg"
-                    error = f"{np.degrees(errors[index]):+.2f} deg"
-                    ok = abs(errors[index]) <= self.joint_tolerance_rad
-                else:
-                    position = f"{qpos_array[index] * 1000:+.2f} mm"
-                    error = f"{errors[index] * 1000:+.2f} mm"
-                    ok = abs(errors[index]) <= self.gripper_tolerance_m
-                self.joint_table.item(
-                    self.joint_rows[name],
-                    values=(name, position, error, "OK" if ok else "Out of tolerance"),
-                    tags=(("ok" if ok else "bad"),),
-                )
-
-            state_array = None if state is None else np.asarray(state, dtype=np.float64)
-            if state_array is None or state_array.shape != (self.contract.state_dim,):
-                actual = "missing" if state_array is None else f"{state_array.size}D"
-                self.eef_var.set("State: --")
-                self.live_var.set(
-                    f"Live telemetry: state {actual}, expected {self.contract.state_dim}D"
-                )
-            elif self.schema == JOINT_SCHEMA:
-                order = "left + right" if self.arm_mode == BIMANUAL else self.arm_side
-                self.eef_var.set(
-                    f"Joint state: {self.contract.state_dim}D = 6 joint angles + gripper ({order})"
-                )
-                self.live_var.set(
-                    f"Joint action: {self.contract.action_dim}D absolute target (same 6+1 format)"
-                )
-            else:
-                arm_summaries: list[str] = []
-                rotation_summaries: list[str] = []
-                for arm_index, side in enumerate(self.contract.arm_sides):
-                    arm_state = state_array[arm_index * 10 : (arm_index + 1) * 10]
-                    xyz = ", ".join(f"{value:+.3f}" for value in arm_state[:3])
-                    rot6d = ", ".join(f"{value:+.2f}" for value in arm_state[3:9])
-                    label = side.upper()[0]
-                    arm_summaries.append(
-                        f"{label} xyz(m)=[{xyz}] grip={arm_state[9]:.3f}"
-                    )
-                    rotation_summaries.append(f"{label} rot6D=[{rot6d}]")
-                self.eef_var.set("   |   ".join(arm_summaries))
-                self.live_var.set("   |   ".join(rotation_summaries))
-
-        self.pose_check_var.set(f"Initial pose: {pose_reason}")
-        if pose_ok is True:
-            self.pose_status_label.configure(fg="#137333")
-        elif pose_ok is False:
-            self.pose_status_label.configure(fg="#b3261e")
-        else:
-            self.pose_status_label.configure(fg="#65717d")
+        visible_sides = set()
+        for side, values in rows:
+            visible_sides.add(side)
+            self.arm_state_vars[side].set("  ".join(f"{value:+.4f}" for value in values))
+        for side in self.arm_state_vars:
+            if side not in visible_sides:
+                self.arm_state_vars[side].set("Waiting for data")
 
     def _poll_messages(self):
         with self.data_lock:
             preview = {key: value.copy() for key, value in self.latest_images.items()}
-            qpos = None if self.latest_qpos is None else self.latest_qpos.copy()
             state = None if self.latest_state is None else self.latest_state.copy()
-            pose_ok = self.latest_pose_ok
-            pose_reason = self.latest_pose_reason
-            pose_errors = self.latest_pose_errors.copy()
             is_recording = self.recording
         if preview:
             self._show_preview(preview)
-        self._update_telemetry(qpos, state, pose_ok, pose_reason, pose_errors)
-        if self.piper is not None and not is_recording and self.reset_thread is None:
+        self._update_telemetry(state)
+        if self.piper is not None and not is_recording:
             self._update_start_button()
 
         try:
@@ -1442,10 +1761,10 @@ class CollectorGUI:
                     if self.recording:
                         self.stop_episode()
                     messagebox.showerror("Collection error", payload[0])
-                elif kind == "reset_done":
-                    self._finish_reset(True)
-                elif kind == "reset_error":
-                    self._finish_reset(False, payload[0])
+                elif kind == "can_activation_done":
+                    self._finish_can_activation(True, payload[0])
+                elif kind == "can_activation_error":
+                    self._finish_can_activation(False, payload[0])
                 elif kind == "dataset_log":
                     line = payload[0]
                     self._append_dataset_log(line)
@@ -1475,16 +1794,20 @@ class CollectorGUI:
                 if self.cameras is not None:
                     source_aspects = getattr(self.cameras, "source_aspects", {})
                     source_aspect = source_aspects.get(key, source_aspect)
+                target_w = max(320, label.winfo_width())
+                target_h = max(180, label.winfo_height())
                 rgb = letterbox_preview_frame(
                     frame,
-                    tile_size=PREVIEW_IMAGE_SIZE,
+                    target_hw=(target_h, target_w),
                     source_aspect=source_aspect,
                 )
                 if rgb is None:
                     continue
                 image = Image.fromarray(rgb, mode="RGB")
                 photo = ImageTk.PhotoImage(image=image)
-                label.configure(image=photo, text="")
+                label.coords(self.preview_image_items[slot], 0, 0)
+                label.itemconfigure(self.preview_image_items[slot], image=photo)
+                label.itemconfigure(self.preview_text_items[slot], state="hidden")
                 self.preview_photos[slot] = photo
             return
 
@@ -1498,9 +1821,12 @@ class CollectorGUI:
             if self.cameras is not None:
                 source_aspects = getattr(self.cameras, "source_aspects", {})
                 source_aspect = source_aspects.get(key, source_aspect)
+            label = self.preview_labels.get(slot)
+            target_w = max(320, 640 if label is None else label.winfo_width())
+            target_h = max(180, 360 if label is None else label.winfo_height())
             rgb = letterbox_preview_frame(
                 frame,
-                tile_size=PREVIEW_IMAGE_SIZE,
+                target_hw=(target_h, target_w),
                 source_aspect=source_aspect,
             )
             if rgb is None:
@@ -1530,11 +1856,11 @@ class CollectorGUI:
                 "Wait for the current conversion or upload task to finish",
             )
             return
-        selections = self.listbox.curselection()
+        selections = self.listbox.selection()
         if not selections:
             messagebox.showinfo("Delete data", "Select one or more episodes first")
             return
-        paths = [pathlib.Path(self.listbox.get(index)) for index in selections]
+        paths = [self.episode_paths[item_id] for item_id in selections]
         preview = "\n".join(path.name for path in paths[:12])
         if len(paths) > 12:
             preview += f"\n... and {len(paths) - 12} more"
@@ -1786,42 +2112,42 @@ class CollectorGUI:
         self._update_dataset_action_buttons()
 
     def refresh_files(self):
-        self.listbox.delete(0, tk.END)
+        for item_id in self.listbox.get_children():
+            self.listbox.delete(item_id)
+        self.episode_paths.clear()
         directory = self.out_dir
         if not directory.exists():
             self.dataset_stats_var.set(
-                f"Dataset: {self.dataset_name_var.get().strip()} | schema: {self.schema} | "
-                f"path: {directory} | no episodes"
+                f"{self.dataset_name_var.get().strip()}  |  No episodes"
             )
             return
+        dataset_name = self.dataset_name_var.get().strip()
         for path in sorted(directory.glob("ep_*.npz")):
-            self.listbox.insert(tk.END, str(path))
+            values = episode_list_values(path, dataset_name)
+            item_id = self.listbox.insert("", "end", values=values)
+            self.episode_paths[item_id] = path.resolve()
         summary = summarize_dataset_directory(directory)
         invalid = f" | invalid {summary['invalid']}" if summary["invalid"] else ""
         self.dataset_stats_var.set(
-            f"Dataset: {self.dataset_name_var.get().strip()} | "
-            f"schema: {self.schema} | path: {directory} | "
-            f"episodes {summary['episodes']} | frames {summary['frames']} | "
-            f"success {summary['success']} / failed {summary['failure']}{invalid}"
+            f"{dataset_name}  |  {summary['episodes']} episodes  |  "
+            f"{summary['frames']} frames  |  {summary['success']} success  |  "
+            f"{summary['failure']} failure{invalid}"
         )
 
     def replay_selected(self):
-        selection = self.listbox.curselection()
+        selection = self.listbox.selection()
         if not selection:
             messagebox.showinfo("Replay", "Select an episode first")
             return
-        path = self.listbox.get(selection[0])
+        path = self.episode_paths[selection[0]]
         viewer = pathlib.Path(__file__).with_name("view_episode.py")
-        subprocess.Popen([sys.executable, str(viewer), path])
+        subprocess.Popen([sys.executable, str(viewer), str(path)])
 
     def _cleanup_devices(self):
         if self.capture_stop is not None:
             self.capture_stop.set()
         if self.capture_thread is not None and self.capture_thread.is_alive():
             self.capture_thread.join(timeout=2.0)
-        if self.reset_thread is not None and self.reset_thread.is_alive():
-            self.reset_thread.join(timeout=2.0)
-        self.reset_thread = None
         self.capture_thread = None
         self.capture_stop = None
         if self.cameras is not None:
@@ -1834,12 +2160,9 @@ class CollectorGUI:
             self.latest_images = {}
             self.latest_qpos = None
             self.latest_state = None
-            self.latest_pose_ok = None
-            self.latest_pose_reason = "Waiting for robot feedback"
-            self.latest_pose_errors = np.zeros(self.contract.joint_dim, dtype=np.float32)
         self.preview_photos.clear()
-        for key, label in self.preview_labels.items():
-            label.configure(image="", text="Waiting for camera...")
+        for slot in self.preview_labels:
+            self._set_preview_message(slot, "Waiting for camera...")
         # Some headless/minimal OpenCV builds do not include GUI backends.
         # Cleanup must still complete so the Exit button can destroy Tk.
         try:
@@ -1848,23 +2171,28 @@ class CollectorGUI:
             pass
 
     def disconnect(self):
+        if self._can_activation_running():
+            messagebox.showwarning("Cannot disconnect", "Wait for CAN activation to finish")
+            return
         if self.recording:
             messagebox.showwarning("Cannot disconnect", "Stop the current episode first")
-            return
-        if self.reset_thread is not None:
-            messagebox.showwarning("Cannot disconnect", "Wait for the reset to complete")
             return
         self._cleanup_devices()
         self.connect_button.configure(text="Connect devices")
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="disabled")
-        self.reset_button.configure(state="disabled")
+        self.activate_can_button.configure(state="normal")
         self._set_connection_config_enabled(True)
         self._configure_mode_ui()
         self.status_var.set("Disconnected")
-        self.pose_check_var.set("Waiting for robot feedback")
 
     def close(self):
+        if self._can_activation_running():
+            messagebox.showwarning(
+                "CAN activation",
+                "Wait for CAN activation to finish before exiting.",
+            )
+            return
         if self._dataset_task_running():
             if not messagebox.askyesno(
                 "Exit",

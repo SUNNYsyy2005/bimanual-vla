@@ -550,6 +550,8 @@ python robot_observation_bridge.py \
   --can can0 \
   --cam-high-device auto \
   --cam-wrist-device auto \
+  --camera-preview \
+  --output-mode auto \
   --instruction "pick up the cube"
 ```
 
@@ -572,9 +574,17 @@ python robot_observation_bridge.py \
 bridge 会同时读取每条机械臂的 10D EEF delivery state 与 7D 实测 joint qpos，
 根据服务端 metadata 自动选择单臂 7D/10D 或双臂 14D/20D state、相机 wire key
 和 7D/14D action 执行方式，并严格校验 `arm_mode`、维度、左右顺序和相机集合。
+也可以用 `--output-mode joint` 或 `--output-mode delivery` 显式锁定输出合同；
+显式模式与服务端 metadata 不一致时会在握手阶段 fail-closed，不会把 EEF 输出
+误解释为关节角（`--policy-schema` 为同义别名）。
+追加 `--camera-preview`（或 `--show-cameras`）会在推理期间打开一个放大的实时窗口，
+并排显示保持原始宽高比的相机画面；默认每路约 600 像素宽、8 FPS 刷新，
+可用 `--camera-preview-fps` 调整。按 `q` 或 `Esc` 只关闭预览，`Ctrl-C` 才停止 bridge。
 默认只打印预测 action；显式追加 `--allow-execution` 后仍需网页对同一 Policy
 短时授权 EXECUTE，并通过 schema 对应的新鲜度、动作幅度/关节限位和 Piper
-状态检查才会下发。模型切换导致连接断开后客户端会自动重连、重新协商
+状态检查才会下发。joint 模式默认用 `--joint-limit-tolerance-rad 0.05` 吸收
+模型在 Piper 硬限位附近的数值 overshoot，并夹回真实限位；超过该容差仍会阻断。
+模型切换导致连接断开后客户端会自动重连、重新协商
 schema，并回到 SHADOW。
 
 每次启动 `robot_observation_bridge.py` 默认都会在 `deployment_runs/` 下创建一个独立
