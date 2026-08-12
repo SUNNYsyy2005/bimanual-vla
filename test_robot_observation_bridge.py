@@ -583,6 +583,24 @@ class EnableHoldTest(unittest.TestCase):
 
 
 class MetadataCompatibilityTest(unittest.TestCase):
+    def test_output_mode_locks_server_schema_without_reinterpreting_actions(self):
+        self.assertEqual(
+            validate_policy_metadata(JOINT_METADATA, "right", output_mode="auto").schema,
+            "joint",
+        )
+        self.assertEqual(
+            validate_policy_metadata(JOINT_METADATA, "right", output_mode="joint").schema,
+            "joint",
+        )
+        with self.assertRaisesRegex(RuntimeError, "--output-mode='joint'"):
+            validate_policy_metadata(
+                DELIVERY_METADATA,
+                "right",
+                output_mode="joint",
+            )
+        with self.assertRaisesRegex(ValueError, "output_mode must be one of"):
+            validate_policy_metadata(JOINT_METADATA, "right", output_mode="cartesian")
+
     def test_v3_delivery_accepts_side_specific_wrist_key(self):
         metadata = dict(
             DELIVERY_METADATA,
@@ -940,6 +958,31 @@ class TargetSafetyTest(unittest.TestCase):
             gripper_semantics=GRIPPER_OPENING_METRES,
         )
         self.assertAlmostEqual(legacy_gripper_m, 0.042)
+
+    def test_joint_limit_tolerance_clips_small_policy_overshoot(self):
+        target = self.qpos.copy()
+        target[2] = 0.02  # Piper joint 3 hard upper limit is exactly 0 rad.
+        target[6] = 0.5
+        joints, _ = build_checked_joint_target(
+            self.qpos,
+            target,
+            max_joint_step_rad=2.0,
+            max_gripper_step=0.25,
+            joint_limit_tolerance_rad=0.05,
+            gripper_semantics=GRIPPER_OPENING_FRACTION,
+        )
+        self.assertEqual(float(joints[2]), 0.0)
+
+        target[2] = 0.051
+        with self.assertRaisesRegex(ExecutionBlocked, "joint3 target"):
+            build_checked_joint_target(
+                self.qpos,
+                target,
+                max_joint_step_rad=2.0,
+                max_gripper_step=0.25,
+                joint_limit_tolerance_rad=0.05,
+                gripper_semantics=GRIPPER_OPENING_FRACTION,
+            )
 
 
 class ClientTransportTimingTest(unittest.TestCase):

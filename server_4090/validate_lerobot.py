@@ -66,12 +66,16 @@ def _install_torchvision_stub_if_broken() -> None:
             return tensor
 
     transforms_module = types.ModuleType("torchvision.transforms")
-    transforms_module.__spec__ = importlib.machinery.ModuleSpec("torchvision.transforms", loader=None)
+    transforms_module.__spec__ = importlib.machinery.ModuleSpec(
+        "torchvision.transforms", loader=None
+    )
     transforms_module.ToTensor = _ToTensor
     transforms_module.InterpolationMode = _InterpolationMode
 
     torchvision_module = types.ModuleType("torchvision")
-    torchvision_module.__spec__ = importlib.machinery.ModuleSpec("torchvision", loader=None, is_package=True)
+    torchvision_module.__spec__ = importlib.machinery.ModuleSpec(
+        "torchvision", loader=None, is_package=True
+    )
     torchvision_module.__path__ = []
     torchvision_module.transforms = transforms_module
     torchvision_module.__version__ = "0.0-dashboard-stub"
@@ -83,9 +87,20 @@ def _install_torchvision_stub_if_broken() -> None:
 _install_torchvision_stub_if_broken()
 
 from check_pi05_dataset import _dataset_contract, check_dataset
-from lerobot.common.datasets import lerobot_dataset as _lerobot_dataset_module
-from lerobot.common.datasets import video_utils as _video_utils_module
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+
+try:
+    # Older LeRobot revisions used by some OpenPI checkouts.
+    from lerobot.common.datasets import lerobot_dataset as _lerobot_dataset_module
+    from lerobot.common.datasets import video_utils as _video_utils_module
+except ModuleNotFoundError as first_error:
+    if first_error.name not in {"lerobot", "lerobot.common", "lerobot.common.datasets"}:
+        raise
+    # Current LeRobot package layout used by the local OpenPI checkout.
+    from lerobot.datasets import lerobot_dataset as _lerobot_dataset_module
+    from lerobot.datasets import video_utils as _video_utils_module
+
+LeRobotDataset = _lerobot_dataset_module.LeRobotDataset
+LeRobotDatasetMetadata = _lerobot_dataset_module.LeRobotDatasetMetadata
 
 
 def _decode_video_frames_cv2(video_path, timestamps, tolerance_s, backend=None):

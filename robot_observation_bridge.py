@@ -39,7 +39,7 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
-from camera import CameraCapture
+from camera import CameraCapture, CameraPreview
 from deployment_recording import DeploymentRunRecorder
 from collect_output_arm import require_can_interface_up
 from piper_action_conventions import (
@@ -93,6 +93,8 @@ DEFAULT_GRIPPER_LOWPASS_ALPHA = 0.5
 DEFAULT_GRIPPER_HYSTERESIS = 0.05
 DEFAULT_GRIPPER_CONFIRM_STEPS = 2
 DEFAULT_FEEDBACK_MAX_AGE_S = 0.5
+DEFAULT_ARM_HOLD_TOLERANCE_RAD = 0.05
+DEFAULT_JOINT_LIMIT_TOLERANCE_RAD = 0.05
 GRIPPER_OPENING_FRACTION = NEW_GRIPPER_SEMANTICS
 GRIPPER_CLOSED_FRACTION = LEGACY_GRIPPER_SEMANTICS
 GRIPPER_OPENING_METRES = LEGACY_GRIPPER_OPENING_METRES_SEMANTICS
@@ -895,8 +897,21 @@ def validate_policy_metadata(
     metadata: dict[str, Any],
     arm_side: str,
     arm_mode: str = "single",
+    output_mode: str = "auto",
 ) -> PolicyProtocol:
-    """Validate server dimensions/cameras before any robot command is possible."""
+    """Validate server dimensions/cameras before any robot command is possible.
+
+    ``output_mode`` is an operator-facing contract lock.  ``auto`` keeps the
+    historical behavior and follows the server handshake; ``joint`` and
+    ``delivery`` require the server to advertise the corresponding schema.
+    An explicit mode never reinterprets an untrusted 7D vector locally: a
+    mismatch is rejected before observations or robot commands are accepted.
+    """
+    output_mode = str(output_mode or "auto").strip().lower()
+    if output_mode not in {"auto", "joint", "delivery"}:
+        raise ValueError(
+            f"output_mode must be one of 'auto', 'joint', or 'delivery', got {output_mode!r}"
+        )
     advertised_mode = str(metadata.get("arm_mode") or "single")
     expected_side = "both" if arm_mode == "bimanual" else arm_side
     expected_action_dim = 14 if arm_mode == "bimanual" else 7
@@ -919,6 +934,11 @@ def validate_policy_metadata(
     ]
 
     schema = metadata.get("schema")
+    if output_mode != "auto" and schema != output_mode:
+        errors.append(
+            f"server schema={schema!r} conflicts with --output-mode={output_mode!r}; "
+            "refusing to reinterpret policy outputs"
+        )
     advertised_action_semantics = (
         metadata.get("wire_action_semantics")
         or metadata.get("model_action_semantics")
@@ -1187,7 +1207,13 @@ def aggregate_action_chunk(
     return command, used_steps
 
 
-def connect_policy(host: str, port: int, arm_side: str, arm_mode: str = "single") -> tuple[Any, PolicyProtocol]:
+def connect_policy(
+    host: str,
+    port: int,
+    arm_side: str,
+    arm_mode: str = "single",
+    output_mode: str = "auto",
+) -> tuple[Any, PolicyProtocol]:
     """Create the official OpenPI client and validate the server handshake."""
     from openpi_client.websocket_client_policy import WebsocketClientPolicy
 
@@ -1197,7 +1223,7 @@ def connect_policy(host: str, port: int, arm_side: str, arm_mode: str = "single"
         metadata = policy.get_server_metadata()
         if not isinstance(metadata, dict):
             raise RuntimeError(f"invalid policy metadata: {type(metadata).__name__}")
-        protocol = validate_policy_metadata(metadata, arm_side, arm_mode)
+        protocol = validate_policy_metadata(metadata, arm_side, arm_mode, output_mode)
     except Exception:
         close_policy(policy)
         raise
@@ -1712,6 +1738,7 @@ def build_checked_joint_target(
     max_joint_step_rad: float,
     max_gripper_step: float | None = None,
     max_gripper_step_m: float | None = None,
+    joint_limit_tolerance_rad: float = 0.0,
     gripper_range_tolerance: float = DEFAULT_GRIPPER_RANGE_TOLERANCE,
     gripper_semantics: str = GRIPPER_OPENING_FRACTION,
 ) -> tuple[np.ndarray, float]:
@@ -1723,12 +1750,21 @@ def build_checked_joint_target(
     if action.shape != (7,) or not np.all(np.isfinite(action)):
         raise ExecutionBlocked("joint action is not finite 7D")
 
-    for index, (value, bounds) in enumerate(zip(action[:6], JOINT_LIMITS_RAD), start=1):
-        if not bounds[0] <= float(value) <= bounds[1]:
+    if joint_limit_tolerance_rad < 0:
+        raise ValueError("joint_limit_tolerance_rad must be non-negative")
+    checked_joints = action[:6].copy()
+    for index, (value, bounds) in enumerate(zip(checked_joints, JOINT_LIMITS_RAD), start=1):
+        value = float(value)
+        if value < bounds[0] - joint_limit_tolerance_rad or value > bounds[1] + joint_limit_tolerance_rad:
             raise ExecutionBlocked(
                 f"joint{index} target {value:.5f}rad outside "
                 f"[{bounds[0]:.5f}, {bounds[1]:.5f}]"
             )
+        # Policies can emit tiny numerical overshoots at a hard mechanical
+        # limit (the trained joint-3 baseline is exactly 0 rad).  Accept only
+        # the configured tolerance and clip to the physical limit before
+        # converting to Piper units.
+        checked_joints[index - 1] = np.clip(value, bounds[0], bounds[1])
     opening_fraction = _opening_fraction(
         action[6],
         semantics=gripper_semantics,
@@ -1736,7 +1772,7 @@ def build_checked_joint_target(
     )
     gripper_m = opening_fraction * GRIPPER_MAX_M
 
-    joint_deltas = np.abs(action[:6] - qpos[:6])
+    joint_deltas = np.abs(checked_joints - qpos[:6])
     worst_joint = int(np.argmax(joint_deltas))
     if float(joint_deltas[worst_joint]) > max_joint_step_rad + 1e-9:
         raise ExecutionBlocked(
@@ -1755,7 +1791,7 @@ def build_checked_joint_target(
         raise ExecutionBlocked(
             f"gripper step {gripper_delta:.5f} exceeds {max_gripper_step:.5f}"
         )
-    return action[:6].copy(), gripper_m
+    return checked_joints, gripper_m
 
 
 class ExecutionController:
@@ -2446,7 +2482,11 @@ class ExecutionController:
             hold_error = float(np.max(np.abs(qpos_slice[:6] - hold_target)))
             mode_ready = self._piper_can_joint_mode_ready(status)
             within_tolerance = hold_error <= float(
-                getattr(self.args, "arm_hold_tolerance_rad", 0.02)
+                getattr(
+                    self.args,
+                    "arm_hold_tolerance_rad",
+                    DEFAULT_ARM_HOLD_TOLERANCE_RAD,
+                )
             )
             if mode_ready and within_tolerance and driver_status["ready"] is not False:
                 self.arm_hold_stable_since.setdefault(side, now_monotonic)
@@ -3673,6 +3713,13 @@ class ExecutionController:
                         max_joint_step_rad=float(getattr(self.args, "max_joint_step_rad", 0.3)),
                         max_gripper_step=getattr(self.args, "max_joint_gripper_step", None),
                         max_gripper_step_m=getattr(self.args, "max_joint_gripper_step_m", None),
+                        joint_limit_tolerance_rad=float(
+                            getattr(
+                                self.args,
+                                "joint_limit_tolerance_rad",
+                                DEFAULT_JOINT_LIMIT_TOLERANCE_RAD,
+                            )
+                        ),
                         gripper_range_tolerance=float(
                             getattr(
                                 self.args,
@@ -4101,6 +4148,7 @@ def build_client_transport_timing(
 
 
 def run(args: argparse.Namespace) -> None:
+    output_mode = getattr(args, "output_mode", "auto")
     for key in ("NO_PROXY", "no_proxy"):
         entries = [item.strip() for item in os.environ.get(key, "").split(",") if item.strip()]
         if args.host not in entries:
@@ -4139,6 +4187,10 @@ def run(args: argparse.Namespace) -> None:
         image_hw=IMAGE_HW,
         capture_hw=CAMERA_SOURCE_HW,
         parallel_reads=True,
+    )
+    preview = CameraPreview(
+        enabled=bool(getattr(args, "camera_preview", False)),
+        fps=float(getattr(args, "camera_preview_fps", 8.0)),
     )
     worker = AsyncPolicyInference()
     recorder = DeploymentRunRecorder(
@@ -4231,10 +4283,11 @@ def run(args: argparse.Namespace) -> None:
         )
         monitoring.record("camera_ready", camera_checks=camera_checks, camera_ids=camera_ids)
         logging.warning(
-            "%s %s client: control=%.3g Hz inference=%.3g Hz expected_chunk=%d "
-            "minimum_chunk=%d. Robot commands still require Dashboard EXECUTE.",
+            "%s %s client: output_mode=%s control=%.3g Hz inference=%.3g Hz "
+            "expected_chunk=%d minimum_chunk=%d. Robot commands still require Dashboard EXECUTE.",
             "EXECUTION-CAPABLE" if args.allow_execution else "SHADOW-ONLY",
             args.arm_mode,
+            output_mode,
             args.control_hz,
             args.hz,
             DEFAULT_OPENPI_CHUNK_STEPS,
@@ -4246,6 +4299,8 @@ def run(args: argparse.Namespace) -> None:
         while True:
             tick_started = time.monotonic()
             execution.record_control_tick(overrun=tick_started > next_control_at + control_period)
+            if preview.enabled:
+                preview.update(cameras.latest_preview_images)
             command_sent = False
             completion: InferenceCompletion | None = None
             try:
@@ -4258,11 +4313,16 @@ def run(args: argparse.Namespace) -> None:
                         last_reconnect_attempt = tick_started
                         try:
                             policy, protocol = connect_policy(
-                                args.host, args.port, args.arm_side, args.arm_mode
+                                args.host,
+                                args.port,
+                                args.arm_side,
+                                args.arm_mode,
+                                output_mode,
                             )
                             execution.configure_protocol(protocol)
                             recorder.update_metadata({
                                 "policy_protocol": {
+                                    "requested_output_mode": output_mode,
                                     "schema": protocol.schema,
                                     "state_dim": protocol.state_dim,
                                     "action_dim": protocol.action_dim,
@@ -4283,6 +4343,7 @@ def run(args: argparse.Namespace) -> None:
                             )
                             monitoring.record(
                                 "policy_connected",
+                                requested_output_mode=output_mode,
                                 protocol=vars(protocol),
                                 metadata=execution.metadata(),
                             )
@@ -4596,6 +4657,7 @@ def run(args: argparse.Namespace) -> None:
         except Exception:
             logging.exception("Failed to finalize deployment recording")
         close_policy(policy)
+        preview.close()
         cameras.close()
         for piper in pipers.values():
             piper.DisconnectPort()
@@ -4607,12 +4669,37 @@ def main() -> None:
     parser.add_argument("--host", default=os.environ.get("BIMANUAL_VLA_POLICY_HOST", DEFAULT_POLICY_HOST))
     parser.add_argument("--port", type=int, default=int(os.environ.get("BIMANUAL_VLA_POLICY_PORT", DEFAULT_POLICY_PORT)))
     parser.add_argument("--arm-mode", choices=("single", "bimanual"), default="single")
+    parser.add_argument(
+        "--output-mode",
+        "--policy-schema",
+        dest="output_mode",
+        choices=("auto", "joint", "delivery"),
+        default="auto",
+        help=(
+            "policy output contract: auto follows server metadata; joint requires "
+            "7D/14D joint targets; delivery requires EEF delivery targets. "
+            "An explicit mode fails closed if the server advertises another schema."
+        ),
+    )
     parser.add_argument("--can", default=DEFAULT_CAN, help="single-arm CAN interface")
     parser.add_argument("--left-can", default=DEFAULT_LEFT_CAN)
     parser.add_argument("--right-can", default=DEFAULT_RIGHT_CAN)
     parser.add_argument("--arm-side", choices=("left", "right", "both"), default="right")
     parser.add_argument("--cam-high-device", default=DEFAULT_HIGH_DEVICE)
     parser.add_argument("--cam-wrist-device", default=DEFAULT_WRIST_DEVICE, help="single-arm wrist camera")
+    parser.add_argument(
+        "--camera-preview",
+        "--show-cameras",
+        dest="camera_preview",
+        action="store_true",
+        help="show a low-resolution native-aspect live preview of the camera feeds",
+    )
+    parser.add_argument(
+        "--camera-preview-fps",
+        type=float,
+        default=8.0,
+        help="preview refresh rate; capture/inference rates are unchanged (default 8 FPS)",
+    )
     parser.add_argument("--cam-left-wrist-device", default=DEFAULT_LEFT_WRIST_DEVICE)
     parser.add_argument("--cam-right-wrist-device", default=DEFAULT_RIGHT_WRIST_DEVICE)
     parser.add_argument(
@@ -4749,6 +4836,12 @@ def main() -> None:
         help="maximum joint-schema absolute target delta per joint",
     )
     parser.add_argument(
+        "--joint-limit-tolerance-rad",
+        type=float,
+        default=DEFAULT_JOINT_LIMIT_TOLERANCE_RAD,
+        help="clip numerical joint-target overshoot at Piper hard limits (default 0.05 rad)",
+    )
+    parser.add_argument(
         "--max-joint-gripper-step",
         type=float,
         default=None,
@@ -4813,8 +4906,8 @@ def main() -> None:
         help="minimum joint-hold settling time after enabling Piper",
     )
     parser.add_argument(
-        "--arm-hold-tolerance-rad", type=float, default=0.02,
-        help="maximum joint error before leaving the post-enable hold",
+        "--arm-hold-tolerance-rad", type=float, default=DEFAULT_ARM_HOLD_TOLERANCE_RAD,
+        help="maximum joint error before leaving the post-enable hold (default 0.05 rad)",
     )
     parser.add_argument(
         "--workspace-x", type=float, nargs=2, default=DEFAULT_WORKSPACE_X_M, metavar=("MIN", "MAX"),
@@ -4850,6 +4943,7 @@ def main() -> None:
         args.hz,
         args.control_hz,
         args.camera_fps,
+        args.camera_preview_fps,
         args.action_hz if args.action_hz is not None else 1.0,
         args.max_action_age_s,
         args.max_feedback_age_s,
@@ -4865,6 +4959,8 @@ def main() -> None:
         args.ik_rotation_tolerance_rad,
         args.gripper_lowpass_alpha,
         args.gripper_hysteresis,
+        args.arm_settle_s,
+        args.arm_hold_tolerance_rad,
         args.enable_timeout_s,
         args.record_video_fps if args.record_video_fps is not None else 1.0,
     )
@@ -4874,6 +4970,8 @@ def main() -> None:
         parser.error("ik-search-joint-radius-rad must be at least ik-max-joint-step-rad")
     if args.ik_joint_regularization_weight < 0:
         parser.error("ik-joint-regularization-weight must be non-negative")
+    if args.joint_limit_tolerance_rad < 0:
+        parser.error("joint-limit-tolerance-rad must be non-negative")
     if args.action_chunk_steps is not None and args.action_chunk_steps <= 0:
         parser.error("action-chunk-steps must be positive")
     if args.ik_max_nfev <= 0:

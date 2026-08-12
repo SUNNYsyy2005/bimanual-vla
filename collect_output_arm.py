@@ -58,12 +58,15 @@ except ModuleNotFoundError:  # Allows schema/tests to run without the hardware S
 RAD_FACTOR = 57295.7795  # Piper unit: 0.001 degree -> rad
 GRIPPER_FACTOR = 1_000_000.0  # Piper unit: 0.001 mm -> metre
 DEFAULT_CAN = "can0"
-DEFAULT_LEFT_CAN = "can1"
-DEFAULT_RIGHT_CAN = "can3"
+DEFAULT_LEFT_CAN = "can0"
+DEFAULT_RIGHT_CAN = "can1"
 DEFAULT_HIGH_DEVICE = "auto"
 DEFAULT_WRIST_DEVICE = "auto"
-DEFAULT_LEFT_WRIST_DEVICE = "auto"
-DEFAULT_RIGHT_WRIST_DEVICE = "auto"
+# The rig has two D405 wrist cameras. Bind them to their USB topology rather
+# than model-only discovery, which cannot distinguish identical D405 devices
+# and previously selected the ASUS/internal webcam for the left wrist.
+DEFAULT_LEFT_WRIST_DEVICE = "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:7.2:1.0-video-index4"
+DEFAULT_RIGHT_WRIST_DEVICE = "/dev/v4l/by-path/pci-0000:80:14.0-usb-0:4.2:1.0-video-index4"
 DEFAULT_CAMERA_FPS = 30
 CAMERA_SOURCE_HW = (240, 424)
 PIPER_FEEDBACK_MAX_AGE_S = 0.5

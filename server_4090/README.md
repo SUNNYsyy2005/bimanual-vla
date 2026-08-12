@@ -286,6 +286,26 @@ python robot_observation_bridge.py \
   --hz 4
 ```
 
+`robot_observation_bridge.py` 默认使用 `--output-mode auto`，按 Policy 握手
+metadata 自动选择 `delivery` 或 `joint`。部署 joint 模型时可以显式锁定合同：
+
+```bash
+python robot_observation_bridge.py \
+  --host 192.168.101.9 \
+  --port 8099 \
+  --can can0 \
+  --cam-high-device /dev/video4 \
+  --cam-wrist-device /dev/video16 \
+  --arm-side right \
+  --output-mode joint \
+  --instruction "pick up the cube"
+```
+
+显式模式只做合同校验，不会把服务端输出强行重解释：若服务端 metadata
+声明的 `schema` 不是所选模式，客户端会在握手阶段拒绝连接，不会发送机器人
+指令。`--policy-schema` 是同一参数的别名；需要兼容旧 delivery 模型时使用
+`--output-mode delivery`。
+
 双臂 shadow-only 示例使用两个 CAN 和三路相机：
 
 ```bash

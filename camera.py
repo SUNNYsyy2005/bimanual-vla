@@ -16,12 +16,21 @@ from pathlib import Path
 import re
 import subprocess
 import time
+import logging
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from typing import Callable
 
 import cv2
 import numpy as np
+
+try:
+    import tkinter as tk
+    from PIL import Image, ImageTk
+except Exception:  # pragma: no cover - headless/minimal installations
+    tk = None
+    Image = None
+    ImageTk = None
 
 # Default inference size. The delivery collector overrides this to 256x256.
 IMG_H, IMG_W = 224, 224
@@ -39,13 +48,14 @@ STALE_THRESHOLD_S = 0.5   # flag image as stale if older than this
 # paths can change after reconnecting a hub, but these model names and serial
 # backed udev properties remain stable.
 CAMERA_MODEL_HINTS = {
-    # Current physical installation: D435i is the overhead view and D405 is
-    # mounted at the single/right wrist. The GUI can swap these roles when the
-    # cameras are moved temporarily.
+    # Current physical installation: D435i is the overhead view. Both wrist
+    # roles are D405 units; their default USB topology bindings live in
+    # collect_output_arm.py because model-only discovery cannot distinguish
+    # identical D405 devices.
     "cam_high": ("realsense_tm__depth_camera_435i", "depth_camera_435i"),
     "cam_wrist": ("realsense_tm__depth_camera_405", "depth_camera_405"),
     "cam_right_wrist": ("realsense_tm__depth_camera_405", "depth_camera_405"),
-    "cam_left_wrist": ("asus_fhd_webcam",),
+    "cam_left_wrist": ("realsense_tm__depth_camera_405", "depth_camera_405"),
 }
 COLOR_FORMAT_SCORES = {
     "MJPG": 40,
@@ -192,6 +202,9 @@ class CameraCapture:
         self._background_thread: threading.Thread | None = None
         self._latest_condition = threading.Condition()
         self._latest_images: dict[str, np.ndarray] = {}
+        # Native-aspect RGB frames for the optional operator preview.  Model
+        # observations remain square/padded in ``_latest_images``.
+        self._latest_preview_images: dict[str, np.ndarray] = {}
         self._latest_timestamps: dict[str, float] = {}
         self._source_aspects: dict[str, float] = {}
         self._background_error: BaseException | None = None
@@ -233,6 +246,7 @@ class CameraCapture:
             self._caps.clear()
         with self._latest_condition:
             self._latest_images.clear()
+            self._latest_preview_images.clear()
             self._latest_timestamps.clear()
             self._source_aspects.clear()
             self._background_error = None
@@ -242,6 +256,14 @@ class CameraCapture:
         """Return the latest native width/height ratio for each camera."""
         with self._latest_condition:
             return dict(self._source_aspects)
+
+    @property
+    def latest_preview_images(self) -> dict[str, np.ndarray]:
+        """Return newest native-aspect RGB frames for a local preview window."""
+        with self._latest_condition:
+            return {
+                key: frame.copy() for key, frame in self._latest_preview_images.items()
+            }
 
     @staticmethod
     def _read_frame(cap: cv2.VideoCapture) -> tuple[bool, np.ndarray | None, float]:
@@ -274,6 +296,7 @@ class CameraCapture:
             src_h, src_w = rgb.shape[:2]
             with self._latest_condition:
                 self._source_aspects[key] = src_w / src_h
+                self._latest_preview_images[key] = rgb.copy()
             scale = min(target_w / src_w, target_h / src_h)
             new_w = max(1, round(src_w * scale))
             new_h = max(1, round(src_h * scale))
@@ -400,3 +423,115 @@ class CameraCapture:
                     "video_device": resolve_video_device(self._ids[key]),
                 }
         return results
+
+
+class CameraPreview:
+    """Large, low-refresh, non-blocking preview for the operator.
+
+    The preview is deliberately outside the inference/control path. If the
+    machine has no graphical display or OpenCV's GUI backend is unavailable,
+    it disables itself and the bridge continues in headless mode.
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        window_name: str = "Piper cameras",
+        fps: float = 8.0,
+    ):
+        self.enabled = bool(enabled)
+        self.window_name = str(window_name)
+        self.fps = float(fps)
+        if not np.isfinite(self.fps) or self.fps <= 0:
+            raise ValueError("camera preview fps must be positive and finite")
+        self._next_update = 0.0
+        self._disabled_logged = False
+        self._root = None
+        self._label = None
+        self._photo = None
+        if self.enabled:
+            self._open_window()
+
+    def _open_window(self) -> None:
+        if tk is None or Image is None or ImageTk is None:
+            self._disable("Tkinter/Pillow is unavailable")
+            return
+        try:
+            self._root = tk.Tk()
+            self._root.title(self.window_name)
+            self._root.protocol("WM_DELETE_WINDOW", self.close)
+            self._root.bind("<Escape>", lambda _event: self.close())
+            self._root.bind("q", lambda _event: self.close())
+            self._label = tk.Label(self._root, bg="black")
+            self._label.pack(fill="both", expand=True)
+            self._root.update_idletasks()
+        except Exception as exc:  # TclError when DISPLAY is unavailable
+            self._disable(f"GUI window unavailable: {exc}")
+
+    def _disable(self, reason: str) -> None:
+        if not self._disabled_logged:
+            logging.warning("Camera preview disabled: %s", reason)
+            self._disabled_logged = True
+        self.enabled = False
+        self._root = None
+        self._label = None
+        self._photo = None
+
+    def update(self, images: dict[str, np.ndarray]) -> None:
+        if not self.enabled or not images:
+            return
+        now = time.monotonic()
+        if now < self._next_update:
+            return
+        self._next_update = now + 1.0 / self.fps
+        try:
+            if self._root is None or self._label is None:
+                self._disable("preview window is not initialized")
+                return
+            frames: list[np.ndarray] = []
+            for key, image in images.items():
+                frame = np.asarray(image)
+                if frame.ndim != 3 or frame.shape[-1] != 3:
+                    continue
+                h, w = frame.shape[:2]
+                # Upscale the low-cost 424x240 camera frame for readability.
+                # Refresh throttling keeps the display overhead below the
+                # original 360px/20Hz preview.
+                tile_w = 600
+                tile_h = max(1, round(h * tile_w / w))
+                frame = cv2.resize(frame, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+                cv2.rectangle(frame, (0, 0), (tile_w - 1, 25), (0, 0, 0), -1)
+                cv2.putText(frame, str(key), (8, 18), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (255, 255, 255), 1, cv2.LINE_AA)
+                frames.append(frame)
+            if not frames:
+                return
+            max_h = max(frame.shape[0] for frame in frames)
+            padded = []
+            for frame in frames:
+                if frame.shape[0] < max_h:
+                    canvas = np.zeros((max_h, frame.shape[1], 3), dtype=np.uint8)
+                    canvas[: frame.shape[0]] = frame
+                    frame = canvas
+                padded.append(frame)
+            rgb = np.concatenate(padded, axis=1)
+            self._photo = ImageTk.PhotoImage(Image.fromarray(rgb, mode="RGB"))
+            self._label.configure(image=self._photo)
+            self._root.update_idletasks()
+            self._root.update()
+        except Exception as exc:
+            self._disable(f"preview update failed: {exc}")
+
+    def close(self) -> None:
+        if not self.enabled:
+            return
+        if self._root is not None:
+            try:
+                self._root.destroy()
+            except Exception:
+                pass
+        self.enabled = False
+        self._root = None
+        self._label = None
+        self._photo = None
