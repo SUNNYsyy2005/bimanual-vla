@@ -13,6 +13,7 @@ Verify device IDs before connecting:
 """
 
 from pathlib import Path
+from dataclasses import dataclass
 import re
 import subprocess
 import time
@@ -57,6 +58,13 @@ CAMERA_MODEL_HINTS = {
     "cam_right_wrist": ("realsense_tm__depth_camera_405", "depth_camera_405"),
     "cam_left_wrist": ("realsense_tm__depth_camera_405", "depth_camera_405"),
 }
+# Physical wrist placement for the current rig. The two D405 units are
+# identical, so model matching alone cannot tell left from right. These USB
+# topology fragments are stable across normal video-node renumbering.
+CAMERA_ROLE_PATH_HINTS = {
+    "cam_left_wrist": ("usb-0:6.2:",),
+    "cam_right_wrist": ("usb-0:5.2:",),
+}
 COLOR_FORMAT_SCORES = {
     "MJPG": 40,
     "YUYV": 35,
@@ -80,10 +88,22 @@ def _command_output(args: list[str]) -> str:
     return result.stdout if result.returncode == 0 else ""
 
 
-def _stable_video_selector(device: Path) -> str:
-    """Prefer a stable udev symlink for a concrete video node."""
+def _stable_video_selector(
+    device: Path,
+    stable_directories: tuple[Path, ...] | None = None,
+) -> str:
+    """Prefer a stable USB-topology symlink for a concrete video node.
+
+    ``by-path`` is intentionally preferred over ``by-id``. Some identical
+    RealSense cameras do not expose unique serial numbers, so their generic
+    ``by-id`` names can move between physical devices after reconnecting.
+    """
     resolved = device.resolve(strict=False)
-    for directory in (Path("/dev/v4l/by-id"), Path("/dev/v4l/by-path")):
+    directories = stable_directories or (
+        Path("/dev/v4l/by-path"),
+        Path("/dev/v4l/by-id"),
+    )
+    for directory in directories:
         if not directory.is_dir():
             continue
         for candidate in sorted(directory.iterdir()):
@@ -95,20 +115,21 @@ def _stable_video_selector(device: Path) -> str:
     return str(device)
 
 
-def discover_video_device(camera_key: str, *, device_root: Path = Path("/dev")) -> str:
-    """Discover the RGB V4L2 node for a known camera role.
+@dataclass(frozen=True)
+class VideoDeviceCandidate:
+    """One colour-capable V4L2 node and its udev identity."""
 
-    RealSense devices expose depth, infrared, metadata and RGB nodes under one
-    USB device.  Model matching alone is therefore insufficient: candidates
-    are also ranked by their advertised colour pixel formats.
-    """
-    hints = CAMERA_MODEL_HINTS.get(camera_key)
-    if not hints:
-        raise RuntimeError(
-            f"Cannot auto-discover unknown camera role {camera_key!r}; enter an explicit /dev/videoN path."
-        )
+    device: Path
+    index: int
+    properties: str
+    format_score: int
 
-    candidates: list[tuple[int, int, Path, str]] = []
+
+def _enumerate_video_candidates(
+    *, device_root: Path = Path("/dev")
+) -> list[VideoDeviceCandidate]:
+    """Inspect V4L2 nodes once so multiple roles can be allocated jointly."""
+    candidates: list[VideoDeviceCandidate] = []
     for device in device_root.glob("video[0-9]*"):
         match = re.fullmatch(r"video(\d+)", device.name)
         if match is None:
@@ -116,8 +137,6 @@ def discover_video_device(camera_key: str, *, device_root: Path = Path("/dev")) 
         properties = _command_output(
             ["udevadm", "info", "--query=property", f"--name={device}"]
         ).lower()
-        if not any(hint in properties for hint in hints):
-            continue
         formats = _command_output(["v4l2-ctl", "-d", str(device), "--list-formats"])
         format_score = max(
             (score for pixel_format, score in COLOR_FORMAT_SCORES.items() if pixel_format in formats),
@@ -125,32 +144,148 @@ def discover_video_device(camera_key: str, *, device_root: Path = Path("/dev")) 
         )
         if format_score <= 0:
             continue
-        candidates.append((format_score, -int(match.group(1)), device, formats))
+        candidates.append(
+            VideoDeviceCandidate(
+                device=device,
+                index=int(match.group(1)),
+                properties=properties,
+                format_score=format_score,
+            )
+        )
+    return candidates
 
+
+def _matching_video_candidates(
+    camera_key: str,
+    candidates: list[VideoDeviceCandidate],
+) -> list[VideoDeviceCandidate]:
+    hints = CAMERA_MODEL_HINTS.get(camera_key)
+    if not hints:
+        raise RuntimeError(
+            f"Cannot auto-discover unknown camera role {camera_key!r}; enter an explicit /dev/videoN path."
+        )
+    role_path_hints = CAMERA_ROLE_PATH_HINTS.get(camera_key, ())
+
+    def sort_key(candidate: VideoDeviceCandidate) -> tuple[int, int, int]:
+        selector = _stable_video_selector(candidate.device)
+        preferred = bool(role_path_hints) and any(
+            hint in selector for hint in role_path_hints
+        )
+        return (0 if preferred else 1, -candidate.format_score, candidate.index)
+
+    return sorted(
+        (
+            candidate
+            for candidate in candidates
+            if any(hint in candidate.properties for hint in hints)
+        ),
+        key=sort_key,
+    )
+
+
+def discover_video_device(camera_key: str, *, device_root: Path = Path("/dev")) -> str:
+    """Discover the RGB V4L2 node for a known camera role.
+
+    RealSense devices expose depth, infrared, metadata and RGB nodes under one
+    USB device.  Model matching alone is therefore insufficient: candidates
+    are also ranked by their advertised colour pixel formats.
+    """
+    candidates = _matching_video_candidates(
+        camera_key,
+        _enumerate_video_candidates(device_root=device_root),
+    )
     if not candidates:
         raise RuntimeError(
             f"Cannot auto-discover an RGB device for {camera_key}. "
             "Check that the expected camera is connected and visible in 'v4l2-ctl --list-devices'."
         )
-    _, _, selected, _ = max(candidates)
-    return _stable_video_selector(selected)
+    return _stable_video_selector(candidates[0].device)
+
+
+def _existing_configured_device(
+    configured_device: object,
+    *,
+    device_root: Path,
+) -> object | None:
+    """Return a valid explicit selector, or ``None`` for auto/stale values."""
+    if isinstance(configured_device, int):
+        numeric_device = device_root / f"video{int(configured_device)}"
+        return configured_device if numeric_device.exists() else None
+    if isinstance(configured_device, str) and configured_device.isdigit():
+        numeric_device = device_root / f"video{int(configured_device)}"
+        return int(configured_device) if numeric_device.exists() else None
+    configured_text = str(configured_device).strip()
+    if configured_text.lower() == "auto":
+        return None
+    candidate = Path(configured_text).expanduser()
+    return str(candidate) if candidate.exists() else None
+
+
+def _concrete_video_device(device: object, *, device_root: Path) -> Path:
+    if isinstance(device, int) or (isinstance(device, str) and device.isdigit()):
+        candidate = device_root / f"video{int(device)}"
+    else:
+        candidate = Path(str(device)).expanduser()
+    return candidate.resolve(strict=False)
+
+
+def select_video_devices(
+    configured_devices: dict[str, object],
+    *,
+    device_root: Path = Path("/dev"),
+) -> dict[str, object]:
+    """Resolve all camera roles together without assigning one node twice.
+
+    Valid explicit selectors take priority. Missing, stale, or ``auto`` values
+    are filled from colour-capable nodes matching the expected camera model.
+    This joint allocation is required for the two identical D405 wrist units.
+    """
+    selected: dict[str, object] = {}
+    used_devices: dict[Path, str] = {}
+    pending: list[str] = []
+
+    for camera_key, configured_device in configured_devices.items():
+        explicit = _existing_configured_device(
+            configured_device,
+            device_root=device_root,
+        )
+        if explicit is None:
+            pending.append(camera_key)
+            continue
+        concrete = _concrete_video_device(explicit, device_root=device_root)
+        previous_role = used_devices.get(concrete)
+        if previous_role is not None:
+            raise RuntimeError(
+                f"Camera roles {previous_role} and {camera_key} both select {concrete}. "
+                "Choose distinct devices or set both selectors to 'auto'."
+            )
+        selected[camera_key] = explicit
+        used_devices[concrete] = camera_key
+
+    candidates = _enumerate_video_candidates(device_root=device_root) if pending else []
+    for camera_key in pending:
+        available = [
+            candidate
+            for candidate in _matching_video_candidates(camera_key, candidates)
+            if candidate.device.resolve(strict=False) not in used_devices
+        ]
+        if not available:
+            expected = " / ".join(CAMERA_MODEL_HINTS.get(camera_key, (camera_key,)))
+            raise RuntimeError(
+                f"Cannot auto-discover a distinct RGB device for {camera_key} "
+                f"(expected {expected}). Check camera connections or choose devices "
+                "in Device settings."
+            )
+        candidate = available[0]
+        selected[camera_key] = _stable_video_selector(candidate.device)
+        used_devices[candidate.device.resolve(strict=False)] = camera_key
+
+    return selected
 
 
 def select_video_device(camera_key: str, configured_device: object) -> object:
     """Keep a valid configured selector, otherwise auto-discover by role."""
-    if isinstance(configured_device, int):
-        numeric_device = Path(f"/dev/video{int(configured_device)}")
-        return configured_device if numeric_device.exists() else discover_video_device(camera_key)
-    if isinstance(configured_device, str) and configured_device.isdigit():
-        numeric_device = Path(f"/dev/video{int(configured_device)}")
-        return int(configured_device) if numeric_device.exists() else discover_video_device(camera_key)
-
-    configured_text = str(configured_device).strip()
-    if configured_text.lower() != "auto":
-        candidate = Path(configured_text).expanduser()
-        if candidate.exists():
-            return str(candidate)
-    return discover_video_device(camera_key)
+    return select_video_devices({camera_key: configured_device})[camera_key]
 
 
 def resolve_video_device(device: object) -> str:
@@ -211,8 +346,9 @@ class CameraCapture:
 
     def open(self):
         try:
+            selected_ids = select_video_devices(self._configured_ids)
             for key, configured_id in self._configured_ids.items():
-                dev_id = select_video_device(key, configured_id)
+                dev_id = selected_ids[key]
                 self._ids[key] = dev_id
                 cap = cv2.VideoCapture(dev_id)
                 if not cap.isOpened():

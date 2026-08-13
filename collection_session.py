@@ -227,6 +227,61 @@ class CollectionSession:
         self.state = SessionState.READY
         return checks
 
+    def reconnect_cameras(self) -> dict[str, dict]:
+        """Reconnect only cameras while keeping the robot/CAN session alive.
+
+        This is used by the GUI's wrist-camera swap control. A failed new
+        camera open rolls back to the previous camera mapping where possible,
+        so a temporary V4L2 error does not leave the live preview black.
+        """
+        if self.state is SessionState.DISCONNECTED or self.piper is None:
+            raise RuntimeError("cannot reconnect cameras while devices are disconnected")
+        contract = EpisodeContract(
+            schema=self.config.schema,
+            arm_mode=self.config.arm_mode,
+            arm_side=self.config.arm_side,
+        )
+        camera_ids = {
+            "cam_high": self.config.cam_high_device,
+        }
+        if self.config.arm_mode == BIMANUAL:
+            camera_ids.update(
+                {
+                    "cam_left_wrist": self.config.cam_left_wrist_device,
+                    "cam_right_wrist": self.config.cam_right_wrist_device,
+                }
+            )
+        else:
+            camera_ids[contract.camera_keys[1]] = self.config.cam_wrist_device
+
+        old_cameras = self.cameras
+        if old_cameras is not None:
+            old_cameras.close()
+        new_cameras = None
+        try:
+            new_cameras = self._camera_factory(
+                cam_ids=camera_ids,
+                fps=self.config.camera_fps,
+                image_hw=IMAGE_HW,
+                capture_hw=CAMERA_SOURCE_HW,
+                parallel_reads=True,
+            )
+            new_cameras.open()
+            checks = self._camera_verifier(new_cameras, self.config.camera_fps)
+        except Exception:
+            if new_cameras is not None:
+                new_cameras.close()
+            if old_cameras is not None:
+                try:
+                    old_cameras.open()
+                    self.cameras = old_cameras
+                except Exception:
+                    self.cameras = None
+            raise
+        self.cameras = new_cameras
+        self.camera_checks = checks
+        return checks
+
     def start_episode(self, task_name: str, instruction: str) -> EpisodeLabel:
         if self.state is not SessionState.READY:
             raise RuntimeError(f"cannot start an episode while session is {self.state.value}")

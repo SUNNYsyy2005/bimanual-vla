@@ -1337,7 +1337,7 @@ class CollectorGUI:
         dialog.protocol("WM_DELETE_WINDOW", cancel)
 
     def swap_camera_roles(self) -> None:
-        """Toggle left/right wrist-camera assignments, reconnecting if needed."""
+        """Swap wrist roles without dropping the active robot connection."""
         if self.arm_mode != BIMANUAL:
             self.swap_wrist_cameras_var.set(False)
             return
@@ -1347,12 +1347,66 @@ class CollectorGUI:
             return
         left = self.left_wrist_var.get()
         right = self.right_wrist_var.get()
+        previous_config = self.session.config if self.session is not None else None
         self.left_wrist_var.set(right)
         self.right_wrist_var.set(left)
-        self.status_var.set("Wrist cameras swapped" if self.swap_wrist_cameras_var.get() else "Wrist cameras restored")
-        if self.session is not None:
-            self.disconnect()
-            self.root.after(100, self.toggle_connection)
+        if self.session is None:
+            self.status_var.set(
+                "Wrist cameras swapped" if self.swap_wrist_cameras_var.get() else "Wrist cameras restored"
+            )
+            return
+
+        # Stop the reader before replacing the V4L2 handles, but keep the
+        # latest frame in memory so a reconnect does not flash black.
+        if self.capture_stop is not None:
+            self.capture_stop.set()
+        if self.capture_thread is not None and self.capture_thread.is_alive():
+            self.capture_thread.join(timeout=2.0)
+        self.capture_thread = None
+        self.capture_stop = None
+        self.status_var.set("Switching wrist cameras...")
+        self.root.update_idletasks()
+        self.session.config = replace(
+            previous_config,
+            cam_left_wrist_device=right,
+            cam_right_wrist_device=left,
+        )
+        try:
+            checks = self.session.reconnect_cameras()
+        except Exception as exc:
+            self.session.config = previous_config
+            self.left_wrist_var.set(left)
+            self.right_wrist_var.set(right)
+            self.swap_wrist_cameras_var.set(not self.swap_wrist_cameras_var.get())
+            self.status_var.set(f"Camera swap failed; original mapping restored: {exc}")
+            messagebox.showerror("Camera swap failed", str(exc))
+            self._restart_capture_thread()
+            return
+
+        self.cameras = self.session.cameras
+        for key, info in checks.items():
+            selected_device = str(info.get("selected_device") or info.get("video_device") or "?")
+            if key == "cam_left_wrist":
+                self.left_wrist_var.set(selected_device)
+            elif key == "cam_right_wrist":
+                self.right_wrist_var.set(selected_device)
+            slot = self.preview_key_to_slot.get(key)
+            if slot is not None:
+                self.preview_title_labels[slot].configure(
+                    text=f"{self._camera_role_title(key)}\n{info.get('video_device', '?')}"
+                )
+        self._restart_capture_thread()
+        self.status_var.set(
+            "Wrist cameras swapped" if self.swap_wrist_cameras_var.get() else "Wrist cameras restored"
+        )
+
+    def _restart_capture_thread(self) -> None:
+        """Start the GUI reader after a camera-only reconnect."""
+        if self.session is None or self.cameras is None:
+            return
+        self.capture_stop = threading.Event()
+        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.capture_thread.start()
 
     def _update_start_button(self):
         if (
