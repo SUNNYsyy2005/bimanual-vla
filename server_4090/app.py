@@ -150,6 +150,8 @@ TRAIN_METRIC = re.compile(
     r"([A-Za-z][A-Za-z0-9_.-]*)\s*=\s*"
     r"(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
 )
+DASHBOARD_SLURM_JOB_ID = re.compile(r"\[dashboard\]\s+slurm_job_id=(\d+)")
+DASHBOARD_SLURM_LOG_STREAM_MARKER = "[dashboard] slurm log stream"
 
 
 def now_iso() -> str:
@@ -1275,6 +1277,51 @@ def process_cmdline(pid: int) -> list[str]:
         return []
 
 
+def process_children_by_parent() -> dict[int, set[int]]:
+    """Return a lightweight /proc process tree indexed by parent PID."""
+    children: dict[int, set[int]] = {}
+    proc_root = Path("/proc")
+    try:
+        entries = list(proc_root.iterdir())
+    except (FileNotFoundError, PermissionError):
+        return children
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            child_pid = int(entry.name)
+            stat = (entry / "stat").read_text(encoding="utf-8")
+            fields = stat.rsplit(")", 1)[1].strip().split()
+            # /proc/<pid>/stat fields after comm start with state then ppid.
+            if len(fields) < 2:
+                continue
+            parent_pid = int(fields[1])
+        except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, IndexError):
+            continue
+        children.setdefault(parent_pid, set()).add(child_pid)
+    return children
+
+
+def process_descendant_pids(
+    root_pid: int,
+    children_by_parent: dict[int, set[int]] | None = None,
+) -> set[int]:
+    """Return all live descendants of ``root_pid`` by walking /proc PPid links."""
+    if root_pid <= 0:
+        return set()
+    children = children_by_parent if children_by_parent is not None else process_children_by_parent()
+    descendants: set[int] = set()
+    pending = list(children.get(root_pid, set()))
+    while pending:
+        pid = pending.pop()
+        if pid in descendants:
+            continue
+        descendants.add(pid)
+        pending.extend(children.get(pid, set()) - descendants)
+    descendants.discard(root_pid)
+    return descendants
+
+
 def process_fd_path(pid: int, fd: int) -> str | None:
     try:
         target = os.readlink(f"/proc/{pid}/fd/{fd}")
@@ -1346,6 +1393,8 @@ def load_config(path: Path) -> dict[str, Any]:
         "visible_dataset_origins": None,
         "enable_policy": True,
         "cluster_targets": {},
+        "local_storage_locations": {},
+        "cache_root": str(Path.home() / ".cache"),
         "eval_video_roots": [],
         "cluster_resources_script": str(REPO_DIR / "scripts" / "query_h100_h200_resources.sh"),
         "transfer_parallelism": 4,
@@ -1368,14 +1417,23 @@ def load_config(path: Path) -> dict[str, Any]:
         "openpi_python",
         "dataset_root",
         "workspace_root",
+        "cache_root",
         "assets_base_dir",
         "checkpoint_base_dir",
         "base_checkpoint",
     ):
         defaults[key] = str(Path(defaults[key]).expanduser().resolve())
-    defaults["checkpoint_allowed_roots"] = [
+    checkpoint_allowed_roots = [
         str(Path(item).expanduser().resolve()) for item in defaults.get("checkpoint_allowed_roots", [])
     ]
+    # Keep configured paths usable after symlink resolution.  A common layout
+    # keeps ~/.cache/openpi on one NVMe mount while pi05_base is a symlink to a
+    # dedicated model directory on another mount; resolving only the configured
+    # parent root otherwise rejects the configured base checkpoint itself.
+    for required_root in (defaults["checkpoint_base_dir"], defaults["base_checkpoint"]):
+        if required_root not in checkpoint_allowed_roots:
+            checkpoint_allowed_roots.append(required_root)
+    defaults["checkpoint_allowed_roots"] = checkpoint_allowed_roots
     defaults["eval_video_roots"] = [
         str(Path(item).expanduser().resolve()) for item in defaults.get("eval_video_roots", [])
     ]
@@ -1390,6 +1448,19 @@ def load_config(path: Path) -> dict[str, Any]:
         defaults["transfer_parallelism"] = max(1, min(16, int(defaults.get("transfer_parallelism", 4))))
     except (TypeError, ValueError):
         defaults["transfer_parallelism"] = 4
+    normalized_local_storage = {}
+    for name, storage in dict(defaults.get("local_storage_locations", {})).items():
+        if not isinstance(storage, dict):
+            continue
+        item = dict(storage)
+        for path_key in ("dataset_root", "checkpoint_base_dir"):
+            if item.get(path_key):
+                item[path_key] = str(Path(item[path_key]).expanduser().resolve())
+        item["kind"] = str(item.get("kind") or "local_archive")
+        item["available"] = bool(item.get("available", True))
+        normalized_local_storage[str(name)] = item
+    defaults["local_storage_locations"] = normalized_local_storage
+
     normalized_targets = {}
     for name, target in dict(defaults.get("cluster_targets", {})).items():
         if not isinstance(target, dict):
@@ -1432,6 +1503,7 @@ class TaskManager:
         self.monitor_wakeup = threading.Event()
         self.monitor_stop = threading.Event()
         self.monitor_thread: threading.Thread | None = None
+        self.training_metric_probe_cache: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
         if self.monitor_interval_s > 0:
             self.monitor_thread = threading.Thread(
                 target=self._monitor_loop,
@@ -1689,9 +1761,11 @@ class TaskManager:
         return task
 
     def _gpu_wait_reason(self, task: dict[str, Any]) -> str | None:
-        if self.config.get("allow_busy_gpus", False):
-            return None
-        gpu_ids = [int(item) for item in task.get("metadata", {}).get("gpu_ids", [])]
+        metadata = task.get("metadata", {}) if isinstance(task.get("metadata"), dict) else {}
+        allow_busy_gpus = bool(
+            metadata.get("allow_busy_gpus", self.config.get("allow_busy_gpus", False))
+        )
+        gpu_ids = [int(item) for item in metadata.get("gpu_ids", [])]
         if not gpu_ids:
             return "queued training task has no GPU ids"
         requested = set(gpu_ids)
@@ -1720,9 +1794,14 @@ class TaskManager:
             for gpu_id in gpu_ids
             if inventory.get(gpu_id, {}).get("processes")
         }
-        if external_busy:
+        if external_busy and not allow_busy_gpus:
             return f"waiting for busy GPU(s): {external_busy}"
-        minimum_free_mib = int(self.config.get("training_min_free_gpu_mib", 23_000))
+        minimum_free_mib = int(
+            metadata.get(
+                "minimum_free_gpu_mib",
+                self.config.get("training_min_free_gpu_mib", 23_000),
+            )
+        )
         low_memory = gpu_memory_shortfalls(inventory, gpu_ids, minimum_free_mib)
         if low_memory:
             return f"waiting for GPU free memory: {low_memory}"
@@ -2345,8 +2424,79 @@ class TaskManager:
         pids.discard(0)
         return pids
 
+    def _active_managed_policy_process_tree(self) -> tuple[set[int], dict[int, str]]:
+        """Return active managed Policy root/descendant PIDs.
+
+        Dashboard-launched tasks run through ``task_runner.py``.  The listening
+        Policy server is therefore a child of the recorded task PID.  External
+        discovery must ignore those children, otherwise one Dashboard-started
+        Policy is also adopted as a second "external" Policy row.
+        """
+        pids: set[int] = set()
+        descendant_owner: dict[int, str] = {}
+        children_by_parent: dict[int, set[int]] | None = None
+        for path in self.root.glob("*/task.json"):
+            task = read_json(path)
+            if not isinstance(task, dict):
+                continue
+            if task.get("type") != "policy" or task.get("state") not in PROCESS_STATES:
+                continue
+            if task.get("metadata", {}).get("external"):
+                continue
+            try:
+                root_pid = int(task.get("pid", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if root_pid <= 0:
+                continue
+            pids.add(root_pid)
+            if not (pid_alive(root_pid) and process_matches_task(root_pid, task)):
+                continue
+            if children_by_parent is None:
+                children_by_parent = process_children_by_parent()
+            for pid in process_descendant_pids(root_pid, children_by_parent):
+                pids.add(pid)
+                descendant_owner.setdefault(pid, str(task.get("id", path.parent.name)))
+        pids.discard(0)
+        return pids, descendant_owner
+
     def _active_policy_pids(self) -> set[int]:
-        return self._active_task_pids({"policy"}, include_external=False)
+        pids, _ = self._active_managed_policy_process_tree()
+        return pids
+
+    def _prune_external_policy_duplicates(self, descendant_owner: dict[int, str]) -> list[str]:
+        """Remove bogus external Policy rows that are actually managed children."""
+        if not descendant_owner:
+            return []
+        removed: list[str] = []
+        for path in list(self.root.glob("*/task.json")):
+            task = read_json(path)
+            if not isinstance(task, dict):
+                continue
+            if task.get("type") != "policy" or task.get("state") not in PROCESS_STATES:
+                continue
+            metadata = task.get("metadata", {}) if isinstance(task.get("metadata"), dict) else {}
+            if not metadata.get("external"):
+                continue
+            try:
+                pid = int(task.get("pid", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            owner_id = descendant_owner.get(pid)
+            if not owner_id:
+                continue
+            task_id = str(task.get("id", path.parent.name))
+            try:
+                self._append_log(
+                    task,
+                    f"removing duplicate external Policy record; pid {pid} is managed by {owner_id}",
+                )
+            except OSError:
+                pass
+            self.processes.pop(task_id, None)
+            shutil.rmtree(path.parent, ignore_errors=True)
+            removed.append(task_id)
+        return removed
 
     def _active_eval_pids(self) -> set[int]:
         return self._active_task_pids({"eval"}, include_external=False)
@@ -2392,7 +2542,8 @@ class TaskManager:
 
     def discover_external_policies(self) -> list[dict[str, Any]]:
         with self.lock:
-            active_pids = self._active_policy_pids()
+            active_pids, descendant_owner = self._active_managed_policy_process_tree()
+            self._prune_external_policy_duplicates(descendant_owner)
             adopted = []
             for candidate in discover_external_policy_candidates(self.config, ignored_pids=active_pids):
                 adopted.append(self.adopt_external_policy(**candidate))
@@ -2611,7 +2762,122 @@ class TaskManager:
                 "tasks": [selected_tasks[task_id] for task_id in normalized_ids],
             }
 
-    def log_tail(self, task_id: str, max_bytes: int = 64 * 1024) -> str:
+    @staticmethod
+    def _task_command_tokens(task: dict[str, Any]) -> list[str]:
+        command = task.get("command", [])
+        tokens = [str(item) for item in command] if isinstance(command, list) else []
+        # Slurm tasks with an automatic dataset sync are wrapped as
+        # ``bash -lc '<sync> && python slurm_job_runner.py ...'``.  Decode the
+        # shell layer just enough to recover Dashboard runner flags such as
+        # ``--job-name``; failures simply fall back to metadata-derived names.
+        if len(tokens) >= 3 and tokens[0] in {"bash", "/bin/bash"} and "-lc" in tokens:
+            try:
+                script = tokens[tokens.index("-lc") + 1]
+                tokens.extend(shlex.split(script))
+            except Exception:
+                pass
+        return tokens
+
+    @classmethod
+    def _task_command_option(cls, task: dict[str, Any], option: str) -> str | None:
+        tokens = cls._task_command_tokens(task)
+        for index, token in enumerate(tokens):
+            if token == option and index + 1 < len(tokens):
+                return tokens[index + 1]
+            prefix = option + "="
+            if token.startswith(prefix):
+                return token[len(prefix):]
+        return None
+
+    def _slurm_job_name(self, task: dict[str, Any]) -> str | None:
+        explicit = self._task_command_option(task, "--job-name")
+        if explicit:
+            return safe_name(explicit, "slurm job name")
+        metadata = task.get("metadata", {}) if isinstance(task.get("metadata"), dict) else {}
+        exp_name = metadata.get("exp_name")
+        if task.get("type") == "train" and exp_name:
+            prefix = "sim" if self.config.get("dashboard_profile") == "simulation" else "real"
+            return safe_name(f"{prefix}_train_{exp_name}", "slurm job name")
+        dataset_id = metadata.get("dataset_id")
+        if task.get("type") == "eval" and dataset_id:
+            return safe_name(f"sim_eval_{dataset_id}", "slurm job name")
+        return None
+
+    @staticmethod
+    def _slurm_job_id_from_log(log_text: str) -> str | None:
+        matches = DASHBOARD_SLURM_JOB_ID.findall(log_text or "")
+        return matches[-1] if matches else None
+
+    def _remote_slurm_log_targets(
+        self,
+        task: dict[str, Any],
+        local_log: str,
+    ) -> tuple[str, dict[str, str]] | None:
+        metadata = task.get("metadata", {}) if isinstance(task.get("metadata"), dict) else {}
+        target_name = metadata.get("slurm_target") or metadata.get("cluster_target")
+        if not target_name or str(metadata.get("runtime") or "") != "slurm":
+            return None
+        targets = self.config.get("cluster_targets", {})
+        target = targets.get(str(target_name))
+        if not isinstance(target, dict):
+            return None
+        submit_host = str(metadata.get("slurm_submit_host") or target.get("submit_host") or "")
+        job_id = self._slurm_job_id_from_log(local_log)
+        job_name = self._slurm_job_name(task)
+        workdir = str(target.get("workdir") or "")
+        if not submit_host or not job_id or not job_name or not workdir:
+            return None
+        log_dir = str(target.get("log_dir") or f"{workdir.rstrip('/')}/logs/dashboard_slurm").rstrip("/")
+        return submit_host, {
+            "stdout": f"{log_dir}/{job_name}_{job_id}.out",
+            "stderr": f"{log_dir}/{job_name}_{job_id}.err",
+        }
+
+    @staticmethod
+    def _remote_tail_command(paths: dict[str, str], max_bytes_per_file: int) -> str:
+        parts = []
+        for label, path in paths.items():
+            quoted_label = shlex.quote(str(label))
+            quoted_path = shlex.quote(path)
+            parts.append(
+                "if [ -f {path} ]; then "
+                "printf '\\n[dashboard] remote slurm %s: %s\\n' {label} {path}; "
+                "tail -c {max_bytes} {path}; "
+                "fi".format(
+                    label=quoted_label,
+                    path=quoted_path,
+                    max_bytes=int(max_bytes_per_file),
+                )
+            )
+        return "; ".join(parts)
+
+    def _remote_slurm_log_tail(
+        self,
+        task: dict[str, Any],
+        local_log: str,
+        max_bytes: int,
+    ) -> str:
+        target_info = self._remote_slurm_log_targets(task, local_log)
+        if target_info is None:
+            return ""
+        host, paths = target_info
+        per_file = max(4096, min(max_bytes, max_bytes // max(1, len(paths))))
+        try:
+            result = subprocess.run(
+                [*SSH_COMMAND, host, self._remote_tail_command(paths, per_file)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=20,
+            )
+        except Exception as exc:
+            return f"\n[dashboard] remote slurm log tail failed: {exc}\n"
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()[-1000:]
+            return f"\n[dashboard] remote slurm log tail failed rc={result.returncode}: {detail}\n"
+        return result.stdout
+
+    def log_tail(self, task_id: str, max_bytes: int = 64 * 1024, *, include_remote_slurm: bool = False) -> str:
         task = read_json(self._path(task_id))
         path = self._log_path(task_id)
         external_log = None
@@ -2626,7 +2892,134 @@ class TaskManager:
         with path.open("rb") as handle:
             size = path.stat().st_size
             handle.seek(max(0, size - max_bytes))
-            return handle.read().decode("utf-8", errors="replace")
+            text = handle.read().decode("utf-8", errors="replace")
+        if include_remote_slurm and isinstance(task, dict) and DASHBOARD_SLURM_LOG_STREAM_MARKER not in text:
+            remote_text = self._remote_slurm_log_tail(task, text, max_bytes)
+            if remote_text:
+                text = (text + "\n" + remote_text)[-max_bytes:]
+        return text
+
+    def _task_log_path_for_read(self, task: dict[str, Any]) -> Path:
+        path = self._log_path(str(task["id"]))
+        external_log = task.get("metadata", {}).get("external_log_path")
+        if external_log:
+            candidate = Path(str(external_log))
+            if candidate.is_file():
+                return candidate
+        return path
+
+    @staticmethod
+    def _first_training_metric_step(path: Path, max_scan_bytes: int = 64 * 1024 * 1024) -> int | None:
+        """Find an early Step metric without materializing a large log in memory."""
+        scanned = 0
+        try:
+            with path.open("rb") as handle:
+                for raw_line in handle:
+                    scanned += len(raw_line)
+                    if scanned > max_scan_bytes:
+                        return None
+                    line = ANSI_ESCAPE.sub("", raw_line.decode("utf-8", errors="replace")).strip()
+                    match = TRAIN_STEP.search(line)
+                    if not match:
+                        continue
+                    if TRAIN_METRIC.findall(match.group(2)):
+                        return int(match.group(1))
+        except (OSError, ValueError):
+            return None
+        return None
+
+    def training_metrics_probe(self, task: dict[str, Any], max_bytes: int = 512 * 1024) -> dict[str, Any] | None:
+        """Return a cached, lightweight hint for whether a train task has curves.
+
+        The full metrics endpoint may read multi-MiB logs and, for Slurm tasks,
+        may SSH to a submit host.  The Dashboard task table refreshes often, so
+        this probe intentionally reads only the local/external log tail and
+        caches by size/mtime.  Slurm tasks without local streamed metrics are
+        marked ``unknown`` instead of ``no_metrics`` to avoid encouraging users
+        to delete a task that may still have remote curves.
+        """
+        if task.get("type") != "train" or not task.get("id"):
+            return None
+        task_id = str(task["id"])
+        metadata = task.get("metadata", {}) if isinstance(task.get("metadata"), dict) else {}
+        runtime = str(metadata.get("runtime") or "")
+        path = self._task_log_path_for_read(task)
+        if not path.exists():
+            status = "unknown" if runtime == "slurm" else "no_metrics"
+            return {
+                "status": status,
+                "has_points": None if status == "unknown" else False,
+                "total_points": 0,
+                "latest_step": 0,
+                "source": "missing_log",
+            }
+        try:
+            stat = path.stat()
+        except OSError:
+            return {
+                "status": "unknown",
+                "has_points": None,
+                "total_points": 0,
+                "latest_step": 0,
+                "source": "stat_failed",
+            }
+        cache_key = (
+            str(path),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            runtime,
+            int(max_bytes),
+        )
+        cached = self.training_metric_probe_cache.get(task_id)
+        if cached and cached[0] == cache_key:
+            return dict(cached[1])
+        try:
+            with path.open("rb") as handle:
+                handle.seek(max(0, stat.st_size - max_bytes))
+                text = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            payload = {
+                "status": "unknown",
+                "has_points": None,
+                "total_points": 0,
+                "latest_step": 0,
+                "source": "read_failed",
+            }
+            self.training_metric_probe_cache[task_id] = (cache_key, payload)
+            return dict(payload)
+        metrics = parse_training_metrics(text, max_points=2)
+        total_points = int(metrics.get("total_points", 0) or 0)
+        points = metrics.get("points") or []
+        latest_step = int(points[-1].get("step", 0)) if points else 0
+        partial = False
+        if total_points == 0 and stat.st_size > max_bytes:
+            first_step = self._first_training_metric_step(path)
+            if first_step is not None:
+                total_points = 1
+                latest_step = first_step
+                partial = True
+        if total_points > 0:
+            status = "has_metrics"
+            has_points: bool | None = True
+        elif runtime == "slurm" and DASHBOARD_SLURM_LOG_STREAM_MARKER not in text:
+            status = "unknown"
+            has_points = None
+        else:
+            status = "no_metrics"
+            has_points = False
+        payload = {
+            "status": status,
+            "has_points": has_points,
+            "total_points": total_points,
+            "latest_step": latest_step,
+            "series": list(metrics.get("series", []))[:12],
+            "source": "local_file_scan" if partial else "local_tail",
+            "tail_bytes": min(int(stat.st_size), int(max_bytes)),
+        }
+        if partial:
+            payload["partial"] = True
+        self.training_metric_probe_cache[task_id] = (cache_key, payload)
+        return dict(payload)
 
 
 class UploadManager:
@@ -3475,6 +3868,7 @@ def build_environment(
     for sensitive_key in ("BIMANUAL_VLA_SERVER_TOKEN", "BIMANUAL_VLA_LOGIN_PASSWORD"):
         env.pop(sensitive_key, None)
     openpi_env_lib = str(Path(config["openpi_python"]).resolve().parent.parent / "lib")
+    cache_root = Path(config.get("cache_root") or (Path.home() / ".cache")).expanduser().resolve()
     inherited_ld = env.get("LD_LIBRARY_PATH", "")
     nccl_preload = _compatible_nccl_preload_path(config)
     ld_parts = []
@@ -3485,8 +3879,8 @@ def build_environment(
         ld_parts.append(inherited_ld)
     env.update(
         {
-            "XDG_CACHE_HOME": str(Path.home() / ".cache"),
-            "HF_HOME": str(Path.home() / ".cache" / "huggingface"),
+            "XDG_CACHE_HOME": str(cache_root),
+            "HF_HOME": str(cache_root / "huggingface"),
             "HF_LEROBOT_HOME": config["dataset_root"],
             "LD_LIBRARY_PATH": ":".join(ld_parts),
             "PYTHONUNBUFFERED": "1",
@@ -3526,6 +3920,8 @@ def create_app(config_path: Path) -> Flask:
     login_user = os.environ.get("BIMANUAL_VLA_LOGIN_USER", "")
     login_password = os.environ.get("BIMANUAL_VLA_LOGIN_PASSWORD", "")
     app = Flask(__name__, template_folder=str(APP_DIR / "templates"))
+    dashboard_template_path = APP_DIR / "templates" / "index.html"
+    dashboard_build_id = hashlib.sha256(dashboard_template_path.read_bytes()).hexdigest()[:12]
     app.config["MAX_CONTENT_LENGTH"] = int(config["max_chunk_mib"] * 1024**2) + 1024 * 1024
     tasks = TaskManager(config)
     dataset_root = Path(config["dataset_root"])
@@ -3644,11 +4040,12 @@ def create_app(config_path: Path) -> Flask:
             upload_default_origin=config.get("upload_default_origin", "real"),
             visible_dataset_origins=config.get("visible_dataset_origins", ["real", "unknown"]),
             enable_policy=bool(config.get("enable_policy", True)),
+            dashboard_build=dashboard_build_id,
         )
 
     @app.get("/healthz")
     def healthz():
-        return jsonify({"ok": True, "time": now_iso()})
+        return jsonify({"ok": True, "time": now_iso(), "dashboard_build": dashboard_build_id})
 
     @app.post("/api/auth/token")
     def issue_token():
@@ -4039,6 +4436,10 @@ def create_app(config_path: Path) -> Flask:
                 progress = transfer_progress_for_task(task)
                 if progress is not None:
                     task["progress"] = progress
+            elif task.get("type") == "train":
+                probe = tasks.training_metrics_probe(task)
+                if probe is not None:
+                    task["training_metrics"] = probe
         for task in task_list:
             if task["type"] != "policy":
                 continue
@@ -4077,9 +4478,11 @@ def create_app(config_path: Path) -> Flask:
                 "config": {
                     "dashboard_profile": config.get("dashboard_profile", "real"),
                     "dashboard_title": config.get("dashboard_title", "Bimanual-VLA Dashboard"),
+                    "dashboard_build": dashboard_build_id,
                     "upload_default_origin": config.get("upload_default_origin", "real"),
                     "visible_dataset_origins": config.get("visible_dataset_origins", ["real", "unknown"]),
                     "enable_policy": bool(config.get("enable_policy", True)),
+                    "local_storage_locations": config.get("local_storage_locations", {}),
                     "cluster_targets": {
                         name: {
                             key: value
@@ -4090,6 +4493,8 @@ def create_app(config_path: Path) -> Flask:
                     },
                     "eval_video_roots": config.get("eval_video_roots", []),
                     "dataset_root": config["dataset_root"],
+                    "workspace_root": config["workspace_root"],
+                    "cache_root": config.get("cache_root"),
                     "upload_roots": {
                         origin: str(Path(config["workspace_root"]) / "uploads" / origin)
                         for origin in ("real", "simulation")
@@ -4197,6 +4602,26 @@ def create_app(config_path: Path) -> Flask:
         result = dataset_editor.update_episode(dataset_id, episode_index, request.get_json(force=True))
         return jsonify(result)
 
+    @app.get("/api/datasets/<dataset_id>/event-semantics")
+    def get_dataset_event_semantics(dataset_id: str):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        return jsonify(dataset_editor.event_semantics(dataset_id))
+
+    @app.post("/api/datasets/<dataset_id>/event-semantics")
+    def save_dataset_event_semantics(dataset_id: str):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        return jsonify(dataset_editor.save_event_semantics(dataset_id, request.get_json(force=True)))
+
+    @app.get("/api/datasets/<dataset_id>/episodes/<int:episode_index>/event-overrides")
+    def get_dataset_episode_event_overrides(dataset_id: str, episode_index: int):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        return jsonify(dataset_editor.event_overrides(dataset_id, episode_index))
+
+    @app.post("/api/datasets/<dataset_id>/episodes/<int:episode_index>/event-overrides")
+    def save_dataset_episode_event_overrides(dataset_id: str, episode_index: int):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        return jsonify(dataset_editor.save_event_overrides(dataset_id, episode_index, request.get_json(force=True)))
+
     @app.post("/api/datasets/<dataset_id>/episodes/delete")
     def delete_dataset_episodes(dataset_id: str):
         dataset_id = safe_name(dataset_id, "dataset id")
@@ -4271,6 +4696,7 @@ def create_app(config_path: Path) -> Flask:
         ignored_pids: set[int] | None = None,
         check_busy: bool = True,
         minimum_free_mib: int = 0,
+        allow_busy: bool | None = None,
     ) -> list[int]:
         raw = payload.get("gpu_ids", [0])
         if isinstance(raw, str):
@@ -4302,9 +4728,14 @@ def create_app(config_path: Path) -> Flask:
             for gpu_id in gpu_ids
         }
         busy = {gpu_id: procs for gpu_id, procs in busy.items() if procs}
-        if busy and not config["allow_busy_gpus"]:
+        effective_allow_busy = (
+            bool(config.get("allow_busy_gpus", False))
+            if allow_busy is None
+            else bool(allow_busy)
+        )
+        if busy and not effective_allow_busy:
             raise ValueError(f"refusing busy GPU(s): {busy}")
-        if minimum_free_mib > 0 and not config["allow_busy_gpus"]:
+        if minimum_free_mib > 0:
             low_memory = gpu_memory_shortfalls(inventory, gpu_ids, minimum_free_mib)
             if low_memory:
                 raise ValueError(f"GPU(s) do not have enough free memory: {low_memory}")
@@ -4381,6 +4812,7 @@ def create_app(config_path: Path) -> Flask:
         num_workers: int,
         steps: int,
         save_interval: int,
+        keep_period: int | None,
         fsdp_devices: int,
         split: EpisodeSplit,
         model_contract: dict[str, Any],
@@ -4407,6 +4839,8 @@ def create_app(config_path: Path) -> Flask:
             "--test-ratio", str(split.test_ratio),
             "--split-seed", str(split.seed),
         ] + action_contract_command_args(model_contract)
+        if keep_period is not None:
+            command += ["--keep-period", str(keep_period)]
         if resume_checkpoint is not None:
             command += ["--resume-checkpoint", str(resume_checkpoint)]
         elif effective_mode != "new":
@@ -4620,6 +5054,257 @@ def create_app(config_path: Path) -> Flask:
                 break
             current = current.parent
 
+    EVENT_OVERRIDE_SCHEMA = "event_overrides.v1"
+    EVENT_LABELS_BY_TASK = {
+        "handover_mic": {
+            0: "E0 未稳定抓住 mic",
+            1: "E1 donor 稳定抓住 mic",
+            2: "E2 mic 稳定抬离支撑面",
+            3: "E3 receiver 稳定抓住 mic",
+            4: "E4 donor 释放且 receiver 独立持有",
+        }
+    }
+
+    def event_override_path_for_video(path: Path) -> Path:
+        return path.parent / "_event_overrides" / f"{path.stem}.json"
+
+    def event_labels_for_task(task_name: Any) -> dict[str, str]:
+        text = str(task_name or "").lower()
+        for key, labels in EVENT_LABELS_BY_TASK.items():
+            if key in text:
+                return {str(index): label for index, label in labels.items()}
+        return {}
+
+    def safe_event_int(value: Any) -> int | None:
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def normalize_event_edits(raw_edits: Any, *, max_step: int | None = None) -> list[dict[str, Any]]:
+        if not isinstance(raw_edits, list):
+            return []
+        by_start: dict[int, dict[str, Any]] = {}
+        for raw in raw_edits:
+            if not isinstance(raw, dict):
+                continue
+            start = safe_event_int(raw.get("start_step", raw.get("step", raw.get("start_frame", raw.get("frame")))))
+            if start is None:
+                continue
+            start = max(0, start)
+            if max_step is not None:
+                start = min(start, max_step)
+            marker: dict[str, Any] = {"start_step": int(start)}
+            current = safe_event_int(raw.get("current_event"))
+            max_event = safe_event_int(raw.get("max_event_reached", raw.get("max_event")))
+            if current is not None:
+                marker["current_event"] = current
+            if max_event is not None:
+                marker["max_event_reached"] = max_event
+            note = raw.get("note")
+            if isinstance(note, str) and note.strip():
+                marker["note"] = note.strip()[:500]
+            if "current_event" in marker or "max_event_reached" in marker:
+                by_start[int(start)] = marker
+        normalized = [by_start[start] for start in sorted(by_start)]
+        running_max: int | None = None
+        for marker in normalized:
+            current = safe_event_int(marker.get("current_event"))
+            declared_max = safe_event_int(marker.get("max_event_reached"))
+            candidates = [value for value in (running_max, current, declared_max) if value is not None]
+            if candidates:
+                running_max = max(candidates)
+                marker["max_event_reached"] = running_max
+        return normalized
+
+
+    def normalize_event_timeline(raw_timeline: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw_timeline, list):
+            return []
+        timeline: list[dict[str, Any]] = []
+        for index, raw in enumerate(raw_timeline):
+            if not isinstance(raw, dict):
+                continue
+            step = safe_event_int(raw.get("step", raw.get("frame", index)))
+            if step is None:
+                step = index
+            item: dict[str, Any] = {"step": max(0, int(step))}
+            frame = safe_event_int(raw.get("frame"))
+            if frame is not None:
+                item["frame"] = max(0, int(frame))
+            current = safe_event_int(raw.get("current_event"))
+            max_event = safe_event_int(raw.get("max_event_reached", raw.get("max_event")))
+            if current is not None:
+                item["current_event"] = current
+            if max_event is not None:
+                item["max_event_reached"] = max_event
+            if "current_event" in item or "max_event_reached" in item:
+                timeline.append(item)
+        timeline.sort(key=lambda item: int(item.get("step", 0)))
+        return timeline
+
+    def read_video_event_overrides(path: Path, *, max_step: int | None = None) -> dict[str, Any] | None:
+        raw = read_json(event_override_path_for_video(path))
+        if not isinstance(raw, dict):
+            return None
+        return {**raw, "schema": raw.get("schema") or EVENT_OVERRIDE_SCHEMA, "edits": normalize_event_edits(raw.get("edits", []), max_step=max_step)}
+
+    def load_episode_video_sidecar(path: Path, episode_index: int) -> tuple[dict[str, Any] | None, str | None]:
+        candidates = sorted(
+            [path.parent / "_episode_results.jsonl", *path.parent.glob("_episode_results.rescore*.jsonl")],
+            key=lambda item: item.stat().st_mtime if item.exists() else 0,
+            reverse=True,
+        )
+        seen: set[Path] = set()
+        fallback: tuple[dict[str, Any], str] | None = None
+        for jsonl_path in candidates:
+            if jsonl_path in seen or not jsonl_path.is_file():
+                continue
+            seen.add(jsonl_path)
+            rows = []
+            try:
+                for line in jsonl_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except Exception:
+                        continue
+                    try:
+                        item_episode_index = int(item.get("episode_index", -1))
+                    except Exception:
+                        item_episode_index = -1
+                    if item_episode_index == episode_index and item.get("counted_in_success_rate", True):
+                        rows.append(item)
+            except Exception:
+                rows = []
+            if rows:
+                item = rows[-1]
+                if fallback is None:
+                    fallback = (item, jsonl_path.name)
+                if item.get("event_timeline") or "current_event" in item or "max_event_reached" in item:
+                    return item, jsonl_path.name
+        if fallback is not None:
+            return fallback
+        return None, None
+
+    def event_track_from_video_sidecar(path: Path, row: dict[str, Any] | None, sidecar_name: str | None, *, task_name: Any = None) -> dict[str, Any] | None:
+        row = row or {}
+        timeline = normalize_event_timeline(row.get("event_timeline"))
+        current = safe_event_int(row.get("current_event"))
+        max_event = safe_event_int(row.get("max_event_reached", row.get("max_event")))
+        if not timeline and (current is not None or max_event is not None):
+            timeline = [{"step": 0}]
+            if current is not None:
+                timeline[0]["current_event"] = current
+            if max_event is not None:
+                timeline[0]["max_event_reached"] = max_event
+        timeline_max = max((int(item.get("step", 0)) for item in timeline), default=0)
+        override_raw = read_video_event_overrides(path, max_step=None)
+        override_max = max((int(item.get("start_step", 0)) for item in (override_raw or {}).get("edits", [])), default=0)
+        max_step = timeline_max if timeline_max > 0 else (override_max if override_max > 0 else None)
+        overrides = read_video_event_overrides(path, max_step=max_step)
+        has_overrides = bool(overrides and overrides.get("edits"))
+        if not timeline and not has_overrides:
+            return None
+        labels = event_labels_for_task(task_name or row.get("task") or row.get("task_name"))
+        override_edits = (overrides or {}).get("edits") or []
+        override_current = safe_event_int(override_edits[-1].get("current_event")) if override_edits else None
+        override_max_values = [
+            value
+            for edit in override_edits
+            for value in (
+                safe_event_int(edit.get("current_event")),
+                safe_event_int(edit.get("max_event_reached")),
+            )
+            if value is not None
+        ]
+        override_reached = max(override_max_values) if override_max_values else None
+        return {
+            "available": bool(timeline or has_overrides),
+            "source": sidecar_name or ("manual_override" if has_overrides else None),
+            "event_version": row.get("event_version") if isinstance(row, dict) else None,
+            "timeline": timeline,
+            "current_event": override_current if override_current is not None else (current if current is not None else (timeline[-1].get("current_event") if timeline else None)),
+            "max_event_reached": max(
+                [
+                    value
+                    for value in (
+                        override_reached,
+                        max_event,
+                        timeline[-1].get("max_event_reached") if timeline else None,
+                    )
+                    if value is not None
+                ],
+                default=None,
+            ),
+            "max_step": max_step,
+            "labels": labels,
+            "overrides": overrides,
+            "override_count": len(overrides.get("edits") or []) if overrides else 0,
+            "marker_semantics": "start_frame_until_next_marker" if has_overrides else None,
+            "editable": True,
+        }
+
+    def save_video_event_override(video_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        path = decode_video_id(video_id)
+        episode_match = re.search(r"episode(\d+)\.(?:mp4|webm|mov|mkv|avi|gif)$", path.name, re.IGNORECASE)
+        row: dict[str, Any] | None = None
+        max_step: int | None = None
+        track: dict[str, Any] | None = None
+        if episode_match is not None:
+            row, sidecar_name = load_episode_video_sidecar(path, int(episode_match.group(1)))
+            if row:
+                track = event_track_from_video_sidecar(path, row, sidecar_name, task_name=row.get("task") or row.get("task_name"))
+                max_step = safe_event_int((track or {}).get("max_step"))
+        edit_values = payload.get("edits")
+        if edit_values is None:
+            step = payload.get("step", payload.get("frame"))
+            edit = {"start_step": step}
+            if "current_event" in payload:
+                edit["current_event"] = payload.get("current_event")
+            if "max_event_reached" in payload or "max_event" in payload:
+                edit["max_event_reached"] = payload.get("max_event_reached", payload.get("max_event"))
+            if "note" in payload:
+                edit["note"] = payload.get("note")
+            edit_values = [edit]
+        replace = bool(payload.get("replace", False))
+        existing = [] if replace else ((read_video_event_overrides(path, max_step=max_step) or {}).get("edits") or [])
+        edits = normalize_event_edits([*existing, *(edit_values or [])], max_step=max_step)
+        if max_step is None:
+            inferred_max = max((int(edit.get("start_step", 0)) for edit in edits), default=0)
+            max_step = inferred_max if inferred_max > 0 else None
+        # Keep handover_mic strict (0..4) and otherwise accept a conservative
+        # generic range; this lets non-event datasets keep using the dashboard.
+        task_text = " ".join(str((row or {}).get(key, "")) for key in ("task", "task_name", "event_version"))
+        max_allowed = 4 if "handover_mic" in task_text.lower() or "mic" in str(path).lower() else 99
+        for edit in edits:
+            for key in ("current_event", "max_event_reached"):
+                if key in edit and not (0 <= int(edit[key]) <= max_allowed):
+                    raise ValueError(f"{key} must be in [0, {max_allowed}]")
+        output = {
+            "schema": EVENT_OVERRIDE_SCHEMA,
+            "video": path.name,
+            "video_id": video_id,
+            "relative_dir": path.parent.name,
+            "event_max_value": max_allowed,
+            "marker_semantics": "start_frame_until_next_marker",
+            "max_step": max_step,
+            "updated_at": now_iso(),
+            "source": "dashboard_eval_video",
+            "edits": edits,
+        }
+        out_path = event_override_path_for_video(path)
+        atomic_json(out_path, output)
+        return {**output, "path": str(out_path), "override_count": len(edits)}
+
     REMOTE_EVAL_VIDEO_INVENTORY_SCRIPT = r'''
 import json, os, re
 from pathlib import Path, PurePosixPath
@@ -4638,7 +5323,7 @@ def infer_metadata(root, rel, path):
     episode_status = None
     episode_seed = None
 
-    episode_match = re.search(r"episode(\d+)\.mp4$", name)
+    episode_match = re.search(r"episode(\d+)\.(?:mp4|webm|mov|mkv|avi|gif)$", name, re.IGNORECASE)
     if episode_match is not None:
         episode_index = int(episode_match.group(1))
         jsonl_path = path.parent / "_episode_results.jsonl"
@@ -4768,6 +5453,7 @@ print(json.dumps(rows, ensure_ascii=False))
         score: float | None = None
         episode_status: str | None = None
         episode_seed: Any | None = None
+        event_track: dict[str, Any] | None = None
         root_path = Path(root)
         path = root_path / relative_path
 
@@ -4776,44 +5462,28 @@ print(json.dumps(rows, ensure_ascii=False))
         # absent until the whole eval finishes and cannot represent individual
         # episode videos; that made running continuous eval videos show up as
         # "unknown" even though _episode_results.jsonl already had statuses.
-        episode_match = re.search(r"episode(\d+)\.mp4$", name)
+        episode_match = re.search(r"episode(\d+)\.(?:mp4|webm|mov|mkv|avi|gif)$", name, re.IGNORECASE)
         if episode_match is not None:
             episode_index = int(episode_match.group(1))
-            jsonl_path = path.parent / "_episode_results.jsonl"
-            if jsonl_path.is_file():
-                try:
-                    rows = []
-                    for line in jsonl_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            item = json.loads(line)
-                        except Exception:
-                            continue
-                        try:
-                            item_episode_index = int(item.get("episode_index", -1))
-                        except Exception:
-                            item_episode_index = -1
-                        if item_episode_index == episode_index and item.get("counted_in_success_rate", True):
-                            rows.append(item)
-                    if rows:
-                        item = rows[-1]
-                        score_value = item.get("stage_reward")
-                        if isinstance(score_value, (int, float)):
-                            score = float(score_value)
-                        episode_status = str(item.get("status", "")) or None
-                        episode_seed = item.get("seed")
-                        if bool(item.get("success")):
+            try:
+                item, sidecar_name = load_episode_video_sidecar(path, episode_index)
+                if item:
+                    score_value = item.get("stage_reward")
+                    if isinstance(score_value, (int, float)):
+                        score = float(score_value)
+                    episode_status = str(item.get("status", "")) or None
+                    episode_seed = item.get("seed")
+                    if bool(item.get("success")):
+                        success = "success"
+                    else:
+                        status_value = str(item.get("status", "failure")).lower()
+                        if status_value in {"success"}:
                             success = "success"
-                        else:
-                            status_value = str(item.get("status", "failure")).lower()
-                            if status_value in {"success"}:
-                                success = "success"
-                            elif status_value in {"failure", "failed", "policy_error", "expert_failed", "expert_invalid", "expert_unstable"} or "success" in item:
-                                success = "failed"
-                except Exception:
-                    pass
+                        elif status_value in {"failure", "failed", "policy_error", "expert_failed", "expert_invalid", "expert_unstable"} or "success" in item:
+                            success = "failed"
+                    event_track = event_track_from_video_sidecar(path, item, sidecar_name, task_name=task_name)
+            except Exception:
+                pass
 
         if success is None:
             for parent in [path.parent, *path.parents]:
@@ -4856,6 +5526,7 @@ print(json.dumps(rows, ensure_ascii=False))
             "score": score,
             "episode_status": episode_status,
             "episode_seed": episode_seed,
+            "event_track": event_track,
             "source": source,
             "display_name": name,
         }
@@ -4998,6 +5669,15 @@ print(json.dumps(rows, ensure_ascii=False))
     def get_eval_video(video_id: str):
         return send_file(decode_video_id(video_id), conditional=True, max_age=0)
 
+    @app.get("/api/eval-videos/<video_id>/event-overrides")
+    def get_eval_video_event_overrides(video_id: str):
+        path = decode_video_id(video_id)
+        return jsonify(read_video_event_overrides(path) or {"schema": EVENT_OVERRIDE_SCHEMA, "edits": []})
+
+    @app.post("/api/eval-videos/<video_id>/event-overrides")
+    def post_eval_video_event_overrides(video_id: str):
+        return jsonify(save_video_event_override(video_id, request.get_json(force=True)))
+
     @app.post("/api/eval-videos/batch-delete")
     def delete_eval_videos_batch():
         payload = request.get_json(force=True)
@@ -5121,13 +5801,26 @@ print(json.dumps(rows, ensure_ascii=False))
         locations = {
             "local_4090": {
                 "name": "local_4090",
-                "label": "4×4090",
+                "label": "4×4090 NVMe（活动）",
                 "kind": "local",
                 "host": None,
                 "dataset_root": config["dataset_root"],
                 "available": True,
+                "training_enabled": True,
             }
         }
+        for name, storage in config.get("local_storage_locations", {}).items():
+            if not storage.get("dataset_root"):
+                continue
+            locations[name] = {
+                "name": name,
+                "label": storage.get("label") or name,
+                "kind": storage.get("kind") or "local_archive",
+                "host": None,
+                "dataset_root": storage.get("dataset_root"),
+                "available": bool(storage.get("available", True)),
+                "training_enabled": bool(storage.get("training_enabled", False)),
+            }
         for name, target in config.get("cluster_targets", {}).items():
             if not target.get("dataset_root"):
                 continue
@@ -5157,13 +5850,28 @@ print(json.dumps(rows, ensure_ascii=False))
         locations = {
             "local_4090": {
                 "name": "local_4090",
-                "label": "4×4090",
+                "label": "4×4090 NVMe（活动）",
                 "kind": "local",
                 "host": None,
                 "dataset_root": str(PurePosixPath(str(config["checkpoint_base_dir"]).rstrip("/")) / config_name),
                 "available": True,
+                "serving_enabled": True,
             }
         }
+        for name, storage in config.get("local_storage_locations", {}).items():
+            if not storage.get("checkpoint_base_dir"):
+                continue
+            locations[name] = {
+                "name": name,
+                "label": storage.get("label") or name,
+                "kind": storage.get("kind") or "local_archive",
+                "host": None,
+                "dataset_root": str(
+                    PurePosixPath(str(storage["checkpoint_base_dir"]).rstrip("/")) / config_name
+                ),
+                "available": bool(storage.get("available", True)),
+                "serving_enabled": bool(storage.get("serving_enabled", False)),
+            }
         for name, target in config.get("cluster_targets", {}).items():
             if not target.get("checkpoint_base_dir"):
                 continue
@@ -5263,7 +5971,7 @@ print(json.dumps(rows, ensure_ascii=False))
 '''
 
     def remote_dataset_inventory(location: dict[str, Any], *, timeout: int = 30) -> tuple[list[dict[str, Any]], str | None]:
-        if location.get("kind") == "local":
+        if location.get("kind") in {"local", "local_archive"}:
             return local_dataset_inventory(location), None
         if location.get("kind") == "slurm_only":
             cache_path = location.get("inventory_cache_path")
@@ -5510,8 +6218,6 @@ print(json.dumps(rows, ensure_ascii=False))
         target_name = str(payload.get("target", "local_4090") or "local_4090")
         if not source_name:
             raise ValueError("source is required")
-        if target_name != "local_4090":
-            raise ValueError("checkpoint sync target must be local_4090 because Policy serving only runs on 4×4090")
         if payload.get("config_name"):
             config_name = safe_name(payload.get("config_name"), "checkpoint config name")
         else:
@@ -5970,6 +6676,12 @@ print(json.dumps(rows, ensure_ascii=False))
         cluster_target_config = runtime_config_for_target(execution_target)
         is_cluster_target = cluster_target_config is not None
         minimum_free_gpu_mib = int(config.get("training_min_free_gpu_mib", 23_000))
+        allow_busy_raw = payload.get("allow_busy_gpus", config.get("allow_busy_gpus", False))
+        allow_busy_gpus = (
+            allow_busy_raw
+            if isinstance(allow_busy_raw, bool)
+            else str(allow_busy_raw).strip().lower() in {"1", "true", "yes", "on"}
+        )
         if is_cluster_target:
             raw_cluster_gpus = payload.get("cluster_gpus", payload.get("gpu_count", payload.get("gpu_ids", 1)))
             if isinstance(raw_cluster_gpus, str) and "," in raw_cluster_gpus:
@@ -5983,6 +6695,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 payload,
                 check_busy=norm_ready,
                 minimum_free_mib=minimum_free_gpu_mib,
+                allow_busy=allow_busy_gpus,
             )
         batch_size = safe_int(payload.get("batch_size", 2), "batch_size", 1, 1024)
         if batch_size % len(gpu_ids):
@@ -5999,6 +6712,8 @@ print(json.dumps(rows, ensure_ascii=False))
         )
         steps = safe_int(payload.get("num_train_steps", 30_000), "num_train_steps", 1, 10_000_000)
         save_interval = safe_int(payload.get("save_interval", 1_000), "save_interval", 1, steps)
+        keep_period_raw = payload.get("keep_period", 5_000)
+        keep_period = 0 if str(keep_period_raw).strip().lower() in {"", "none", "null", "0", "false", "no", "off"} else safe_int(keep_period_raw, "keep_period", 1, 10_000_000)
         eval_enabled_raw = payload.get("eval_enabled", True)
         eval_enabled = (
             eval_enabled_raw
@@ -6058,6 +6773,7 @@ print(json.dumps(rows, ensure_ascii=False))
             num_workers=num_workers,
             steps=steps,
             save_interval=save_interval,
+            keep_period=keep_period,
             fsdp_devices=fsdp_devices,
             split=split,
             model_contract=model_contract,
@@ -6136,6 +6852,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 num_workers=num_workers,
                 steps=steps,
                 save_interval=save_interval,
+                keep_period=keep_period,
                 fsdp_devices=fsdp_devices,
                 split=split,
                 model_contract=model_contract,
@@ -6190,9 +6907,11 @@ print(json.dumps(rows, ensure_ascii=False))
             "num_workers": num_workers,
             "steps": steps,
             "save_interval": save_interval,
+            "keep_period": keep_period,
             "fsdp_devices": fsdp_devices,
             "xla_memory_fraction": xla_memory_fraction,
             "minimum_free_gpu_mib": minimum_free_gpu_mib,
+            "allow_busy_gpus": allow_busy_gpus,
             "mode": mode,
             "effective_mode": effective_mode,
             "resume_kind": resume_kind,
@@ -6260,7 +6979,11 @@ print(json.dumps(rows, ensure_ascii=False))
                 return jsonify(task), 201
 
             if norm_ready:
-                gpu_ids = parse_gpus(payload, minimum_free_mib=minimum_free_gpu_mib)
+                gpu_ids = parse_gpus(
+                    payload,
+                    minimum_free_mib=minimum_free_gpu_mib,
+                    allow_busy=allow_busy_gpus,
+                )
                 metadata["gpu_ids"] = gpu_ids
                 task = tasks.start(
                     "train",
@@ -6868,6 +7591,7 @@ print(json.dumps(rows, ensure_ascii=False))
                     "fsdp_devices",
                     "steps",
                     "save_interval",
+                    "keep_period",
                     "checkpoint",
                     "checkpoint_step",
                     "checkpoint_dir",
@@ -6900,9 +7624,13 @@ print(json.dumps(rows, ensure_ascii=False))
                 if key in metadata
             },
         }
+        if task.get("type") == "train":
+            probe = tasks.training_metrics_probe(task)
+            if probe is not None:
+                summary["training_metrics"] = probe
         if include_metrics and task.get("type") == "train":
             metrics = parse_training_metrics(
-                tasks.log_tail(str(task["id"]), 16 * 1024 * 1024),
+                tasks.log_tail(str(task["id"]), 16 * 1024 * 1024, include_remote_slurm=True),
                 max_points=1200,
             )
             planned_steps = metadata.get("steps")
@@ -6986,7 +7714,7 @@ print(json.dumps(rows, ensure_ascii=False))
     def task_log(task_id: str):
         max_bytes = safe_int(request.args.get("max_bytes", 64 * 1024), "max_bytes", 1024, 1024 * 1024)
         task = tasks.get(task_id)
-        return jsonify({"task": task, "log": tasks.log_tail(task_id, max_bytes)})
+        return jsonify({"task": task, "log": tasks.log_tail(task_id, max_bytes, include_remote_slurm=True)})
 
     @app.get("/api/tasks/<task_id>/metrics")
     def task_metrics(task_id: str):
@@ -6994,7 +7722,10 @@ print(json.dumps(rows, ensure_ascii=False))
         if task.get("type") != "train":
             raise ValueError("metrics are only available for train tasks")
         max_points = safe_int(request.args.get("max_points", 1200), "max_points", 50, 5000)
-        result = parse_training_metrics(tasks.log_tail(task_id, 16 * 1024 * 1024), max_points=max_points)
+        result = parse_training_metrics(
+            tasks.log_tail(task_id, 16 * 1024 * 1024, include_remote_slurm=True),
+            max_points=max_points,
+        )
         eval_tasks = [
             item
             for item in tasks.list()

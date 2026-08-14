@@ -10,11 +10,12 @@
   "enable_policy": false,
   "openpi_repo": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05",
   "openpi_python": "/home/sunny/miniconda3/envs/openpi/bin/python",
-  "dataset_root": "/home/sunny/.cache/huggingface/lerobot",
-  "workspace_root": "/home/sunny/.local/share/bimanual-vla-sim-dashboard",
+  "dataset_root": "/mnt/nvme0n1p4_1T/sunny/tsq-storage/datasets/lerobot",
+  "workspace_root": "/mnt/nvme0n1p4_1T/sunny/tsq-storage/dashboard-workspace",
+  "cache_root": "/mnt/nvme0n1p4_1T/sunny/tsq-storage/cache",
   "assets_base_dir": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/assets",
-  "checkpoint_base_dir": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints",
-  "base_checkpoint": "/home/sunny/.cache/openpi/openpi-assets/checkpoints/pi05_base",
+  "checkpoint_base_dir": "/mnt/nvme0n1p4_1T/sunny/tsq-storage/checkpoints/openpi",
+  "base_checkpoint": "/mnt/nvme0n1p4_1T/sunny/tsq-storage/checkpoints/base-models/pi05_base",
   "allowed_gpu_ids": [
     0,
     1,
@@ -30,14 +31,26 @@
   "max_upload_gib": 500,
   "max_chunk_mib": 64,
   "checkpoint_allowed_roots": [
-    "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints",
-    "/home/sunny/.cache/openpi/openpi-assets/checkpoints"
+    "/mnt/nvme0n1p4_1T/sunny/tsq-storage/checkpoints/openpi",
+    "/mnt/nvme0n1p4_1T/sunny/tsq-storage/checkpoints/base-models"
   ],
   "eval_video_roots": [
     "/home/sunny/.local/share/bimanual-vla-sim-dashboard/eval_videos",
     "/home/sunny/robotwin_ws/RoboTwin/eval_result",
-    "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/outputs"
+    "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/outputs",
+    "/home/sunny/TSQ/tsq_rl/results",
+    "/mnt/sda1_16T/sunny/tsq-archive/eval-videos"
   ],
+  "local_storage_locations": {
+    "local_4090_hdd": {
+      "label": "4×4090 HDD（归档）",
+      "kind": "local_archive",
+      "dataset_root": "/mnt/sda1_16T/sunny/tsq-archive/datasets",
+      "checkpoint_base_dir": "/mnt/sda1_16T/sunny/tsq-archive/checkpoints",
+      "training_enabled": false,
+      "serving_enabled": false
+    }
+  },
   "cluster_targets": {
     "h100": {
       "submit_host": "login-server",
@@ -135,5 +148,6 @@
     }
   },
   "transfer_parallelism": 4,
-  "nas_dataset_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync"
+  "nas_dataset_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync",
+  "nas_checkpoint_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_checkpoint_sync"
 }

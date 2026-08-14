@@ -34,6 +34,7 @@ from server_4090.app import (
     policy_time_contract_status,
     require_policy_execution_time_contract,
 )
+from server_4090.slurm_job_runner import slurm_output_paths
 
 
 class DatasetOriginClassificationTest(unittest.TestCase):
@@ -182,6 +183,27 @@ class TrainingMetricsParserTest(unittest.TestCase):
         self.assertEqual(result["points"][0]["step"], 0)
         self.assertEqual(result["points"][-1]["step"], 99)
         self.assertEqual(result["summary"]["loss"]["max"], 9.5)
+
+    def test_slurm_log_stream_markers_do_not_block_metric_parsing(self):
+        log = (
+            "[dashboard] slurm_job_id=12345\n"
+            "[dashboard] slurm log stream stdout: /logs/train_12345.out bytes=0:40/40\n"
+            "Step 100: loss=0.42, grad_norm=1.5\n"
+        )
+
+        result = parse_training_metrics(log)
+
+        self.assertEqual(result["points"], [{"step": 100, "loss": 0.42, "grad_norm": 1.5}])
+
+    def test_slurm_runner_predicts_sbatch_output_paths(self):
+        paths = slurm_output_paths(
+            {"workdir": "/work/pi05", "log_dir": "/logs/dashboard"},
+            "sim_train_pick_cube",
+            "12345",
+        )
+
+        self.assertEqual(paths["stdout"], "/logs/dashboard/sim_train_pick_cube_12345.out")
+        self.assertEqual(paths["stderr"], "/logs/dashboard/sim_train_pick_cube_12345.err")
 
 
 class EvalMetricsTest(unittest.TestCase):

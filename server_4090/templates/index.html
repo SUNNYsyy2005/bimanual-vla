@@ -149,6 +149,13 @@
     .eval-video-title { min-width:0; }
     .eval-video-actions { display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap; justify-content:flex-end; }
     .eval-video-card video { display:block; width:100%; max-height:520px; margin-top:10px; border:1px solid #2e465f; border-radius:9px; background:#000; }
+    .event-status { margin-top:8px; padding:8px 9px; border:1px solid #294866; border-radius:9px; background:#08192b; color:#d9ebff; font-size:12px; line-height:1.45; }
+    .event-status.no-track { color:var(--muted); border-style:dashed; }
+    .event-status strong { color:#f7fbff; }
+    .event-editor { display:flex; flex-wrap:wrap; gap:7px; align-items:center; margin-top:7px; }
+    .event-editor select,.event-editor input { width:auto; min-width:82px; padding:5px 7px; }
+    .event-editor button { width:auto; padding:5px 8px; }
+    .event-pill { display:inline-block; margin:2px 4px 2px 0; padding:1px 6px; border:1px solid #35597b; border-radius:999px; background:#0d2136; color:#bfeaff; }
     @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid,.telemetry-latency-grid{grid-template-columns:repeat(2,1fr)}.episode-editor-grid{grid-template-columns:1fr}}
     @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid,.telemetry-vector-grid{grid-template-columns:1fr}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
   </style>
@@ -158,7 +165,7 @@
     <header class="topbar">
       <div class="brand">
         <div class="brand-mark">π</div>
-        <div><h1>{{ dashboard_title }}</h1><div class="muted">{{ "仿真数据上传、4×4090/H100/H200 训练评测与视频查看" if dashboard_profile == "simulation" else "数据集、训练、Policy 与实机遥测统一管理" }}</div></div>
+        <div><h1>{{ dashboard_title }} <span class="pill" id="dashboardBuildBadge">build {{ dashboard_build }}</span></h1><div class="muted">{{ "仿真数据上传、4×4090/H100/H200 训练评测与视频查看" if dashboard_profile == "simulation" else "数据集、训练、Policy 与实机遥测统一管理" }}</div></div>
       </div>
       <div class="auth-panel">
         <div class="toolbar"><input id="token" type="password" placeholder="Dashboard API Token"><button class="inline" onclick="saveToken()">保存 Token</button><button class="inline secondary" onclick="refreshAll()">刷新</button></div>
@@ -214,13 +221,15 @@
           <h2>Episode 级数据集编辑与相机预览</h2>
           <p class="muted">参数编辑不修改 state/action/图像帧；合并、删除或编辑会先构造临时数据集并校验，成功后原子替换。已有 norm stats 将失效。</p>
           <div class="row3"><div><label>目标数据集</label><select id="editorDataset"></select></div><div><label>合并来源</label><select id="mergeSourceDataset"></select></div><div><label>&nbsp;</label><button type="button" id="mergeDatasetButton" onclick="mergeDatasetEpisodes()">增量合并到目标</button></div></div>
+          <details id="datasetEventSemanticsPanel"><summary><strong>数据集 Event 语义</strong>（每个数据集独立保存）</summary><p class="muted">保存到 <code>meta/event_semantics.json</code>。每行格式为 <code>E编号: 语义</code>；episode 中只标注 event 起始帧。</p><div class="row"><div><label>Event 最大编号</label><input id="datasetEventMaxValue" type="number" min="0" max="99" step="1" value="4"></div><div><label>说明（可选）</label><input id="datasetEventDescription" placeholder="该 event 划分的用途或版本"></div></div><label>Event 定义</label><textarea id="datasetEventLabels" rows="7" placeholder="E0: 未稳定抓住物体&#10;E1: 稳定抓住物体&#10;E2: 稳定抬起物体"></textarea><div class="toolbar"><button class="inline secondary" type="button" onclick="saveDatasetEventSemantics()">保存 Event 语义文件</button><span id="datasetEventSemanticsStatus" class="muted">选择数据集后加载。</span></div></details>
           <div class="toolbar"><button class="inline secondary" type="button" onclick="loadDatasetEpisodes(0)">刷新 episodes</button><button class="inline danger" type="button" onclick="deleteSelectedEpisodes()">删除选中 episodes</button></div>
           <div id="episodeEditorSummary" class="muted editor-summary">选择数据集后加载。</div>
           <div class="episode-editor-grid">
-            <div class="episode-panel table-wrap"><table><thead><tr><th></th><th>Episode</th><th>帧数</th><th>Instruction</th><th>Task</th><th>Success</th><th>操作</th></tr></thead><tbody id="episodeRows"></tbody></table><div class="toolbar" style="margin:10px"><button class="inline secondary" type="button" onclick="changeEpisodePage(-1)">上一页</button><span id="episodePage" class="muted">-</span><button class="inline secondary" type="button" onclick="changeEpisodePage(1)">下一页</button></div></div>
+            <div class="episode-panel table-wrap"><table><thead><tr><th></th><th>Episode</th><th>帧数</th><th>Instruction</th><th>Task</th><th>Success</th><th>Event</th><th>操作</th></tr></thead><tbody id="episodeRows"></tbody></table><div class="toolbar" style="margin:10px"><button class="inline secondary" type="button" onclick="changeEpisodePage(-1)">上一页</button><span id="episodePage" class="muted">-</span><button class="inline secondary" type="button" onclick="changeEpisodePage(1)">下一页</button></div></div>
             <div class="episode-panel">
               <form id="episodeForm"><input id="episodeIndex" type="hidden"><label>Episode</label><input id="episodeIndexDisplay" disabled><label>Instruction</label><textarea id="episodeInstruction" rows="3" required></textarea><label>Task name（可选）</label><input id="episodeTaskName" placeholder="未设置"><label>Success（可选）</label><select id="episodeSuccess"><option value="">未设置</option><option value="true">true</option><option value="false">false</option></select><label>附加 metadata（JSON object）</label><textarea id="episodeMetadata" rows="7">{}</textarea><label>删除 metadata 字段（逗号分隔）</label><input id="episodeRemoveMetadata" placeholder="operator_note, bad_reason"><p><button type="submit">保存 Episode 参数</button></p></form>
-              <h3>相机媒体</h3><div id="episodeVideos" class="episode-videos"><span class="muted">选择 episode 后加载。</span></div>
+              <h3>Event track（可选）</h3><div id="episodeEventTrack" class="event-status no-track">选择 episode 后加载。</div>
+              <h3>相机媒体 <span class="event-pill">三路强制同步</span></h3><div class="muted">任意一路播放、暂停或拖动，其他相机同步到同一帧。</div><div id="episodeVideos" class="episode-videos"><span class="muted">选择 episode 后加载。</span></div>
             </div>
           </div>
         </div>
@@ -251,7 +260,8 @@
             <div class="row3"><div><label>执行目标</label><select name="execution_target" class="execution-target-select"><option value="local_4090">4×4090 本地</option></select></div><div><label>GPU IDs / 集群卡数</label><input name="gpu_ids" value="0,1" placeholder="本地 0,1；集群填 1/2/4"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div>
             <div class="row"><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>Slurm GPU count（可选）</label><input name="cluster_gpus" type="number" min="1" max="8" placeholder="选择 H100/H200 时使用"></div></div>
             <div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>全局 Batch</label><input name="batch_size" type="number" value="2"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div>
-            <div class="row3"><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div><div><label>JAX 显存预分配比例</label><input name="xla_memory_fraction" type="number" value="0.90" min="0.50" max="0.95" step="0.01"></div><div><label>Episode 划分</label><input value="自动加载已保存的 norm 划分" disabled></div></div>
+            <div class="row3"><div><label>Save interval</label><input name="save_interval" type="number" value="1000"></div><div><label>Keep period</label><input name="keep_period" type="number" value="5000" min="0"><p class="muted">0=只保留最新；2000=保护 2k 倍数 checkpoint。</p></div><div><label>JAX 显存预分配比例</label><input name="xla_memory_fraction" type="number" value="0.90" min="0.50" max="0.95" step="0.01"></div></div>
+            <p class="muted">Episode 划分：自动加载已保存的 norm 划分。Keep period 控制 Orbax 额外保留哪些 step；若要每 2k 保留一次，请同时设置 Save interval=2000、Keep period=2000。</p>
             <div class="row3"><div><label>测试集自动评测</label><select name="eval_enabled"><option value="true">启用（推荐）</option><option value="false">禁用</option></select></div><div><label>评测间隔 steps</label><input name="eval_interval_steps" type="number" value="5000" min="5000" step="5000"></div><div><label>最多评测 batches</label><input name="eval_max_batches" type="number" value="50" min="1"></div></div>
             <div class="row3"><div><label>Eval batch</label><input name="eval_batch_size" type="number" value="1" min="1"></div><div><label>Eval workers</label><input name="eval_num_workers" type="number" value="2" min="0"></div><div><label>Eval JAX 显存比例</label><input name="eval_xla_memory_fraction" type="number" value="0.85" min="0.50" max="0.95" step="0.01"></div></div>
             <label>启动方式</label><select name="mode"><option value="auto">auto（推荐）</option><option value="new">new</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select>
@@ -261,6 +271,24 @@
         <div class="card two-third">
           <h2>训练进程管理</h2>
           <p class="muted">查看 Norm / Train / Eval 任务状态、PID、依赖关系；已结束任务可删除记录和日志，不会删除 checkpoint 或训练输出。</p>
+          <div class="toolbar task-filter-toolbar">
+            <label style="margin:0">任务类型</label>
+            <select id="trainingTaskTypeFilter">
+              <option value="all">全部</option>
+              <option value="train">Train</option>
+              <option value="norm">Norm</option>
+              <option value="eval">Eval</option>
+            </select>
+            <label style="margin:0">训练曲线</label>
+            <select id="trainingMetricFilter">
+              <option value="all">全部</option>
+              <option value="has_metrics">有指标曲线</option>
+              <option value="no_metrics">无指标曲线</option>
+              <option value="no_metrics_terminal">无指标曲线且已结束</option>
+              <option value="unknown_metrics">指标状态未知</option>
+            </select>
+            <span id="trainingTaskFilterSummary" class="muted">-</span>
+          </div>
           <div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('training')" disabled data-bulk-delete-scope="training">批量删除已选日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束任务；不会删除 checkpoint、模型或训练输出。</span></div>
           <div class="table-wrap training-jobs-wrap"><table class="training-jobs-table"><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="training" onchange="toggleTaskSelection('training', this.checked)" aria-label="全选训练历史任务"></th><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div>
         </div>
@@ -366,10 +394,12 @@ loginUserInput.value = localStorage.getItem('bimanualVlaLoginUser') || '';
 
 const ACTIVE_STATES = new Set(['starting', 'running', 'stopping', 'waiting_norm', 'waiting_gpu']);
 const TERMINAL_STATES = new Set(['completed', 'failed', 'lost', 'stopped', 'skipped']);
+const TRAINING_TASK_TYPES = new Set(['norm', 'train', 'eval']);
 const DASHBOARD_PROFILE = {{ dashboard_profile|tojson }};
 const UPLOAD_DEFAULT_ORIGIN = {{ upload_default_origin|tojson }};
 const VISIBLE_DATASET_ORIGINS = new Set({{ visible_dataset_origins|tojson }});
 const ENABLE_POLICY = {{ enable_policy|tojson }};
+const DASHBOARD_BUILD = {{ dashboard_build|tojson }};
 const ENABLE_EVAL_VIDEOS = DASHBOARD_PROFILE === 'simulation';
 const MODULE_LIST = ['overview', 'datasets', 'training'];
 if (ENABLE_POLICY) MODULE_LIST.push('policy', 'telemetry');
@@ -381,6 +411,8 @@ let latestDatasetLocations = null;
 let latestTelemetryKey = null;
 let previewUrls = new Map();
 let episodeMediaPlayers = [];
+let episodeVideoSyncState = {leader: null, currentTime: 0, playing: false, playbackRate: 1};
+let episodeImageSyncState = {timer: null, position: 0, playing: false, fps: 20};
 let episodeDatasetData = null;
 let episodeOffset = 0;
 let trainingMetricsData = null;
@@ -393,8 +425,17 @@ let trainingMetricDrag = null;
 const selectedTaskLogs = {training: null, eval: null, policy: null};
 const selectedTaskIds = new Set();
 const selectedEvalVideoIds = new Set();
+const expandedEvalVideoIds = new Set();
+let evalVideoDataById = new Map();
 const selectedCheckpointPaths = new Set();
 const episodeLimit = 100;
+const HANDOVER_MIC_EVENT_LABELS = {
+  0: 'E0 未稳定抓住 mic',
+  1: 'E1 donor 稳定抓住 mic',
+  2: 'E2 mic 稳定抬离支撑面',
+  3: 'E3 receiver 稳定抓住 mic',
+  4: 'E4 donor 释放且 receiver 独立持有',
+};
 
 function saveToken() {
   localStorage.setItem('bimanualVlaToken', tokenInput.value);
@@ -553,6 +594,7 @@ async function loadEvalVideos(includeRemote = false) {
   const summary = document.getElementById('evalVideoSummary');
   const list = document.getElementById('evalVideoList');
   if (!summary || !list) return;
+  let detachedPlayers = null;
   const params = new URLSearchParams({limit: '300'});
   if (includeRemote) params.set('include_remote', 'true');
   const taskFilter = document.getElementById('evalVideoTaskFilter')?.value.trim();
@@ -567,6 +609,7 @@ async function loadEvalVideos(includeRemote = false) {
   try {
     const data = await api(`/api/eval-videos?${params.toString()}`);
     const videos = data.videos || [];
+    evalVideoDataById = new Map(videos.map(video => [video.id, video]));
     const visibleIds = new Set(videos.filter(video => video.deletable).map(video => video.id));
     for (const videoId of [...selectedEvalVideoIds]) {
       if (!visibleIds.has(videoId)) selectedEvalVideoIds.delete(videoId);
@@ -579,40 +622,284 @@ async function loadEvalVideos(includeRemote = false) {
     const success = (data.facets && data.facets.success) || {};
     const remoteErrors = Object.entries(data.remote_errors || {}).map(([k, v]) => `${k}: ${String(v).slice(0, 160)}`);
     summary.textContent = `${videos.length}/${data.total ?? videos.length} 个视频 · 成功 ${success.success || 0} · 失败 ${success.failed || 0} · 未知 ${success.unknown || 0}${remoteErrors.length ? ' · 远端提示: ' + remoteErrors.join(' ; ') : ''}`;
+    detachedPlayers = detachEvalVideoPlayers();
     list.innerHTML = videos.map(video => renderEvalVideoRow(video)).join('') || '<div class="muted">没有找到符合筛选条件的 mp4/webm/mov/mkv/avi/gif 文件。</div>';
+    restoreEvalVideoPlayers(detachedPlayers);
     updateEvalVideoBulkControls();
   } catch (error) {
+    if (detachedPlayers) restoreEvalVideoPlayers(detachedPlayers);
     summary.textContent = `视频加载失败：${error.message}`;
     show(error.message);
   }
+}
+
+function evalPlayerId(videoId) {
+  return `evalPlayer_${videoId}`;
+}
+
+function evalVideoUrl(videoId) {
+  return `/api/eval-videos/${encodeURIComponent(videoId)}?token=${encodeURIComponent(tokenInput.value)}&cache=${Date.now()}`;
+}
+
+function eventLabelsForTrack(track, fallbackText = '') {
+  const labels = (track && track.labels) || {};
+  if (Object.keys(labels).length) return labels;
+  const text = String(fallbackText || '').toLowerCase();
+  if (text.includes('handover_mic') || text.includes('handover mic')) return HANDOVER_MIC_EVENT_LABELS;
+  return {};
+}
+
+function eventLabel(eventValue, track = null, fallbackText = '') {
+  if (eventValue == null || eventValue === '') return '-';
+  const value = Number(eventValue);
+  const labels = eventLabelsForTrack(track, fallbackText);
+  return labels[value] || `E${value}`;
+}
+
+function maxEventValue(track = null, fallbackText = '') {
+  const labels = eventLabelsForTrack(track, fallbackText);
+  const keys = Object.keys(labels).map(Number).filter(Number.isFinite);
+  if (keys.length) return Math.max(...keys);
+  if (track && Number.isFinite(Number(track.event_max_value))) return Math.max(0, Math.min(99, Number(track.event_max_value)));
+  return 4;
+}
+
+function editableTrackForEpisode(episode) {
+  const existing = episode && episode.event_track;
+  if (existing && existing.available) return existing;
+  const length = Math.max(1, Number((episode && episode.length) || 1));
+  const semantics = (episodeDatasetData && episodeDatasetData.event_semantics) || {};
+  return {
+    available: false,
+    editable: true,
+    create_mode: true,
+    source: 'new manual track',
+    timeline: [],
+    current_event: 0,
+    max_event_reached: 0,
+    max_step: length - 1,
+    length,
+    event_max_value: Number.isFinite(Number(semantics.event_max_value)) ? Number(semantics.event_max_value) : 4,
+    labels: semantics.labels || {},
+    marker_semantics: 'start_frame_until_next_marker',
+    overrides: {schema: 'event_markers.v1', marker_semantics: 'start_frame_until_next_marker', edits: []},
+    override_count: 0,
+  };
+}
+
+function normalizedTimeline(track) {
+  const timeline = Array.isArray(track && track.timeline) ? track.timeline : [];
+  return timeline
+    .map((item, index) => ({...item, step: Number(item.step ?? item.frame ?? index)}))
+    .filter(item => Number.isFinite(item.step))
+    .sort((a, b) => a.step - b.step);
+}
+
+function eventStepForVideo(video, track, currentTime, duration) {
+  const timeline = normalizedTimeline(track);
+  const maxStep = Number(track && track.max_step);
+  const timelineMax = timeline.length ? Math.max(...timeline.map(item => Number(item.step) || 0)) : 0;
+  const targetMax = Number.isFinite(maxStep) && maxStep > 0 ? maxStep : timelineMax;
+  if (duration > 0 && targetMax > 0) return Math.max(0, Math.min(targetMax, Math.round((currentTime / duration) * targetMax)));
+  return 0;
+}
+
+function eventStepForFrame(frame, track) {
+  const timeline = normalizedTimeline(track);
+  const maxStep = Number(track && track.max_step);
+  const timelineMax = timeline.length ? Math.max(...timeline.map(item => Number(item.step) || 0)) : 0;
+  const targetMax = Number.isFinite(maxStep) && maxStep > 0 ? maxStep : timelineMax;
+  return Math.max(0, Math.min(targetMax || frame, Math.round(frame)));
+}
+
+function eventStateAt(track, step) {
+  const timeline = normalizedTimeline(track);
+  let state = null;
+  for (const item of timeline) {
+    if (Number(item.step) > step) break;
+    state = {...(state || {}), ...item};
+  }
+  if (!state && timeline.length) state = {...timeline[0]};
+  const edits = (((track || {}).overrides || {}).edits || [])
+    .filter(Boolean)
+    .map((edit, index) => ({...edit, _markerOrder: index, _markerStart: Number(edit.start_step ?? edit.start_frame ?? edit.step ?? edit.frame)}))
+    .filter(edit => Number.isFinite(edit._markerStart))
+    .sort((left, right) => left._markerStart - right._markerStart || left._markerOrder - right._markerOrder);
+  // Each manual annotation is a change-point marker: it becomes active at its
+  // start frame and remains active until a later marker replaces it.
+  for (const edit of edits) {
+    if (edit._markerStart > step) break;
+    state = {...(state || {}), ...edit, manual_override: true, marker_active: true};
+  }
+  return state;
+}
+
+function renderEventOptions(maxValue, selected, track = null, fallbackText = '') {
+  const options = [];
+  for (let value = 0; value <= maxValue; value += 1) {
+    options.push(`<option value="${value}" ${Number(selected) === value ? 'selected' : ''}>${esc(eventLabel(value, track, fallbackText))}</option>`);
+  }
+  return options.join('');
+}
+
+function renderEventStatusHTML(track, step, fallbackText = '') {
+  if (!track || !track.available) return '<div class="event-status no-track">current_event: no event track</div>';
+  const resolvedState = eventStateAt(track, step);
+  const hasMarkers = Boolean((((track || {}).overrides || {}).edits || []).length);
+  const state = resolvedState || {};
+  const useTrackSummary = !hasMarkers;
+  const current = state.current_event ?? (useTrackSummary ? track.current_event : null);
+  const maxReached = state.max_event_reached ?? (useTrackSummary ? track.max_event_reached : null) ?? current;
+  const overrideText = state.manual_override ? ' <span class="event-pill">manual override</span>' : '';
+  const sourceText = track.source ? ` · source=${esc(track.source)}` : '';
+  const overrideCount = Number(track.override_count || (((track.overrides || {}).edits || []).length || 0));
+  return `<div class="event-status"><strong>step/frame ${esc(step)}</strong>${sourceText}${overrideCount ? ` · overrides=${overrideCount}` : ''}<br>`
+    + `<span class="event-pill">current: ${esc(eventLabel(current, track, fallbackText))}</span>`
+    + `<span class="event-pill">max: ${esc(eventLabel(maxReached, track, fallbackText))}</span>${overrideText}</div>`;
+}
+
+function renderEventEditorHTML(prefix, track, step, fallbackText = '', options = {}) {
+  if (!track || (!track.available && !options.allowCreate)) return '';
+  const resolvedState = eventStateAt(track, step);
+  const hasMarkers = Boolean((((track || {}).overrides || {}).edits || []).length);
+  const state = resolvedState || {};
+  const current = state.current_event ?? (!hasMarkers ? track.current_event : null) ?? 0;
+  const maxReached = state.max_event_reached ?? (!hasMarkers ? track.max_event_reached : null) ?? current;
+  const maxValue = maxEventValue(track, fallbackText);
+  return `<div class="event-editor" data-event-editor-prefix="${esc(prefix)}">`
+    + `<label style="margin:0">current</label><select data-event-current>${renderEventOptions(maxValue, current, track, fallbackText)}</select>`
+    + `<label style="margin:0">max</label><select data-event-max>${renderEventOptions(maxValue, maxReached, track, fallbackText)}</select>`
+    + `<input data-event-note placeholder="note 可选">`
+    + `<button type="button" class="secondary" data-event-save="marker">标记为 event 起始帧</button>`
+    + `<span class="muted">此 event 从当前帧持续到下一个 event 起始帧；若没有后续标注则持续到 episode 结束。</span>`
+    + `</div>`;
+}
+
+function bindEventEditor(container, saveFn, stepFn) {
+  container.querySelectorAll('[data-event-save]').forEach(button => {
+    button.addEventListener('click', async () => {
+      const editor = button.closest('.event-editor');
+      if (!editor) return;
+      const current = Number(editor.querySelector('[data-event-current]')?.value ?? 0);
+      const maxReached = Number(editor.querySelector('[data-event-max]')?.value ?? current);
+      const note = editor.querySelector('[data-event-note]')?.value || '';
+      const step = Math.max(0, Math.round(Number(stepFn()) || 0));
+      try {
+        const payload = {step, current_event: current, max_event_reached: maxReached, note};
+        await saveFn(payload);
+        show(`已保存 event 起始帧：step=${step}，持续到下一个 marker`, false);
+      } catch (error) {
+        show(error.message);
+      }
+    });
+  });
+}
+
+function detachEvalVideoPlayers() {
+  const players = new Map();
+  document.querySelectorAll('#evalVideoList [id^="evalPlayer_"]').forEach(holder => {
+    if (!holder.childNodes.length) return;
+    const videoId = holder.id.slice('evalPlayer_'.length);
+    const video = holder.querySelector('video');
+    const state = {
+      fragment: document.createDocumentFragment(),
+      paused: video ? video.paused : true,
+      currentTime: video ? video.currentTime : null,
+      playbackRate: video ? video.playbackRate : 1,
+    };
+    while (holder.firstChild) state.fragment.appendChild(holder.firstChild);
+    players.set(videoId, state);
+    expandedEvalVideoIds.add(videoId);
+  });
+  return players;
+}
+
+function restoreEvalVideoPlayers(players) {
+  players.forEach((state, videoId) => {
+    const holder = document.getElementById(evalPlayerId(videoId));
+    if (!holder) return;
+    holder.appendChild(state.fragment);
+    const video = holder.querySelector('video');
+    if (!video) return;
+    if (state.currentTime != null && Number.isFinite(state.currentTime)) {
+      try { video.currentTime = state.currentTime; } catch (_) {}
+    }
+    if (Number.isFinite(state.playbackRate)) video.playbackRate = state.playbackRate;
+    if (!state.paused) video.play().catch(() => {});
+  });
 }
 
 function renderEvalVideoRow(video) {
   const statusClass = video.success === 'success' ? 'ok' : video.success === 'failed' ? 'bad' : 'warn';
   const statusLabel = video.success === 'success' ? '成功' : video.success === 'failed' ? '失败' : '未知';
   const meta = `${esc(video.source || (video.remote ? 'remote' : '4×4090'))} · task=${esc(video.task || '-')} · exp=${esc(video.experiment || '-')} · ${esc(video.updated_at)} · ${esc(video.size_mib)} MiB`;
-  const holderId = `evalPlayer_${esc(video.id)}`;
+  const holderId = evalPlayerId(esc(video.id));
   const label = video.display_name || video.name || video.relative_path;
   const checkbox = video.deletable
     ? `<input type="checkbox" class="eval-video-select" data-video-id="${esc(video.id)}" data-video-label="${esc(label)}" data-video-path="${esc(video.relative_path)}" onchange="onEvalVideoSelectionChange(this)" ${selectedEvalVideoIds.has(video.id) ? 'checked' : ''} aria-label="选择评估视频 ${esc(video.relative_path)}">`
     : `<span class="muted" title="远端视频请先同步到 4×4090">远端</span>`;
   const action = video.remote
     ? `<button class="inline" type="button" data-source="${esc(video.source)}" data-root="${esc(video.root)}" data-relative-path="${esc(video.relative_path)}" onclick="syncEvalVideo(this.dataset.source, this.dataset.root, this.dataset.relativePath)">同步到 4×4090</button>`
-    : `<button class="inline" type="button" data-video-id="${esc(video.id)}" onclick="playEvalVideo(this.dataset.videoId)">加载 / 播放</button><button class="inline danger" type="button" data-video-id="${esc(video.id)}" data-video-label="${esc(label)}" onclick="deleteEvalVideo(this.dataset.videoId, this.dataset.videoLabel)">删除</button>`;
+    : `<button class="inline" type="button" data-video-id="${esc(video.id)}" onclick="playEvalVideo(this.dataset.videoId)">${expandedEvalVideoIds.has(video.id) ? '收起播放器' : '加载 / 播放'}</button><button class="inline danger" type="button" data-video-id="${esc(video.id)}" data-video-label="${esc(label)}" onclick="deleteEvalVideo(this.dataset.videoId, this.dataset.videoLabel)">删除</button>`;
+  const eventSummary = renderEvalEventSummary(video);
   return `<div class="eval-video-card${video.remote ? ' remote' : ''}" data-video-id="${esc(video.id)}">
-    <header><div class="eval-video-header"><div class="eval-video-select-cell">${checkbox}</div><div class="eval-video-title"><strong>${esc(video.display_name || video.name || video.relative_path)}</strong> <span class="${statusClass}">${statusLabel}</span><br><code class="path">${esc(video.relative_path)}</code><br><span class="muted">${meta}${video.score == null ? '' : ` · score=${esc(video.score)}`}</span></div></div><div class="eval-video-actions">${action}</div></header>
+    <header><div class="eval-video-header"><div class="eval-video-select-cell">${checkbox}</div><div class="eval-video-title"><strong>${esc(video.display_name || video.name || video.relative_path)}</strong> <span class="${statusClass}">${statusLabel}</span><br><code class="path">${esc(video.relative_path)}</code><br><span class="muted">${meta}${video.score == null ? '' : ` · score=${esc(video.score)}`}</span>${eventSummary}</div></div><div class="eval-video-actions">${action}</div></header>
     <div id="${holderId}"></div>
   </div>`;
 }
 
+function renderEvalEventSummary(video) {
+  const track = video && video.event_track;
+  if (!track || !track.available) return '';
+  const text = `${video.task || ''} ${video.relative_path || ''}`;
+  const cur = track.current_event;
+  const maxReached = track.max_event_reached ?? cur;
+  const overrideCount = Number(track.override_count || (((track.overrides || {}).edits || []).length || 0));
+  return `<br><span class="event-pill">cur ${esc(eventLabel(cur, track, text))}</span><span class="event-pill">max ${esc(eventLabel(maxReached, track, text))}</span><span class="muted">${track.source ? ` · event=${esc(track.source)}` : ''}${overrideCount ? ` · overrides=${overrideCount}` : ''}</span>`;
+}
+
 function playEvalVideo(videoId) {
-  const holder = document.getElementById(`evalPlayer_${videoId}`);
+  const holder = document.getElementById(evalPlayerId(videoId));
   if (!holder) return;
   if (holder.innerHTML.trim()) {
     holder.innerHTML = '';
+    expandedEvalVideoIds.delete(videoId);
     return;
   }
-  holder.innerHTML = `<video controls autoplay preload="metadata" src="/api/eval-videos/${encodeURIComponent(videoId)}?token=${encodeURIComponent(tokenInput.value)}&cache=${Date.now()}"></video>`;
+  expandedEvalVideoIds.add(videoId);
+  const video = evalVideoDataById.get(videoId) || {};
+  const track = video.event_track;
+  holder.innerHTML = `<video controls autoplay preload="metadata" src="${evalVideoUrl(videoId)}"></video><div data-eval-event-status></div><div data-eval-event-editor></div>`;
+  const player = holder.querySelector('video');
+  const status = holder.querySelector('[data-eval-event-status]');
+  const editor = holder.querySelector('[data-eval-event-editor]');
+  const fallbackText = `${video.task || ''} ${video.relative_path || ''}`;
+  const update = () => {
+    if (!status || !player) return;
+    const step = eventStepForVideo(video, track, Number(player.currentTime || 0), Number(player.duration || 0));
+    status.innerHTML = renderEventStatusHTML(track, step, fallbackText);
+    if (editor) {
+      if (editor.contains(document.activeElement) && editor.querySelector('.event-editor')) return;
+      editor.innerHTML = renderEventEditorHTML('eval', track, step, fallbackText);
+      bindEventEditor(editor, async payload => {
+        const saved = await api(`/api/eval-videos/${encodeURIComponent(videoId)}/event-overrides`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
+        });
+        if (track) {
+          track.overrides = saved;
+          track.override_count = saved.override_count || ((saved.edits || []).length || 0);
+          if (saved.max_step != null) track.max_step = saved.max_step;
+          video.event_track = track;
+          evalVideoDataById.set(videoId, video);
+        }
+        update();
+      }, () => eventStepForVideo(video, track, Number(player.currentTime || 0), Number(player.duration || 0)));
+    }
+  };
+  player.addEventListener('loadedmetadata', update);
+  player.addEventListener('timeupdate', update);
+  player.addEventListener('seeked', update);
+  update();
 }
 
 async function syncEvalVideo(source, root, relativePath) {
@@ -934,16 +1221,84 @@ async function deleteDataset(datasetId) {
   }
 }
 
-async function loadDatasetEpisodes(offset = episodeOffset) {
-  clearEpisodeMedia();
+function parseDatasetEventLabels(text, maxValue) {
+  const labels = {};
+  for (const rawLine of String(text || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const match = line.match(/^E?(\d+)\s*[:：=-]\s*(.+)$/i);
+    if (!match) throw new Error(`Event 定义格式无效：${line}`);
+    const event = Number(match[1]);
+    if (!Number.isInteger(event) || event < 0 || event > maxValue) {
+      throw new Error(`Event 编号必须在 E0..E${maxValue}：${line}`);
+    }
+    const meaning = match[2].trim();
+    if (!meaning) throw new Error(`Event 语义不能为空：${line}`);
+    labels[String(event)] = `E${event} ${meaning}`;
+  }
+  return labels;
+}
+
+function renderDatasetEventSemantics(semantics = null) {
+  const value = semantics || {};
+  const maxValue = Math.max(0, Math.min(99, Number(value.event_max_value ?? 4) || 0));
+  const labels = value.labels && typeof value.labels === 'object' ? value.labels : {};
+  document.getElementById('datasetEventMaxValue').value = String(maxValue);
+  document.getElementById('datasetEventDescription').value = value.description || '';
+  document.getElementById('datasetEventLabels').value = Array.from({length: maxValue + 1}, (_, event) => {
+    const raw = String(labels[event] || labels[String(event)] || `E${event}`);
+    const meaning = raw.replace(new RegExp(`^E${event}\\s*`, 'i'), '').trim();
+    return `E${event}: ${meaning}`;
+  }).join('\n');
+  const status = document.getElementById('datasetEventSemanticsStatus');
+  status.textContent = value.exists
+    ? `已加载独立文件 · ${value.path || 'meta/event_semantics.json'}`
+    : '尚无独立文件；保存后创建 meta/event_semantics.json';
+}
+
+async function saveDatasetEventSemantics() {
   const datasetId = document.getElementById('editorDataset').value;
   if (!datasetId) {
-    document.getElementById('episodeRows').innerHTML = '<tr><td colspan="7" class="muted">暂无数据集</td></tr>';
+    show('请先选择数据集。');
+    return;
+  }
+  const maxValue = Math.max(0, Math.min(99, Math.round(Number(document.getElementById('datasetEventMaxValue').value) || 0)));
+  try {
+    const labels = parseDatasetEventLabels(document.getElementById('datasetEventLabels').value, maxValue);
+    const saved = await api(`/api/datasets/${encodeURIComponent(datasetId)}/event-semantics`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        event_max_value: maxValue,
+        labels,
+        description: document.getElementById('datasetEventDescription').value || '',
+      }),
+    });
+    if (episodeDatasetData) episodeDatasetData.event_semantics = saved;
+    renderDatasetEventSemantics(saved);
+    await loadDatasetEpisodes(episodeOffset);
+    show(`已保存 ${datasetId}/meta/event_semantics.json`, false);
+  } catch (error) {
+    show(error.message);
+  }
+}
+
+async function loadDatasetEpisodes(offset = episodeOffset) {
+  clearEpisodeMedia();
+  const eventBox = document.getElementById('episodeEventTrack');
+  if (eventBox) {
+    eventBox.className = 'event-status no-track';
+    eventBox.textContent = '选择 episode 后加载。';
+  }
+  const datasetId = document.getElementById('editorDataset').value;
+  if (!datasetId) {
+    document.getElementById('episodeRows').innerHTML = '<tr><td colspan="8" class="muted">暂无数据集</td></tr>';
     return;
   }
   try {
     episodeOffset = Math.max(0, offset);
     episodeDatasetData = await api(`/api/datasets/${encodeURIComponent(datasetId)}?offset=${episodeOffset}&limit=${episodeLimit}`);
+    renderDatasetEventSemantics(episodeDatasetData.event_semantics);
     renderEpisodeRows();
   } catch (error) {
     show(error.message);
@@ -958,8 +1313,9 @@ function renderEpisodeRows() {
       <td><code>${esc(e.episode_index)}</code></td><td>${esc(e.length)}</td>
       <td>${esc(e.instruction)}</td><td>${e.task_name == null || e.task_name === '' ? '<span class="muted">-</span>' : esc(e.task_name)}</td>
       <td class="${e.success === false ? 'bad' : e.success === true ? 'ok' : 'muted'}">${e.success == null ? '-' : esc(e.success)}</td>
+      <td>${renderEpisodeEventCell(e)}</td>
       <td><button class="inline secondary" onclick="editEpisode(${Number(e.episode_index)})">编辑</button></td>
-    </tr>`).join('') || '<tr><td colspan="7" class="muted">没有 episode</td></tr>';
+    </tr>`).join('') || '<tr><td colspan="8" class="muted">没有 episode</td></tr>';
   const start = data.total ? data.offset + 1 : 0;
   const end = Math.min(data.total, data.offset + data.limit);
   const info = data.info || {};
@@ -969,6 +1325,16 @@ function renderEpisodeRows() {
   document.getElementById('episodePage').textContent = `${start}-${end} / ${data.total}`;
 }
 
+function renderEpisodeEventCell(episode) {
+  const track = episode && episode.event_track;
+  if (!track || !track.available) return '<span class="muted">no event</span><br><span class="muted">可在编辑页新增</span>';
+  const text = `${episode.instruction || ''} ${episode.task_name || ''}`;
+  const cur = track.current_event;
+  const maxReached = track.max_event_reached ?? cur;
+  const overrideCount = Number(track.override_count || (((track.overrides || {}).edits || []).length || 0));
+  return `<span class="event-pill">cur ${esc(eventLabel(cur, track, text))}</span><span class="event-pill">max ${esc(eventLabel(maxReached, track, text))}</span>${overrideCount ? `<br><span class="muted">overrides=${overrideCount}</span>` : ''}`;
+}
+
 function changeEpisodePage(direction) {
   if (!episodeDatasetData) return;
   const next = episodeOffset + direction * episodeLimit;
@@ -976,19 +1342,168 @@ function changeEpisodePage(direction) {
   loadDatasetEpisodes(next);
 }
 
+const EPISODE_VIDEO_SYNC_DRIFT_SECONDS = 0.08;
+
+function activeEpisodeVideoPlayers(source = null) {
+  return episodeMediaPlayers.filter(player => (
+    player.type === 'video'
+    && player.video
+    && player.video.isConnected
+    && (!source || Number(player.episodeIndex) === Number(source.episodeIndex))
+  ));
+}
+
+function isActiveEpisodeVideoPlayer(player) {
+  return activeEpisodeVideoPlayers(player).includes(player);
+}
+
+function clampEpisodeVideoTime(video, seconds) {
+  const value = Math.max(0, Number(seconds) || 0);
+  const duration = Number(video && video.duration);
+  return Number.isFinite(duration) && duration > 0 ? Math.min(value, duration) : value;
+}
+
+function setEpisodeVideoTime(player, seconds, force = false) {
+  const video = player && player.video;
+  if (!video) return;
+  const target = clampEpisodeVideoTime(video, seconds);
+  if (video.readyState === 0) {
+    player.pendingSyncTime = target;
+    return;
+  }
+  const difference = Math.abs(Number(video.currentTime || 0) - target);
+  if (difference < 0.005 || (!force && difference < EPISODE_VIDEO_SYNC_DRIFT_SECONDS)) return;
+  player.syncingSeek = true;
+  player.pendingSyncTime = null;
+  try {
+    video.currentTime = target;
+  } catch (_error) {
+    player.pendingSyncTime = target;
+    player.syncingSeek = false;
+    return;
+  }
+  // Some browsers omit seeked when the target is already buffered.  Avoid
+  // leaving the guard set forever while still suppressing the generated event.
+  window.setTimeout(() => { player.syncingSeek = false; }, 750);
+}
+
+function syncEpisodeVideoTime(source, force = false) {
+  if (!isActiveEpisodeVideoPlayer(source)) return;
+  const time = Math.max(0, Number(source.video.currentTime || 0));
+  episodeVideoSyncState.leader = source;
+  episodeVideoSyncState.currentTime = time;
+  for (const player of activeEpisodeVideoPlayers(source)) {
+    if (player !== source) setEpisodeVideoTime(player, time, force);
+  }
+}
+
+function syncEpisodeVideoPlayback(source, playing) {
+  if (!isActiveEpisodeVideoPlayer(source)) return;
+  episodeVideoSyncState.leader = source;
+  episodeVideoSyncState.currentTime = Math.max(0, Number(source.video.currentTime || 0));
+  episodeVideoSyncState.playing = Boolean(playing);
+  episodeVideoSyncState.playbackRate = Number(source.video.playbackRate || 1);
+  syncEpisodeVideoTime(source, true);
+  for (const player of activeEpisodeVideoPlayers(source)) {
+    if (player === source) continue;
+    player.video.playbackRate = episodeVideoSyncState.playbackRate;
+    if (playing && player.video.paused) {
+      player.syncingPlayback = 'play';
+      player.video.play().catch(() => {
+        player.syncingPlayback = null;
+        player.status.textContent = '同步播放失败：请检查浏览器自动播放权限或视频解码';
+        player.status.className = 'warn';
+      });
+    } else if (!playing && !player.video.paused) {
+      player.syncingPlayback = 'pause';
+      player.video.pause();
+    }
+  }
+}
+
+function syncEpisodeVideoRate(source) {
+  if (!isActiveEpisodeVideoPlayer(source)) return;
+  const rate = Number(source.video.playbackRate || 1);
+  episodeVideoSyncState.playbackRate = rate;
+  for (const player of activeEpisodeVideoPlayers(source)) {
+    if (player !== source && Number(player.video.playbackRate) !== rate) {
+      player.syncingRate = true;
+      player.video.playbackRate = rate;
+    }
+  }
+}
+
 function clearEpisodeMedia() {
-  for (const player of episodeMediaPlayers) {
+  const oldPlayers = episodeMediaPlayers;
+  episodeMediaPlayers = [];
+  episodeVideoSyncState = {leader: null, currentTime: 0, playing: false, playbackRate: 1};
+  if (episodeImageSyncState.timer) clearInterval(episodeImageSyncState.timer);
+  episodeImageSyncState = {timer: null, position: 0, playing: false, fps: 20};
+  for (const player of oldPlayers) {
     if (player.timer) clearInterval(player.timer);
     player.generation = (player.generation || 0) + 1;
+    if (player.video) player.video.pause();
     if (player.objectUrl) URL.revokeObjectURL(player.objectUrl);
   }
-  episodeMediaPlayers = [];
+}
+
+function updateEpisodeEventDisplay(episode, frame = 0) {
+  const box = document.getElementById('episodeEventTrack');
+  if (!box) return;
+  const track = editableTrackForEpisode(episode);
+  const text = `${(episode && episode.instruction) || ''} ${(episode && episode.task_name) || ''}`;
+  const step = eventStepForFrame(frame, track);
+  box.className = track.available ? 'event-status' : 'event-status no-track';
+  if (box.dataset.episodeIndex !== String(episode.episode_index) || !box.querySelector('[data-episode-event-status]')) {
+    box.dataset.episodeIndex = String(episode.episode_index);
+    box.innerHTML = '<div data-episode-event-status></div><div data-episode-event-editor></div>';
+  }
+  const statusEl = box.querySelector('[data-episode-event-status]');
+  const editorEl = box.querySelector('[data-episode-event-editor]');
+  if (statusEl) {
+    statusEl.innerHTML = track.available
+      ? renderEventStatusHTML(track, step, text)
+      : '<div class="event-status no-track"><strong>当前没有 event track</strong><br>可从当前播放帧新增标注；保存后会创建独立 override sidecar，不修改原 parquet。</div>';
+  }
+  const editorFocused = editorEl && editorEl.contains(document.activeElement);
+  if (editorEl && (!editorFocused || !editorEl.querySelector('.event-editor'))) {
+    editorEl.innerHTML = renderEventEditorHTML('episode', track, step, text, {allowCreate: true});
+    bindEventEditor(editorEl, async payload => {
+      const datasetId = document.getElementById('editorDataset').value;
+      if (!datasetId) throw new Error('未选择 dataset');
+      await api(`/api/datasets/${encodeURIComponent(datasetId)}/episodes/${episode.episode_index}/event-overrides`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
+      });
+      const keepFrame = Number(payload.step || 0);
+      await loadDatasetEpisodes(episodeOffset);
+      await editEpisode(Number(episode.episode_index));
+      const refreshed = ((episodeDatasetData && episodeDatasetData.episodes) || [])
+        .find(item => Number(item.episode_index) === Number(episode.episode_index));
+      updateEpisodeEventDisplay(refreshed || episode, keepFrame);
+    }, () => eventStepForFrame(frame, track));
+  }
+}
+
+function activeEpisodeImagePlayers(source = null) {
+  return episodeMediaPlayers.filter(player => (
+    player.type === 'image'
+    && player.image
+    && player.image.isConnected
+    && (!source || Number(player.episodeIndex) === Number(source.episodeIndex))
+  ));
 }
 
 async function loadImageFrame(player, frameIndex) {
-  if (player.loading || player.frames <= 0) return;
+  if (player.frames <= 0) return;
   const index = Math.max(0, Math.min(player.frames - 1, Math.floor(frameIndex)));
+  if (player.loading) {
+    // Keep only the newest synchronized target.  This prevents a slow camera
+    // request from permanently falling behind the other two cameras.
+    player.pendingFrame = index;
+    return;
+  }
   player.loading = true;
+  player.pendingFrame = null;
   const generation = player.generation;
   try {
     const blob = await apiBlob(`/api/datasets/${encodeURIComponent(player.datasetId)}/episodes/${player.episodeIndex}/image/${encodeURIComponent(player.key)}/${index}`);
@@ -1000,40 +1515,66 @@ async function loadImageFrame(player, frameIndex) {
     player.frame = index;
     player.slider.value = String(index);
     player.counter.textContent = `${index + 1} / ${player.frames}`;
+    if (player.episode) updateEpisodeEventDisplay(player.episode, index);
   } catch (error) {
     player.status.textContent = `加载失败：${error.message}`;
     player.status.className = 'bad';
-    player.playing = false;
-    player.button.textContent = '播放';
+    setEpisodeImagePlaying(false);
   } finally {
     player.loading = false;
+    const pending = player.pendingFrame;
+    player.pendingFrame = null;
+    if (generation === player.generation && pending != null && pending !== player.frame) {
+      loadImageFrame(player, pending);
+    }
   }
 }
 
-function setImagePlayerPlaying(player, playing) {
-  player.playing = playing;
-  player.button.textContent = playing ? '暂停' : '播放';
-  if (player.timer) clearInterval(player.timer);
-  player.timer = null;
-  if (!playing || player.frames <= 1) return;
-  const renderFps = Math.max(1, Math.min(Number(player.fps) || 20, 10));
-  const sourceFps = Math.max(1, Number(player.fps) || 20);
-  player.timer = setInterval(() => {
-    if (!player.playing || player.loading) return;
-    player.position = (player.position + sourceFps / renderFps) % player.frames;
-    loadImageFrame(player, Math.floor(player.position));
+function seekEpisodeImagePlayers(source, frameIndex) {
+  const players = activeEpisodeImagePlayers(source);
+  if (!players.length) return;
+  const sharedFrames = Math.max(1, Math.min(...players.map(player => Math.max(1, Number(player.frames) || 1))));
+  const frame = Math.max(0, Math.min(sharedFrames - 1, Math.round(Number(frameIndex) || 0)));
+  episodeImageSyncState.position = frame;
+  for (const player of players) {
+    player.position = frame;
+    player.slider.value = String(frame);
+    loadImageFrame(player, frame);
+  }
+}
+
+function setEpisodeImagePlaying(playing, source = null) {
+  const players = activeEpisodeImagePlayers(source);
+  episodeImageSyncState.playing = Boolean(playing);
+  if (episodeImageSyncState.timer) clearInterval(episodeImageSyncState.timer);
+  episodeImageSyncState.timer = null;
+  for (const player of players) {
+    player.playing = episodeImageSyncState.playing;
+    player.button.textContent = episodeImageSyncState.playing ? '暂停全部' : '播放全部';
+  }
+  if (!episodeImageSyncState.playing || !players.length) return;
+  const sharedFrames = Math.max(1, Math.min(...players.map(player => Math.max(1, Number(player.frames) || 1))));
+  if (sharedFrames <= 1) return;
+  const sourceFps = Math.max(1, Number((source && source.fps) || players[0].fps) || 20);
+  const renderFps = Math.max(1, Math.min(sourceFps, 10));
+  episodeImageSyncState.fps = sourceFps;
+  episodeImageSyncState.timer = setInterval(() => {
+    if (!episodeImageSyncState.playing) return;
+    episodeImageSyncState.position = (episodeImageSyncState.position + sourceFps / renderFps) % sharedFrames;
+    seekEpisodeImagePlayers(players[0], Math.floor(episodeImageSyncState.position));
   }, 1000 / renderFps);
 }
 
 function createImagePlayer(container, datasetId, episode, media) {
   const card = document.createElement('div');
   card.className = 'media-card';
+  card.dataset.cameraSync = 'shared-image-clock';
   const header = document.createElement('header');
   const title = document.createElement('strong');
   title.textContent = media.key.replace('observation.images.', '');
   const status = document.createElement('span');
   status.className = 'muted';
-  status.textContent = `图片序列 · ${media.fps || 20} fps`;
+  status.textContent = `图片序列 · ${media.fps || 20} fps · 强制同步`;
   header.append(title, status);
   const image = document.createElement('img');
   image.alt = `${title.textContent} frame`;
@@ -1042,12 +1583,14 @@ function createImagePlayer(container, datasetId, episode, media) {
   const button = document.createElement('button');
   button.type = 'button';
   button.className = 'inline secondary';
-  button.textContent = '暂停';
+  button.textContent = '播放全部';
+  button.dataset.cameraSyncControl = 'play-pause-all';
   const slider = document.createElement('input');
   slider.type = 'range';
   slider.min = '0';
   slider.max = String(Math.max(0, Number(media.frames || episode.length || 1) - 1));
   slider.value = '0';
+  slider.dataset.cameraSyncControl = 'seek-all';
   const counter = document.createElement('span');
   counter.className = 'muted';
   counter.textContent = `1 / ${Number(media.frames || episode.length || 1)}`;
@@ -1058,17 +1601,14 @@ function createImagePlayer(container, datasetId, episode, media) {
   const player = {
     type: 'image', datasetId, episodeIndex: episode.episode_index, key: media.key,
     fps: Number(media.fps || 20), frames: Number(media.frames || episode.length || 0),
+    episode,
     frame: 0, position: 0, image, slider, counter, button, status,
-    playing: true, loading: false, timer: null, url: null, generation: 0,
+    playing: false, loading: false, pendingFrame: null, timer: null, url: null, generation: 0,
   };
   episodeMediaPlayers.push(player);
-  button.addEventListener('click', () => setImagePlayerPlaying(player, !player.playing));
-  slider.addEventListener('input', () => {
-    player.position = Number(slider.value);
-    loadImageFrame(player, player.position);
-  });
-  loadImageFrame(player, 0);
-  setImagePlayerPlaying(player, true);
+  button.addEventListener('click', () => setEpisodeImagePlaying(!episodeImageSyncState.playing, player));
+  slider.addEventListener('input', () => seekEpisodeImagePlayers(player, Number(slider.value)));
+  loadImageFrame(player, episodeImageSyncState.position);
 }
 
 async function createVideoPlayer(container, datasetId, episode, media) {
@@ -1079,14 +1619,22 @@ async function createVideoPlayer(container, datasetId, episode, media) {
   title.textContent = media.key.replace('observation.images.', '');
   const status = document.createElement('span');
   status.className = 'muted';
-  status.textContent = 'MP4';
+  status.textContent = 'MP4 · 强制同步';
   header.append(title, status);
   const video = document.createElement('video');
   video.controls = true;
   video.preload = 'metadata';
-  card.append(header, video);
+  const eventBox = document.createElement('div');
+  eventBox.className = 'event-status no-track';
+  eventBox.textContent = 'current_event: no event track';
+  card.append(header, video, eventBox);
   container.appendChild(card);
-  const player = {type: 'video', timer: null, url: null, objectUrl: null, generation: 0};
+  const player = {
+    type: 'video', datasetId, episodeIndex: episode.episode_index, key: media.key,
+    episode, media, video, status, eventBox,
+    timer: null, url: null, objectUrl: null, generation: 0,
+    pendingSyncTime: null, syncingSeek: false, syncingPlayback: null, syncingRate: false,
+  };
   episodeMediaPlayers.push(player);
   if (!tokenInput.value) {
     status.textContent = '加载失败：缺少 Token';
@@ -1100,14 +1648,77 @@ async function createVideoPlayer(container, datasetId, episode, media) {
   const url = `/api/datasets/${encodeURIComponent(datasetId)}/episodes/${episode.episode_index}/video/${encodeURIComponent(media.key)}?token=${encodeURIComponent(tokenInput.value)}&cache=${Date.now()}`;
   player.url = url;
   video.src = url;
+
+  const updateEvent = () => {
+    const fps = Number(media.fps || (episodeDatasetData && episodeDatasetData.info && episodeDatasetData.info.fps) || 20);
+    const frame = Math.max(0, Math.round(Number(video.currentTime || 0) * (Number.isFinite(fps) && fps > 0 ? fps : 20)));
+    eventBox.className = 'event-status';
+    eventBox.innerHTML = renderEventStatusHTML(episode.event_track, eventStepForFrame(frame, episode.event_track), `${episode.instruction || ''} ${episode.task_name || ''}`);
+    updateEpisodeEventDisplay(episode, frame);
+  };
+
   video.addEventListener('loadedmetadata', () => {
-    status.textContent = `MP4 · ${media.fps || 20} fps · ${media.frames || episode.length || '-'} frames`;
+    status.textContent = `MP4 · ${media.fps || 20} fps · ${media.frames || episode.length || '-'} frames · 强制同步`;
     status.className = 'muted';
+    video.playbackRate = Number(episodeVideoSyncState.playbackRate || 1);
+    const pendingTime = player.pendingSyncTime == null
+      ? Number(episodeVideoSyncState.currentTime || 0)
+      : Number(player.pendingSyncTime);
+    setEpisodeVideoTime(player, pendingTime, true);
+    if (episodeVideoSyncState.playing && video.paused) {
+      player.syncingPlayback = 'play';
+      video.play().catch(() => { player.syncingPlayback = null; });
+    }
+    updateEvent();
   });
+  video.addEventListener('play', () => {
+    if (!isActiveEpisodeVideoPlayer(player)) return;
+    if (player.syncingPlayback === 'play') {
+      player.syncingPlayback = null;
+      return;
+    }
+    syncEpisodeVideoPlayback(player, true);
+  });
+  video.addEventListener('pause', () => {
+    if (!isActiveEpisodeVideoPlayer(player)) return;
+    if (player.syncingPlayback === 'pause') {
+      player.syncingPlayback = null;
+      return;
+    }
+    syncEpisodeVideoPlayback(player, false);
+  });
+  video.addEventListener('seeking', () => {
+    updateEvent();
+    if (player.syncingSeek) return;
+    syncEpisodeVideoTime(player, true);
+  });
+  video.addEventListener('seeked', () => {
+    updateEvent();
+    if (player.syncingSeek) {
+      player.syncingSeek = false;
+      return;
+    }
+    syncEpisodeVideoTime(player, true);
+  });
+  video.addEventListener('timeupdate', () => {
+    updateEvent();
+    if (!video.paused && (!episodeVideoSyncState.leader || episodeVideoSyncState.leader === player)) {
+      syncEpisodeVideoTime(player, false);
+    }
+  });
+  video.addEventListener('ratechange', () => {
+    if (player.syncingRate) {
+      player.syncingRate = false;
+      return;
+    }
+    syncEpisodeVideoRate(player);
+  });
+  video.addEventListener('ended', () => syncEpisodeVideoPlayback(player, false));
   video.addEventListener('error', () => {
     status.textContent = '加载失败：视频请求未授权或浏览器无法解码';
     status.className = 'bad';
   });
+  updateEvent();
 }
 
 async function editEpisode(index) {
@@ -1121,6 +1732,7 @@ async function editEpisode(index) {
   document.getElementById('episodeSuccess').value = episode.success == null ? '' : episode.success === false ? 'false' : 'true';
   document.getElementById('episodeMetadata').value = JSON.stringify(episode.parameters || {}, null, 2);
   document.getElementById('episodeRemoveMetadata').value = '';
+  updateEpisodeEventDisplay(episode, 0);
 
   clearEpisodeMedia();
   const container = document.getElementById('episodeVideos');
@@ -1137,6 +1749,14 @@ async function editEpisode(index) {
   for (const item of media) {
     if (item.type === 'image') createImagePlayer(container, datasetId, episode, item);
     else if (item.type === 'video') createVideoPlayer(container, datasetId, episode, item);
+  }
+  // Image-backed LeRobot datasets (including handover_mic_*) expose three
+  // camera streams as frame sequences rather than MP4.  Start them only after
+  // all players exist so one shared timer advances every camera together.
+  const imagePlayers = activeEpisodeImagePlayers();
+  if (imagePlayers.length) {
+    seekEpisodeImagePlayers(imagePlayers[0], 0);
+    setEpisodeImagePlaying(true, imagePlayers[0]);
   }
 }
 
@@ -2280,6 +2900,76 @@ function jobDependencySummary(task) {
   return `<br><span class="ok">由 norm 自动串联</span><br><code class="task-ref" title="${esc(id)}">${esc(shortTaskId(id))}</code>`;
 }
 
+function trainingMetricProbe(task) {
+  return (task && task.training_metrics && typeof task.training_metrics === 'object') ? task.training_metrics : {};
+}
+
+function trainingMetricStatus(task) {
+  if (!task || task.type !== 'train') return 'not_train';
+  const probe = trainingMetricProbe(task);
+  if (probe.status) return String(probe.status);
+  if (probe.has_points === true) return 'has_metrics';
+  if (probe.has_points === false) return 'no_metrics';
+  if (task.metrics && Number(task.metrics.latest_step || 0) > 0) return 'has_metrics';
+  return 'unknown';
+}
+
+function trainingMetricInline(task) {
+  if (!task || task.type !== 'train') return '';
+  const probe = trainingMetricProbe(task);
+  const status = trainingMetricStatus(task);
+  if (status === 'has_metrics') {
+    const points = Number(probe.total_points || 0);
+    const step = Number(probe.latest_step || 0);
+    if (probe.partial) return `<br><span class="ok">训练曲线：有数据（早期日志命中${step ? ` · first step ${esc(step)}` : ''}）</span>`;
+    return `<br><span class="ok">训练曲线：${points ? `${esc(points)} 点` : '有数据'}${step ? ` · latest step ${esc(step)}` : ''}</span>`;
+  }
+  if (status === 'no_metrics') {
+    return '<br><span class="warn">训练曲线：无指标点</span>';
+  }
+  return '<br><span class="muted">训练曲线：未知（远端 Slurm 日志未扫描或日志暂不可读）</span>';
+}
+
+function filteredTrainingJobs(items) {
+  const typeFilter = document.getElementById('trainingTaskTypeFilter')?.value || 'all';
+  const metricFilter = document.getElementById('trainingMetricFilter')?.value || 'all';
+  let jobs = items.filter(t => TRAINING_TASK_TYPES.has(t.type));
+  if (typeFilter !== 'all') jobs = jobs.filter(t => t.type === typeFilter);
+  if (metricFilter !== 'all') {
+    jobs = jobs.filter(t => {
+      if (t.type !== 'train') return false;
+      const status = trainingMetricStatus(t);
+      if (metricFilter === 'has_metrics') return status === 'has_metrics';
+      if (metricFilter === 'no_metrics') return status === 'no_metrics';
+      if (metricFilter === 'no_metrics_terminal') return status === 'no_metrics' && TERMINAL_STATES.has(t.state);
+      if (metricFilter === 'unknown_metrics') return status === 'unknown';
+      return true;
+    });
+  }
+  return jobs;
+}
+
+function updateTrainingTaskFilterSummary(allJobs, shownJobs) {
+  const el = document.getElementById('trainingTaskFilterSummary');
+  if (!el) return;
+  const counts = {train: 0, norm: 0, eval: 0};
+  let withMetrics = 0;
+  let noMetrics = 0;
+  let noMetricsTerminal = 0;
+  let unknownMetrics = 0;
+  for (const task of allJobs) {
+    if (counts[task.type] !== undefined) counts[task.type] += 1;
+    if (task.type !== 'train') continue;
+    const status = trainingMetricStatus(task);
+    if (status === 'has_metrics') withMetrics += 1;
+    else if (status === 'no_metrics') {
+      noMetrics += 1;
+      if (TERMINAL_STATES.has(task.state)) noMetricsTerminal += 1;
+    } else if (status === 'unknown') unknownMetrics += 1;
+  }
+  el.textContent = `显示 ${shownJobs.length}/${allJobs.length} · train ${counts.train} / norm ${counts.norm} / eval ${counts.eval} · 曲线 ${withMetrics} 有 / ${noMetrics} 无（已结束 ${noMetricsTerminal}） / ${unknownMetrics} 未知`;
+}
+
 
 function formatBytes(value) {
   const number = Number(value);
@@ -2363,7 +3053,9 @@ function fillTasks(items) {
     return `<tr><td class="task-selection-cell">${checkbox}</td><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid || '-')}${badge}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal ? `<br>${esc(t.stop_signal)}` : ''}</td><td>GPU ${esc((m.gpu_ids || []).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.arm_mode || '-')}</span> <span class="pill">${esc(m.schema || '-')}</span></td><td>dataset=${esc(m.dataset_id)} · <span class="pill">${esc(modelVariantLabel(m.model_variant))}</span><br>contract v${esc(m.contract_version || '?')} · raw/model ${esc(m.raw_action_dim || '?')}D/${esc(m.model_action_dim || '?')}D · offset ${esc(m.action_offset ?? '-')}/+${esc(m.model_action_start_offset ?? 1)}<br>${esc(m.model_action_convention || '-')} · gripper ${esc(m.raw_gripper_semantics || '-')} → ${esc(m.gripper_semantics || m.wire_gripper_semantics || '-')}<br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}','policy')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','policy')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="7" class="muted">暂无 Policy 进程；可在上方创建。</td></tr>';
 
-  const jobs = items.filter(t => t.type !== 'policy' && t.type !== 'transfer');
+  const allJobs = items.filter(t => TRAINING_TASK_TYPES.has(t.type));
+  const jobs = filteredTrainingJobs(items);
+  updateTrainingTaskFilterSummary(allJobs, jobs);
   document.getElementById('jobs').innerHTML = jobs.map(t => {
     const m = t.metadata || {};
     const active = ACTIVE_STATES.has(t.state);
@@ -2384,7 +3076,7 @@ function fillTasks(items) {
       const model = `<br>model=${esc(modelVariantLabel(m.model_variant))}${m.base_checkpoint ? ` · base=<code class="path" title="${esc(m.base_checkpoint)}">${esc(shortPath(m.base_checkpoint))}</code>` : ''}`;
       const contract = `<br>contract=v${esc(m.contract_version || '?')} · raw/model=${esc(m.raw_action_dim || '?')}D/${esc(m.model_action_dim || '?')}D · offset=${esc(m.action_offset ?? '-')}/+${esc(m.model_action_start_offset ?? 1)} · ${esc(m.model_action_convention || '-')}<br>gripper=${esc(m.raw_gripper_semantics || '-')} → ${esc(m.gripper_semantics || m.wire_gripper_semantics || '-')}`;
       const evalConfig = m.auto_eval ? `<br>eval=${m.auto_eval.enabled ? `每 ${esc(m.auto_eval.every_steps)} steps · batch ${esc(m.auto_eval.batch_size)} × ${esc(m.auto_eval.max_batches)}` : `禁用${m.auto_eval.disabled_reason ? ` (${esc(m.auto_eval.disabled_reason)})` : ''}`}` : '';
-      params = `dataset=${esc(m.dataset_id || '-')} · arm=${esc(m.arm_mode || '-')} · schema=${esc(m.schema || '-')}${contract}${model}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}<br>train batch=${esc(m.batch_size || '-')} · FSDP ${esc(m.fsdp_devices || '-')} · XLA ${esc(m.xla_memory_fraction || '-')}<br>norm batch=${esc(m.norm_batch_size || '等待/未知')}${evalConfig}` : `<br>norm batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}${split}`;
+      params = `dataset=${esc(m.dataset_id || '-')} · arm=${esc(m.arm_mode || '-')} · schema=${esc(m.schema || '-')}${contract}${model}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}<br>train batch=${esc(m.batch_size || '-')} · FSDP ${esc(m.fsdp_devices || '-')} · XLA ${esc(m.xla_memory_fraction || '-')}<br>norm batch=${esc(m.norm_batch_size || '等待/未知')}${evalConfig}` : `<br>norm batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}${trainingMetricInline(t)}${split}`;
     }
     const stateDetails = `${jobDependencySummary(t)}${t.skip_reason ? `<br><span class="warn">${esc(t.skip_reason)}</span>` : ''}${t.start_error ? `<br><span class="bad">${esc(t.start_error)}</span>` : ''}`;
     const logModule = t.type === 'eval' ? 'eval' : 'training';
@@ -2796,6 +3488,13 @@ async function refreshAll() {
   }
   try {
     const data = await api('/api/status');
+    const serverBuild = String(((data || {}).config || {}).dashboard_build || '');
+    if (serverBuild && serverBuild !== DASHBOARD_BUILD) {
+      const url = new URL(window.location.href);
+      url.searchParams.set('_dashboard_build', serverBuild);
+      window.location.replace(url.toString());
+      return;
+    }
     latestStatus = data;
     const locationData = await loadDatasetLocations(false);
     if (locationData) latestStatus.datasets = mergeDatasetLocationInfo(data.datasets || [], locationData);
@@ -3025,11 +3724,14 @@ const trainExperimentInput = document.getElementById('trainExperimentName');
 document.getElementById('replacePolicy').addEventListener('change', () => updatePolicyOperation(true));
 document.getElementById('checkpointSelect').addEventListener('change', syncPolicyCheckpointVariant);
 document.getElementById('checkpointExperimentFilter').addEventListener('change', () => fillCheckpoints((latestStatus && latestStatus.checkpoints) || []));
+document.getElementById('trainingTaskTypeFilter').addEventListener('change', () => fillTasks((latestStatus && latestStatus.tasks) || []));
+document.getElementById('trainingMetricFilter').addEventListener('change', () => fillTasks((latestStatus && latestStatus.tasks) || []));
 document.getElementById('policyPort').addEventListener('input', updateClientCommand);
 document.getElementById('editorDataset').addEventListener('change', () => {
   episodeDatasetData = null;
   clearEpisodeMedia();
   updateMergeSourceOptions();
+  document.getElementById('datasetEventSemanticsStatus').textContent = '正在加载数据集 Event 语义…';
   loadDatasetEpisodes(0);
 });
 document.getElementById('trainMetricsTask').addEventListener('change', () => {

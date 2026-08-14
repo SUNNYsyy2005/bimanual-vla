@@ -501,7 +501,46 @@ def run_shard(
                 f"{location_host(target)}:{location_root(target)}/",
             ]
         elif is_login_shared_slurm(source) and not is_login_shared_slurm(target):
-            # H100 shared /DATA via login-server -> 4x4090.
+            # H100 shared /DATA via login-server -> target.
+            #
+            # When the target is another path on the same SSH host (the common
+            # H100 -> NAS staging case used before H200 Slurm import), running
+            # local rsync would incorrectly treat /DATA/NAS/... as a 4x4090
+            # path.  Execute rsync on login-server instead and stream the NUL
+            # file list through stdin.  This keeps the data path on the
+            # cluster/NAS side and avoids pulling multi-GB datasets through the
+            # Dashboard host just to push them back again.
+            source_host = location_host(source)
+            target_host = location_host(target)
+            if source_host and target_host and source_host == target_host:
+                remote_rsync = " ".join(
+                    [
+                        "rsync",
+                        "-a",
+                        "--partial",
+                        "--append-verify",
+                        "--timeout=1200",
+                        "--from0",
+                        "--files-from=-",
+                        q(f"{location_root(source)}/"),
+                        q(f"{location_root(target)}/"),
+                    ]
+                )
+                pipeline = f"cat {q(list_path)} | {shlex.join([*ssh_options, source_host, remote_rsync])}"
+                result = subprocess.run(
+                    ["bash", "-lc", pipeline],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=clean_transport_env(),
+                )
+                elapsed = time.time() - started
+                summary = (
+                    f"[dashboard] shard {shard_index + 1}/{shard_count} "
+                    f"rc={result.returncode} elapsed_s={elapsed:.1f}\n{result.stdout[-4000:]}"
+                )
+                return result.returncode, summary
+            # H100 shared /DATA via login-server -> local 4x4090 path.
             rsync += [
                 f"{location_host(source)}:{location_root(source)}/",
                 f"{location_root(target)}/",

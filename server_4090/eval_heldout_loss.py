@@ -184,7 +184,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     params = model_lib.restore_params(checkpoint / "params", sharding=replicated_sharding)
     model = config.model.load(params)
-    eval_loss = nnx_utils.module_jit(model.compute_loss_per_dim)
+    # `compute_loss_per_dim` branches on `train` inside `preprocess_observation`.
+    # JAX must see that flag as static; otherwise it traces `train=False` into a
+    # boolean array and fails with TracerBoolConversionError at the first batch.
+    eval_loss = nnx_utils.module_jit(model.compute_loss_per_dim, static_argnames=("train",))
 
     rng = jax.random.key(args.eval_seed)
     total_per_dim: np.ndarray | None = None

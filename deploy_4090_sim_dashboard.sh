@@ -47,9 +47,10 @@ example = json.loads(Path('server_4090/config.simulation.example.json').read_tex
 path = Path('server_4090/config.simulation.json')
 current = json.loads(path.read_text())
 for key in (
-    'dataset_root', 'assets_base_dir', 'checkpoint_base_dir', 'base_checkpoint',
-    'checkpoint_allowed_roots', 'eval_video_roots', 'cluster_targets',
+    'dataset_root', 'workspace_root', 'cache_root', 'assets_base_dir', 'checkpoint_base_dir', 'base_checkpoint',
+    'checkpoint_allowed_roots', 'eval_video_roots', 'local_storage_locations', 'cluster_targets',
     'transfer_parallelism', 'cluster_resources_script', 'nas_dataset_staging_root',
+    'nas_checkpoint_staging_root',
 ):
     if key in example:
         current[key] = example[key]

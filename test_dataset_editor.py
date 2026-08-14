@@ -451,6 +451,194 @@ class DatasetEditorTest(unittest.TestCase):
         self.assertIsNone(details["task_name"])
         self.assertIsNone(details["success"])
 
+    def test_optional_event_track_from_metadata_and_override_sidecar(self):
+        target = make_dataset(self.datasets, "handover_mic_eval", [5])
+        write_jsonl(
+            target / "meta" / "episodes.jsonl",
+            [
+                {
+                    "episode_index": 0,
+                    "tasks": ["handover_mic instruction"],
+                    "length": 5,
+                    "task_name": "handover_mic",
+                    "current_event": 1,
+                    "max_event_reached": 2,
+                    "event_version": "event_v3",
+                    "event_timeline": [
+                        {"step": 0, "current_event": 0, "max_event_reached": 0},
+                        {"step": 3, "current_event": 1, "max_event_reached": 2},
+                    ],
+                }
+            ],
+        )
+
+        editor = self.editor()
+        episode = editor.details("handover_mic_eval")["episodes"][0]
+        self.assertTrue(episode["event_track"]["available"])
+        self.assertEqual(episode["event_track"]["current_event"], 1)
+        self.assertEqual(episode["event_track"]["max_event_reached"], 2)
+        self.assertIn("2", episode["event_track"]["labels"])
+
+        saved = editor.save_event_overrides(
+            "handover_mic_eval",
+            0,
+            {"frame": 4, "current_event": 3, "max_event_reached": 3, "note": "manual"},
+        )
+        self.assertEqual(saved["override_count"], 1)
+        self.assertTrue((target / "meta" / "dashboard_event_overrides" / "episode_000000.json").is_file())
+        episode = editor.details("handover_mic_eval")["episodes"][0]
+        self.assertEqual(episode["event_track"]["override_count"], 1)
+        self.assertEqual(episode["event_track"]["overrides"]["edits"][0]["current_event"], 3)
+
+        with self.assertRaisesRegex(ValueError, "current_event"):
+            editor.save_event_overrides("handover_mic_eval", 0, {"frame": 0, "current_event": 8})
+
+    def test_create_event_track_for_dataset_without_event_data(self):
+        # "dynamic" contains the substring "mic" but is not handover_mic;
+        # it must still support a custom event range.
+        target = make_dataset(self.datasets, "dynamic_task", [6])
+        editor = self.editor()
+
+        episode = editor.details("dynamic_task")["episodes"][0]
+        self.assertIsNone(episode["event_track"])
+
+        saved = editor.save_event_overrides(
+            "dynamic_task",
+            0,
+            {
+                "frame": 2,
+                "end_frame": 5,
+                "current_event": 2,
+                "max_event_reached": 2,
+                "event_max_value": 6,
+                "note": "created in dashboard",
+            },
+        )
+        self.assertEqual(saved["event_max_value"], 6)
+        self.assertEqual(saved["override_count"], 1)
+        self.assertTrue(
+            (target / "meta" / "dashboard_event_overrides" / "episode_000000.json").is_file()
+        )
+
+        episode = editor.details("dynamic_task")["episodes"][0]
+        track = episode["event_track"]
+        self.assertTrue(track["available"])
+        self.assertEqual(track["source"], "manual_override")
+        self.assertEqual(track["current_event"], 2)
+        self.assertEqual(track["max_event_reached"], 2)
+        self.assertEqual(track["event_max_value"], 6)
+        self.assertEqual(track["override_count"], 1)
+        self.assertEqual(track["max_step"], 5)
+
+        with self.assertRaisesRegex(ValueError, "current_event"):
+            editor.save_event_overrides(
+                "dynamic_task",
+                0,
+                {"frame": 0, "current_event": 7, "event_max_value": 6},
+            )
+
+    def test_dataset_event_semantics_file_and_start_frame_markers(self):
+        target = make_dataset(self.datasets, "custom_events", [8])
+        editor = self.editor()
+
+        initial = editor.details("custom_events")
+        self.assertFalse(initial["event_semantics"]["exists"])
+        self.assertEqual(initial["event_semantics"]["event_max_value"], 4)
+
+        semantics = editor.save_event_semantics(
+            "custom_events",
+            {
+                "event_max_value": 6,
+                "description": "dataset-specific event meanings",
+                "labels": {
+                    "0": "not started",
+                    "1": "object grasped",
+                    "2": "object lifted",
+                    "3": "receiver grasped",
+                    "4": "handover complete",
+                    "5": "placed",
+                    "6": "terminal posture",
+                },
+            },
+        )
+        semantics_path = target / "meta" / "event_semantics.json"
+        self.assertTrue(semantics_path.is_file())
+        self.assertEqual(semantics["event_max_value"], 6)
+        self.assertEqual(semantics["labels"]["2"], "E2 object lifted")
+        self.assertEqual(json.loads(semantics_path.read_text())["schema"], "event_semantics.v1")
+
+        first = editor.save_event_overrides(
+            "custom_events",
+            0,
+            {
+                "frame": 2,
+                # Legacy callers may still send an end frame, but it must not
+                # be persisted because annotations are change-point markers.
+                "end_frame": 7,
+                "current_event": 2,
+                "max_event_reached": 2,
+            },
+        )
+        self.assertEqual(
+            first["edits"],
+            [{"start_frame": 2, "current_event": 2, "max_event_reached": 2}],
+        )
+        self.assertEqual(first["marker_semantics"], "start_frame_until_next_marker")
+
+        editor.save_event_overrides(
+            "custom_events",
+            0,
+            {"frame": 5, "current_event": 1, "max_event_reached": 1},
+        )
+        replaced = editor.save_event_overrides(
+            "custom_events",
+            0,
+            {"frame": 5, "current_event": 3, "max_event_reached": 3, "note": "corrected"},
+        )
+        # A second save at the same frame edits that marker rather than creating
+        # an overlapping annotation. Historical max remains monotonic.
+        self.assertEqual(replaced["override_count"], 2)
+        self.assertEqual(
+            replaced["edits"],
+            [
+                {"start_frame": 2, "current_event": 2, "max_event_reached": 2},
+                {
+                    "start_frame": 5,
+                    "current_event": 3,
+                    "max_event_reached": 3,
+                    "note": "corrected",
+                },
+            ],
+        )
+        self.assertTrue(all("end_frame" not in marker for marker in replaced["edits"]))
+
+        details = editor.details("custom_events")
+        track = details["episodes"][0]["event_track"]
+        self.assertEqual(details["event_semantics"]["labels"]["3"], "E3 receiver grasped")
+        self.assertEqual(track["labels"]["3"], "E3 receiver grasped")
+        self.assertEqual(track["current_event"], 3)
+        self.assertEqual(track["max_event_reached"], 3)
+        self.assertEqual(track["marker_semantics"], "start_frame_until_next_marker")
+
+    def test_event_marker_regression_keeps_historical_max(self):
+        make_dataset(self.datasets, "regression_events", [9])
+        editor = self.editor()
+        editor.save_event_semantics(
+            "regression_events",
+            {"event_max_value": 4, "labels": {str(i): f"stage {i}" for i in range(5)}},
+        )
+        editor.save_event_overrides(
+            "regression_events", 0, {"frame": 1, "current_event": 2, "max_event_reached": 2}
+        )
+        saved = editor.save_event_overrides(
+            "regression_events", 0, {"frame": 6, "current_event": 1, "max_event_reached": 1}
+        )
+        self.assertEqual(saved["edits"][1]["current_event"], 1)
+        self.assertEqual(saved["edits"][1]["max_event_reached"], 2)
+        track = editor.details("regression_events")["episodes"][0]["event_track"]
+        self.assertEqual(track["current_event"], 1)
+        self.assertEqual(track["max_event_reached"], 2)
+
     def test_rename_moves_norm_stats_and_delete_removes_dataset_only(self):
         make_dataset(self.datasets, "target", [2])
         norm_dir = self.assets / "pi05_piper_single_arm_lora" / "target"

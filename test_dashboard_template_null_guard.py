@@ -53,6 +53,22 @@ class DashboardTemplateNullGuardTest(unittest.TestCase):
         self.assertIn('@app.post("/api/tasks/batch-delete")', app_source)
         self.assertIn("def delete_many", app_source)
 
+    def test_training_task_filters_include_type_and_empty_metrics(self):
+        template = (
+            Path(__file__).parent / "server_4090/templates/index.html"
+        ).read_text(encoding="utf-8")
+        app_source = (Path(__file__).parent / "server_4090/app.py").read_text(encoding="utf-8")
+
+        self.assertIn('id="trainingTaskTypeFilter"', template)
+        self.assertIn('<option value="train">Train</option>', template)
+        self.assertIn('<option value="norm">Norm</option>', template)
+        self.assertIn('<option value="eval">Eval</option>', template)
+        self.assertIn('id="trainingMetricFilter"', template)
+        self.assertIn('<option value="no_metrics_terminal">无指标曲线且已结束</option>', template)
+        self.assertIn('function filteredTrainingJobs(items)', template)
+        self.assertIn('training_metrics', app_source)
+        self.assertIn('def training_metrics_probe', app_source)
+
     def test_training_metrics_chart_has_draggable_x_axis_range(self):
         template = (
             Path(__file__).parent / "server_4090/templates/index.html"
@@ -86,6 +102,54 @@ class DashboardTemplateNullGuardTest(unittest.TestCase):
         self.assertIn("obs.first_action", template)
         self.assertNotIn('id="singleWristPreview"', template)
         self.assertNotIn('id="previewWrist"', template)
+
+    def test_dataset_episode_camera_videos_are_force_synchronized(self):
+        template = (
+            Path(__file__).parent / "server_4090/templates/index.html"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("function syncEpisodeVideoPlayback(source, playing)", template)
+        self.assertIn("function syncEpisodeVideoTime(source, force = false)", template)
+        self.assertIn("function syncEpisodeVideoRate(source)", template)
+        self.assertIn("video.addEventListener('play'", template)
+        self.assertIn("video.addEventListener('pause'", template)
+        self.assertIn("video.addEventListener('seeking'", template)
+        self.assertIn("video.addEventListener('seeked'", template)
+        self.assertIn("video.addEventListener('ratechange'", template)
+        self.assertIn("EPISODE_VIDEO_SYNC_DRIFT_SECONDS", template)
+        self.assertIn("MP4 · 强制同步", template)
+        # Most handover_mic datasets store cameras as parquet image sequences,
+        # not MP4 files, so those custom players need the same shared controls.
+        self.assertIn("function seekEpisodeImagePlayers(source, frameIndex)", template)
+        self.assertIn("function setEpisodeImagePlaying(playing, source = null)", template)
+        self.assertIn("图片序列 · ${media.fps || 20} fps · 强制同步", template)
+        self.assertIn("button.textContent = episodeImageSyncState.playing ? '暂停全部' : '播放全部'", template)
+        self.assertIn("slider.addEventListener('input', () => seekEpisodeImagePlayers", template)
+        self.assertIn("card.dataset.cameraSync = 'shared-image-clock'", template)
+        self.assertIn("button.dataset.cameraSyncControl = 'play-pause-all'", template)
+        self.assertIn("slider.dataset.cameraSyncControl = 'seek-all'", template)
+        self.assertIn("三路强制同步", template)
+        self.assertIn("const DASHBOARD_BUILD =", template)
+        self.assertIn("serverBuild !== DASHBOARD_BUILD", template)
+
+    def test_dataset_without_event_track_can_create_manual_track(self):
+        template = (
+            Path(__file__).parent / "server_4090/templates/index.html"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("function editableTrackForEpisode(episode)", template)
+        self.assertIn("Event 最大编号", template)
+        self.assertIn("{allowCreate: true}", template)
+        self.assertIn("可在编辑页新增", template)
+        self.assertIn("event_max_value", template)
+        self.assertIn("不修改原 parquet", template)
+        self.assertIn("meta/event_semantics.json", template)
+        self.assertIn("标记为 event 起始帧", template)
+        self.assertIn("持续到下一个 event 起始帧", template)
+        self.assertIn("function saveDatasetEventSemantics()", template)
+        self.assertIn("function parseDatasetEventLabels(text, maxValue)", template)
+        self.assertNotIn("保存到末尾", template)
+        self.assertNotIn("data-event-save=\"to_end\"", template)
 
     def test_timed_target_helpers_guard_null_object_values(self):
         template = (

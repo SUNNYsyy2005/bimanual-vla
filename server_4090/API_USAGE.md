@@ -722,6 +722,7 @@ Content-Type: application/json
   "num_workers":2,
   "num_train_steps":30000,
   "save_interval":1000,
+  "keep_period":5000,
   "xla_memory_fraction":0.9,
   "test_ratio":0.1,
   "split_seed":42,
@@ -753,6 +754,7 @@ H100/H200 Slurm 示例：
   "num_workers":2,
   "num_train_steps":30000,
   "save_interval":1000,
+  "keep_period":5000,
   "test_ratio":0.1,
   "split_seed":42,
   "eval_enabled":true,
@@ -771,6 +773,7 @@ H100/H200 Slurm 示例：
 - `resume_checkpoint` 必须包含 `_CHECKPOINT_METADATA`、`params/_METADATA`、`train_state/_METADATA`，并且必须有与目标实机数据集完全匹配的 action-contract marker；不同 schema/动作语义（例如 EEF 7D 与 joint 7D）会被拒绝；
 - `batch_size` 必须能被 GPU 数整除；
 - `fsdp_devices` 必须整除 GPU 数；
+- `keep_period`：传给 Orbax checkpoint manager，额外保护 step 能被该值整除的 checkpoint；例如 `save_interval=2000` 且 `keep_period=2000` 会保留 `4000/6000/8000/10000` 等 2k 倍数 checkpoint。传 `0`/空值可禁用周期保护（只保留最新 checkpoint）。
 - `eval_interval_steps` 必须能被 `save_interval` 整除，且当前要求是 5000 的倍数；
 - 若 norm 不存在，本地训练会自动先创建 norm task，并在 norm 完成后训练；Slurm 训练会在一个 Slurm job 内先 norm 后 train。
 - `execution_target` 为 H100/H200 时，Dashboard 会先根据远端 inventory 判断数据集是否存在；不存在或 inventory 不可用时，默认先执行一次幂等数据集同步（`auto_sync_dataset=true`，目标已存在则跳过），然后再提交 Slurm norm/train。
@@ -1183,6 +1186,7 @@ curl -X POST "$DASH/api/tasks/train" \
     "fsdp_devices":1,
     "num_train_steps":30000,
     "save_interval":1000,
+    "keep_period":5000,
     "test_ratio":0.1,
     "split_seed":42,
     "eval_enabled":true,

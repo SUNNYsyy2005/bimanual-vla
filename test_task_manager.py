@@ -43,6 +43,9 @@ class TaskManagerDeleteTest(unittest.TestCase):
         state: str = "completed",
         metadata: dict | None = None,
         dependency: dict | None = None,
+        pid: int | None = None,
+        command: list[str] | None = None,
+        launch_command: list[str] | None = None,
     ) -> Path:
         task_dir = Path(self.tempdir.name) / "tasks" / task_id
         task_dir.mkdir(parents=True)
@@ -51,10 +54,14 @@ class TaskManagerDeleteTest(unittest.TestCase):
             "type": task_type,
             "state": state,
             "created_at": "2026-08-03T00:00:00+0800",
-            "command": ["python", "/tmp/task.py", "--config"],
+            "command": command or ["python", "/tmp/task.py", "--config"],
             "metadata": metadata or {},
             "log_path": str(task_dir / "task.log"),
         }
+        if pid is not None:
+            task["pid"] = pid
+        if launch_command is not None:
+            task["launch_command"] = launch_command
         if dependency is not None:
             task["dependency"] = dependency
         (task_dir / "task.json").write_text(json.dumps(task), encoding="utf-8")
@@ -235,6 +242,81 @@ class TaskManagerDeleteTest(unittest.TestCase):
         self.manager.delete("norm-old")
 
         self.assertFalse(norm_dir.exists())
+
+    def test_discover_external_policy_ignores_managed_runner_descendant(self):
+        managed_dir = self.write_task(
+            "policy-managed",
+            task_type="policy",
+            state="running",
+            pid=111,
+            command=["/opt/openpi/bin/python", "openpi_single_arm.py", "serve", "--port", "8000"],
+            launch_command=[
+                "/usr/bin/python3",
+                "/repo/server_4090/task_runner.py",
+                "--exit-json",
+                "/tmp/exit.json",
+            ],
+            metadata={"port": 8000},
+        )
+        duplicate_dir = self.write_task(
+            "policy-external-222",
+            task_type="policy",
+            state="running",
+            pid=222,
+            command=["/opt/openpi/bin/python", "openpi_single_arm.py", "serve", "--port", "8000"],
+            metadata={"external": True, "adopted": True, "port": 8000},
+        )
+
+        with mock.patch("server_4090.app.pid_alive", return_value=True), \
+            mock.patch("server_4090.app.process_matches_task", return_value=True), \
+            mock.patch("server_4090.app.process_children_by_parent", return_value={111: {222}}), \
+            mock.patch("server_4090.app.discover_external_policy_candidates", return_value=[]) as discover:
+            adopted = self.manager.discover_external_policies()
+
+        self.assertEqual(adopted, [])
+        discover.assert_called_once()
+        self.assertEqual(discover.call_args.kwargs["ignored_pids"], {111, 222})
+        self.assertTrue(managed_dir.exists())
+        self.assertFalse(duplicate_dir.exists())
+
+    def test_training_metrics_probe_detects_curve_and_empty_train_logs(self):
+        metric_dir = self.write_task("train-with-metrics", task_type="train", state="completed")
+        (metric_dir / "task.log").write_text(
+            "Step 10: loss=0.5\nStep 20: loss=0.25, grad_norm=0.1\n",
+            encoding="utf-8",
+        )
+        metric_task = json.loads((metric_dir / "task.json").read_text(encoding="utf-8"))
+
+        probe = self.manager.training_metrics_probe(metric_task)
+
+        self.assertEqual(probe["status"], "has_metrics")
+        self.assertTrue(probe["has_points"])
+        self.assertEqual(probe["total_points"], 2)
+        self.assertEqual(probe["latest_step"], 20)
+
+        empty_dir = self.write_task("train-empty", task_type="train", state="completed")
+        (empty_dir / "task.log").write_text("launcher exited before first step\n", encoding="utf-8")
+        empty_task = json.loads((empty_dir / "task.json").read_text(encoding="utf-8"))
+
+        empty_probe = self.manager.training_metrics_probe(empty_task)
+
+        self.assertEqual(empty_probe["status"], "no_metrics")
+        self.assertFalse(empty_probe["has_points"])
+
+    def test_training_metrics_probe_marks_unstreamed_slurm_as_unknown(self):
+        task_dir = self.write_task(
+            "train-slurm",
+            task_type="train",
+            state="completed",
+            metadata={"runtime": "slurm", "slurm_target": "h100"},
+        )
+        (task_dir / "task.log").write_text("[dashboard] slurm_job_id=123\n", encoding="utf-8")
+        task = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
+
+        probe = self.manager.training_metrics_probe(task)
+
+        self.assertEqual(probe["status"], "unknown")
+        self.assertIsNone(probe["has_points"])
 
 
 if __name__ == "__main__":
