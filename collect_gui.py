@@ -72,7 +72,6 @@ CAN_BITRATE = 1_000_000
 CAN_ACTIVATE_SCRIPT = pathlib.Path(
     "/home/user/dual_ARM_project/piper_sdk/piper_sdk/can_activate.sh"
 )
-BIMANUAL_CAN_USB_PORTS = ("3-1.4:1.0", "3-1.3:1.0")
 
 
 def validate_can_name(can_name: str) -> str:
@@ -1479,13 +1478,13 @@ class CollectorGUI:
 
         def worker(secret: str) -> None:
             try:
-                expected_bus_info = None
-                if len(can_names) == 2:
-                    expected_bus_info = dict(zip(can_names, BIMANUAL_CAN_USB_PORTS))
+                # USB topology changes when adapters are moved between ports
+                # or a hub is re-enumerated. Resolve each current interface's
+                # actual bus-info instead of rejecting valid adapters because
+                # they no longer match an old hard-coded port.
                 statuses = activate_can_interfaces(
                     can_names,
                     secret,
-                    expected_bus_info=expected_bus_info,
                 )
                 self.messages.put(("can_activation_done", statuses))
             except Exception as exc:
