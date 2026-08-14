@@ -90,7 +90,12 @@
     .frame-controls input[type=range] { padding:0; }
     .checkbox-cell input { width:auto; } .editor-summary { min-height:22px; margin:8px 0; }
     .chart-shell { position:relative; min-height:360px; padding:10px; border:1px solid #2b4664; border-radius:12px; background:#07121f; }
-    #trainMetricsChart { display:block; width:100%; height:340px; }
+    #trainMetricsChart { display:block; width:100%; height:340px; cursor:grab; touch-action:none; }
+    #trainMetricsChart.dragging,#trainMetricRangeChart.dragging { cursor:grabbing; }
+    .metric-range-control { margin-top:10px; padding:9px 10px 7px; border:1px solid #29445f; border-radius:10px; background:#081625; }
+    .metric-range-header { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:6px 12px; margin-bottom:5px; color:#c8d9eb; font-size:12px; }
+    .metric-range-header strong { color:#f2f8ff; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+    #trainMetricRangeChart { display:block; width:100%; height:78px; cursor:grab; touch-action:none; }
     .chart-toolbar { display:grid; grid-template-columns:minmax(260px,1fr) auto; gap:10px; align-items:end; margin-bottom:10px; }
     .metric-legend { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
     .metric-toggle { width:auto; padding:5px 9px; border-color:#3c5878; background:#12233a; font-size:12px; }
@@ -107,6 +112,16 @@
     .telemetry-details summary { cursor:pointer; color:#9fdcff; font-size:11px; }
     .telemetry-detail-list { display:grid; gap:4px; margin-top:6px; color:#adc0d6; font-size:11px; line-height:1.4; }
     .telemetry-detail-list code { color:#d9ebff; }
+    .telemetry-vector-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:12px 0; }
+    .telemetry-vector-card { min-width:0; padding:10px; border:1px solid #304b68; border-radius:11px; background:#07121f; }
+    .telemetry-vector-card h3 { margin-top:0; }
+    .telemetry-vector-card pre { min-height:300px; max-height:none; margin-bottom:0; }
+    .telemetry-camera-heading { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; margin-top:16px; }
+    .telemetry-camera-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; margin-top:10px; }
+    .telemetry-camera-card { min-width:0; margin:0; padding:10px; border:1px solid #304b68; border-radius:11px; background:#07121f; }
+    .telemetry-camera-card figcaption { display:flex; justify-content:space-between; gap:8px; margin-bottom:8px; color:#e9f4ff; font-weight:700; }
+    .telemetry-camera-card img { display:block; width:100%; min-height:180px; max-height:390px; object-fit:contain; border:1px solid #2e465f; border-radius:9px; background:#03070c; }
+    .telemetry-camera-card .camera-status { margin-top:7px; color:var(--muted); font-size:11px; }
     .metric-toggle.off { opacity:.45; }
     .progress-track { height:8px; overflow:hidden; border-radius:999px; background:#07101c; }
     .progress-bar { height:100%; width:0; background:linear-gradient(90deg,var(--blue),var(--green)); }
@@ -135,7 +150,7 @@
     .eval-video-actions { display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap; justify-content:flex-end; }
     .eval-video-card video { display:block; width:100%; max-height:520px; margin-top:10px; border:1px solid #2e465f; border-radius:9px; background:#000; }
     @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid,.telemetry-latency-grid{grid-template-columns:repeat(2,1fr)}.episode-editor-grid{grid-template-columns:1fr}}
-    @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid{grid-template-columns:1fr}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
+    @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid,.telemetry-vector-grid{grid-template-columns:1fr}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
   </style>
 </head>
 <body>
@@ -258,7 +273,9 @@
           <h2>训练指标曲线</h2>
           <div class="chart-toolbar"><div><label>训练任务</label><select id="trainMetricsTask"></select></div><button class="inline secondary" type="button" onclick="loadTrainingMetrics()">刷新曲线</button></div>
           <div id="trainMetricsSummary" class="muted">选择训练任务后加载指标。</div><div class="progress-track" style="margin:10px 0"><div id="trainProgressBar" class="progress-bar"></div></div>
-          <div class="chart-shell"><canvas id="trainMetricsChart"></canvas></div><div id="trainMetricLegend" class="metric-legend"></div>
+          <div class="chart-shell"><canvas id="trainMetricsChart" aria-label="训练指标曲线；在图内左右拖动可平移 X 轴"></canvas></div>
+          <div class="metric-range-control"><div class="metric-range-header"><span>显示范围 · 拖动选区平移，拖动两侧边界缩放</span><strong id="trainMetricRangeLabel">全部 step</strong></div><canvas id="trainMetricRangeChart" aria-label="训练指标 X 轴范围选择器"></canvas></div>
+          <div id="trainMetricLegend" class="metric-legend"></div>
         </div>
         <div class="card third">
           <h2>Checkpoint</h2>
@@ -325,7 +342,7 @@
     </section>
 
     <section id="module-telemetry" class="dashboard-module" data-module="telemetry" hidden>
-      <div class="module-heading"><div><h2>实时遥测</h2><p>只读展示 Policy 实际收到的 state、相机、prompt、预测 action 和异步 chunk 生命周期。默认 delivery 安全阈值来自 <code>8_3_64eps</code> 全量 20 Hz 统计：translation 0.05 m/step、rotation 0.18 rad/step、gripper 0.30 fraction/step，workspace x[-0.05,0.30]、y[0.01,0.50]、z[0.14,0.52]；每条 20 Hz command 仍独立检查，CLI 可继续收紧。</p></div></div>
+      <div class="module-heading"><div><h2>实时遥测</h2><p>按 Policy 合同动态展示单臂两路或双臂三路相机、分臂 state、首条预测 action 和异步 chunk 生命周期。Delivery 模式使用 EEF/workspace 安全阈值；Joint 模式展示绝对关节目标及客户端逐周期关节/夹爪安全检查。</p></div></div>
       <div class="stat-grid telemetry-latency-grid" aria-label="异步链路延迟">
         <div class="stat-card"><div class="stat-label">客户端测量：上传</div><div id="telemetryUpload" class="stat-value">-</div><div id="telemetryUploadDetail" class="stat-detail">client report · one-way wall-clock</div></div>
         <div class="stat-card"><div class="stat-label">模型推理（实测）</div><div id="telemetryModel" class="stat-value">-</div><div class="stat-detail">server model execution</div></div>
@@ -336,7 +353,7 @@
       </div>
       <p class="muted">说明：上传/下行由客户端根据本次请求的服务端时间戳回显计算并汇报；单向值仍需两端 wall-clock 基本同步。RTT 和“结果→首条命令”由客户端 monotonic clock 实测，模型推理由服务端 monotonic clock 实测。</p>
       <div class="grid">
-        <div class="card"><h2>Policy 实时观测</h2><div id="robotObservation" class="warn">尚未收到 telemetry。</div><div class="preview-grid"><div><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div><div><h3>Prompt / predicted action</h3><pre id="policyAction">action: -</pre></div></div><h3>模型 → IK → Piper 命令 → 下一周期反馈</h3><pre id="actuatorTrace">actuator trace: -</pre><div id="robotImages" class="preview-grid"><figure><figcaption>顶部全局</figcaption><img id="previewHigh" alt="high camera"></figure><figure id="singleWristPreview"><figcaption>单臂腕部</figcaption><img id="previewWrist" alt="wrist camera"></figure><figure id="leftWristPreview" hidden><figcaption>左臂腕部</figcaption><img id="previewLeftWrist" alt="left wrist camera"></figure><figure id="rightWristPreview" hidden><figcaption>右臂腕部</figcaption><img id="previewRightWrist" alt="right wrist camera"></figure></div></div>
+        <div class="card"><h2>Policy 实时观测</h2><div id="robotObservation" class="warn">尚未收到 telemetry。</div><div id="telemetryContractBadges" class="telemetry-badges"></div><div class="telemetry-vector-grid"><div class="telemetry-vector-card"><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div><div class="telemetry-vector-card"><h3 id="policyFirstActionTitle">首条预测 action</h3><pre id="policyFirstAction">action: -</pre></div></div><details class="telemetry-details" open><summary>Prompt / 合同 / Chunk 与安全状态</summary><pre id="policyAction">action: -</pre></details><h3>模型 → IK → Piper 命令 → 下一周期反馈</h3><pre id="actuatorTrace">actuator trace: -</pre><div class="telemetry-camera-heading"><h3 style="margin:0">Policy 实际收到的相机</h3><span id="robotCameraSummary" class="muted">等待 telemetry。</span></div><div id="robotImages" class="telemetry-camera-grid"><div class="muted">尚无相机帧。</div></div></div>
       </div>
     </section>
   </main>
@@ -362,13 +379,17 @@ const METRIC_COLORS = ['#42c7ff', '#3ee6a8', '#ffd166', '#ff6f91', '#a78bfa', '#
 let latestStatus = null;
 let latestDatasetLocations = null;
 let latestTelemetryKey = null;
-let previewUrls = [];
+let previewUrls = new Map();
 let episodeMediaPlayers = [];
 let episodeDatasetData = null;
 let episodeOffset = 0;
 let trainingMetricsData = null;
 let enabledMetrics = new Set();
 let metricsRequestSerial = 0;
+let trainingMetricRange = null;
+let trainingMetricPlotGeometry = null;
+let trainingMetricRangeGeometry = null;
+let trainingMetricDrag = null;
 const selectedTaskLogs = {training: null, eval: null, policy: null};
 const selectedTaskIds = new Set();
 const selectedEvalVideoIds = new Set();
@@ -1473,6 +1494,7 @@ function fillTrainingTasks(items) {
   if (tasks.some(task => task.id === old)) select.value = old;
   if (!tasks.length) {
     trainingMetricsData = null;
+    trainingMetricRange = null;
     document.getElementById('trainMetricsSummary').textContent = '暂无训练任务。';
     document.getElementById('trainMetricLegend').innerHTML = '';
     document.getElementById('trainProgressBar').style.width = '0%';
@@ -1497,9 +1519,11 @@ async function loadTrainingMetrics(options = {}) {
   try {
     const data = await api(`/api/tasks/${encodeURIComponent(taskId)}/metrics?max_points=1200`);
     if (serial !== metricsRequestSerial || select.value !== taskId) return;
-    const previousSeries = trainingMetricsData && trainingMetricsData.task && trainingMetricsData.task.id === taskId
+    const sameTask = trainingMetricsData && trainingMetricsData.task && trainingMetricsData.task.id === taskId;
+    const previousSeries = sameTask
       ? enabledMetrics : new Set();
     trainingMetricsData = data;
+    syncTrainingMetricRange(data, taskId, !sameTask);
     if (!previousSeries.size) {
       const defaults = ['loss', 'eval_loss_model', 'loss_physical_14d', 'eval_loss_objective'].filter(key => data.series.includes(key));
       enabledMetrics = new Set(defaults.length ? defaults : data.series.filter(key => key !== 'param_norm').slice(0, 3));
@@ -1545,25 +1569,241 @@ function renderTrainingMetrics() {
   drawTrainingMetrics();
 }
 
-function drawTrainingMetrics() {
-  const canvas = document.getElementById('trainMetricsChart');
-  if (!canvas) return;
+function trainingMetricStepBounds(points = []) {
+  const steps = points.map(point => Number(point.step)).filter(Number.isFinite);
+  if (!steps.length) return null;
+  return {min: Math.min(...steps), max: Math.max(...steps)};
+}
+
+function trainingMetricMinimumSpan(bounds) {
+  const fullSpan = Math.max(0, Number(bounds.max) - Number(bounds.min));
+  return fullSpan ? Math.min(fullSpan, Math.max(1, fullSpan / 2000)) : 0;
+}
+
+function normalizeTrainingMetricWindow(start, end, bounds, mode = 'pan') {
+  const fullMin = Number(bounds.min);
+  const fullMax = Number(bounds.max);
+  const fullSpan = Math.max(0, fullMax - fullMin);
+  if (!fullSpan) return {start: fullMin, end: fullMax};
+  const minimumSpan = trainingMetricMinimumSpan(bounds);
+  let nextStart = Number.isFinite(Number(start)) ? Number(start) : fullMin;
+  let nextEnd = Number.isFinite(Number(end)) ? Number(end) : fullMax;
+  if (mode === 'left') {
+    nextEnd = Math.max(fullMin + minimumSpan, Math.min(fullMax, nextEnd));
+    nextStart = Math.max(fullMin, Math.min(nextEnd - minimumSpan, nextStart));
+  } else if (mode === 'right') {
+    nextStart = Math.max(fullMin, Math.min(fullMax - minimumSpan, nextStart));
+    nextEnd = Math.max(nextStart + minimumSpan, Math.min(fullMax, nextEnd));
+  } else {
+    const requestedSpan = Math.max(minimumSpan, nextEnd - nextStart);
+    const windowSpan = Math.min(fullSpan, requestedSpan);
+    if (nextStart < fullMin) {
+      nextStart = fullMin;
+      nextEnd = fullMin + windowSpan;
+    } else if (nextEnd > fullMax) {
+      nextEnd = fullMax;
+      nextStart = fullMax - windowSpan;
+    } else {
+      nextEnd = nextStart + windowSpan;
+    }
+  }
+  return {start: nextStart, end: nextEnd};
+}
+
+function syncTrainingMetricRange(data, taskId, reset = false) {
+  const bounds = trainingMetricStepBounds((data && data.points) || []);
+  if (!bounds) {
+    trainingMetricRange = null;
+    return;
+  }
+  const previous = trainingMetricRange && trainingMetricRange.taskId === taskId && !reset
+    ? trainingMetricRange : null;
+  if (!previous) {
+    trainingMetricRange = {taskId, start: bounds.min, end: bounds.max, fullMin: bounds.min, fullMax: bounds.max};
+    return;
+  }
+  const oldFullSpan = Math.max(0, previous.fullMax - previous.fullMin);
+  const oldWindowSpan = Math.max(0, previous.end - previous.start);
+  const tolerance = Math.max(1, oldFullSpan * 0.001);
+  const wasFullRange = previous.start <= previous.fullMin + tolerance && previous.end >= previous.fullMax - tolerance;
+  const followedLatest = previous.end >= previous.fullMax - tolerance;
+  let start = previous.start;
+  let end = previous.end;
+  if (wasFullRange) {
+    start = bounds.min;
+    end = bounds.max;
+  } else if (followedLatest && bounds.max > previous.fullMax) {
+    end = bounds.max;
+    start = end - oldWindowSpan;
+  }
+  const normalized = normalizeTrainingMetricWindow(start, end, bounds, 'pan');
+  trainingMetricRange = {taskId, ...normalized, fullMin: bounds.min, fullMax: bounds.max};
+}
+
+function currentTrainingMetricRange(points = []) {
+  const bounds = trainingMetricStepBounds(points);
+  if (!bounds) return null;
+  const taskId = trainingMetricsData && trainingMetricsData.task && trainingMetricsData.task.id;
+  if (!trainingMetricRange || trainingMetricRange.taskId !== taskId) {
+    syncTrainingMetricRange(trainingMetricsData, taskId, true);
+  }
+  return trainingMetricRange || {taskId, start: bounds.min, end: bounds.max, fullMin: bounds.min, fullMax: bounds.max};
+}
+
+function setTrainingMetricWindow(start, end, mode = 'pan') {
+  const data = trainingMetricsData;
+  const bounds = trainingMetricStepBounds((data && data.points) || []);
+  if (!bounds) return;
+  const normalized = normalizeTrainingMetricWindow(start, end, bounds, mode);
+  const taskId = data && data.task && data.task.id;
+  trainingMetricRange = {taskId, ...normalized, fullMin: bounds.min, fullMax: bounds.max};
+  drawTrainingMetrics();
+}
+
+function trainingMetricSeriesPoints(points, key, minStep, maxStep) {
+  const series = points
+    .map(point => ({step: Number(point.step), value: Number(point[key])}))
+    .filter(point => Number.isFinite(point.step) && Number.isFinite(point.value))
+    .sort((left, right) => left.step - right.step);
+  if (!series.length) return [];
+  const visible = series.filter(point => point.step >= minStep && point.step <= maxStep);
+  const before = [...series].reverse().find(point => point.step < minStep);
+  const after = series.find(point => point.step > maxStep);
+  if (before) visible.unshift(before);
+  if (after) visible.push(after);
+  return visible;
+}
+
+function configureMetricCanvas(canvas, fallbackWidth, fallbackHeight) {
   const rect = canvas.getBoundingClientRect();
-  const width = Math.max(320, Math.floor(rect.width || 800));
-  const height = Math.max(260, Math.floor(rect.height || 340));
+  const width = Math.max(320, Math.floor(rect.width || fallbackWidth));
+  const height = Math.max(60, Math.floor(rect.height || fallbackHeight));
   const ratio = Math.max(1, window.devicePixelRatio || 1);
   canvas.width = Math.floor(width * ratio);
   canvas.height = Math.floor(height * ratio);
   const ctx = canvas.getContext('2d');
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
+  return {ctx, width, height};
+}
+
+function drawTrainingMetricRange() {
+  const canvas = document.getElementById('trainMetricRangeChart');
+  const label = document.getElementById('trainMetricRangeLabel');
+  if (!canvas || !label) return;
+  const {ctx, width, height} = configureMetricCanvas(canvas, 800, 78);
+  ctx.fillStyle = '#06111d';
+  ctx.fillRect(0, 0, width, height);
+  const data = trainingMetricsData;
+  const points = (data && data.points) || [];
+  const bounds = trainingMetricStepBounds(points);
+  const range = currentTrainingMetricRange(points);
+  if (!bounds || !range) {
+    trainingMetricRangeGeometry = null;
+    label.textContent = '全部 step';
+    ctx.fillStyle = '#71859c';
+    ctx.font = '12px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText('暂无范围数据', width / 2, height / 2 + 4);
+    return;
+  }
+
+  const fullSpan = Math.max(0, bounds.max - bounds.min);
+  const displayMax = fullSpan ? bounds.max : bounds.min + 1;
+  const margin = {left: 10, right: 10, top: 7, bottom: 20};
+  const plotWidth = Math.max(1, width - margin.left - margin.right);
+  const plotHeight = Math.max(1, height - margin.top - margin.bottom);
+  const x = step => margin.left + (step - bounds.min) / (displayMax - bounds.min) * plotWidth;
+  const selected = ((data && data.series) || []).filter(key => enabledMetrics.has(key));
+  const navigatorSeries = selected.length ? selected : ((data && data.series) || []).slice(0, 3);
+  const allValues = [];
+  for (const point of points) {
+    for (const key of navigatorSeries) {
+      const value = Number(point[key]);
+      if (Number.isFinite(value)) allValues.push(value);
+    }
+  }
+  let minValue = allValues.length ? Math.min(...allValues) : 0;
+  let maxValue = allValues.length ? Math.max(...allValues) : 1;
+  if (minValue === maxValue) maxValue = minValue + Math.abs(minValue || 1) * 0.1;
+  const y = value => margin.top + (maxValue - value) / (maxValue - minValue) * plotHeight;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(margin.left, margin.top, plotWidth, plotHeight);
+  ctx.clip();
+  navigatorSeries.forEach(key => {
+    const colorIndex = (data.series || []).indexOf(key);
+    ctx.strokeStyle = METRIC_COLORS[(colorIndex < 0 ? 0 : colorIndex) % METRIC_COLORS.length];
+    ctx.globalAlpha = 0.72;
+    ctx.lineWidth = 1.25;
+    ctx.beginPath();
+    let started = false;
+    for (const point of points) {
+      const step = Number(point.step);
+      const value = Number(point[key]);
+      if (!Number.isFinite(step) || !Number.isFinite(value)) continue;
+      if (!started) { ctx.moveTo(x(step), y(value)); started = true; }
+      else ctx.lineTo(x(step), y(value));
+    }
+    if (started) ctx.stroke();
+  });
+  ctx.restore();
+  ctx.globalAlpha = 1;
+
+  const selectionLeft = fullSpan ? x(range.start) : margin.left;
+  const selectionRight = fullSpan ? x(range.end) : margin.left + plotWidth;
+  ctx.fillStyle = 'rgba(2,8,15,.68)';
+  ctx.fillRect(margin.left, margin.top, Math.max(0, selectionLeft - margin.left), plotHeight);
+  ctx.fillRect(selectionRight, margin.top, Math.max(0, margin.left + plotWidth - selectionRight), plotHeight);
+  ctx.fillStyle = 'rgba(66,199,255,.10)';
+  ctx.fillRect(selectionLeft, margin.top, Math.max(1, selectionRight - selectionLeft), plotHeight);
+  ctx.strokeStyle = '#42c7ff';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(selectionLeft, margin.top, Math.max(1, selectionRight - selectionLeft), plotHeight);
+  const handleWidth = 9;
+  for (const handleX of [selectionLeft, selectionRight]) {
+    ctx.fillStyle = '#42c7ff';
+    ctx.fillRect(handleX - handleWidth / 2, margin.top, handleWidth, plotHeight);
+    ctx.strokeStyle = '#082338';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(handleX - 1.5, margin.top + plotHeight / 2 - 7);
+    ctx.lineTo(handleX - 1.5, margin.top + plotHeight / 2 + 7);
+    ctx.moveTo(handleX + 1.5, margin.top + plotHeight / 2 - 7);
+    ctx.lineTo(handleX + 1.5, margin.top + plotHeight / 2 + 7);
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#8297ad';
+  ctx.font = '10px ui-monospace, monospace';
+  ctx.textBaseline = 'bottom';
+  ctx.textAlign = 'left';
+  ctx.fillText(String(Math.round(bounds.min)), margin.left, height - 2);
+  ctx.textAlign = 'right';
+  ctx.fillText(String(Math.round(bounds.max)), width - margin.right, height - 2);
+  const fullRange = range.start <= bounds.min && range.end >= bounds.max;
+  label.textContent = fullRange
+    ? `全部 step ${Math.round(bounds.min)} – ${Math.round(bounds.max)}`
+    : `step ${Math.round(range.start)} – ${Math.round(range.end)} / ${Math.round(bounds.min)} – ${Math.round(bounds.max)}`;
+  trainingMetricRangeGeometry = {
+    left: margin.left, right: margin.left + plotWidth, top: margin.top, bottom: margin.top + plotHeight,
+    plotWidth, fullMin: bounds.min, fullMax: bounds.max, selectionLeft, selectionRight,
+  };
+}
+
+function drawTrainingMetrics() {
+  const canvas = document.getElementById('trainMetricsChart');
+  if (!canvas) return;
+  const {ctx, width, height} = configureMetricCanvas(canvas, 800, 340);
   ctx.fillStyle = '#07121f';
   ctx.fillRect(0, 0, width, height);
+  trainingMetricPlotGeometry = null;
 
   const data = trainingMetricsData;
   const points = (data && data.points) || [];
   const selected = ((data && data.series) || []).filter(key => enabledMetrics.has(key));
-  if (!points.length || !selected.length) {
+  const range = currentTrainingMetricRange(points);
+  drawTrainingMetricRange();
+  if (!points.length || !selected.length || !range) {
     ctx.fillStyle = '#91a4bd';
     ctx.font = '14px system-ui';
     ctx.textAlign = 'center';
@@ -1571,20 +1811,24 @@ function drawTrainingMetrics() {
     return;
   }
 
+  const minStep = range.start;
+  const maxStep = range.end > range.start ? range.end : range.start + 1;
+  const seriesPoints = new Map();
   const values = [];
-  for (const point of points) {
-    for (const key of selected) {
-      const value = Number(point[key]);
-      if (Number.isFinite(value)) values.push(value);
-    }
+  for (const key of selected) {
+    const visible = trainingMetricSeriesPoints(points, key, minStep, maxStep);
+    seriesPoints.set(key, visible);
+    visible.forEach(point => values.push(point.value));
   }
-  if (!values.length) return;
-  const steps = points.map(point => Number(point.step)).filter(Number.isFinite);
-  let minStep = Math.min(...steps);
-  let maxStep = Math.max(...steps);
+  if (!values.length) {
+    ctx.fillStyle = '#91a4bd';
+    ctx.font = '14px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText('当前 X 轴范围内没有所选指标', width / 2, height / 2);
+    return;
+  }
   let minValue = Math.min(...values);
   let maxValue = Math.max(...values);
-  if (minStep === maxStep) maxStep = minStep + 1;
   if (minValue === maxValue) {
     const pad = Math.abs(minValue || 1) * 0.1;
     minValue -= pad;
@@ -1596,10 +1840,14 @@ function drawTrainingMetrics() {
   }
 
   const margin = {left: 72, right: 18, top: 18, bottom: 42};
-  const plotWidth = width - margin.left - margin.right;
-  const plotHeight = height - margin.top - margin.bottom;
+  const plotWidth = Math.max(1, width - margin.left - margin.right);
+  const plotHeight = Math.max(1, height - margin.top - margin.bottom);
   const x = step => margin.left + (step - minStep) / (maxStep - minStep) * plotWidth;
   const y = value => margin.top + (maxValue - value) / (maxValue - minValue) * plotHeight;
+  trainingMetricPlotGeometry = {
+    left: margin.left, right: margin.left + plotWidth, top: margin.top, bottom: margin.top + plotHeight,
+    plotWidth, minStep: range.start, maxStep: range.end,
+  };
   ctx.strokeStyle = '#223a55';
   ctx.fillStyle = '#91a4bd';
   ctx.lineWidth = 1;
@@ -1616,12 +1864,16 @@ function drawTrainingMetrics() {
   ctx.textBaseline = 'top';
   for (let i = 0; i <= 5; i++) {
     const xx = margin.left + plotWidth * i / 5;
-    const step = Math.round(minStep + (maxStep - minStep) * i / 5);
-    ctx.fillText(String(step), xx, height - margin.bottom + 10);
+    const step = range.start + (range.end - range.start) * i / 5;
+    ctx.fillText(String(Math.round(step)), xx, height - margin.bottom + 10);
   }
   ctx.fillStyle = '#b8c9dc';
-  ctx.fillText('step', margin.left + plotWidth / 2, height - 16);
+  ctx.fillText('step · 左右拖动平移', margin.left + plotWidth / 2, height - 16);
 
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(margin.left, margin.top, plotWidth, plotHeight);
+  ctx.clip();
   selected.forEach(key => {
     const colorIndex = (data.series || []).indexOf(key);
     const isEval = key.startsWith('eval_');
@@ -1632,26 +1884,109 @@ function drawTrainingMetrics() {
     ctx.setLineDash(isEval ? [7, 5] : []);
     ctx.beginPath();
     let started = false;
-    for (const point of points) {
-      const value = Number(point[key]);
-      const step = Number(point.step);
-      if (!Number.isFinite(value) || !Number.isFinite(step)) continue;
-      if (!started) { ctx.moveTo(x(step), y(value)); started = true; }
-      else ctx.lineTo(x(step), y(value));
+    for (const point of seriesPoints.get(key) || []) {
+      if (!started) { ctx.moveTo(x(point.step), y(point.value)); started = true; }
+      else ctx.lineTo(x(point.step), y(point.value));
     }
     if (started) ctx.stroke();
     ctx.setLineDash([]);
     if (isEval) {
-      for (const point of points) {
-        const value = Number(point[key]);
-        const step = Number(point.step);
-        if (!Number.isFinite(value) || !Number.isFinite(step)) continue;
+      for (const point of seriesPoints.get(key) || []) {
+        if (point.step < range.start || point.step > range.end) continue;
         ctx.beginPath();
-        ctx.arc(x(step), y(value), 3.5, 0, Math.PI * 2);
+        ctx.arc(x(point.step), y(point.value), 3.5, 0, Math.PI * 2);
         ctx.fill();
       }
     }
   });
+  ctx.restore();
+}
+
+function metricPointerPosition(event, canvas) {
+  const rect = canvas.getBoundingClientRect();
+  return {x: event.clientX - rect.left, y: event.clientY - rect.top};
+}
+
+function beginTrainingMetricDrag(event, source) {
+  if (event.pointerType === 'mouse' && event.button !== 0) return;
+  const canvas = event.currentTarget;
+  const range = currentTrainingMetricRange((trainingMetricsData && trainingMetricsData.points) || []);
+  if (!range) return;
+  const position = metricPointerPosition(event, canvas);
+  let kind;
+  let geometry;
+  if (source === 'plot') {
+    geometry = trainingMetricPlotGeometry;
+    if (!geometry || position.x < geometry.left || position.x > geometry.right || position.y < geometry.top || position.y > geometry.bottom) return;
+    kind = 'plot-pan';
+  } else {
+    geometry = trainingMetricRangeGeometry;
+    if (!geometry || geometry.fullMax <= geometry.fullMin || position.y < geometry.top - 8 || position.y > geometry.bottom + 8) return;
+    const handleHitRadius = 13;
+    if (Math.abs(position.x - geometry.selectionLeft) <= handleHitRadius || position.x < geometry.selectionLeft) kind = 'range-left';
+    else if (Math.abs(position.x - geometry.selectionRight) <= handleHitRadius || position.x > geometry.selectionRight) kind = 'range-right';
+    else kind = 'range-pan';
+  }
+  trainingMetricDrag = {
+    pointerId: event.pointerId,
+    canvas,
+    kind,
+    startX: position.x,
+    startStep: range.start,
+    endStep: range.end,
+    geometry: {...geometry},
+  };
+  canvas.setPointerCapture(event.pointerId);
+  canvas.classList.add('dragging');
+  if (kind === 'range-left' && position.x < geometry.selectionLeft) {
+    const step = geometry.fullMin + (Math.max(geometry.left, position.x) - geometry.left) / geometry.plotWidth * (geometry.fullMax - geometry.fullMin);
+    setTrainingMetricWindow(step, range.end, 'left');
+  } else if (kind === 'range-right' && position.x > geometry.selectionRight) {
+    const step = geometry.fullMin + (Math.min(geometry.right, position.x) - geometry.left) / geometry.plotWidth * (geometry.fullMax - geometry.fullMin);
+    setTrainingMetricWindow(range.start, step, 'right');
+  }
+  event.preventDefault();
+}
+
+function moveTrainingMetricDrag(event) {
+  const drag = trainingMetricDrag;
+  if (!drag || drag.pointerId !== event.pointerId) return;
+  const position = metricPointerPosition(event, drag.canvas);
+  const geometry = drag.geometry;
+  const deltaX = position.x - drag.startX;
+  if (drag.kind === 'plot-pan') {
+    const windowSpan = drag.endStep - drag.startStep;
+    const deltaStep = -deltaX / geometry.plotWidth * windowSpan;
+    setTrainingMetricWindow(drag.startStep + deltaStep, drag.endStep + deltaStep, 'pan');
+  } else if (drag.kind === 'range-pan') {
+    const fullSpan = geometry.fullMax - geometry.fullMin;
+    const deltaStep = deltaX / geometry.plotWidth * fullSpan;
+    setTrainingMetricWindow(drag.startStep + deltaStep, drag.endStep + deltaStep, 'pan');
+  } else {
+    const x = Math.max(geometry.left, Math.min(geometry.right, position.x));
+    const step = geometry.fullMin + (x - geometry.left) / geometry.plotWidth * (geometry.fullMax - geometry.fullMin);
+    if (drag.kind === 'range-left') setTrainingMetricWindow(step, drag.endStep, 'left');
+    else setTrainingMetricWindow(drag.startStep, step, 'right');
+  }
+  event.preventDefault();
+}
+
+function endTrainingMetricDrag(event) {
+  const drag = trainingMetricDrag;
+  if (!drag || drag.pointerId !== event.pointerId) return;
+  drag.canvas.classList.remove('dragging');
+  if (drag.canvas.hasPointerCapture && drag.canvas.hasPointerCapture(event.pointerId)) drag.canvas.releasePointerCapture(event.pointerId);
+  trainingMetricDrag = null;
+}
+
+function updateTrainingMetricRangeCursor(event) {
+  if (trainingMetricDrag) return;
+  const canvas = event.currentTarget;
+  const geometry = trainingMetricRangeGeometry;
+  if (!geometry) { canvas.style.cursor = 'default'; return; }
+  const {x} = metricPointerPosition(event, canvas);
+  const nearHandle = Math.abs(x - geometry.selectionLeft) <= 13 || Math.abs(x - geometry.selectionRight) <= 13;
+  canvas.style.cursor = nearHandle || x < geometry.selectionLeft || x > geometry.selectionRight ? 'ew-resize' : 'grab';
 }
 
 function fmtTime(epoch) {
@@ -2150,29 +2485,149 @@ ${robotArgs} \\
   --instruction "pick up the cube"`;
 }
 
+const TELEMETRY_CAMERA_LABELS = {
+  cam_high: '顶部全局',
+  cam_wrist: '单臂腕部',
+  cam_left_wrist: '左臂腕部',
+  cam_right_wrist: '右臂腕部',
+};
+
+function telemetryCameraKeys(obs) {
+  const shapes = obs && obs.camera_shapes && typeof obs.camera_shapes === 'object' ? obs.camera_shapes : {};
+  const available = Object.keys(shapes).filter(key => shapes[key]);
+  const preferred = obs && obs.arm_mode === 'bimanual'
+    ? ['cam_high', 'cam_left_wrist', 'cam_right_wrist']
+    : ['cam_high', 'cam_wrist'];
+  return [...preferred.filter(key => available.includes(key)), ...available.filter(key => !preferred.includes(key))];
+}
+
+function telemetryCameraShape(shape) {
+  return Array.isArray(shape) && shape.length ? shape.join('×') : 'shape 未上报';
+}
+
+function clearObservationPreviews(message = '尚无相机帧。') {
+  previewUrls.forEach(url => URL.revokeObjectURL(url));
+  previewUrls.clear();
+  document.getElementById('robotImages').innerHTML = `<div class="muted">${esc(message)}</div>`;
+  document.getElementById('robotCameraSummary').textContent = message;
+}
+
+function renderObservationCameraCards(obs, keys) {
+  const shapes = obs.camera_shapes || {};
+  document.getElementById('robotCameraSummary').textContent = `${obs.arm_mode === 'bimanual' ? '双臂三路' : '单臂两路'} · 已上报 ${keys.length} 路`;
+  document.getElementById('robotImages').innerHTML = keys.map((key, index) => `
+    <figure class="telemetry-camera-card" data-camera-key="${esc(key)}">
+      <figcaption><span>${esc(TELEMETRY_CAMERA_LABELS[key] || key)}</span><code>${esc(key)}</code></figcaption>
+      <img id="telemetryCameraImage${index}" alt="${esc(TELEMETRY_CAMERA_LABELS[key] || key)}" hidden>
+      <div id="telemetryCameraStatus${index}" class="camera-status">${esc(telemetryCameraShape(shapes[key]))} · 正在加载最新帧…</div>
+    </figure>`).join('');
+}
+
 async function loadObservationPreviews(obs) {
   if (!obs || !obs.telemetry_session) return;
-  try {
-    const suffix = `?v=${encodeURIComponent(obs.sequence)}`;
-    const session = encodeURIComponent(obs.telemetry_session);
-    const bimanual = obs.arm_mode === 'bimanual';
-    const keys = bimanual ? ['cam_high', 'cam_left_wrist', 'cam_right_wrist'] : ['cam_high', 'cam_wrist'];
-    const blobs = await Promise.all(keys.map(key => apiBlob(`/api/policy-telemetry/${session}/image/${key}${suffix}`)));
-    previewUrls.forEach(URL.revokeObjectURL);
-    previewUrls = blobs.map(blob => URL.createObjectURL(blob));
-    document.getElementById('previewHigh').src = previewUrls[0];
-    document.getElementById('singleWristPreview').hidden = bimanual;
-    document.getElementById('leftWristPreview').hidden = !bimanual;
-    document.getElementById('rightWristPreview').hidden = !bimanual;
-    if (bimanual) {
-      document.getElementById('previewLeftWrist').src = previewUrls[1];
-      document.getElementById('previewRightWrist').src = previewUrls[2];
-    } else {
-      document.getElementById('previewWrist').src = previewUrls[1];
-    }
-  } catch (error) {
-    console.warn('telemetry preview refresh failed', error);
+  const keys = telemetryCameraKeys(obs);
+  if (!keys.length) {
+    clearObservationPreviews('Policy 未上报相机字段。');
+    return;
   }
+  const requestKey = `${obs.telemetry_session}:${obs.sequence}`;
+  renderObservationCameraCards(obs, keys);
+  previewUrls.forEach(url => URL.revokeObjectURL(url));
+  previewUrls.clear();
+  const suffix = `?v=${encodeURIComponent(obs.sequence)}`;
+  const session = encodeURIComponent(obs.telemetry_session);
+  const results = await Promise.allSettled(
+    keys.map(key => apiBlob(`/api/policy-telemetry/${session}/image/${encodeURIComponent(key)}${suffix}`)),
+  );
+  if (latestTelemetryKey !== requestKey) return;
+  results.forEach((result, index) => {
+    const key = keys[index];
+    const image = document.getElementById(`telemetryCameraImage${index}`);
+    const status = document.getElementById(`telemetryCameraStatus${index}`);
+    if (!image || !status) return;
+    if (result.status === 'fulfilled') {
+      const url = URL.createObjectURL(result.value);
+      previewUrls.set(key, url);
+      image.src = url;
+      image.hidden = false;
+      status.textContent = `${telemetryCameraShape((obs.camera_shapes || {})[key])} · sequence ${obs.sequence}`;
+    } else {
+      image.hidden = true;
+      status.textContent = `${telemetryCameraShape((obs.camera_shapes || {})[key])} · 当前帧读取失败`;
+      console.warn(`telemetry camera ${key} refresh failed`, result.reason);
+    }
+  });
+}
+
+function telemetryVectorLabels(obs, kind, perArmDim) {
+  const gripperSemantics = String(
+    kind === 'state'
+      ? (obs.state_gripper_semantics || obs.raw_gripper_semantics || '')
+      : (obs.wire_gripper_semantics || obs.raw_gripper_semantics || ''),
+  );
+  const gripper = gripperSemantics.includes('metre') || gripperSemantics.endsWith('_m')
+    ? 'gripper_opening(m)'
+    : gripperSemantics.includes('closed_fraction')
+      ? 'gripper_closed_fraction'
+      : 'gripper_opening_fraction';
+  if (obs.schema === 'joint' && perArmDim === 7) {
+    const prefix = kind === 'action' ? 'target_' : '';
+    return [`${prefix}joint1(rad)`, `${prefix}joint2(rad)`, `${prefix}joint3(rad)`, `${prefix}joint4(rad)`, `${prefix}joint5(rad)`, `${prefix}joint6(rad)`, gripper];
+  }
+  if (kind === 'state' && perArmDim === 10) {
+    return ['x(m)', 'y(m)', 'z(m)', 'r6d_c0_x', 'r6d_c0_y', 'r6d_c0_z', 'r6d_c1_x', 'r6d_c1_y', 'r6d_c1_z', gripper];
+  }
+  if (kind === 'action' && perArmDim === 7) {
+    return ['delta_x(m)', 'delta_y(m)', 'delta_z(m)', 'delta_rx(rad)', 'delta_ry(rad)', 'delta_rz(rad)', gripper];
+  }
+  return Array.from({length: perArmDim}, (_, index) => `dim_${index}`);
+}
+
+function formatTelemetryVector(obs, rawValues, kind) {
+  const values = Array.isArray(rawValues) ? rawValues : [];
+  if (!values.length) return '未上报';
+  const armCount = obs.arm_mode === 'bimanual' ? 2 : 1;
+  const perArmDim = Math.floor(values.length / armCount);
+  const labels = telemetryVectorLabels(obs, kind, perArmDim);
+  const sides = armCount === 2 ? ['left', 'right'] : [obs.arm_side || 'arm'];
+  return sides.map((side, armIndex) => {
+    const armValues = values.slice(armIndex * perArmDim, (armIndex + 1) * perArmDim);
+    return `[${side}]\n${armValues.map((value, index) => {
+      const number = Number(value);
+      return `${labels[index] || index}: ${Number.isFinite(number) ? number.toFixed(6) : '-'}`;
+    }).join('\n')}`;
+  }).join('\n\n');
+}
+
+function telemetryJointDeltaSummary(obs, action) {
+  const state = Array.isArray(obs.state) ? obs.state : [];
+  if (obs.schema !== 'joint' || !Array.isArray(action) || action.length !== state.length) return '';
+  const armCount = obs.arm_mode === 'bimanual' ? 2 : 1;
+  const sides = armCount === 2 ? ['left', 'right'] : [obs.arm_side || 'arm'];
+  return sides.map((side, armIndex) => {
+    const offset = armIndex * 7;
+    const jointDelta = action.slice(offset, offset + 6).map((value, index) => Math.abs(Number(value) - Number(state[offset + index])));
+    const maxDelta = jointDelta.length ? Math.max(...jointDelta) : NaN;
+    const gripperDelta = Math.abs(Number(action[offset + 6]) - Number(state[offset + 6]));
+    return `${side}: max|target-state|=${Number.isFinite(maxDelta) ? maxDelta.toFixed(6) : '-'} rad · |gripper Δ|=${Number.isFinite(gripperDelta) ? gripperDelta.toFixed(6) : '-'}`;
+  }).join('\n');
+}
+
+function renderTelemetryContractBadges(obs) {
+  const cameraCount = telemetryCameraKeys(obs).length;
+  const chunkRows = obs.client_chunk_rows ?? ((obs.actions_shape || [])[0] ?? '-');
+  const control = obs.execution_control || {};
+  const badges = [
+    obs.arm_mode === 'bimanual' ? '双臂' : `单臂 ${obs.arm_side || '-'}`,
+    `${obs.schema || '-'} schema`,
+    `state ${obs.state_dim || '?'}D`,
+    `action ${obs.model_action_dim || '?'}D × ${chunkRows}`,
+    `camera ${cameraCount}`,
+    `${obs.action_hz ?? '-'} Hz`,
+    String(control.mode || 'shadow').toUpperCase(),
+    obs.fresh ? 'telemetry fresh' : 'telemetry stale',
+  ];
+  document.getElementById('telemetryContractBadges').innerHTML = badges.map(value => `<span>${esc(value)}</span>`).join('');
 }
 
 function fillObservation(obs) {
@@ -2182,10 +2637,14 @@ function fillObservation(obs) {
   if (!obs) {
     status.className = 'warn';
     status.textContent = '尚未收到官方 Policy telemetry；请先启动 Policy，再在机械臂控制电脑启动 WebSocket shadow 客户端。';
+    document.getElementById('telemetryContractBadges').innerHTML = '';
     document.getElementById('robotStateTitle').textContent = 'Policy state';
     document.getElementById('robotState').textContent = 'state: -';
+    document.getElementById('policyFirstActionTitle').textContent = '首条预测 action';
+    document.getElementById('policyFirstAction').textContent = 'action: -';
     document.getElementById('policyAction').textContent = 'action: -';
     document.getElementById('actuatorTrace').textContent = 'actuator trace: -';
+    clearObservationPreviews();
     ['telemetryUpload', 'telemetryModel', 'telemetryDownload', 'telemetryTransport', 'telemetryFirstCommand', 'telemetryActionError'].forEach(id => { document.getElementById(id).textContent = '-'; });
     ['telemetryUploadDetail', 'telemetryDownloadDetail', 'telemetryTransportDetail'].forEach(id => { document.getElementById(id).textContent = '尚无客户端汇报'; });
     return;
@@ -2205,6 +2664,8 @@ function fillObservation(obs) {
   const clientTransportMs = obs.client_network_transport_total_ms;
   const roundTripMs = obs.client_round_trip_ms;
   const drop = queueDropInfo(obs);
+  const cameraKeys = telemetryCameraKeys(obs);
+  renderTelemetryContractBadges(obs);
   document.getElementById('telemetryUpload').textContent = metricMs(uploadMs);
   document.getElementById('telemetryUploadDetail').textContent = clientUploadMs != null
     ? '客户端汇报 · wall-clock 单向测量'
@@ -2222,23 +2683,15 @@ function fillObservation(obs) {
     : '尚无客户端总传输汇报 · RTT 为客户端 monotonic 实测';
   document.getElementById('telemetryFirstCommand').textContent = metricMs(obs.client_result_to_first_command_ms);
   document.getElementById('telemetryActionError').textContent = signedMetricMs(currentTargetErrorMs);
-  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · 服务端=${control.mode || 'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open ? 'OPEN' : 'CLOSED'} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · 上传=${clientTimingMetric(clientUploadMs, serverUploadMs)} · 推理实测=${metricMs(modelMs)} · 下行=${clientTimingMetric(clientDownloadMs, null)} · 当前动作时间误差=${signedMetricMs(currentTargetErrorMs)} · 安全=${drop.unsafeLabel} · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
+  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · ${obs.arm_mode === 'bimanual' ? '双臂' : '单臂'} ${obs.schema || '-'} · state/action=${obs.state_dim || '?'}D/${obs.model_action_dim || '?'}D · camera=${cameraKeys.length} · 服务端=${control.mode || 'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open ? 'OPEN' : 'CLOSED'} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · 上传=${clientTimingMetric(clientUploadMs, serverUploadMs)} · 推理实测=${metricMs(modelMs)} · 下行=${clientTimingMetric(clientDownloadMs, null)} · 当前动作时间误差=${signedMetricMs(currentTargetErrorMs)} · 安全=${drop.unsafeLabel} · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
   const joint = obs.schema === 'joint';
-  const stateGripper = String(obs.state_gripper_semantics || obs.raw_gripper_semantics || '');
-  const gripperLabel = stateGripper.includes('metre') || stateGripper.endsWith('_m')
-    ? 'gripper_opening(m)'
-    : stateGripper.includes('closed_fraction')
-      ? 'gripper_closed_fraction'
-      : 'gripper_opening_fraction';
-  const labels = joint ? ['joint1(rad)', 'joint2(rad)', 'joint3(rad)', 'joint4(rad)', 'joint5(rad)', 'joint6(rad)', gripperLabel] : ['x(m)', 'y(m)', 'z(m)', 'r6d_c0_x', 'r6d_c0_y', 'r6d_c0_z', 'r6d_c1_x', 'r6d_c1_y', 'r6d_c1_z', gripperLabel];
-  const perArmDim = joint ? 7 : 10;
   const state = obs.state || [];
-  const formatArm = (side, values) => `[${side}]\n${values.map((v, i) => `${labels[i] || i}: ${Number(v).toFixed(6)}`).join('\n')}`;
-  const values = obs.arm_mode === 'bimanual'
-    ? `${formatArm('left', state.slice(0, perArmDim))}\n\n${formatArm('right', state.slice(perArmDim, perArmDim * 2))}`
-    : state.map((v, i) => `${labels[i] || i}: ${Number(v).toFixed(6)}`).join('\n');
   document.getElementById('robotStateTitle').textContent = `${obs.state_dim}D ${obs.arm_mode === 'bimanual' ? 'bimanual ' : ''}${obs.schema} state`;
-  document.getElementById('robotState').textContent = `schema=${obs.schema} arm_mode=${obs.arm_mode || 'single'} arm=${obs.arm_side} dim=${obs.state_dim}\n${values}`;
+  document.getElementById('robotState').textContent = `schema=${obs.schema} arm_mode=${obs.arm_mode || 'single'} arm=${obs.arm_side} dim=${obs.state_dim}\nsemantics=${obs.raw_action_semantics || '-'}\n\n${formatTelemetryVector(obs, state, 'state')}`;
+  const firstAction = Array.isArray(obs.first_action) ? obs.first_action : [];
+  const jointDelta = telemetryJointDeltaSummary(obs, firstAction);
+  document.getElementById('policyFirstActionTitle').textContent = `${obs.model_action_dim || firstAction.length || '?'}D ${obs.arm_mode === 'bimanual' ? '双臂' : '单臂'}首条 wire action`;
+  document.getElementById('policyFirstAction').textContent = `shape=${JSON.stringify(obs.actions_shape || [])}\nwire=${obs.wire_action_semantics || '-'} · ${obs.wire_action_convention || '-'}\nrange=${compactNumber(obs.action_min)} .. ${compactNumber(obs.action_max)}\n\n${formatTelemetryVector(obs, firstAction, 'action')}${jointDelta ? `\n\n[相对当前 state]\n${jointDelta}` : ''}`;
   const launchHz = obs.client_inference_launch_hz ?? obs.client_inference_hz ?? obs.recommended_inference_launch_hz ?? 4;
   const actionHz = obs.client_policy_action_hz ?? obs.action_hz ?? 20;
   const controlHz = obs.client_control_hz ?? obs.client_command_hz ?? actionHz;
@@ -2258,6 +2711,10 @@ function fillObservation(obs) {
   const targetTimes = Array.isArray(obs.client_plan_target_times) ? JSON.stringify(obs.client_plan_target_times) : '-';
   const targetAt = actionTargetAt(obs);
   const rejectedResult = obs.client_rejected_result ? JSON.stringify(obs.client_rejected_result) : false;
+  const cameraSummary = cameraKeys.map(key => `${key}=${telemetryCameraShape((obs.camera_shapes || {})[key])}`).join(' · ') || '-';
+  const safetyFallback = joint
+    ? 'joint absolute target；客户端逐周期检查关节目标/变化量、夹爪与 Piper 状态'
+    : 'translation=0.05m, rotation=0.18rad, gripper=0.30 fraction; workspace x[-0.05,0.30] y[0.01,0.50] z[0.14,0.52]';
   const horizonStatus = obs.horizon_execution_ready
     ? `ready (>= ${obs.minimum_horizon ?? 16})`
     : `BLOCKED: ${obs.horizon_error || 'action_horizon must be >= 16'}`;
@@ -2267,6 +2724,7 @@ raw semantics: ${obs.raw_action_semantics || '-'} · ${obs.raw_action_convention
 model semantics: ${obs.model_action_semantics || '-'} · ${obs.model_action_convention || '-'}
 wire semantics: ${obs.wire_action_semantics || '-'} · ${obs.wire_action_convention || '-'}
 gripper: raw=${obs.raw_gripper_semantics || '-'} · state=${obs.state_gripper_semantics || '-'} · wire=${obs.wire_gripper_semantics || '-'}
+cameras: ${cameraSummary}
 actions shape / chunk rows: ${JSON.stringify(obs.actions_shape || [])} / ${chunkRows}
 action_hz / control_hz / inference launch_hz: ${actionHz ?? '-'} / ${controlHz ?? '-'} / ${launchHz ?? '-'} Hz
 action_horizon / min horizon: ${obs.action_horizon ?? '-'} / ${obs.minimum_horizon ?? 16} (client=${obs.client_minimum_horizon ?? '-'}) · ${horizonStatus}
@@ -2294,7 +2752,7 @@ current action target timestamp: ${fmtTime(targetAt)} · time error (now-target,
 last safe target: ${obs.client_last_safe_target ? JSON.stringify(obs.client_last_safe_target) : '-'}
 queue anchor: ${queueAnchor}
 safety profile: ${obs.client_safety_profile || '-'}
-safety limits: ${obs.client_delivery_safety_limits ? JSON.stringify(obs.client_delivery_safety_limits) : 'translation=0.05m, rotation=0.18rad, gripper=0.30 fraction; workspace x[-0.05,0.30] y[0.01,0.50] z[0.14,0.52]'}
+safety limits: ${obs.client_delivery_safety_limits ? JSON.stringify(obs.client_delivery_safety_limits) : safetyFallback}
 last wire action: ${lastWire}
 last decoded target: ${decodedTarget}
 actuator command sequence/generation/source/queue: ${obs.client_actuator_command_sequence ?? '-'} / ${obs.client_actuator_command_generation ?? '-'} / ${obs.client_actuator_command_source_index ?? '-'} / ${obs.client_actuator_command_queue_index ?? '-'}
@@ -2312,7 +2770,7 @@ robot enabled sides: ${Array.isArray(obs.client_robot_enabled_sides) ? obs.clien
 driver enable feedback: ${obs.client_robot_driver_enable_status ? JSON.stringify(obs.client_robot_driver_enable_status) : '-'}
 enable hold handshake: ${obs.client_robot_enable_hold ? JSON.stringify(obs.client_robot_enable_hold) : '-'}
 last command sent: ${fmtTime(obs.client_last_command_at)}
-safety @20Hz: translation<=0.05m, rotation<=0.18rad, gripper<=0.30 fraction; workspace x[-0.05,0.30] y[0.01,0.50] z[0.14,0.52]; CLI may tighten`;
+safety @20Hz: ${joint ? 'joint target/rate + gripper + Piper status checks' : 'translation<=0.05m, rotation<=0.18rad, gripper<=0.30 fraction; workspace x[-0.05,0.30] y[0.01,0.50] z[0.14,0.52]'}; CLI may tighten`;
   const key = `${obs.telemetry_session}:${obs.sequence}`;
   if (key !== latestTelemetryKey) {
     latestTelemetryKey = key;
@@ -2576,9 +3034,26 @@ document.getElementById('editorDataset').addEventListener('change', () => {
 });
 document.getElementById('trainMetricsTask').addEventListener('change', () => {
   trainingMetricsData = null;
+  trainingMetricRange = null;
   enabledMetrics = new Set();
   loadTrainingMetrics();
 });
+const trainMetricsCanvas = document.getElementById('trainMetricsChart');
+const trainMetricRangeCanvas = document.getElementById('trainMetricRangeChart');
+trainMetricsCanvas.addEventListener('pointerdown', event => beginTrainingMetricDrag(event, 'plot'));
+trainMetricsCanvas.addEventListener('pointermove', moveTrainingMetricDrag);
+trainMetricsCanvas.addEventListener('pointerup', endTrainingMetricDrag);
+trainMetricsCanvas.addEventListener('pointercancel', endTrainingMetricDrag);
+trainMetricRangeCanvas.addEventListener('pointerdown', event => beginTrainingMetricDrag(event, 'range'));
+trainMetricRangeCanvas.addEventListener('pointermove', event => {
+  updateTrainingMetricRangeCursor(event);
+  moveTrainingMetricDrag(event);
+});
+trainMetricRangeCanvas.addEventListener('pointerleave', () => {
+  if (!trainingMetricDrag) trainMetricRangeCanvas.style.cursor = 'grab';
+});
+trainMetricRangeCanvas.addEventListener('pointerup', endTrainingMetricDrag);
+trainMetricRangeCanvas.addEventListener('pointercancel', endTrainingMetricDrag);
 
 document.getElementById('episodeForm').onsubmit = async event => {
   event.preventDefault();

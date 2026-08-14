@@ -2471,6 +2471,59 @@ class ExecutionQueueTest(unittest.TestCase):
         for piper in pipers.values():
             self.assertNotIn("JointCtrl", [call[0] for call in piper.calls])
 
+    def test_bimanual_joint_action_maps_left_and_right_to_piper_units(self):
+        protocol = validate_policy_metadata(BIMANUAL_JOINT_METADATA, "both", "bimanual")
+        pipers = {"left": FakePiper(), "right": FakePiper()}
+        execution = ExecutionController(
+            pipers,
+            execution_args(
+                arm_mode="bimanual",
+                arm_side="both",
+                gripper_lowpass_alpha=1.0,
+                gripper_confirm_steps=1,
+            ),
+        )
+        execution.configure_protocol(protocol)
+        execution.robot_enabled = {"left", "right"}
+
+        qpos = np.concatenate([self.qpos, self.qpos])
+        left_target = np.array([0.10, 1.10, -1.10, 0.05, -0.10, 0.20, 0.60])
+        right_target = np.array([-0.10, 0.90, -0.90, -0.05, 0.10, -0.20, 0.40])
+        target = np.concatenate([left_target, right_target])[None, :]
+        raw_state = np.concatenate([self.raw_state, self.raw_state])
+        now = time.time()
+        self.assertEqual(
+            execution.queue_result(
+                execution_result(target),
+                raw_state,
+                qpos,
+                protocol,
+                {"cam_high": now, "cam_left_wrist": now, "cam_right_wrist": now},
+                0.01,
+            ),
+            1,
+        )
+        self.assertTrue(
+            execution.execute_next(
+                raw_state,
+                qpos,
+                protocol,
+                feedback_captured_at=time.time(),
+            )
+        )
+
+        for side, side_target in (("left", left_target), ("right", right_target)):
+            joint_call = next(call for call in pipers[side].calls if call[0] == "JointCtrl")
+            gripper_call = next(call for call in pipers[side].calls if call[0] == "GripperCtrl")
+            expected_joints = np.rint(side_target[:6] * RAD_FACTOR).astype(np.int64)
+            expected_gripper = round(float(side_target[6]) * GRIPPER_MAX_M * 1_000_000.0)
+            self.assertEqual(tuple(joint_call[1:]), tuple(map(int, expected_joints)))
+            self.assertEqual(gripper_call[1], expected_gripper)
+
+        self.assertEqual(
+            set(execution.last_actuator_command["sides"]), {"left", "right"}
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -53,6 +53,40 @@ class DashboardTemplateNullGuardTest(unittest.TestCase):
         self.assertIn('@app.post("/api/tasks/batch-delete")', app_source)
         self.assertIn("def delete_many", app_source)
 
+    def test_training_metrics_chart_has_draggable_x_axis_range(self):
+        template = (
+            Path(__file__).parent / "server_4090/templates/index.html"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('id="trainMetricRangeChart"', template)
+        self.assertIn('id="trainMetricRangeLabel"', template)
+        self.assertIn("function setTrainingMetricWindow(start, end, mode = 'pan')", template)
+        self.assertIn("function beginTrainingMetricDrag(event, source)", template)
+        self.assertIn("kind = 'range-left'", template)
+        self.assertIn("kind = 'range-right'", template)
+        self.assertIn("kind = 'range-pan'", template)
+        self.assertIn("beginTrainingMetricDrag(event, 'plot')", template)
+        self.assertIn("beginTrainingMetricDrag(event, 'range')", template)
+        self.assertIn("touch-action:none", template)
+        self.assertNotIn('trainMetricRangeReset', template)
+
+    def test_realtime_telemetry_supports_dynamic_bimanual_cameras_and_vectors(self):
+        template = (
+            Path(__file__).parent / "server_4090/templates/index.html"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('id="policyFirstAction"', template)
+        self.assertIn('id="telemetryContractBadges"', template)
+        self.assertIn('class="telemetry-camera-grid"', template)
+        self.assertIn("function telemetryCameraKeys(obs)", template)
+        self.assertIn("['cam_high', 'cam_left_wrist', 'cam_right_wrist']", template)
+        self.assertIn("Promise.allSettled", template)
+        self.assertIn("function formatTelemetryVector(obs, rawValues, kind)", template)
+        self.assertIn("function telemetryJointDeltaSummary(obs, action)", template)
+        self.assertIn("obs.first_action", template)
+        self.assertNotIn('id="singleWristPreview"', template)
+        self.assertNotIn('id="previewWrist"', template)
+
     def test_timed_target_helpers_guard_null_object_values(self):
         template = (
             Path(__file__).parent / "server_4090/templates/index.html"
