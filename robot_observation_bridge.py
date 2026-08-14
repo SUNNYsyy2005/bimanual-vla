@@ -5004,7 +5004,17 @@ def main() -> None:
         args.arm_side = "both"
         if args.left_can == args.right_can:
             parser.error("--left-can and --right-can must differ in bimanual mode")
-        if len({args.cam_high_device, args.cam_left_wrist_device, args.cam_right_wrist_device}) != 3:
+        camera_devices = (
+            args.cam_high_device,
+            args.cam_left_wrist_device,
+            args.cam_right_wrist_device,
+        )
+        explicit_camera_devices = [
+            str(device).strip().lower()
+            for device in camera_devices
+            if str(device).strip().lower() != "auto"
+        ]
+        if len(set(explicit_camera_devices)) != len(explicit_camera_devices):
             parser.error("bimanual camera devices must be distinct")
     elif args.arm_side not in {"left", "right"}:
         parser.error("single mode requires --arm-side left or right")

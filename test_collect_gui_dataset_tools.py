@@ -4,23 +4,78 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
 from camera import resolve_video_device, select_video_device
 from collect_gui import (
+    CollectorGUI,
     activate_can_interfaces,
+    build_inference_bridge_command,
     build_can_activation_command,
     build_dataset_tool_command,
     discover_dataset_names,
     episode_list_values,
     format_arm_state_rows,
     letterbox_preview_frame,
+    load_gui_preferences,
     move_episodes_to_trash,
     parse_can_link_status,
+    save_gui_preferences,
     summarize_dataset_directory,
 )
+from collection_session import SessionState
 from piper_data_contract import BIMANUAL, DELIVERY_SCHEMA, JOINT_SCHEMA, SINGLE_ARM
+
+
+class GuiPreferencesTest(unittest.TestCase):
+    def test_preferences_round_trip_with_user_only_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nested" / "preferences.json"
+            values = {
+                "remember_can_password": True,
+                "can_admin_password": "secret",
+                "remember_upload_token": True,
+                "upload_token": "token-value",
+            }
+
+            save_gui_preferences(values, path)
+
+            self.assertEqual(load_gui_preferences(path), values)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_invalid_preferences_are_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "preferences.json"
+            path.write_text("not json", encoding="utf-8")
+
+            self.assertEqual(load_gui_preferences(path), {})
+
+
+class SpaceShortcutTest(unittest.TestCase):
+    def test_episode_action_runs_once_on_space_release(self):
+        gui = CollectorGUI.__new__(CollectorGUI)
+        calls = []
+        gui.root = SimpleNamespace(_w=".", after_idle=lambda callback: callback())
+        gui._space_pressed = False
+        gui._space_action_pending = False
+        gui.recording = False
+        gui.session = SimpleNamespace(state=SessionState.READY)
+        gui.start_episode = lambda: calls.append("start")
+        gui.stop_episode = lambda: calls.append("stop")
+        gui.status_var = SimpleNamespace(set=lambda _value: None)
+        widget = SimpleNamespace(
+            winfo_toplevel=lambda: SimpleNamespace(_w="."),
+            winfo_class=lambda: "TButton",
+        )
+        event = SimpleNamespace(widget=widget)
+
+        self.assertEqual(gui._handle_space_key(event), "break")
+        self.assertEqual(calls, [])
+        self.assertEqual(gui._handle_space_release(event), "break")
+        self.assertEqual(calls, ["start"])
+        self.assertFalse(gui._space_pressed)
 
 
 class CanActivationTest(unittest.TestCase):
@@ -156,6 +211,57 @@ class CanActivationTest(unittest.TestCase):
             self.assertEqual(activation_commands[0][-1], "3-1.4:1.0")
             self.assertEqual(activation_commands[1][-1], "3-1.3:1.0")
             self.assertEqual(bus_by_name, {"can0": "3-1.4:1.0", "can1": "3-1.3:1.0"})
+
+
+class InferenceCommandTest(unittest.TestCase):
+    def _command(self, **overrides):
+        values = dict(
+            python_executable="/env/bin/python",
+            script_path="/project/robot_observation_bridge.py",
+            host="192.168.101.9",
+            port=8099,
+            hz=4,
+            arm_mode=BIMANUAL,
+            arm_side="both",
+            can="can0",
+            left_can="can0",
+            right_can="can1",
+            cam_high_device="/dev/video4",
+            cam_wrist_device="auto",
+            cam_left_wrist_device="/dev/video24",
+            cam_right_wrist_device="/dev/video12",
+            instruction="put bottles on the black site",
+            allow_execution=True,
+        )
+        values.update(overrides)
+        return build_inference_bridge_command(**values)
+
+    def test_bimanual_command_defaults_to_execution_enabled(self):
+        command = self._command()
+        self.assertIn("--allow-execution", command)
+        self.assertEqual(command[command.index("--left-can") + 1], "can0")
+        self.assertEqual(command[command.index("--right-can") + 1], "can1")
+
+    def test_execution_flag_can_be_disabled(self):
+        self.assertNotIn("--allow-execution", self._command(allow_execution=False))
+
+    def test_bimanual_rejects_duplicate_devices(self):
+        with self.assertRaises(ValueError):
+            self._command(right_can="can0")
+        with self.assertRaises(ValueError):
+            self._command(cam_right_wrist_device="/dev/video24")
+
+    def test_auto_camera_selectors_are_resolved_by_camera_capture(self):
+        command = self._command(
+            cam_high_device="auto",
+            cam_left_wrist_device="auto",
+            cam_right_wrist_device="auto",
+        )
+        self.assertEqual(command[command.index("--cam-high-device") + 1], "auto")
+
+    def test_single_arm_requires_left_or_right(self):
+        with self.assertRaises(ValueError):
+            self._command(arm_mode=SINGLE_ARM, arm_side="both")
 
 
 class EpisodeTrashTest(unittest.TestCase):
