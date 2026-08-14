@@ -118,6 +118,7 @@ from openpi.shared import normalize
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as training_config
 from openpi.training import data_loader
+from openpi.training import optimizer as _optimizer
 from openpi.training import weight_loaders
 
 
@@ -1590,10 +1591,16 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
         )
     _validate_checkpoint_contract(args, contract)
 
+    # Keep the network/checkpoint action head at the OpenPI-compatible 32-D
+    # size, but optimize only the real robot action dimensions.  Without this,
+    # Piper 7-D/14-D datasets are padded to 32-D and the training loss is
+    # diluted by zero padding, so low scalar loss can still hide poor joint/
+    # gripper fitting.
     model = pi0_config.Pi0Config(
         pi05=model_variant == "pi05",
         paligemma_variant="gemma_2b_lora",
         action_expert_variant="gemma_300m_lora",
+        loss_action_dim=int(contract.model_action_dim),
     )
     base_checkpoint = Path(args.base_checkpoint).expanduser().resolve()
     params_path = base_checkpoint / "params"
@@ -1612,12 +1619,14 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
         if contract.schema == "joint"
         else contract.model_action_convention
     )
+    weight_decay = float(getattr(args, "weight_decay", 1e-10))
     return training_config.TrainConfig(
         name=config_name(model_variant, contract.arm_mode),
         exp_name=getattr(args, "exp_name", "runtime"),
         model=model,
         data=data_factory,
         freeze_filter=model.get_freeze_filter(),
+        optimizer=_optimizer.AdamW(weight_decay=weight_decay),
         weight_loader=weight_loaders.CheckpointWeightLoader(str(params_path)),
         assets_base_dir=str(Path(args.assets_base_dir).expanduser().resolve()),
         checkpoint_base_dir=str(Path(args.checkpoint_base_dir).expanduser().resolve()),
@@ -1625,6 +1634,7 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
         num_workers=getattr(args, "num_workers", 2),
         num_train_steps=getattr(args, "num_train_steps", 30_000),
         save_interval=getattr(args, "save_interval", 1_000),
+        keep_period=getattr(args, "keep_period", 5_000),
         log_interval=getattr(args, "log_interval", 100),
         fsdp_devices=getattr(args, "fsdp_devices", 1),
         resume=bool(getattr(args, "resume", False) and not getattr(args, "resume_checkpoint", None)),
@@ -3066,6 +3076,12 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--num-workers", type=int, default=2)
     train.add_argument("--num-train-steps", type=int, default=30_000)
     train.add_argument("--save-interval", type=int, default=1_000)
+    train.add_argument(
+        "--keep-period",
+        type=int,
+        default=5_000,
+        help="Preserve every N-step checkpoint in addition to latest; use 0 to disable periodic preservation",
+    )
     train.add_argument("--log-interval", type=int, default=100)
     train.add_argument("--fsdp-devices", type=int, default=1)
     train.add_argument("--test-ratio", type=float, default=None)
@@ -3074,6 +3090,12 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--resume", action="store_true")
     mode.add_argument("--overwrite", action="store_true")
     train.add_argument("--wandb-enabled", action="store_true")
+    train.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-10,
+        help="AdamW weight decay (default 1e-10, effectively disabled)",
+    )
 
     serve = subparsers.add_parser("serve")
     add_common(serve)
@@ -3088,6 +3110,11 @@ def parse_args() -> argparse.Namespace:
     for name in ("batch_size", "num_workers", "num_train_steps", "save_interval", "log_interval", "fsdp_devices"):
         if hasattr(args, name) and getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if hasattr(args, "keep_period") and args.keep_period is not None:
+        if args.keep_period < 0:
+            parser.error("--keep-period must be non-negative")
+        if args.keep_period == 0:
+            args.keep_period = None
     if hasattr(args, "test_ratio") and args.test_ratio is not None and not 0.0 <= args.test_ratio < 1.0:
         parser.error("--test-ratio must be in [0, 1)")
     return args

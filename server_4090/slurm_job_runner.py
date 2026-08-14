@@ -159,6 +159,85 @@ def build_script(target: dict[str, Any], job_name: str, commands: list[list[str]
     return "\n".join(prelude + [""] + body + [""])
 
 
+def slurm_output_paths(target: dict[str, Any], job_name: str, job_id: str) -> dict[str, str]:
+    workdir = target["workdir"]
+    log_dir = target.get("log_dir", f"{workdir.rstrip('/')}/logs/dashboard_slurm")
+    return {
+        "stdout": f"{str(log_dir).rstrip('/')}/{job_name}_{job_id}.out",
+        "stderr": f"{str(log_dir).rstrip('/')}/{job_name}_{job_id}.err",
+    }
+
+
+def remote_file_size(host: str, path: str) -> int | None:
+    result = run_ssh(
+        host,
+        "if [ -f {path} ]; then wc -c < {path}; fi".format(path=shlex.quote(path)),
+        timeout=30,
+    )
+    if result.returncode != 0:
+        return None
+    text = result.stdout.strip().splitlines()
+    if not text:
+        return None
+    try:
+        return int(text[-1].strip())
+    except ValueError:
+        return None
+
+
+def remote_file_chunk(host: str, path: str, offset: int, length: int) -> str:
+    if length <= 0:
+        return ""
+    # tail's +N offset is 1-based.  Limit each poll so a very noisy job cannot
+    # make the lightweight Dashboard-side Slurm watcher balloon in memory.
+    command = (
+        f"tail -c +{int(offset) + 1} {shlex.quote(path)} "
+        f"| head -c {int(length)}"
+    )
+    result = run_ssh(host, command, timeout=60)
+    if result.returncode != 0:
+        return ""
+    return result.stdout
+
+
+def stream_remote_logs(
+    host: str,
+    paths: dict[str, str],
+    offsets: dict[str, int],
+    *,
+    max_chunk_bytes: int = 4 * 1024 * 1024,
+) -> None:
+    """Mirror newly appended Slurm stdout/stderr into this runner's stdout.
+
+    The Dashboard stores this runner stdout in the local task log.  Without this
+    bridge, H100/H200 training metrics remain only in Slurm's ``%x_%j.out`` and
+    the training chart cannot parse OpenPI's ``Step N: loss=...`` lines.
+    """
+    for label, path in paths.items():
+        size = remote_file_size(host, path)
+        if size is None:
+            continue
+        offset = max(0, int(offsets.get(label, 0)))
+        if size < offset:
+            offset = 0
+        if size <= offset:
+            offsets[label] = size
+            continue
+        length = min(size - offset, int(max_chunk_bytes))
+        chunk = remote_file_chunk(host, path, offset, length)
+        if not chunk:
+            continue
+        new_offset = offset + len(chunk.encode(errors="replace"))
+        if new_offset > size or length == size - offset:
+            new_offset = size
+        print(
+            f"\n[dashboard] slurm log stream {label}: {path} bytes={offset}:{new_offset}/{size}",
+            flush=True,
+        )
+        print(chunk, end="" if chunk.endswith("\n") else "\n", flush=True)
+        offsets[label] = new_offset
+
+
 def parse_job_id(output: str) -> str:
     for token in output.replace(".", " ").split():
         if token.isdigit():
@@ -199,10 +278,15 @@ def main() -> int:
         return submit.returncode
     job_id = parse_job_id(submit.stdout)
     print(f"[dashboard] slurm_job_id={job_id}", flush=True)
+    log_paths = slurm_output_paths(target, args.job_name, job_id)
+    for label, path in log_paths.items():
+        print(f"[dashboard] slurm_{label}_log={path}", flush=True)
+    log_offsets = {label: 0 for label in log_paths}
 
     last_state = None
     transport_failures = 0
     while True:
+        stream_remote_logs(host, log_paths, log_offsets)
         q = run_ssh(host, f"squeue -h -j {shlex.quote(job_id)} -o '%T|%M|%R'", timeout=60)
         qout = q.stdout.strip()
         if q.returncode == 0 and qout:
@@ -245,6 +329,7 @@ def main() -> int:
             transport_failures = 0
             print(f"[dashboard] sacct {job_id}: state={state} exit_code={exit_code}", flush=True)
             if state.startswith("COMPLETED") or state not in {"PENDING", "RUNNING", "CONFIGURING", "COMPLETING"}:
+                stream_remote_logs(host, log_paths, log_offsets)
                 print(f"[dashboard] final_state={state} exit_code={exit_code}", flush=True)
                 return 0 if state.startswith("COMPLETED") else 1
             time.sleep(max(5.0, args.poll_interval))

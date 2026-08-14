@@ -111,6 +111,27 @@ POLICY_CONFIG_NAMES = (
 )
 DATASET_ORIGINS = {"real", "simulation", "unknown"}
 DATASET_ORIGIN_METADATA_FILENAME = "dashboard_dataset_origin.json"
+EVENT_OVERRIDE_SCHEMA = "event_markers.v1"
+EVENT_OVERRIDE_DIRNAME = "dashboard_event_overrides"
+EVENT_SEMANTICS_SCHEMA = "event_semantics.v1"
+EVENT_SEMANTICS_FILENAME = "event_semantics.json"
+EVENT_CURRENT_COLUMNS = (
+    "current_event",
+    "event_id",
+    "event",
+    "oracle.current_event",
+    "oracle/event_id",
+    "oracle/event",
+)
+EVENT_MAX_COLUMNS = (
+    "max_event_reached",
+    "max_event",
+    "oracle.max_event_reached",
+    "oracle/max_event_reached",
+    "oracle.max_event",
+    "oracle/max_event",
+)
+EVENT_STEP_COLUMNS = ("step", "frame", "frame_index", "timestep", "time_step")
 
 
 class DatasetValidationError(ValueError):
@@ -435,6 +456,341 @@ def _metadata_by_index(path: Path) -> dict[int, dict[str, Any]]:
     return result
 
 
+def _safe_int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _event_column_names(table: pa.Table, candidates: tuple[str, ...]) -> list[str]:
+    names = set(table.column_names)
+    result: list[str] = []
+    for name in candidates:
+        if name in names:
+            result.append(name)
+    return result
+
+
+def _table_column_pylist(table: pa.Table, name: str) -> list[Any] | None:
+    try:
+        return table[name].to_pylist()
+    except (KeyError, TypeError, pa.ArrowInvalid):
+        return None
+
+
+def _episode_override_path(root: Path, episode_index: int) -> Path:
+    return root / "meta" / EVENT_OVERRIDE_DIRNAME / f"episode_{episode_index:06d}.json"
+
+
+def _normalize_event_edits(raw_edits: Any, *, episode_length: int | None = None) -> list[dict[str, Any]]:
+    """Normalize event annotations as change-point markers.
+
+    Only the start frame is meaningful.  A marker applies from its start frame
+    until the next marker, or through the end of the episode when no later
+    marker exists.  Legacy range annotations are intentionally collapsed to
+    their start frame.
+    """
+    if not isinstance(raw_edits, list):
+        return []
+    max_frame = max(0, int(episode_length) - 1) if episode_length is not None and episode_length > 0 else None
+    by_start: dict[int, dict[str, Any]] = {}
+    for raw in raw_edits:
+        if not isinstance(raw, dict):
+            continue
+        start = _safe_int_or_none(raw.get("start_frame", raw.get("frame", raw.get("start_step", raw.get("step")))))
+        if start is None:
+            continue
+        start = max(0, start)
+        if max_frame is not None:
+            start = min(start, max_frame)
+        marker: dict[str, Any] = {"start_frame": start}
+        current = _safe_int_or_none(raw.get("current_event"))
+        max_event = _safe_int_or_none(raw.get("max_event_reached", raw.get("max_event")))
+        if current is not None:
+            marker["current_event"] = current
+        if max_event is not None:
+            marker["max_event_reached"] = max_event
+        note = raw.get("note")
+        if isinstance(note, str) and note.strip():
+            marker["note"] = note.strip()[:500]
+        if "current_event" in marker or "max_event_reached" in marker:
+            # Saving the same frame edits/replaces that marker instead of
+            # creating ambiguous overlapping ranges.
+            by_start[start] = marker
+
+    normalized = [by_start[start] for start in sorted(by_start)]
+    running_max: int | None = None
+    for marker in normalized:
+        current = _safe_int_or_none(marker.get("current_event"))
+        declared_max = _safe_int_or_none(marker.get("max_event_reached"))
+        candidates = [value for value in (running_max, current, declared_max) if value is not None]
+        if candidates:
+            running_max = max(candidates)
+            marker["max_event_reached"] = running_max
+    return normalized
+
+
+def _read_event_overrides(path: Path, *, episode_length: int | None = None) -> dict[str, Any] | None:
+    value = _read_json(path)
+    if not isinstance(value, dict):
+        return None
+    edits = _normalize_event_edits(value.get("edits", []), episode_length=episode_length)
+    return {**value, "schema": value.get("schema") or EVENT_OVERRIDE_SCHEMA, "edits": edits}
+
+
+def _event_timeline_from_table(table: pa.Table, *, episode_length: int | None = None) -> dict[str, Any] | None:
+    current_names = _event_column_names(table, EVENT_CURRENT_COLUMNS)
+    max_names = _event_column_names(table, EVENT_MAX_COLUMNS)
+    if not current_names and not max_names:
+        return None
+    current_name = current_names[0] if current_names else None
+    max_name = max_names[0] if max_names else None
+    current_values = _table_column_pylist(table, current_name) if current_name else None
+    max_values = _table_column_pylist(table, max_name) if max_name else None
+    row_count = int(table.num_rows)
+    length = int(episode_length or row_count)
+    if current_values is None:
+        current_values = [None] * row_count
+    if max_values is None:
+        max_values = [None] * row_count
+    steps: list[int]
+    step_name = _event_column_names(table, EVENT_STEP_COLUMNS)
+    if step_name:
+        raw_steps = _table_column_pylist(table, step_name[0]) or []
+        steps = []
+        for index, value in enumerate(raw_steps[:row_count]):
+            parsed = _safe_int_or_none(value)
+            steps.append(parsed if parsed is not None else index)
+        if len(steps) < row_count:
+            steps.extend(range(len(steps), row_count))
+    else:
+        steps = list(range(row_count))
+    timeline: list[dict[str, Any]] = []
+    last_current: int | None = None
+    last_max: int | None = None
+    for index in range(row_count):
+        current = _safe_int_or_none(current_values[index] if index < len(current_values) else None)
+        max_event = _safe_int_or_none(max_values[index] if index < len(max_values) else None)
+        if current is None and max_event is None:
+            continue
+        if max_event is None and current is not None:
+            max_event = max(last_max if last_max is not None else current, current)
+        if current is None and max_event is not None:
+            current = last_current if last_current is not None else max_event
+        if current == last_current and max_event == last_max:
+            continue
+        row: dict[str, Any] = {"frame": index, "step": int(steps[index]) if index < len(steps) else index}
+        if current is not None:
+            row["current_event"] = int(current)
+        if max_event is not None:
+            row["max_event_reached"] = int(max_event)
+        timeline.append(row)
+        last_current = current
+        last_max = max_event
+    if not timeline:
+        return None
+    final = timeline[-1]
+    return {
+        "available": True,
+        "source": "parquet_columns",
+        "current_column": current_name,
+        "max_column": max_name,
+        "length": length,
+        "timeline": timeline,
+        "current_event": final.get("current_event"),
+        "max_event_reached": final.get("max_event_reached"),
+    }
+
+
+def _event_timeline_from_episode_row(row: dict[str, Any], *, episode_length: int | None = None) -> dict[str, Any] | None:
+    raw_timeline = row.get("event_timeline")
+    timeline: list[dict[str, Any]] = []
+    if isinstance(raw_timeline, list):
+        for index, raw in enumerate(raw_timeline):
+            if not isinstance(raw, dict):
+                continue
+            frame = _safe_int_or_none(raw.get("frame", raw.get("step", index)))
+            if frame is None:
+                frame = index
+            item: dict[str, Any] = {"frame": max(0, int(frame)), "step": max(0, int(frame))}
+            step = _safe_int_or_none(raw.get("step"))
+            if step is not None:
+                item["step"] = max(0, int(step))
+            current = _safe_int_or_none(raw.get("current_event"))
+            max_event = _safe_int_or_none(raw.get("max_event_reached", raw.get("max_event")))
+            if current is not None:
+                item["current_event"] = current
+            if max_event is not None:
+                item["max_event_reached"] = max_event
+            if "current_event" in item or "max_event_reached" in item:
+                timeline.append(item)
+    current = _safe_int_or_none(row.get("current_event"))
+    max_event = _safe_int_or_none(row.get("max_event_reached", row.get("max_event")))
+    if not timeline and (current is not None or max_event is not None):
+        timeline = [{"frame": 0, "step": 0}]
+        if current is not None:
+            timeline[0]["current_event"] = current
+        if max_event is not None:
+            timeline[0]["max_event_reached"] = max_event
+    if not timeline:
+        return None
+    timeline.sort(key=lambda item: int(item.get("frame", item.get("step", 0))))
+    final = timeline[-1]
+    return {
+        "available": True,
+        "source": "episodes_metadata",
+        "length": episode_length,
+        "event_version": row.get("event_version"),
+        "timeline": timeline,
+        "current_event": current if current is not None else final.get("current_event"),
+        "max_event_reached": max_event if max_event is not None else final.get("max_event_reached"),
+    }
+
+
+def _merge_event_overrides(base: dict[str, Any] | None, overrides: dict[str, Any] | None) -> dict[str, Any] | None:
+    if base is None and overrides is None:
+        return None
+    result = dict(base or {"available": False, "timeline": []})
+    override_edits = overrides.get("edits") if isinstance(overrides, dict) else None
+    result["available"] = bool((base and base.get("available")) or override_edits)
+    if overrides and override_edits:
+        edits = sorted(
+            list(override_edits),
+            key=lambda item: int(item.get("start_frame", item.get("start_step", 0))),
+        )
+        result["overrides"] = {**overrides, "edits": edits}
+        result["override_count"] = len(edits)
+        result["editable"] = True
+        result["marker_semantics"] = "start_frame_until_next_marker"
+        if base is None:
+            result["source"] = "manual_override"
+        declared_max = _safe_int_or_none(overrides.get("event_max_value"))
+        if declared_max is not None:
+            result.setdefault("event_max_value", declared_max)
+
+        # The last marker remains active through the end of the episode.
+        # max_event_reached is monotonic even if current_event later regresses.
+        current = _safe_int_or_none(result.get("current_event"))
+        max_reached = _safe_int_or_none(result.get("max_event_reached"))
+        for marker in edits:
+            marker_current = _safe_int_or_none(marker.get("current_event"))
+            marker_max = _safe_int_or_none(marker.get("max_event_reached"))
+            if marker_current is not None:
+                current = marker_current
+            candidates = [value for value in (max_reached, marker_current, marker_max) if value is not None]
+            if candidates:
+                max_reached = max(candidates)
+        if current is not None:
+            result["current_event"] = current
+        if max_reached is not None:
+            result["max_event_reached"] = max_reached
+    elif base is not None:
+        result["editable"] = True
+    else:
+        result["editable"] = False
+    return result
+
+
+def _is_handover_mic_text(*texts: Any) -> bool:
+    haystack = " ".join(str(text or "") for text in texts).lower()
+    return "handover_mic" in haystack or "handover mic" in haystack
+
+
+def _infer_event_max_value(*texts: Any) -> int:
+    return 4 if _is_handover_mic_text(*texts) else 99
+
+
+def _event_labels_for_text(*texts: Any) -> dict[str, str]:
+    if _is_handover_mic_text(*texts):
+        return {
+            "0": "E0 未稳定抓住 mic",
+            "1": "E1 donor 稳定抓住 mic",
+            "2": "E2 mic 稳定抬离支撑面",
+            "3": "E3 receiver 稳定抓住 mic",
+            "4": "E4 donor 释放且 receiver 独立持有",
+        }
+    return {}
+
+
+def _event_semantics_path(root: Path) -> Path:
+    return root / "meta" / EVENT_SEMANTICS_FILENAME
+
+
+def _normalize_event_semantics(
+    raw: Any,
+    *,
+    dataset_id: str,
+    fallback_labels: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    value = raw if isinstance(raw, dict) else {}
+    labels: dict[str, str] = {}
+    raw_labels = value.get("labels")
+    if isinstance(raw_labels, dict):
+        for raw_event, raw_label in raw_labels.items():
+            event = _safe_int_or_none(raw_event)
+            if event is None or event < 0 or event > 99:
+                continue
+            label = str(raw_label or "").strip()
+            if label:
+                prefix = f"E{event}"
+                labels[str(event)] = (label if label.lower().startswith(prefix.lower()) else f"{prefix} {label}")[:500]
+    raw_events = value.get("events")
+    if isinstance(raw_events, list):
+        for item in raw_events:
+            if not isinstance(item, dict):
+                continue
+            event = _safe_int_or_none(item.get("event", item.get("id", item.get("value"))))
+            if event is None or event < 0 or event > 99:
+                continue
+            label = str(item.get("label", item.get("name", item.get("description", ""))) or "").strip()
+            if label:
+                prefix = f"E{event}"
+                labels[str(event)] = (label if label.lower().startswith(prefix.lower()) else f"{prefix} {label}")[:500]
+    if not labels and fallback_labels:
+        labels = dict(fallback_labels)
+
+    handover_mic = _is_handover_mic_text(dataset_id, value.get("task"), value.get("task_name"))
+    requested_max = _safe_int_or_none(value.get("event_max_value"))
+    observed_max = max((int(key) for key in labels), default=0)
+    event_max_value = 4 if handover_mic else max(0, requested_max if requested_max is not None else max(4, observed_max))
+    hard_max = 4 if handover_mic else 99
+    if event_max_value > hard_max:
+        raise ValueError(f"event_max_value must be in [0, {hard_max}]")
+    invalid_labels = sorted(int(key) for key in labels if int(key) > event_max_value)
+    if invalid_labels:
+        raise ValueError(f"event labels exceed event_max_value={event_max_value}: {invalid_labels}")
+
+    result: dict[str, Any] = {
+        "schema": EVENT_SEMANTICS_SCHEMA,
+        "dataset_id": dataset_id,
+        "event_max_value": event_max_value,
+        "labels": {str(index): labels.get(str(index), f"E{index}") for index in range(event_max_value + 1)},
+    }
+    description = value.get("description")
+    if isinstance(description, str) and description.strip():
+        result["description"] = description.strip()[:2000]
+    terminal = value.get("terminal")
+    if isinstance(terminal, (str, dict)):
+        result["terminal"] = terminal
+    return result
+
+
+def _read_event_semantics(root: Path, dataset_id: str, *fallback_texts: Any) -> dict[str, Any]:
+    path = _event_semantics_path(root)
+    raw = _read_json(path)
+    fallback_labels = _event_labels_for_text(dataset_id, *fallback_texts)
+    semantics = _normalize_event_semantics(raw, dataset_id=dataset_id, fallback_labels=fallback_labels)
+    semantics["exists"] = isinstance(raw, dict)
+    semantics["source"] = "dataset_file" if isinstance(raw, dict) else ("inferred_default" if fallback_labels else "new_dataset_semantics")
+    semantics["path"] = str(path)
+    return semantics
+
+
 def _tasks_by_index(root: Path) -> dict[int, str]:
     result: dict[int, str] = {}
     for row in _read_jsonl(root / "meta" / "tasks.jsonl"):
@@ -691,21 +1047,53 @@ class DatasetEditor:
         rows = []
         video_keys = _video_keys(info)
         image_keys = _image_keys(info)
+        event_semantics = _read_event_semantics(root, dataset_id, list(tasks.values()))
         for index in selected:
             row = dict(episodes.get(index, {}))
+            parquet_path = parquet[index]
             task_values = row.get("tasks")
             if not isinstance(task_values, list):
                 task_values = []
             if not task_values:
-                table = pq.read_table(parquet[index], columns=["task_index"])
+                table = pq.read_table(parquet_path, columns=["task_index"])
                 task_ids = np.asarray(table["task_index"].to_numpy(zero_copy_only=False), dtype=np.int64)
                 task_values = _unique_strings([tasks.get(int(item), f"task_{int(item)}") for item in task_ids])
             length = row.get("length")
             if length is None:
-                length = pq.read_metadata(parquet[index]).num_rows
+                length = pq.read_metadata(parquet_path).num_rows
+            event_track = _event_timeline_from_episode_row(row, episode_length=int(length))
+            # Event columns are optional and uncommon, so only read them when a
+            # cheap schema probe says one is present.  Most datasets therefore
+            # keep the old fast path and show no event controls in the UI.
+            try:
+                schema_names = set(pq.read_schema(parquet_path).names)
+            except (OSError, pa.ArrowInvalid):
+                schema_names = set()
+            has_event_columns = any(
+                name in schema_names for name in (*EVENT_CURRENT_COLUMNS, *EVENT_MAX_COLUMNS)
+            )
+            event_columns = [
+                name for name in (*EVENT_CURRENT_COLUMNS, *EVENT_MAX_COLUMNS, *EVENT_STEP_COLUMNS)
+                if has_event_columns and name in schema_names
+            ]
+            if event_columns and event_track is None:
+                try:
+                    event_table = pq.read_table(parquet_path, columns=event_columns)
+                    event_track = _event_timeline_from_table(event_table, episode_length=int(length))
+                except (KeyError, OSError, TypeError, ValueError, pa.ArrowInvalid):
+                    event_track = event_track
+            overrides = _read_event_overrides(_episode_override_path(root, index), episode_length=int(length))
+            event_track = _merge_event_overrides(event_track, overrides)
+            if event_track is not None:
+                event_track.setdefault("length", int(length))
+                event_track.setdefault("max_step", max(0, int(length) - 1))
+                event_track["labels"] = dict(event_semantics.get("labels") or {})
+                event_track["event_max_value"] = int(event_semantics.get("event_max_value", 4))
+                event_track["marker_semantics"] = "start_frame_until_next_marker"
             parameters = {
                 key: value for key, value in row.items()
                 if key not in RESERVED_EPISODE_FIELDS
+                and key not in {"event_timeline", "current_event", "max_event_reached", "event_version"}
             }
             rows.append(
                 {
@@ -716,6 +1104,7 @@ class DatasetEditor:
                     "task_name": row.get("task_name"),
                     "success": row.get("success"),
                     "parameters": parameters,
+                    "event_track": event_track,
                     "video_keys": video_keys,
                     "image_keys": image_keys,
                     "media": [
@@ -735,6 +1124,7 @@ class DatasetEditor:
             "dataset_origin_marker": read_dataset_origin_marker(root),
             "info": display_info,
             "tasks": [{"task_index": key, "task": value} for key, value in sorted(tasks.items())],
+            "event_semantics": event_semantics,
             "episodes": rows,
             "offset": offset,
             "limit": limit,
@@ -783,6 +1173,129 @@ class DatasetEditor:
                     except OSError:
                         pass
             return target
+
+    def event_semantics(self, dataset_id: str) -> dict[str, Any]:
+        dataset_id = _safe_dataset_id(dataset_id)
+        root = self._dataset_path(dataset_id)
+        info = _read_json(root / "meta" / "info.json")
+        if not isinstance(info, dict):
+            raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
+        tasks = _tasks_by_index(root)
+        return _read_event_semantics(root, dataset_id, list(tasks.values()))
+
+    def save_event_semantics(self, dataset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        dataset_id = _safe_dataset_id(dataset_id)
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        root = self._dataset_path(dataset_id)
+        info = _read_json(root / "meta" / "info.json")
+        if not isinstance(info, dict):
+            raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
+        tasks = _tasks_by_index(root)
+        fallback_labels = _event_labels_for_text(dataset_id, list(tasks.values()))
+        semantics = _normalize_event_semantics(
+            payload, dataset_id=dataset_id, fallback_labels=fallback_labels
+        )
+        semantics.update(
+            {
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "source": "dashboard_dataset_editor",
+            }
+        )
+        path = _event_semantics_path(root)
+        with self._lock(dataset_id):
+            _atomic_json(path, semantics)
+        return {**semantics, "exists": True, "path": str(path)}
+
+    def event_overrides(self, dataset_id: str, episode_index: int) -> dict[str, Any]:
+        dataset_id = _safe_dataset_id(dataset_id)
+        root = self._dataset_path(dataset_id)
+        info = _read_json(root / "meta" / "info.json")
+        if not isinstance(info, dict):
+            raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
+        parquet_path = _parquet_paths(root).get(int(episode_index))
+        if parquet_path is None:
+            raise FileNotFoundError(f"episode {episode_index} does not exist in {dataset_id}")
+        length = pq.read_metadata(parquet_path).num_rows
+        overrides = _read_event_overrides(_episode_override_path(root, int(episode_index)), episode_length=length)
+        return overrides or {"schema": EVENT_OVERRIDE_SCHEMA, "edits": []}
+
+    def save_event_overrides(self, dataset_id: str, episode_index: int, payload: dict[str, Any]) -> dict[str, Any]:
+        dataset_id = _safe_dataset_id(dataset_id)
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        root = self._dataset_path(dataset_id)
+        info = _read_json(root / "meta" / "info.json")
+        if not isinstance(info, dict):
+            raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
+        parquets = _parquet_paths(root)
+        parquet_path = parquets.get(int(episode_index))
+        if parquet_path is None:
+            raise FileNotFoundError(f"episode {episode_index} does not exist in {dataset_id}")
+        episodes = _metadata_by_index(root / "meta" / "episodes.jsonl")
+        row = dict(episodes.get(int(episode_index), {}))
+        length = int(row.get("length") or pq.read_metadata(parquet_path).num_rows)
+        edit_values = payload.get("edits")
+        if edit_values is None:
+            frame = payload.get("frame", payload.get("step"))
+            edit: dict[str, Any] = {"start_frame": frame}
+            if "current_event" in payload:
+                edit["current_event"] = payload.get("current_event")
+            if "max_event_reached" in payload or "max_event" in payload:
+                edit["max_event_reached"] = payload.get("max_event_reached", payload.get("max_event"))
+            if "note" in payload:
+                edit["note"] = payload.get("note")
+            edit_values = [edit]
+        replace = bool(payload.get("replace", False))
+        existing_payload = self.event_overrides(dataset_id, int(episode_index))
+        existing = [] if replace else (existing_payload.get("edits") or [])
+        edits = _normalize_event_edits([*existing, *(edit_values or [])], episode_length=length)
+        semantics = _read_event_semantics(
+            root, dataset_id, row.get("task_name"), row.get("tasks"), row.get("event_version")
+        )
+        requested_max = _safe_int_or_none(payload.get("event_max_value"))
+        if not semantics.get("exists") and requested_max is not None:
+            semantics = _normalize_event_semantics(
+                {"event_max_value": requested_max, "labels": semantics.get("labels") or {}},
+                dataset_id=dataset_id,
+                fallback_labels=semantics.get("labels") or {},
+            )
+            semantics.update({"exists": False, "path": str(_event_semantics_path(root))})
+        event_max_value = int(semantics.get("event_max_value", 4))
+        hard_max = 4 if _is_handover_mic_text(dataset_id, row.get("task_name"), row.get("tasks")) else 99
+        if event_max_value < 0 or event_max_value > hard_max:
+            raise ValueError(f"event_max_value must be in [0, {hard_max}]")
+        for edit in edits:
+            for key in ("current_event", "max_event_reached"):
+                if key not in edit:
+                    continue
+                value = int(edit[key])
+                if value < 0 or value > event_max_value:
+                    raise ValueError(f"{key} must be in [0, {event_max_value}]")
+        now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        output = {
+            "schema": EVENT_OVERRIDE_SCHEMA,
+            "dataset_id": dataset_id,
+            "episode_index": int(episode_index),
+            "length": length,
+            "event_max_value": event_max_value,
+            "marker_semantics": "start_frame_until_next_marker",
+            "updated_at": now,
+            "source": "dashboard_dataset_editor",
+            "edits": edits,
+        }
+        path = _episode_override_path(root, int(episode_index))
+        with self._lock(dataset_id):
+            if not semantics.get("exists"):
+                semantics_output = {
+                    key: value
+                    for key, value in semantics.items()
+                    if key not in {"exists", "path"}
+                }
+                semantics_output.update({"updated_at": now, "source": "dashboard_dataset_editor"})
+                _atomic_json(_event_semantics_path(root), semantics_output)
+            _atomic_json(path, output)
+        return {**output, "path": str(path), "override_count": len(edits)}
 
     def image_path(self, dataset_id: str, episode_index: int, image_key: str, frame_index: int) -> Path:
         source, _mimetype = self.image_source(dataset_id, episode_index, image_key, frame_index)

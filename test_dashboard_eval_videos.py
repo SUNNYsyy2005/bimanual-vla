@@ -90,6 +90,74 @@ class DashboardEvalVideoManagementTest(unittest.TestCase):
         self.assertIn('id="evalVideoSelectAll"', template)
         self.assertIn('batchDeleteSelectedEvalVideos()', template)
         self.assertIn('/api/eval-videos/batch-delete', template)
+        self.assertIn('const expandedEvalVideoIds = new Set();', template)
+        self.assertIn('detachEvalVideoPlayers()', template)
+        self.assertIn('restoreEvalVideoPlayers(detachedPlayers)', template)
+
+    def test_eval_video_event_track_and_override_endpoint_are_optional(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, token, eval_video_root = self._make_app(root)
+            run = eval_video_root / "handover_mic_run"
+            run.mkdir(parents=True, exist_ok=True)
+            video = run / "episode0003.mp4"
+            video.write_bytes(b"video")
+            (run / "_episode_results.jsonl").write_text(
+                json.dumps(
+                    {
+                        "episode_index": 3,
+                        "success": False,
+                        "stage_reward": 0.5,
+                        "status": "failure",
+                        "event_version": "event_v3",
+                        "current_event": 0,
+                        "max_event_reached": 2,
+                        "event_timeline": [
+                            {"step": 0, "current_event": 0, "max_event_reached": 0},
+                            {"step": 4, "current_event": 2, "max_event_reached": 2},
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            client = app.test_client()
+            headers = {"Authorization": f"Bearer {token}"}
+            response = client.get("/api/eval-videos?limit=20", headers=headers)
+            self.assertEqual(response.status_code, 200)
+            item = response.get_json()["videos"][0]
+            self.assertIn("event_track", item)
+            self.assertEqual(item["event_track"]["max_event_reached"], 2)
+            self.assertEqual(item["event_track"]["max_step"], 4)
+
+            save = client.post(
+                f"/api/eval-videos/{item['id']}/event-overrides",
+                headers=headers,
+                json={"step": 4, "current_event": 3, "max_event_reached": 3, "note": "checked"},
+            )
+            self.assertEqual(save.status_code, 200)
+            saved = save.get_json()
+            self.assertEqual(saved["override_count"], 1)
+            self.assertEqual(saved["marker_semantics"], "start_frame_until_next_marker")
+            self.assertNotIn("end_step", saved["edits"][0])
+            self.assertTrue((run / "_event_overrides" / "episode0003.json").is_file())
+
+            # Saving the same start frame replaces the marker rather than
+            # creating an overlapping range annotation.
+            corrected = client.post(
+                f"/api/eval-videos/{item['id']}/event-overrides",
+                headers=headers,
+                json={"step": 4, "end_step": 999, "current_event": 2, "max_event_reached": 3},
+            ).get_json()
+            self.assertEqual(corrected["override_count"], 1)
+            self.assertEqual(corrected["edits"][0]["start_step"], 4)
+            self.assertNotIn("end_step", corrected["edits"][0])
+
+            after = client.get("/api/eval-videos?limit=20", headers=headers).get_json()["videos"][0]
+            self.assertEqual(after["event_track"]["override_count"], 1)
+            self.assertEqual(after["event_track"]["overrides"]["edits"][0]["current_event"], 2)
+            self.assertEqual(after["event_track"]["max_event_reached"], 3)
 
 
 if __name__ == "__main__":
