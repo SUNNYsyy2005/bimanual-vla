@@ -45,6 +45,51 @@ class CanActivationTest(unittest.TestCase):
             ],
         )
 
+    def test_activation_uses_current_usb_mapping_when_ports_changed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory) / "can_activate.sh"
+            helper.write_text("#!/bin/sh\n", encoding="utf-8")
+            helper.chmod(0o755)
+            bus_by_name = {"can0": "3-5.3:1.0", "can1": "3-5.4:1.0"}
+
+            def runner(command, **kwargs):
+                if command[:6] == ["ip", "-brief", "link", "show", "type", "can"]:
+                    return subprocess.CompletedProcess(command, 0, "can0 DOWN\ncan1 DOWN\n", "")
+                if command[:2] == ["ethtool", "-i"]:
+                    address = bus_by_name[command[2]]
+                    return subprocess.CompletedProcess(command, 0, f"bus-info: {address}\n", "")
+                if command[0] == "sudo":
+                    if command[4] == "bash":
+                        target_name = command[-3]
+                        address = command[-1]
+                        current_name = next(
+                            name for name, current_address in bus_by_name.items()
+                            if current_address == address
+                        )
+                        bus_by_name[target_name] = bus_by_name.pop(current_name)
+                    return subprocess.CompletedProcess(command, 0, "activated\n", "")
+                if command[:4] == ["ip", "-details", "link", "show"]:
+                    name = command[4]
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        f"17: {name}: <NOARP,UP,LOWER_UP,ECHO> mtu 16\n"
+                        "    can state ERROR-ACTIVE\n"
+                        "      bitrate 1000000 sample-point 0.750\n",
+                        "",
+                    )
+                raise AssertionError(command)
+
+            statuses = activate_can_interfaces(
+                ("can0", "can1"),
+                "secret",
+                helper_path=helper,
+                runner=runner,
+            )
+
+            self.assertEqual(statuses["can0"]["bus_info"], "3-5.3:1.0")
+            self.assertEqual(statuses["can1"]["bus_info"], "3-5.4:1.0")
+
     def test_link_status_parses_up_and_bitrate(self):
         status = parse_can_link_status(
             "17: can0: <NOARP,UP,LOWER_UP,ECHO> mtu 16\n"
