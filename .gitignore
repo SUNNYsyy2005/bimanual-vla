@@ -31,3 +31,7 @@ monitoring_data/*
 
 # 本地汇报文档（可选，按需去掉注释保留）
 # daily_report_*.md
+# 本地评测 / 分析生成物
+artifacts/
+eval_artifacts/
+tmp_eval_videos/
