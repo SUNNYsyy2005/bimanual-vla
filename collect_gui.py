@@ -12,11 +12,13 @@ still rejected before and during recording.
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -24,7 +26,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 from dataclasses import replace
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import messagebox, ttk
 
 import cv2
 import numpy as np
@@ -72,6 +74,32 @@ CAN_BITRATE = 1_000_000
 CAN_ACTIVATE_SCRIPT = pathlib.Path(
     "/home/user/dual_ARM_project/piper_sdk/piper_sdk/can_activate.sh"
 )
+GUI_PREFERENCES_PATH = pathlib.Path("~/.config/bimanual-vla/collect_gui_preferences.json").expanduser()
+
+
+def load_gui_preferences(path: str | pathlib.Path = GUI_PREFERENCES_PATH) -> dict[str, object]:
+    """Load non-project GUI preferences without making startup fragile."""
+    try:
+        value = json.loads(pathlib.Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def save_gui_preferences(
+    values: dict[str, object],
+    path: str | pathlib.Path = GUI_PREFERENCES_PATH,
+) -> None:
+    """Persist GUI credentials/settings in a user-only file."""
+    target = pathlib.Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(values, ensure_ascii=True, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.chmod(temporary, 0o600)
+    temporary.replace(target)
 
 
 def validate_can_name(can_name: str) -> str:
@@ -444,6 +472,88 @@ def build_dataset_tool_command(
     return command
 
 
+def build_inference_bridge_command(
+    *,
+    python_executable: str,
+    script_path: str | pathlib.Path,
+    host: str,
+    port: int,
+    hz: float,
+    arm_mode: str,
+    arm_side: str,
+    can: str,
+    left_can: str,
+    right_can: str,
+    cam_high_device: str,
+    cam_wrist_device: str,
+    cam_left_wrist_device: str,
+    cam_right_wrist_device: str,
+    instruction: str,
+    allow_execution: bool,
+    camera_preview: bool = False,
+) -> list[str]:
+    """Build the local robot-observation bridge command without shell quoting."""
+    if not host.strip():
+        raise ValueError("policy host must not be empty")
+    if not 1 <= int(port) <= 65_535:
+        raise ValueError("policy port must be in [1, 65535]")
+    if float(hz) <= 0:
+        raise ValueError("inference rate must be positive")
+    if arm_mode not in {SINGLE_ARM, BIMANUAL}:
+        raise ValueError(f"unsupported arm mode: {arm_mode}")
+    if arm_mode == BIMANUAL:
+        if arm_side != "both":
+            raise ValueError("bimanual inference requires arm side both")
+        if validate_can_name(left_can) == validate_can_name(right_can):
+            raise ValueError("left and right CAN interfaces must be distinct")
+        camera_devices = (cam_high_device.strip(), cam_left_wrist_device.strip(), cam_right_wrist_device.strip())
+        explicit_camera_devices = [
+            device for device in camera_devices if device.lower() != "auto"
+        ]
+        if len(set(explicit_camera_devices)) != len(explicit_camera_devices):
+            raise ValueError("bimanual camera devices must be distinct")
+    elif arm_side not in {"left", "right"}:
+        raise ValueError("single-arm inference requires arm side left or right")
+    instruction = instruction.strip()
+    if not instruction:
+        raise ValueError("instruction must not be empty")
+    command = [
+        python_executable,
+        str(pathlib.Path(script_path).resolve()),
+        "--host",
+        host.strip(),
+        "--port",
+        str(int(port)),
+        "--hz",
+        str(float(hz)),
+        "--arm-mode",
+        arm_mode,
+        "--arm-side",
+        "both" if arm_mode == BIMANUAL else arm_side,
+        "--can",
+        validate_can_name(can),
+        "--left-can",
+        validate_can_name(left_can),
+        "--right-can",
+        validate_can_name(right_can),
+        "--cam-high-device",
+        cam_high_device.strip(),
+        "--cam-wrist-device",
+        cam_wrist_device.strip(),
+        "--cam-left-wrist-device",
+        cam_left_wrist_device.strip(),
+        "--cam-right-wrist-device",
+        cam_right_wrist_device.strip(),
+        "--instruction",
+        instruction,
+    ]
+    if camera_preview:
+        command.append("--camera-preview")
+    if allow_execution:
+        command.append("--allow-execution")
+    return command
+
+
 def ask_english_yes_no(parent: tk.Misc, title: str, message: str) -> bool:
     """Show a Tk confirmation dialog with explicit English button labels.
 
@@ -582,10 +692,11 @@ def format_arm_state_rows(
 class CollectorGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Piper - pi0.5 Data Collection")
+        self.root.title("Super GUI")
         self.root.geometry("1800x1200")
         self.root.minsize(1350, 950)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.gui_preferences = load_gui_preferences()
 
         self.session: CollectionSession | None = None
         self.piper = None
@@ -596,6 +707,21 @@ class CollectorGUI:
         self.dataset_task_thread: threading.Thread | None = None
         self.dataset_task_process: subprocess.Popen | None = None
         self.dataset_task_name: str | None = None
+        self.inference_process: subprocess.Popen | None = None
+        self.inference_process_thread: threading.Thread | None = None
+        self.inference_stop_requested = False
+        self.inference_restart_requested = False
+        self.inference_log_widget: tk.Text | None = None
+        self.inference_mode_frame: ttk.Frame | None = None
+        self.collection_mode_frame: ttk.Frame | None = None
+        self.inference_mode_selectors: list[ttk.Combobox] = []
+        self.inference_mode_display_vars: list[tk.StringVar] = []
+        self.inference_start_button: ttk.Button | None = None
+        self.inference_stop_button: ttk.Button | None = None
+        self.inference_activate_can_button: ttk.Button | None = None
+        self.inference_device_settings_button: ttk.Button | None = None
+        self.inference_swap_camera_button: ttk.Checkbutton | None = None
+        self.app_mode = "collection"
         self.prepared_lerobot_path: str | None = None
         self.dataset_tools_window: tk.Toplevel | None = None
         self.dataset_log_widget: tk.Text | None = None
@@ -607,6 +733,7 @@ class CollectorGUI:
         self.messages: queue.Queue = queue.Queue()
         self.recording = False
         self._space_pressed = False
+        self._space_action_pending = False
         self.episode_index = 0
         self.capture_fps = 20
         self.camera_fps = DEFAULT_CAMERA_FPS
@@ -628,24 +755,60 @@ class CollectorGUI:
         self.right_can_var = tk.StringVar(value=DEFAULT_RIGHT_CAN)
         self.high_var = tk.StringVar(value=DEFAULT_HIGH_DEVICE)
         self.wrist_var = tk.StringVar(value=DEFAULT_WRIST_DEVICE)
-        self.left_wrist_var = tk.StringVar(value=DEFAULT_LEFT_WRIST_DEVICE)
-        self.right_wrist_var = tk.StringVar(value=DEFAULT_RIGHT_WRIST_DEVICE)
+        self.left_wrist_var = tk.StringVar(
+            value=str(self.gui_preferences.get("left_wrist_device") or DEFAULT_LEFT_WRIST_DEVICE)
+        )
+        self.right_wrist_var = tk.StringVar(
+            value=str(self.gui_preferences.get("right_wrist_device") or DEFAULT_RIGHT_WRIST_DEVICE)
+        )
         self.fps_var = tk.StringVar(value="20")
         self.camera_fps_var = tk.StringVar(value=str(DEFAULT_CAMERA_FPS))
         self.out_var = tk.StringVar(value="episodes_piper_v21")
         self.task_var = tk.StringVar(value="pick_cube")
         self.instruction_var = tk.StringVar(value="pick up the cube")
+        self.task_summary_var = tk.StringVar(value=self.task_var.get())
+        self.instruction_summary_var = tk.StringVar(value=self.instruction_var.get())
         self.dataset_source_var = tk.StringVar(
             value=str(pathlib.Path(self.out_var.get()).expanduser().resolve())
         )
         self.dataset_name_var = tk.StringVar(value="episodes_piper_v21")
         self._dataset_before_add = self.dataset_name_var.get()
+        remembered_server = str(self.gui_preferences.get("upload_server") or "").strip()
         self.dataset_server_var = tk.StringVar(
-            value=os.environ.get("BIMANUAL_VLA_SERVER", DEFAULT_SERVER)
+            value=remembered_server or os.environ.get("BIMANUAL_VLA_SERVER", DEFAULT_SERVER)
         )
+        remembered_token = str(self.gui_preferences.get("upload_token") or "")
         self.dataset_token_var = tk.StringVar(
-            value=os.environ.get("BIMANUAL_VLA_SERVER_TOKEN", "")
+            value=remembered_token or os.environ.get("BIMANUAL_VLA_SERVER_TOKEN", "")
         )
+        self.remember_upload_token_var = tk.BooleanVar(
+            value=bool(self.gui_preferences.get("remember_upload_token", True))
+        )
+        remembered_can_password = str(self.gui_preferences.get("can_admin_password") or "")
+        self.can_admin_password = remembered_can_password
+        self.remember_can_password_var = tk.BooleanVar(
+            value=bool(self.gui_preferences.get("remember_can_password", True))
+        )
+        self.inference_host_var = tk.StringVar(
+            value=str(
+                self.gui_preferences.get("inference_host")
+                or os.environ.get("BIMANUAL_VLA_POLICY_HOST", "192.168.101.9")
+            )
+        )
+        self.inference_port_var = tk.StringVar(
+            value=str(self.gui_preferences.get("inference_port") or "8099")
+        )
+        self.inference_hz_var = tk.StringVar(
+            value=str(self.gui_preferences.get("inference_hz") or "4")
+        )
+        self.inference_allow_execution_var = tk.BooleanVar(
+            value=bool(self.gui_preferences.get("inference_allow_execution", True))
+        )
+        self.inference_camera_preview_var = tk.BooleanVar(
+            value=bool(self.gui_preferences.get("inference_camera_preview", False))
+        )
+        self.inference_status_var = tk.StringVar(value="Inference idle")
+        self.inference_pid_var = tk.StringVar(value="No inference process")
         self.dataset_workers_var = tk.StringVar(value="4")
         self.dataset_install_mode_var = tk.StringVar(value="merge")
         self.dataset_allow_gripper_var = tk.BooleanVar(value=False)
@@ -659,9 +822,13 @@ class CollectorGUI:
             "left": tk.StringVar(value="Waiting for data"),
             "right": tk.StringVar(value="Waiting for data"),
         }
-        self.swap_wrist_cameras_var = tk.BooleanVar(value=False)
+        self.swap_wrist_cameras_var = tk.BooleanVar(
+            value=bool(self.gui_preferences.get("swap_wrist_cameras", False))
+        )
         self.device_settings_window: tk.Toplevel | None = None
+        self.task_settings_window: tk.Toplevel | None = None
         self._build_ui()
+        self._disable_button_focus(self.root)
         self._configure_mode_ui()
         self.refresh_files()
         self._install_space_shortcut()
@@ -676,12 +843,16 @@ class CollectorGUI:
             "text": "#202124",
             "secondary": "#68707d",
             "accent": "#1a73e8",
+            "accent_teal": "#0f9d8a",
+            "accent_coral": "#e76f51",
+            "accent_violet": "#7c4dff",
             "camera": "#16181c",
         }
         self.root.configure(bg=colors["window"])
-        tkfont.nametofont("TkDefaultFont").configure(family="DejaVu Sans", size=10)
-        tkfont.nametofont("TkTextFont").configure(family="DejaVu Sans", size=10)
-        tkfont.nametofont("TkHeadingFont").configure(family="DejaVu Sans", size=12, weight="bold")
+        ui_font = "Ubuntu"
+        tkfont.nametofont("TkDefaultFont").configure(family=ui_font, size=10)
+        tkfont.nametofont("TkTextFont").configure(family="Noto Sans CJK SC", size=10)
+        tkfont.nametofont("TkHeadingFont").configure(family=ui_font, size=12, weight="bold")
         style = ttk.Style()
         try:
             style.theme_use("clam")
@@ -690,13 +861,38 @@ class CollectorGUI:
         style.configure(".", background=colors["window"], foreground=colors["text"])
         style.configure("TFrame", background=colors["window"])
         style.configure("TLabel", background=colors["window"], foreground=colors["text"])
-        style.configure("TButton", font=("DejaVu Sans", 10), padding=(13, 8), relief="flat")
+        style.configure(
+            "TButton",
+            font=(ui_font, 10),
+            padding=(13, 8),
+            relief="flat",
+            focuscolor=colors["window"],
+            focusthickness=0,
+        )
+        style.configure("TCheckbutton", focuscolor=colors["window"], focusthickness=0)
         style.configure("Accent.TButton", foreground="#ffffff", background=colors["accent"])
         style.map(
             "Accent.TButton",
             background=[("active", "#1769d2"), ("disabled", "#a8c7ea")],
             foreground=[("disabled", "#f3f3f3")],
         )
+        for style_name, background, active in (
+            ("Teal.TButton", colors["accent_teal"], "#0b806f"),
+            ("Coral.TButton", colors["accent_coral"], "#c9573d"),
+            ("Violet.TButton", colors["accent_violet"], "#633bd1"),
+        ):
+            style.configure(
+                style_name,
+                foreground="#ffffff",
+                background=background,
+                focuscolor=background,
+                focusthickness=0,
+            )
+            style.map(
+                style_name,
+                background=[("active", active), ("disabled", "#b8bdc7")],
+                foreground=[("disabled", "#f4f5f7")],
+            )
         style.configure(
             "Card.TLabelframe",
             background=colors["surface"],
@@ -708,7 +904,7 @@ class CollectorGUI:
             "Card.TLabelframe.Label",
             background=colors["window"],
             foreground=colors["text"],
-            font=("DejaVu Sans", 11, "bold"),
+            font=(ui_font, 11, "bold"),
         )
         style.configure("Card.TFrame", background=colors["surface"])
         style.configure("Card.TLabel", background=colors["surface"], foreground=colors["text"])
@@ -723,7 +919,7 @@ class CollectorGUI:
             rowheight=30,
             borderwidth=0,
             relief="flat",
-            font=("DejaVu Sans", 9),
+            font=(ui_font, 9),
         )
         style.configure(
             "Episodes.Treeview.Heading",
@@ -731,7 +927,7 @@ class CollectorGUI:
             foreground=colors["secondary"],
             relief="flat",
             padding=(8, 7),
-            font=("DejaVu Sans", 9, "bold"),
+            font=(ui_font, 9, "bold"),
         )
         style.map(
             "Episodes.Treeview",
@@ -752,15 +948,64 @@ class CollectorGUI:
                 text=title,
                 bg=colors["surface"],
                 fg=colors["text"],
-                font=("DejaVu Sans", 11, "bold"),
+                font=(ui_font, 11, "bold"),
                 anchor="w",
             ).pack(fill="x", padx=14, pady=(12, 7))
             body = ttk.Frame(card, style="Card.TFrame", padding=(14, 0, 14, 12))
             body.pack(fill="both", expand=True)
             return card, body
 
+        banner = tk.Frame(self.root, bg="#25315b", height=64)
+        banner.pack(fill="x", padx=16, pady=(14, 0))
+        banner.pack_propagate(False)
+        tk.Label(
+            banner,
+            text="SUPER GUI",
+            bg="#25315b",
+            fg="#ffffff",
+            font=(ui_font, 20, "bold"),
+            anchor="w",
+        ).pack(side="left", padx=18)
+        mode_switch = tk.Frame(banner, bg="#25315b")
+        mode_switch.pack(side="right", padx=(8, 18))
+        self.collection_mode_button = tk.Button(
+            mode_switch,
+            text="Data collection",
+            command=lambda: self.set_app_mode("collection"),
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=7,
+            takefocus=0,
+            bg="#ffffff",
+            fg="#25315b",
+            activebackground="#e7ecff",
+            activeforeground="#25315b",
+            font=(ui_font, 10, "bold"),
+        )
+        self.collection_mode_button.pack(side="left", padx=(0, 4))
+        self.inference_mode_button = tk.Button(
+            mode_switch,
+            text="Model inference",
+            command=lambda: self.set_app_mode("inference"),
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=7,
+            takefocus=0,
+            bg="#44517e",
+            fg="#ffffff",
+            activebackground="#5a69a0",
+            activeforeground="#ffffff",
+            font=(ui_font, 10, "bold"),
+        )
+        self.inference_mode_button.pack(side="left")
+        for color in (colors["accent"], colors["accent_teal"], colors["accent_coral"], colors["accent_violet"]):
+            tk.Frame(banner, bg=color, width=10).pack(side="right", fill="y")
+
         main = ttk.Frame(self.root, padding=16)
         main.pack(fill="both", expand=True)
+        self.collection_mode_frame = main
         main.columnconfigure(0, weight=0, minsize=570)
         main.columnconfigure(1, weight=1)
         main.rowconfigure(0, weight=1)
@@ -776,6 +1021,7 @@ class CollectorGUI:
         task_card, task = make_card(left, "Task and dataset")
         task_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         task.columnconfigure(1, weight=1)
+        task.columnconfigure(2, weight=0)
         selectors = [
             ("Arm mode", self.arm_mode_var, (("Single arm", SINGLE_ARM), ("Bimanual", BIMANUAL))),
             (
@@ -818,11 +1064,35 @@ class CollectorGUI:
         self.dataset_name_entry.grid(row=3, column=1, sticky="ew", pady=3, padx=(8, 0))
         self.dataset_name_entry.bind("<<ComboboxSelected>>", self._dataset_selection_changed)
         ttk.Label(task, text="Task name", width=18, style="Card.TLabel").grid(row=4, column=0, sticky="w", pady=4)
-        ttk.Entry(task, textvariable=self.task_var).grid(row=4, column=1, sticky="ew", pady=3, padx=(8, 0))
+        ttk.Label(
+            task,
+            textvariable=self.task_summary_var,
+            style="Secondary.Card.TLabel",
+            anchor="w",
+        ).grid(row=4, column=1, sticky="ew", pady=3, padx=(8, 0))
+        ttk.Button(
+            task,
+            text="...",
+            width=3,
+            command=self.open_task_settings,
+        ).grid(row=4, column=2, sticky="e", pady=3, padx=(8, 0))
         ttk.Label(task, text="Instruction", width=18, style="Card.TLabel").grid(row=5, column=0, sticky="w", pady=4)
-        ttk.Entry(task, textvariable=self.instruction_var).grid(row=5, column=1, sticky="ew", pady=3, padx=(8, 0))
+        ttk.Label(
+            task,
+            textvariable=self.instruction_summary_var,
+            style="Secondary.Card.TLabel",
+            anchor="w",
+            justify="left",
+            wraplength=360,
+        ).grid(row=5, column=1, sticky="ew", pady=3, padx=(8, 0))
+        ttk.Button(
+            task,
+            text="...",
+            width=3,
+            command=self.open_task_settings,
+        ).grid(row=5, column=2, sticky="e", pady=3, padx=(8, 0))
         device_bar = ttk.Frame(task, style="Card.TFrame")
-        device_bar.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        device_bar.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         device_bar.columnconfigure(0, weight=1)
         ttk.Label(
             device_bar,
@@ -845,13 +1115,13 @@ class CollectorGUI:
         controls_card.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         for column in range(3):
             controls.columnconfigure(column, weight=1)
-        self.activate_can_button = ttk.Button(controls, text="Activate CAN", command=self.activate_can, style="Accent.TButton")
+        self.activate_can_button = ttk.Button(controls, text="Activate CAN", command=self.activate_can, style="Teal.TButton")
         self.activate_can_button.grid(row=0, column=0, padx=3, pady=3, sticky="ew")
         self.connect_button = ttk.Button(controls, text="Connect devices", command=self.toggle_connection, style="Accent.TButton")
         self.connect_button.grid(row=0, column=1, padx=3, pady=3, sticky="ew")
-        self.start_button = ttk.Button(controls, text="Start episode", command=self.start_episode, state="disabled")
+        self.start_button = ttk.Button(controls, text="Start episode", command=self.start_episode, state="disabled", style="Coral.TButton")
         self.start_button.grid(row=0, column=2, padx=3, pady=3, sticky="ew")
-        self.stop_button = ttk.Button(controls, text="Stop episode", command=self.stop_episode, state="disabled")
+        self.stop_button = ttk.Button(controls, text="Stop episode", command=self.stop_episode, state="disabled", style="Violet.TButton")
         self.stop_button.grid(row=1, column=0, padx=3, pady=3, sticky="ew")
         self.swap_camera_button = ttk.Checkbutton(
             controls,
@@ -884,7 +1154,7 @@ class CollectorGUI:
             status_line,
             textvariable=self.status_var,
             style="Card.TLabel",
-            font=("DejaVu Sans", 10, "bold"),
+            font=(ui_font, 10, "bold"),
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             status_line,
@@ -896,12 +1166,12 @@ class CollectorGUI:
             arm_data,
             textvariable=self.arm_state_header_var,
             style="Secondary.Card.TLabel",
-            font=("DejaVu Sans", 9),
+            font=(ui_font, 9),
         )
         self.arm_state_dimension_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 4))
         self.arm_state_labels = {}
         for row, side in enumerate(("left", "right"), start=3):
-            side_label = ttk.Label(arm_data, text=side.capitalize(), width=7, style="Card.TLabel", font=("DejaVu Sans", 10, "bold"))
+            side_label = ttk.Label(arm_data, text=side.capitalize(), width=7, style="Card.TLabel", font=(ui_font, 10, "bold"))
             side_label.grid(row=row, column=0, sticky="nw", pady=4)
             value_label = ttk.Label(
                 arm_data,
@@ -979,7 +1249,7 @@ class CollectorGUI:
                 text=title,
                 bg=colors["camera"],
                 fg="#f5f7fa",
-                font=("DejaVu Sans", 10, "bold"),
+                font=(ui_font, 10, "bold"),
             )
             title_label.pack(fill="x", padx=7, pady=(6, 4))
             label = tk.Canvas(
@@ -997,7 +1267,7 @@ class CollectorGUI:
                 158,
                 text="Waiting for camera...",
                 fill="#8e8e93",
-                font=("DejaVu Sans", 10),
+                font=(ui_font, 10),
             )
             label.bind(
                 "<Configure>",
@@ -1012,6 +1282,212 @@ class CollectorGUI:
             self.preview_labels[slot] = label
             self.preview_image_items[slot] = image_item
             self.preview_text_items[slot] = text_item
+
+        self._build_inference_mode_ui()
+
+    def _build_inference_mode_ui(self) -> None:
+        """Build the separate policy/inference page.
+
+        The bridge owns cameras and CAN while it runs, so this page deliberately
+        does not duplicate the collection preview or connection controls.
+        Shared hardware settings are edited through the same Device settings
+        dialog used by collection mode.
+        """
+        frame = ttk.Frame(self.root, padding=28)
+        self.inference_mode_frame = frame
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(2, weight=1)
+
+        intro = tk.Frame(frame, bg="#ffffff", highlightthickness=1, highlightbackground="#d9dde5")
+        intro.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
+        tk.Label(
+            intro,
+            text="Model inference",
+            bg="#ffffff",
+            fg="#202124",
+            font=("Ubuntu", 16, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=18, pady=(14, 2))
+        tk.Label(
+            intro,
+            text="Run robot_observation_bridge with the current CAN and camera mapping.",
+            bg="#ffffff",
+            fg="#68707d",
+            font=("Ubuntu", 10),
+            anchor="w",
+        ).pack(fill="x", padx=18, pady=(0, 14))
+
+        config = ttk.LabelFrame(frame, text="Policy and task", padding=14)
+        config.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 14))
+        config.columnconfigure(1, weight=1)
+        ttk.Label(config, text="Policy host").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Entry(config, textvariable=self.inference_host_var, width=36).grid(
+            row=0, column=1, sticky="ew", padx=(12, 0), pady=5
+        )
+        ttk.Label(config, text="Policy port").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Entry(config, textvariable=self.inference_port_var, width=36).grid(
+            row=1, column=1, sticky="ew", padx=(12, 0), pady=5
+        )
+        ttk.Label(config, text="Inference rate (Hz)").grid(row=2, column=0, sticky="w", pady=5)
+        ttk.Entry(config, textvariable=self.inference_hz_var, width=36).grid(
+            row=2, column=1, sticky="ew", padx=(12, 0), pady=5
+        )
+        ttk.Label(config, text="Arm mode").grid(row=3, column=0, sticky="w", pady=5)
+        arm_display = tk.StringVar(value="Bimanual" if self.arm_mode == BIMANUAL else "Single arm")
+        arm_selector = ttk.Combobox(
+            config,
+            textvariable=arm_display,
+            values=("Single arm", "Bimanual"),
+            state="readonly",
+        )
+        arm_selector.grid(row=3, column=1, sticky="ew", padx=(12, 0), pady=5)
+        arm_selector.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._set_arm_mode_from_display(arm_display.get()),
+        )
+        self.inference_mode_selectors.append(arm_selector)
+        self.inference_mode_display_vars.append(arm_display)
+
+        ttk.Label(config, text="Arm side").grid(row=4, column=0, sticky="w", pady=5)
+        side_display = tk.StringVar(value="Both" if self.arm_side == "both" else self.arm_side.capitalize())
+        side_selector = ttk.Combobox(
+            config,
+            textvariable=side_display,
+            values=("Left", "Right", "Both"),
+            state="readonly",
+        )
+        side_selector.grid(row=4, column=1, sticky="ew", padx=(12, 0), pady=5)
+        side_selector.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._set_arm_side_from_display(side_display.get()),
+        )
+        self.inference_mode_selectors.append(side_selector)
+        self.inference_mode_display_vars.append(side_display)
+
+        instruction_line = ttk.Frame(config)
+        instruction_line.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 3))
+        instruction_line.columnconfigure(1, weight=1)
+        ttk.Label(instruction_line, text="Instruction").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            instruction_line,
+            textvariable=self.instruction_summary_var,
+            justify="left",
+            wraplength=310,
+        ).grid(row=0, column=1, sticky="ew", padx=(12, 8))
+        ttk.Button(instruction_line, text="...", width=3, command=self.open_task_settings).grid(
+            row=0, column=2, sticky="e"
+        )
+
+        options = ttk.Frame(config)
+        options.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Checkbutton(
+            options,
+            text="Allow execution",
+            variable=self.inference_allow_execution_var,
+        ).pack(side="left")
+        ttk.Checkbutton(
+            options,
+            text="Camera preview",
+            variable=self.inference_camera_preview_var,
+        ).pack(side="left", padx=(18, 0))
+
+        devices = ttk.LabelFrame(frame, text="Devices", padding=14)
+        devices.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 14))
+        devices.columnconfigure(0, weight=1)
+        ttk.Label(
+            devices,
+            textvariable=self.device_summary_var,
+            justify="left",
+            wraplength=460,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 12))
+        device_buttons = ttk.Frame(devices)
+        device_buttons.grid(row=1, column=0, sticky="ew")
+        device_buttons.columnconfigure(0, weight=1)
+        device_buttons.columnconfigure(1, weight=1)
+        self.inference_activate_can_button = ttk.Button(
+            device_buttons,
+            text="Activate CAN",
+            command=self.activate_can,
+            style="Teal.TButton",
+        )
+        self.inference_activate_can_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self.inference_device_settings_button = ttk.Button(
+            device_buttons,
+            text="Device settings...",
+            command=self.open_device_settings,
+        )
+        self.inference_device_settings_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        self.inference_swap_camera_button = ttk.Checkbutton(
+            devices,
+            text="Swap left/right wrist cameras",
+            variable=self.swap_wrist_cameras_var,
+            command=self.swap_camera_roles,
+            takefocus=False,
+        )
+        self.inference_swap_camera_button.grid(row=2, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(
+            devices,
+            text="The bridge uses the selected left/right CAN and three camera devices.",
+            foreground="#68707d",
+            justify="left",
+            wraplength=460,
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+        action = ttk.Frame(frame)
+        action.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        action.columnconfigure(0, weight=1)
+        action.rowconfigure(2, weight=1)
+        buttons = ttk.Frame(action)
+        buttons.grid(row=0, column=0, sticky="ew")
+        self.inference_start_button = ttk.Button(
+            buttons,
+            text="Start inference",
+            command=self.start_inference,
+            style="Accent.TButton",
+        )
+        self.inference_start_button.pack(side="left", padx=(0, 8))
+        self.inference_stop_button = ttk.Button(
+            buttons,
+            text="Stop inference",
+            command=self.stop_inference,
+            state="disabled",
+            style="Violet.TButton",
+        )
+        self.inference_stop_button.pack(side="left")
+        ttk.Label(
+            action,
+            textvariable=self.inference_status_var,
+            font=("Ubuntu", 11, "bold"),
+        ).grid(row=1, column=0, sticky="w", pady=(12, 2))
+        ttk.Label(action, textvariable=self.inference_pid_var, foreground="#68707d").grid(
+            row=1, column=0, sticky="e", pady=(12, 2)
+        )
+        self.inference_log_widget = tk.Text(
+            action,
+            height=20,
+            wrap="none",
+            state="disabled",
+            bg="#16181c",
+            fg="#e8eaed",
+            insertbackground="#ffffff",
+            relief="flat",
+            padx=10,
+            pady=8,
+        )
+        self.inference_log_widget.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        frame.pack_forget()
+
+    def _set_arm_mode_from_display(self, value: str) -> None:
+        self.arm_mode_var.set(BIMANUAL if value == "Bimanual" else SINGLE_ARM)
+        self._configure_mode_ui()
+
+    def _set_arm_side_from_display(self, value: str) -> None:
+        if value == "Both":
+            self.arm_side_var.set("right")
+        else:
+            self.arm_side_var.set(value.lower())
+        self._configure_mode_ui()
 
 
     @property
@@ -1088,6 +1564,9 @@ class CollectorGUI:
         if not hasattr(self, "preview_labels"):
             return
         bimanual = self.arm_mode == BIMANUAL
+        if self.inference_mode_display_vars:
+            self.inference_mode_display_vars[0].set("Bimanual" if bimanual else "Single arm")
+            self.inference_mode_display_vars[1].set("Both" if bimanual else self.arm_side.capitalize())
         if bimanual:
             self.preview_key_to_slot = {
                 "cam_high": "high",
@@ -1131,12 +1610,77 @@ class CollectorGUI:
         self._refresh_dataset_choices()
         if hasattr(self, "listbox"):
             self.refresh_files()
+        self._update_mode_controls()
+
+    def _inference_running(self) -> bool:
+        process = self.inference_process
+        return process is not None and process.poll() is None
+
+    def set_app_mode(self, mode: str) -> None:
+        if mode not in {"collection", "inference"} or mode == self.app_mode:
+            return
+        if self.recording:
+            messagebox.showwarning("Mode locked", "Stop and save the current episode first.")
+            return
+        if self._inference_running():
+            messagebox.showwarning("Mode locked", "Stop inference before switching modes.")
+            return
+        if mode == "inference" and self.piper is not None:
+            messagebox.showwarning(
+                "Mode locked",
+                "Disconnect collection devices before starting model inference.",
+            )
+            return
+        self.app_mode = mode
+        if mode == "collection":
+            self.inference_mode_frame.pack_forget()
+            self.collection_mode_frame.pack(fill="both", expand=True)
+        else:
+            self.collection_mode_frame.pack_forget()
+            self.inference_mode_frame.pack(fill="both", expand=True)
+        self._update_mode_controls()
+
+    def _update_mode_controls(self) -> None:
+        running = self._inference_running()
+        collection_active = self.app_mode == "collection"
+        if hasattr(self, "collection_mode_button"):
+            self.collection_mode_button.configure(
+                bg="#ffffff" if collection_active else "#44517e",
+                fg="#25315b" if collection_active else "#ffffff",
+            )
+            self.inference_mode_button.configure(
+                bg="#ffffff" if not collection_active else "#44517e",
+                fg="#25315b" if not collection_active else "#ffffff",
+            )
+        if self.inference_start_button is not None:
+            self.inference_start_button.configure(state="disabled" if running else "normal")
+        if self.inference_stop_button is not None:
+            self.inference_stop_button.configure(state="normal" if running else "disabled")
+        if self.inference_activate_can_button is not None:
+            self.inference_activate_can_button.configure(
+                state="disabled" if running or self._can_activation_running() else "normal"
+            )
+        if self.inference_device_settings_button is not None:
+            self.inference_device_settings_button.configure(state="disabled" if running else "normal")
+        if self.inference_swap_camera_button is not None:
+            self.inference_swap_camera_button.configure(
+                state=(
+                    "normal"
+                    if self.arm_mode == BIMANUAL and self.app_mode == "inference"
+                    else "disabled"
+                )
+            )
 
     def _set_connection_config_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled) and not self._inference_running()
         selector_state = "readonly" if enabled else "disabled"
         for selector in self.mode_selectors:
             selector.configure(state=selector_state)
+        for selector in self.inference_mode_selectors:
+            selector.configure(state=selector_state)
         self.device_settings_button.configure(state="normal" if enabled else "disabled")
+        if self.inference_device_settings_button is not None:
+            self.inference_device_settings_button.configure(state="normal" if enabled else "disabled")
         dataset_state = "disabled" if self.recording else "readonly"
         self.dataset_name_entry.configure(state=dataset_state)
         self.edit_dataset_button.configure(state=dataset_state)
@@ -1145,6 +1689,11 @@ class CollectorGUI:
             if self.arm_mode == BIMANUAL and not self.recording
             else "disabled"
         )
+        if self.inference_activate_can_button is not None:
+            self.inference_activate_can_button.configure(
+                state="normal" if enabled and not self._can_activation_running() else "disabled"
+            )
+        self._update_mode_controls()
 
     def _refresh_dataset_choices(self) -> None:
         if hasattr(self, "dataset_name_entry"):
@@ -1189,12 +1738,129 @@ class CollectorGUI:
         self._dataset_before_add = value
         self._apply_dataset_name(value, parent=self.root)
 
+    def _disable_button_focus(self, widget: tk.Misc) -> None:
+        """Keep mouse-operated controls from retaining a dotted focus ring."""
+        for child in widget.winfo_children():
+            if isinstance(child, (ttk.Button, ttk.Checkbutton)):
+                child.configure(takefocus=False)
+            self._disable_button_focus(child)
+
+    def _save_gui_preferences(self) -> None:
+        values: dict[str, object] = {
+            "upload_server": self.dataset_server_var.get().strip(),
+            "remember_can_password": bool(self.remember_can_password_var.get()),
+            "remember_upload_token": bool(self.remember_upload_token_var.get()),
+            "inference_host": self.inference_host_var.get().strip(),
+            "inference_port": self.inference_port_var.get().strip(),
+            "inference_hz": self.inference_hz_var.get().strip(),
+            "inference_allow_execution": bool(self.inference_allow_execution_var.get()),
+            "inference_camera_preview": bool(self.inference_camera_preview_var.get()),
+            "left_wrist_device": self.left_wrist_var.get().strip(),
+            "right_wrist_device": self.right_wrist_var.get().strip(),
+            "swap_wrist_cameras": bool(self.swap_wrist_cameras_var.get()),
+        }
+        if self.remember_can_password_var.get() and self.can_admin_password:
+            values["can_admin_password"] = self.can_admin_password
+        if self.remember_upload_token_var.get() and self.dataset_token_var.get().strip():
+            values["upload_token"] = self.dataset_token_var.get().strip()
+        try:
+            save_gui_preferences(values)
+        except OSError as exc:
+            self.status_var.set(f"Could not save GUI preferences: {exc}")
+            return
+        self.gui_preferences = values
+
+    def _update_task_summary(self) -> None:
+        self.task_summary_var.set(self.task_var.get().strip() or "Not set")
+        instruction = self.instruction_var.get().strip()
+        self.instruction_summary_var.set(instruction or "Uses the task name")
+
+    def open_task_settings(self) -> None:
+        if self.task_settings_window is not None and self.task_settings_window.winfo_exists():
+            self.task_settings_window.lift()
+            self.task_settings_window.focus_force()
+            return
+        dialog = tk.Toplevel(self.root)
+        self.task_settings_window = dialog
+        dialog.title("Task details")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        pending_task = tk.StringVar(value=self.task_var.get())
+        pending_instruction = tk.StringVar(value=self.instruction_var.get())
+        ttk.Label(body, text="Task name", width=16).grid(row=0, column=0, sticky="w", pady=5)
+        task_entry = ttk.Entry(body, textvariable=pending_task, width=54)
+        task_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=5)
+        ttk.Label(body, text="Instruction", width=16).grid(row=1, column=0, sticky="w", pady=5)
+        instruction_entry = ttk.Entry(body, textvariable=pending_instruction, width=54)
+        instruction_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=5)
+        if self.app_mode == "inference":
+            ttk.Label(
+                body,
+                text="A running bridge must restart before a changed instruction takes effect.",
+                foreground="#68707d",
+            ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        buttons = ttk.Frame(body)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
+
+        def close_dialog() -> None:
+            self.task_settings_window = None
+            dialog.destroy()
+
+        def apply_settings() -> None:
+            task_name = pending_task.get().strip()
+            if not task_name:
+                messagebox.showerror("Task details", "Task name must not be empty.", parent=dialog)
+                return
+            self.task_var.set(task_name)
+            self.instruction_var.set(pending_instruction.get().strip())
+            self._update_task_summary()
+            if self._inference_running():
+                restart = ask_english_yes_no(
+                    dialog,
+                    "Restart inference",
+                    "The bridge received the instruction at startup. Restart inference now to apply the new instruction?\n\n"
+                    "The current bridge will stop gracefully; Dashboard EXECUTE authorization may need to be confirmed again.",
+                )
+                if restart:
+                    self.inference_restart_requested = True
+                    self.inference_status_var.set("Applying new instruction; restarting inference...")
+                    self.stop_inference()
+                else:
+                    self.inference_status_var.set(
+                        "Instruction changed; restart inference to apply it"
+                    )
+            else:
+                self.status_var.set("Task details updated")
+            close_dialog()
+
+        ttk.Button(buttons, text="Cancel", command=close_dialog).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(
+            buttons,
+            text="Apply",
+            command=apply_settings,
+            style="Accent.TButton",
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        active_entry = instruction_entry if self.app_mode == "inference" else task_entry
+        active_entry.focus_set()
+        active_entry.selection_range(0, tk.END)
+        dialog.bind("<Escape>", lambda _event: close_dialog())
+        dialog.bind("<Return>", lambda _event: apply_settings())
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+
     def open_device_settings(self) -> None:
         if self.device_settings_window is not None and self.device_settings_window.winfo_exists():
             self.device_settings_window.lift()
             self.device_settings_window.focus_force()
             return
-        if self.session is not None:
+        if self.session is not None or self._inference_running():
             messagebox.showinfo("Device settings", "Disconnect devices before changing hardware settings.")
             return
         dialog = tk.Toplevel(self.root)
@@ -1340,6 +2006,28 @@ class CollectorGUI:
         if self.arm_mode != BIMANUAL:
             self.swap_wrist_cameras_var.set(False)
             return
+        if self._inference_running():
+            left = self.left_wrist_var.get()
+            right = self.right_wrist_var.get()
+            self.left_wrist_var.set(right)
+            self.right_wrist_var.set(left)
+            restart = ask_english_yes_no(
+                self.root,
+                "Restart inference",
+                "Swap the wrist camera roles and restart inference now?\n\n"
+                "The current bridge will stop gracefully; Dashboard EXECUTE authorization may need to be confirmed again.",
+            )
+            if restart:
+                self.inference_restart_requested = True
+                self.inference_status_var.set("Applying camera swap; restarting inference...")
+                self._save_gui_preferences()
+                self.stop_inference()
+            else:
+                self.left_wrist_var.set(left)
+                self.right_wrist_var.set(right)
+                self.swap_wrist_cameras_var.set(not self.swap_wrist_cameras_var.get())
+            return
+            return
         if self.recording or (self.session is not None and self.session.state is SessionState.REVIEW):
             self.swap_wrist_cameras_var.set(not self.swap_wrist_cameras_var.get())
             messagebox.showwarning("Camera roles locked", "Finish the current episode first.")
@@ -1353,6 +2041,7 @@ class CollectorGUI:
             self.status_var.set(
                 "Wrist cameras swapped" if self.swap_wrist_cameras_var.get() else "Wrist cameras restored"
             )
+            self._save_gui_preferences()
             return
 
         # Stop the reader before replacing the V4L2 handles, but keep the
@@ -1398,6 +2087,7 @@ class CollectorGUI:
         self.status_var.set(
             "Wrist cameras swapped" if self.swap_wrist_cameras_var.get() else "Wrist cameras restored"
         )
+        self._save_gui_preferences()
 
     def _restart_capture_thread(self) -> None:
         """Start the GUI reader after a camera-only reconnect."""
@@ -1443,7 +2133,71 @@ class CollectorGUI:
             )
         return (validate_can_name(self.can_var.get()),)
 
+    def _ask_can_activation_password(self, can_names: tuple[str, ...]) -> str | None:
+        result: dict[str, str | None] = {"password": None}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Activate CAN")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text=f"Administrator password for {', '.join(can_names)}",
+        ).pack(anchor="w")
+        password_var = tk.StringVar(value=self.can_admin_password)
+        entry = ttk.Entry(body, textvariable=password_var, show="*", width=42)
+        entry.pack(fill="x", pady=(10, 6))
+        ttk.Checkbutton(
+            body,
+            text="Remember on this computer",
+            variable=self.remember_can_password_var,
+            takefocus=False,
+        ).pack(anchor="w")
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(14, 0))
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
+
+        def cancel() -> None:
+            dialog.destroy()
+
+        def confirm() -> None:
+            password = password_var.get()
+            if not password:
+                messagebox.showerror(
+                    "Activate CAN",
+                    "Administrator password must not be empty",
+                    parent=dialog,
+                )
+                return
+            result["password"] = password
+            self.can_admin_password = password if self.remember_can_password_var.get() else ""
+            self._save_gui_preferences()
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Cancel", command=cancel, takefocus=False).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(
+            buttons,
+            text="Activate",
+            command=confirm,
+            style="Accent.TButton",
+            takefocus=False,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        entry.focus_set()
+        dialog.bind("<Escape>", lambda _event: cancel())
+        dialog.bind("<Return>", lambda _event: confirm())
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.wait_window()
+        return result["password"]
+
     def activate_can(self) -> None:
+        if self._inference_running():
+            messagebox.showwarning("Cannot activate CAN", "Stop inference before reconfiguring CAN interfaces.")
+            return
         if self.piper is not None:
             messagebox.showwarning(
                 "Cannot activate CAN",
@@ -1459,20 +2213,14 @@ class CollectorGUI:
         except ValueError as exc:
             messagebox.showerror("Invalid CAN configuration", str(exc))
             return
-        password = simpledialog.askstring(
-            "Activate CAN",
-            f"Administrator password for activating {', '.join(can_names)}:",
-            parent=self.root,
-            show="*",
-        )
+        password = self._ask_can_activation_password(can_names)
         if password is None:
-            return
-        if not password:
-            messagebox.showerror("Activate CAN", "Administrator password must not be empty")
             return
 
         self.status_var.set(f"Activating CAN interfaces: {', '.join(can_names)}...")
         self.activate_can_button.configure(state="disabled")
+        if self.inference_activate_can_button is not None:
+            self.inference_activate_can_button.configure(state="disabled")
         self.connect_button.configure(state="disabled")
         self._set_connection_config_enabled(False)
 
@@ -1502,6 +2250,134 @@ class CollectorGUI:
         password = ""
         self.can_activation_thread.start()
 
+    def _append_inference_log(self, line: str) -> None:
+        widget = self.inference_log_widget
+        if widget is None:
+            return
+        widget.configure(state="normal")
+        widget.insert("end", line.rstrip("\n") + "\n")
+        widget.see("end")
+        widget.configure(state="disabled")
+
+    def _validate_inference_settings(self) -> tuple[list[str], str]:
+        try:
+            port = int(self.inference_port_var.get())
+            hz = float(self.inference_hz_var.get())
+        except ValueError as exc:
+            raise ValueError("Policy port and inference rate must be numeric") from exc
+        command = build_inference_bridge_command(
+            python_executable=sys.executable,
+            script_path=pathlib.Path(__file__).with_name("robot_observation_bridge.py"),
+            host=self.inference_host_var.get(),
+            port=port,
+            hz=hz,
+            arm_mode=self.arm_mode,
+            arm_side=self.arm_side,
+            can=self.can_var.get(),
+            left_can=self.left_can_var.get(),
+            right_can=self.right_can_var.get(),
+            cam_high_device=self.high_var.get(),
+            cam_wrist_device=self.wrist_var.get(),
+            cam_left_wrist_device=self.left_wrist_var.get(),
+            cam_right_wrist_device=self.right_wrist_var.get(),
+            instruction=self.instruction_var.get(),
+            allow_execution=bool(self.inference_allow_execution_var.get()),
+            camera_preview=bool(self.inference_camera_preview_var.get()),
+        )
+        return command, f"{self.inference_host_var.get().strip()}:{port} @ {hz:g} Hz"
+
+    def start_inference(self) -> None:
+        if self._inference_running():
+            return
+        if self.recording or self.piper is not None:
+            messagebox.showwarning(
+                "Cannot start inference",
+                "Disconnect collection devices and finish any episode first.",
+            )
+            return
+        if self._can_activation_running():
+            messagebox.showwarning("Cannot start inference", "Wait for CAN activation to finish.")
+            return
+        try:
+            command, endpoint = self._validate_inference_settings()
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Invalid inference settings", str(exc))
+            return
+        self._save_gui_preferences()
+        self._append_inference_log("$ " + " ".join(command))
+        self.inference_stop_requested = False
+        try:
+            self.inference_process = subprocess.Popen(
+                command,
+                cwd=str(pathlib.Path(__file__).resolve().parent),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+        except OSError as exc:
+            self.inference_process = None
+            messagebox.showerror("Cannot start inference", str(exc))
+            return
+        process = self.inference_process
+        self.inference_status_var.set(f"Inference running · {endpoint}")
+        self.inference_pid_var.set(f"PID {process.pid}")
+        if self.inference_log_widget is not None:
+            self.inference_log_widget.configure(state="normal")
+            self.inference_log_widget.delete("1.0", "end")
+            self.inference_log_widget.configure(state="disabled")
+
+        def reader() -> None:
+            assert process.stdout is not None
+            try:
+                for line in process.stdout:
+                    self.messages.put(("inference_log", line.rstrip("\n")))
+            finally:
+                return_code = process.wait()
+                self.messages.put(("inference_done", return_code, self.inference_stop_requested))
+
+        self.inference_process_thread = threading.Thread(
+            target=reader,
+            name="inference-log-reader",
+            daemon=True,
+        )
+        self.inference_process_thread.start()
+        self._set_connection_config_enabled(False)
+        self._update_mode_controls()
+
+    def stop_inference(self) -> None:
+        process = self.inference_process
+        if process is None or process.poll() is not None:
+            self._finish_inference(process.returncode if process is not None else 0, True)
+            return
+        self.inference_stop_requested = True
+        self.inference_status_var.set("Stopping inference...")
+        if self.inference_stop_button is not None:
+            self.inference_stop_button.configure(state="disabled")
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGINT)
+        except (OSError, ProcessLookupError):
+            process.send_signal(signal.SIGINT)
+
+    def _finish_inference(self, return_code: int | None, requested: bool) -> None:
+        restart_requested = self.inference_restart_requested
+        self.inference_process = None
+        self.inference_process_thread = None
+        self.inference_stop_requested = False
+        self.inference_restart_requested = False
+        self.inference_pid_var.set("No inference process")
+        if requested or return_code == 0:
+            self.inference_status_var.set("Inference idle")
+        else:
+            self.inference_status_var.set(f"Inference exited with code {return_code}")
+        self._set_connection_config_enabled(True)
+        self._update_mode_controls()
+        if restart_requested:
+            self.root.after(250, self.start_inference)
+
     def _finish_can_activation(
         self,
         success: bool,
@@ -1511,6 +2387,9 @@ class CollectorGUI:
         self._set_connection_config_enabled(True)
         self.connect_button.configure(state="normal")
         self.activate_can_button.configure(state="normal")
+        if self.inference_activate_can_button is not None:
+            self.inference_activate_can_button.configure(state="normal")
+        self._update_mode_controls()
         if success:
             assert isinstance(payload, dict)
             summary = ", ".join(f"{name}=UP" for name in payload)
@@ -1603,10 +2482,7 @@ class CollectorGUI:
             messagebox.showerror("Connection failed", str(exc))
 
     def _handle_space_key(self, event: tk.Event) -> str | None:
-        """Use Space as start/stop even when a selector or button owns focus."""
-        if self._space_pressed:
-            return "break"
-        self._space_pressed = True
+        """Capture Space before focused selector/button class bindings."""
         if event.widget.winfo_toplevel()._w != self.root._w:
             return None
         widget_class = str(event.widget.winfo_class())
@@ -1617,8 +2493,13 @@ class CollectorGUI:
             "Spinbox",
             "TSpinbox",
         }:
-            # Preserve spaces while the operator is typing task/instruction.
+            # Preserve spaces inside any explicitly editable field.
             return None
+        self._space_pressed = True
+        return "break"
+
+    def _run_space_action(self) -> None:
+        self._space_action_pending = False
         if self.recording:
             self.stop_episode()
         elif self.session is not None and self.session.state is SessionState.READY:
@@ -1629,10 +2510,24 @@ class CollectorGUI:
             self.status_var.set(
                 f"Cannot start an episode while session is {self.session.state.value}"
             )
-        return "break"
 
-    def _handle_space_release(self, _event: tk.Event) -> None:
+    def _handle_space_release(self, event: tk.Event) -> str | None:
+        if event.widget.winfo_toplevel()._w != self.root._w:
+            return None
+        if str(event.widget.winfo_class()) in {
+            "Entry",
+            "TEntry",
+            "Text",
+            "Spinbox",
+            "TSpinbox",
+        }:
+            return None
+        pressed = self._space_pressed
         self._space_pressed = False
+        if pressed and not self._space_action_pending:
+            self._space_action_pending = True
+            self.root.after_idle(self._run_space_action)
+        return "break"
 
     def _install_space_shortcut(self) -> None:
         """Run the collection shortcut before focused widget class bindings."""
@@ -1650,6 +2545,30 @@ class CollectorGUI:
                 add_tag(child)
 
         add_tag(self.root)
+        self.root.bind_class(
+            "TButton",
+            "<ButtonRelease-1>",
+            self._clear_main_button_focus,
+            add="+",
+        )
+        self.root.bind_class(
+            "TCheckbutton",
+            "<ButtonRelease-1>",
+            self._clear_main_button_focus,
+            add="+",
+        )
+
+    def _clear_main_button_focus(self, event: tk.Event) -> None:
+        """Remove mouse focus rings without stealing focus from dialogs."""
+        if event.widget.winfo_toplevel()._w != self.root._w:
+            return
+
+        def clear_if_main_still_focused() -> None:
+            focused = self.root.focus_get()
+            if focused is None or focused.winfo_toplevel()._w == self.root._w:
+                self.root.focus_set()
+
+        self.root.after_idle(clear_if_main_still_focused)
 
     def start_episode(self):
         if self.session is None or self.recording:
@@ -1673,6 +2592,7 @@ class CollectorGUI:
             return
         self.task_var.set(label.task_name)
         self.instruction_var.set(label.instruction)
+        self._update_task_summary()
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.dataset_name_entry.configure(state="disabled")
@@ -1831,9 +2751,17 @@ class CollectorGUI:
                         int(payload[1]),
                         payload[2],
                     )
+                elif kind == "inference_log":
+                    self._append_inference_log(str(payload[0]))
+                elif kind == "inference_done":
+                    self._append_inference_log(
+                        f"[bridge exited with code {payload[0]}]"
+                    )
+                    self._finish_inference(int(payload[0]), bool(payload[1]))
         except queue.Empty:
             pass
         self._update_dataset_action_buttons()
+        self._update_mode_controls()
         self.root.after(100, self._poll_messages)
 
     def _show_preview(self, images: dict[str, np.ndarray]):
@@ -1979,15 +2907,21 @@ class CollectorGUI:
             )
             entry.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=4)
 
-        ttk.Label(form, text="Install mode", width=18).grid(row=5, column=0, sticky="w", pady=4)
+        ttk.Checkbutton(
+            form,
+            text="Remember upload token on this computer",
+            variable=self.remember_upload_token_var,
+            takefocus=False,
+        ).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(2, 6))
+        ttk.Label(form, text="Install mode", width=18).grid(row=6, column=0, sticky="w", pady=4)
         ttk.Combobox(
             form,
             textvariable=self.dataset_install_mode_var,
             values=("merge", "install", "overwrite"),
             state="readonly",
-        ).grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=4)
+        ).grid(row=6, column=1, sticky="ew", padx=(8, 0), pady=4)
         options = ttk.Frame(form)
-        options.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        options.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(
             options,
             text="Allow incomplete gripper coverage",
@@ -2021,7 +2955,7 @@ class CollectorGUI:
         log_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        log = tk.Text(log_frame, wrap="word", font=("Monospace", 10), state="disabled")
+        log = tk.Text(log_frame, wrap="word", font=("Ubuntu Mono", 10), state="disabled")
         log.grid(row=0, column=0, sticky="nsew")
         log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=log.yview)
         log_scroll.grid(row=0, column=1, sticky="ns")
@@ -2032,8 +2966,10 @@ class CollectorGUI:
             "Upload archive parts are transport chunks; their count is not the episode count.\n"
         )
         self._update_dataset_action_buttons()
+        self._disable_button_focus(dialog)
 
         def close_dialog():
+            self._save_gui_preferences()
             self.dataset_log_widget = None
             self.dataset_action_buttons = []
             self.dataset_tools_window = None
@@ -2087,6 +3023,7 @@ class CollectorGUI:
                 if len(token) < 20:
                     raise ValueError("enter the server token (at least 20 characters)")
                 environment["BIMANUAL_VLA_SERVER_TOKEN"] = token
+                self._save_gui_preferences()
         except (OSError, ValueError) as exc:
             messagebox.showerror("Dataset task configuration", str(exc))
             return
@@ -2240,6 +3177,7 @@ class CollectorGUI:
         self.status_var.set("Disconnected")
 
     def close(self):
+        self._save_gui_preferences()
         if self._can_activation_running():
             messagebox.showwarning(
                 "CAN activation",
@@ -2261,6 +3199,24 @@ class CollectorGUI:
                     process.kill()
             if self.dataset_task_thread is not None:
                 self.dataset_task_thread.join(timeout=3.0)
+        if self._inference_running():
+            self.stop_inference()
+            process = self.inference_process
+            if process is not None:
+                try:
+                    process.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                    except OSError:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                        except OSError:
+                            process.kill()
         if self.recording:
             if not messagebox.askyesno("Exit", "The current episode has not been saved. Exit anyway?"):
                 return

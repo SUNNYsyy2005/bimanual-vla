@@ -316,7 +316,22 @@ unset BIMANUAL_VLA_SERVER_TOKEN
 
 同一个服务器数据集不能混合不兼容的数据合同，例如不同的 schema、state/action 维度、FPS 或相机字段。应使用新的 `Dataset name` 分开上传，或统一转换格式后再合并。
 
-## 8. 每次操作检查清单
+## 8. 模型推理模式
+
+顶部的 `Data collection` 和 `Model inference` 用于切换工作模式。两种模式互斥：
+采集设备连接后不能启动推理，推理进程运行时也不能连接采集设备、修改设备配置或交换腕部相机。
+
+推理页对应 `robot_observation_bridge.py`。Policy host、port、推理频率、Arm mode、Arm side
+和 Instruction 都可以在页面修改；CAN 与三路相机沿用 `Device settings...` 中的当前配置。
+`Activate CAN` 会同时激活当前配置的左、右 CAN 接口。启动前确认两个接口均为 `UP` 并有反馈。
+如果左右腕部画面对应反了，点击 `Swap left/right wrist cameras`；推理运行中确认重启后，新的映射才会传给桥接器。
+
+`Allow execution` 默认开启。开启只表示允许本地桥接器在 Dashboard 授权和自身安全检查均通过时执行动作，
+不会绕过服务器授权、反馈新鲜度、限位或工作空间检查。关闭时桥接器只观察和请求推理，不发送机器人动作。
+
+停止推理会先向桥接器发送 `SIGINT`，等待其正常清理；页面下方日志会显示桥接器输出和退出码。
+
+## 9. 每次操作检查清单
 
 采集前：
 
@@ -337,7 +352,7 @@ unset BIMANUAL_VLA_SERVER_TOKEN
 - [ ] 日志出现 `Dataset install/merge complete`。
 - [ ] Dashboard 中 episode 和 frame 数量符合预期。
 
-## 9. 数据安全
+## 10. 数据安全
 
 - 不要把服务器 token 写进脚本、截图、聊天记录或 Git。
 - 不要把大型 NPZ、LeRobot 缓存或 tar 文件提交到 Git。
