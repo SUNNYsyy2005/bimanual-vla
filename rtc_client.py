@@ -26,6 +26,7 @@ freshness, range, delta, and Piper-status checks.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import json
@@ -97,6 +98,7 @@ DEFAULT_MIN_ACTION_CHUNK_STEPS = 16
 DEFAULT_BLEND_STEPS = 3
 DEFAULT_RTC_EXECUTION_HORIZON = 8
 DEFAULT_RTC_MAX_GUIDANCE_WEIGHT = 5.0
+INFERENCE_RATE_HISTORY_SIZE = 32
 DEFAULT_ACTUATOR_DELAY_S = 0.0
 DEFAULT_GRIPPER_LOWPASS_ALPHA = 0.5
 DEFAULT_GRIPPER_HYSTERESIS = 0.05
@@ -1588,6 +1590,35 @@ class PeriodicSchedule:
         return True
 
 
+def estimate_event_rate_hz(timestamps: Any) -> float | None:
+    """Estimate the observed rate from a short monotonic timestamp history."""
+    values = [float(value) for value in timestamps]
+    if len(values) < 2:
+        return None
+    elapsed = values[-1] - values[0]
+    if not math.isfinite(elapsed) or elapsed <= 0:
+        return None
+    return (len(values) - 1) / elapsed
+
+
+def estimate_single_inflight_ceiling_hz(latency_s: Any) -> float | None:
+    """Return the throughput ceiling imposed by one serialized request.
+
+    ``AsyncPolicyInference`` intentionally allows only one request in flight.
+    Therefore a capture-to-result latency of ``L`` seconds cannot sustain more
+    than approximately ``1 / L`` completed requests per second, even when the
+    periodic launch schedule is configured higher.  This is a diagnostic upper
+    bound, not a replacement for the observed launch/result rates.
+    """
+    try:
+        value = float(latency_s)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return 1.0 / value
+
+
 def _blend_absolute_target(
     old_target: np.ndarray,
     new_target: np.ndarray,
@@ -1949,6 +1980,8 @@ class ExecutionController:
         self.inference_old_remaining = 0
         self.inference_launch_count = 0
         self.inference_launch_deferred_count = 0
+        self._inference_launch_times: deque[float] = deque(maxlen=INFERENCE_RATE_HISTORY_SIZE)
+        self._inference_completion_times: deque[float] = deque(maxlen=INFERENCE_RATE_HISTORY_SIZE)
         self.last_client_transport_timing: dict[str, Any] = {}
         self.last_client_timing_source: str | None = None
         self.last_client_one_way_clock: str | None = None
@@ -2086,6 +2119,11 @@ class ExecutionController:
         self.inference_capture_monotonic = launch.captured_monotonic
         self.inference_launch_at = launch.launched_at
         self.inference_launch_count += 1
+        self._inference_launch_times.append(float(launch.launched_monotonic))
+
+    def record_inference_completion(self, arrived_monotonic: float) -> None:
+        """Record every completed response, including rejected action chunks."""
+        self._inference_completion_times.append(float(arrived_monotonic))
 
     def record_launch_deferred(self) -> None:
         self.inference_launch_deferred_count += 1
@@ -2225,6 +2263,12 @@ class ExecutionController:
             "command_hz": self.control_hz,
             "control_hz": self.control_hz,
             "inference_hz": self.inference_hz,
+            "configured_inference_hz": self.inference_hz,
+            "inference_launch_hz": estimate_event_rate_hz(self._inference_launch_times),
+            "inference_result_hz": estimate_event_rate_hz(self._inference_completion_times),
+            "inference_single_inflight_ceiling_hz": estimate_single_inflight_ceiling_hz(
+                self.inference_latency_s
+            ),
             "expected_action_horizon": self.expected_action_horizon,
             "min_action_chunk_steps": self.min_action_chunk_steps,
             "action_chunk_steps": self.action_chunk_steps,
@@ -3229,6 +3273,7 @@ class ExecutionController:
         self.inference_arrival_at = arrived_at
         self.inference_arrival_monotonic = arrived_monotonic
         self.inference_latency_s = latency_s
+        self.record_inference_completion(arrived_monotonic)
         self._record_client_transport_timing(result, generation=launch.generation)
         self.inference_old_remaining = len(self.pending_actions)
         self.inference_skip_steps = 0
@@ -3437,6 +3482,7 @@ class ExecutionController:
         self.inference_latency_s = (
             completion.arrived_monotonic - completion.launch.captured_monotonic
         )
+        self.record_inference_completion(completion.arrived_monotonic)
         self.inference_old_remaining = len(self.pending_actions)
         return self._reject_result(
             completion.launch.generation, reason, completion.arrived_at

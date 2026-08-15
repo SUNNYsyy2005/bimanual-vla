@@ -2196,7 +2196,18 @@ def sanitize_async_client_telemetry(
 
     result: dict[str, Any] = {}
     positive_float_fields = {
-        "client_inference_launch_hz": ("inference_launch_hz", "launch_hz", "client_inference_launch_hz", "inference_hz"),
+        "client_inference_launch_hz": ("inference_launch_hz", "launch_hz", "client_inference_launch_hz"),
+        "client_inference_result_hz": ("inference_result_hz", "result_hz", "client_inference_result_hz"),
+        "client_configured_inference_hz": (
+            "configured_inference_hz",
+            "requested_inference_hz",
+            "inference_hz",
+        ),
+        "client_inference_single_inflight_ceiling_hz": (
+            "inference_single_inflight_ceiling_hz",
+            "single_inflight_ceiling_hz",
+            "client_inference_single_inflight_ceiling_hz",
+        ),
         "client_control_hz": ("control_hz", "action_hz", "client_control_hz", "command_hz"),
     }
     for output, keys in positive_float_fields.items():
@@ -2759,6 +2770,11 @@ class PolicyTelemetry:
             client_policy_action_hz = _telemetry_positive_float(client.get("policy_action_hz"))
             client_command_hz = async_client["client_control_hz"]
             client_inference_hz = async_client["client_inference_launch_hz"]
+            if client_inference_hz is None:
+                # Preserve the legacy field as a configured-rate fallback, but
+                # keep the explicit launch/result fields authoritative for
+                # dashboards that distinguish target from observed throughput.
+                client_inference_hz = async_client["client_configured_inference_hz"]
             client_action_chunk_steps = async_client["client_chunk_rows"]
             client_last_action_chunk_steps = self._positive_int(
                 client.get("last_action_chunk_steps")

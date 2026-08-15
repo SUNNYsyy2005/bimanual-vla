@@ -76,7 +76,9 @@ telemetry 断开或任一逐周期安全检查失败时，客户端只会保持�
 ## 控制与 RTC 时序
 
 - 相机和 Piper 反馈持续运行；
-- Policy 推理默认以 4 Hz 发起，单次只允许一个在途请求；
+- Policy 推理默认以 4 Hz **尝试发起**，单次只允许一个在途请求；
+- 因此 4 Hz 是调度目标，不是实际吞吐保证；若 capture-to-result 为 550 ms，实际频率上限约为 `1/0.55=1.82 Hz`；
+- 客户端 telemetry 分开上报 `configured_inference_hz`、`inference_launch_hz`、`inference_result_hz`，并上报单在途上限；
 - 客户端根据上一轮 capture-to-result latency 估计本次 `inference_delay_steps`；
 - 客户端根据 active chunk 的 `source_index` 发送 `previous_chunk_offset_steps`；
 - 服务端按 WebSocket session 保存上一轮 normalized chunk，并在 denoising 时应用 RTC guidance；

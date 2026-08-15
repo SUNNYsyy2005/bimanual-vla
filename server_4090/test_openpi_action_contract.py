@@ -124,7 +124,10 @@ class AsyncTelemetrySanitizerTest(unittest.TestCase):
     def test_valid_async_fields_are_sanitized_and_preserved(self):
         telemetry = HELPER.sanitize_async_client_telemetry(
             {
-                "inference_launch_hz": 4.02,
+                "inference_launch_hz": 2.0,
+                "inference_result_hz": 1.8,
+                "configured_inference_hz": 4.0,
+                "inference_single_inflight_ceiling_hz": 1.82,
                 "control_hz": 20,
                 "chunk_rows": 50,
                 "action_horizon": 50,
@@ -183,7 +186,10 @@ class AsyncTelemetrySanitizerTest(unittest.TestCase):
             action_horizon=50,
         )
 
-        self.assertAlmostEqual(telemetry["client_inference_launch_hz"], 4.02)
+        self.assertAlmostEqual(telemetry["client_inference_launch_hz"], 2.0)
+        self.assertAlmostEqual(telemetry["client_inference_result_hz"], 1.8)
+        self.assertAlmostEqual(telemetry["client_configured_inference_hz"], 4.0)
+        self.assertAlmostEqual(telemetry["client_inference_single_inflight_ceiling_hz"], 1.82)
         self.assertEqual(telemetry["client_control_hz"], 20.0)
         self.assertEqual(telemetry["client_chunk_rows"], 50)
         self.assertEqual(telemetry["client_action_horizon"], 50)
@@ -222,6 +228,9 @@ class AsyncTelemetrySanitizerTest(unittest.TestCase):
         telemetry = HELPER.sanitize_async_client_telemetry(
             {
                 "inference_launch_hz": float("nan"),
+                "inference_result_hz": float("nan"),
+                "configured_inference_hz": float("nan"),
+                "inference_single_inflight_ceiling_hz": float("nan"),
                 "control_hz": -20,
                 "chunk_rows": 0,
                 "action_horizon": 15,
@@ -238,6 +247,9 @@ class AsyncTelemetrySanitizerTest(unittest.TestCase):
         )
 
         self.assertIsNone(telemetry["client_inference_launch_hz"])
+        self.assertIsNone(telemetry["client_inference_result_hz"])
+        self.assertIsNone(telemetry["client_configured_inference_hz"])
+        self.assertIsNone(telemetry["client_inference_single_inflight_ceiling_hz"])
         self.assertIsNone(telemetry["client_control_hz"])
         self.assertIsNone(telemetry["client_chunk_rows"])
         self.assertFalse(telemetry["client_horizon_matches_policy"])
@@ -253,6 +265,7 @@ class AsyncTelemetrySanitizerTest(unittest.TestCase):
     def test_client_telemetry_alias_priority_is_explicit(self):
         telemetry = HELPER.sanitize_async_client_telemetry(
             {
+                "inference_hz": 4.0,
                 "round_trip_ms": 222.0,
                 "client_observation_upload_ms": 12.0,
                 "observation_upload_ms": 22.0,
@@ -477,7 +490,8 @@ class AsyncTelemetrySanitizerTest(unittest.TestCase):
             action_horizon=50,
         )
 
-        self.assertEqual(telemetry["client_inference_launch_hz"], 4.0)
+        self.assertIsNone(telemetry["client_inference_launch_hz"])
+        self.assertEqual(telemetry["client_configured_inference_hz"], 4.0)
         self.assertEqual(telemetry["client_control_hz"], 20.0)
         self.assertEqual(telemetry["client_chunk_rows"], 50)
         self.assertEqual(telemetry["client_minimum_horizon"], 16)
