@@ -33,6 +33,7 @@ rsync -av --relative \
   "$LOCAL_ROOT/./export_lerobot.py" \
   "$LOCAL_ROOT/./download_openpi_checkpoint.py" \
   "$LOCAL_ROOT/./upload_dataset_4090.py" \
+  "$LOCAL_ROOT/./rtc_client.py" \
   "$LOCAL_ROOT/./robot_observation_bridge.py" \
   "$LOCAL_ROOT/./piper_action_conventions.py" \
   "$LOCAL_ROOT/./piper_data_contract.py" \

@@ -270,12 +270,12 @@ POST   /api/tasks/batch-delete
 
 服务端只列出同时包含 `params/` 和 `_CHECKPOINT_METADATA` 的完整 checkpoint，并通过 `assets/<dataset_id>/norm_stats.json` 判断 checkpoint 所属数据集。启动 Policy 时会再次校验，防止 checkpoint 与数据集错配。
 
-## 机械臂电脑：官方 Policy 客户端
+## 机械臂电脑：RTC 实时控制客户端
 
 脚本必须运行在物理连接 Piper CAN 和相机的电脑，而不是 4×4090；单臂使用一个 CAN 和两路相机：
 
 ```bash
-python robot_observation_bridge.py \
+python rtc_client.py \
   --host 192.168.101.9 \
   --port 8000 \
   --can can0 \
@@ -286,11 +286,11 @@ python robot_observation_bridge.py \
   --hz 4
 ```
 
-`robot_observation_bridge.py` 默认使用 `--output-mode auto`，按 Policy 握手
+`rtc_client.py` 默认使用 `--output-mode auto`，按 Policy 握手
 metadata 自动选择 `delivery` 或 `joint`。部署 joint 模型时可以显式锁定合同：
 
 ```bash
-python robot_observation_bridge.py \
+python rtc_client.py \
   --host 192.168.101.9 \
   --port 8099 \
   --can can0 \
@@ -309,7 +309,7 @@ python robot_observation_bridge.py \
 双臂 shadow-only 示例使用两个 CAN 和三路相机：
 
 ```bash
-python robot_observation_bridge.py \
+python rtc_client.py \
   --host 192.168.101.9 \
   --port 8000 \
   --arm-mode bimanual \
@@ -354,6 +354,10 @@ anchor，不能与 canonical absolute-EEF 静默混用。`joint` wire action 已
 按 20 Hz 逐行执行。
 
 该脚本不需要 Dashboard URL 或 Token。上述默认命令不会调用动作控制 API。
+
+`rtc_client.py` 是唯一的实时控制入口；它直接拥有 Piper CAN、相机、Policy
+WebSocket 和独立 20 Hz 控制循环。旧的 `robot_observation_bridge.py` 仍保留为
+兼容入口，但不再是 GUI 的推理模式，也不应由 `collect_gui.py` 隐式启动。
 
 需要让客户端具备执行能力时，必须在机械臂电脑本地显式追加：
 

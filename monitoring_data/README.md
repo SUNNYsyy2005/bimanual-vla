@@ -1,6 +1,6 @@
 # Local monitoring recordings
 
-Each `robot_observation_bridge.py` run creates a timestamped directory containing:
+Each `rtc_client.py` run creates a timestamped directory containing:
 
 - `manifest.json`: command-line arguments, host, PID, and recording format.
 - `events.jsonl`: append-only events for Piper connection, camera/policy setup,
@@ -14,3 +14,5 @@ capture timestamps are retained.
 
 The default location is `./monitoring_data`. Override it with
 `--monitoring-dir /path/to/root` or `BIMANUAL_VLA_MONITORING_DIR`.
+
+`robot_observation_bridge.py` remains a compatibility launcher for legacy deployments.

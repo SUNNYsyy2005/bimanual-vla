@@ -1,0 +1,5037 @@
+#!/usr/bin/env python3
+"""Canonical robot-side RTC (real-time control) client.
+
+This executable owns the physical control path: Piper CAN feedback and command
+I/O, camera capture, OpenPI WebSocket inference, timestamped action chunks, an
+independent 20 Hz servo loop, and fail-closed safety gates.  The historical
+``robot_observation_bridge.py`` name is a compatibility alias that forwards to
+this module and cannot select a different implementation.
+
+The client is fail-closed and follows validated single-arm/bimanual ``delivery``
+or ``joint`` policy metadata. By default it only sends real observations
+and prints predictions. Robot motion requires both a time-limited Dashboard
+``execute`` authorization and the local ``--allow-execution`` flag. Robot
+control and camera acquisition run continuously at 20 Hz while a single
+asynchronous policy request is launched every 250 ms (4 Hz) when the previous
+request has completed. A 50-row OpenPI chunk must contain at least 16 rows.
+Every decoded row is timestamped from the observation's monotonic capture time;
+each control tick selects the closest future target for its estimated actuator
+execution time, then blends a new pose trajectory into the still-active plan
+over 2--4 steps (default 3). The gripper is filtered separately and is never
+pose-blended. If a plan runs out under a valid double gate, the last safe target
+is held until a valid replacement arrives. Every command passes schema-specific
+freshness, range, delta, and Piper-status checks.
+"""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, replace
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import queue
+import re
+import socket
+import sys
+import threading
+import time
+from typing import Any, Callable
+import uuid
+
+import numpy as np
+from scipy.optimize import least_squares
+from scipy.spatial.transform import Rotation
+
+from camera import CameraCapture, CameraPreview
+from deployment_recording import DeploymentRunRecorder
+from collect_output_arm import require_can_interface_up
+from piper_action_conventions import (
+    DELIVERY_CHUNK_ORIGIN_ACTION_SEMANTICS,
+    DELIVERY_MODEL_ACTION_SEMANTICS,
+    DELIVERY_STEP_ACTION_SEMANTICS,
+    JOINT_ACTION_SEMANTICS as WIRE_JOINT_ACTION_SEMANTICS,
+    LEGACY_GRIPPER_SEMANTICS,
+    NEW_GRIPPER_SEMANTICS,
+    chunk_origin_deltas_to_absolute_eef_targets,
+    matrix_to_rotation6d,
+    step_deltas_to_chunk_origin,
+)
+
+from piper_data_contract import (
+    CONTRACT_VERSION,
+    GRIPPER_MAX_M,
+    IMAGE_HW,
+    LEGACY_GRIPPER_OPENING_METRES_SEMANTICS,
+    STATE_NAMES,
+    build_delivery_state,
+)
+
+
+RAD_FACTOR = 57295.7795  # Piper unit: 0.001 degree -> rad
+GRIPPER_FACTOR = 1_000_000.0  # Piper unit: 0.001 mm -> metre
+JOINT_LIMITS_RAD = np.array(
+    [
+        (-2.6179, 2.6179),
+        (0.0000, 3.1400),
+        (-2.9670, 0.0000),
+        (-1.7450, 1.7450),
+        (-1.2200, 1.2200),
+        (-2.0944, 2.0944),
+    ],
+    dtype=np.float64,
+)
+JOINT_ACTION_SEMANTICS = frozenset(
+    {"absolute_joint_position", "absolute_next_joint_position", WIRE_JOINT_ACTION_SEMANTICS}
+)
+DEFAULT_POLICY_HOST = "192.168.101.9"
+DEFAULT_POLICY_PORT = 8000
+DEFAULT_ACTION_HZ = 20.0
+DEFAULT_INFERENCE_HZ = 4.0
+DEFAULT_CAMERA_FPS = 20
+DEFAULT_OPENPI_CHUNK_STEPS = 50
+DEFAULT_MIN_ACTION_CHUNK_STEPS = 16
+DEFAULT_BLEND_STEPS = 3
+DEFAULT_ACTUATOR_DELAY_S = 0.0
+DEFAULT_GRIPPER_LOWPASS_ALPHA = 0.5
+DEFAULT_GRIPPER_HYSTERESIS = 0.05
+DEFAULT_GRIPPER_CONFIRM_STEPS = 2
+DEFAULT_FEEDBACK_MAX_AGE_S = 0.5
+DEFAULT_ARM_HOLD_TOLERANCE_RAD = 0.05
+DEFAULT_JOINT_LIMIT_TOLERANCE_RAD = 0.05
+GRIPPER_OPENING_FRACTION = NEW_GRIPPER_SEMANTICS
+GRIPPER_CLOSED_FRACTION = LEGACY_GRIPPER_SEMANTICS
+GRIPPER_OPENING_METRES = LEGACY_GRIPPER_OPENING_METRES_SEMANTICS
+DEFAULT_CAN = "can0"
+DEFAULT_LEFT_CAN = "can1"
+DEFAULT_RIGHT_CAN = "can3"
+DEFAULT_HIGH_DEVICE = "auto"
+DEFAULT_WRIST_DEVICE = "auto"
+DEFAULT_LEFT_WRIST_DEVICE = "auto"
+DEFAULT_RIGHT_WRIST_DEVICE = "auto"
+CAMERA_SOURCE_HW = (240, 424)
+# 8_3_64eps full-set envelope: 18,034 frames sampled at 20 Hz. These defaults
+# include a small margin over observed maxima. They remain CLI-tightenable, and
+# every blended target still passes the same per-step checks before execution.
+SAFETY_PROFILE = "8_3_64eps_18034_frames_20hz"
+DEFAULT_MAX_TRANSLATION_STEP_M = 0.05  # observed max 0.04830 m
+DEFAULT_MAX_ROTATION_STEP_RAD = 0.18  # observed max 0.15766 rad
+DEFAULT_MAX_GRIPPER_STEP = 0.30  # observed max 0.261 opening fraction
+DEFAULT_WORKSPACE_X_M = (-0.05, 0.30)  # observed [-0.03815, 0.27987]
+DEFAULT_WORKSPACE_Y_M = (0.01, 0.50)  # observed [0.02183, 0.47802]
+DEFAULT_WORKSPACE_Z_M = (0.14, 0.52)  # observed [0.14706, 0.50322]
+DEFAULT_GRIPPER_RANGE_TOLERANCE = 0.02
+PIPER_FEEDBACK_MAX_AGE_S = 0.5
+IK_JOINT_LIMIT_MARGIN_RAD = 0.002
+# Piper feedback can sit a few degrees beyond the SDK's nominal zero-angle
+# limits while the controller reports a healthy, non-limit status.  This is a
+# feedback/calibration tolerance only: local IK may start from that measured
+# pose, but it may not move farther out past it.
+IK_FEEDBACK_LIMIT_TOLERANCE_RAD = 0.06
+# One 20 Hz command must be a small servo step.  The numerical solve may look
+# farther along the same joint branch, then the returned command is rate
+# limited to this value so a Cartesian target cannot produce a wrist jump.
+DEFAULT_IK_MAX_JOINT_STEP_RAD = 0.02
+DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD = 0.30
+DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT = 1.0
+IK_JOINT_REGULARIZATION_SCALE_RAD = 0.08
+DEFAULT_IK_POSITION_TOLERANCE_M = 0.0015
+DEFAULT_IK_ROTATION_TOLERANCE_RAD = 0.02
+DEFAULT_IK_MAX_NFEV = 100
+DEFAULT_MONITORING_DIR = "monitoring_data"
+PIPER_CTRL_MODE_CAN = 0x01
+PIPER_MOVE_MODE_J = 0x01
+PIPER_ARM_STATUS_NORMAL = 0x00
+PIPER_ARM_STATUS_JOINT_BRAKE_NOT_RELEASED = 0x06
+PIPER_ENABLE_CONFIRM_CYCLES = 3
+PIPER_ENABLE_RETRY_S = 0.02
+
+
+class ExecutionBlocked(RuntimeError):
+    """The action was rejected before a robot command was sent."""
+
+
+class PiperFeedbackStaleError(ExecutionBlocked):
+    """Piper SDK getters contain missing or cached CAN feedback."""
+
+
+class MonitoringRecorder:
+    """Append complete RTC monitoring events to a local JSONL session.
+
+    The recorder is deliberately independent of the control path: a recording
+    failure is logged and never blocks or changes a robot command. Numpy values
+    are converted to finite JSON values so the resulting file can be consumed
+    directly by standard analysis tools.
+    """
+
+    def __init__(self, root: str | Path, args: argparse.Namespace):
+        root_path = Path(root).expanduser()
+        root_path.mkdir(parents=True, exist_ok=True)
+        session_id = time.strftime("%Y%m%d_%H%M%S", time.localtime()) + "_" + uuid.uuid4().hex[:8]
+        self.session_dir = root_path / session_id
+        self.session_dir.mkdir(parents=True, exist_ok=False)
+        self.events_path = self.session_dir / "events.jsonl"
+        self.manifest_path = self.session_dir / "manifest.json"
+        self._file = self.events_path.open("a", encoding="utf-8", buffering=1)
+        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=4096)
+        self._accepting = True
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name="monitoring-writer",
+            daemon=True,
+        )
+        self._writer_thread.start()
+        self.event_count = 0
+        self.dropped_event_count = 0
+        self._closed = False
+        manifest = {
+            "format": "bimanual-vla-monitoring-v1",
+            "session_id": session_id,
+            "started_at": time.time(),
+            "host": socket.gethostname(),
+            "pid": os.getpid(),
+            "command": Path(sys.argv[0]).name or "rtc_client.py",
+            "args": self._json_safe(vars(args)),
+        }
+        self.manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
+        self.record("session_started", monitoring_dir=str(root_path))
+        logging.info("Monitoring recorder: %s", self.events_path)
+
+    def _writer_loop(self) -> None:
+        while True:
+            row = self._queue.get()
+            try:
+                if row is None:
+                    return
+                self._file.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+                self._file.flush()
+            except Exception:
+                logging.exception("Monitoring writer failed")
+            finally:
+                self._queue.task_done()
+
+    @classmethod
+    def _json_safe(cls, value: Any) -> Any:
+        if isinstance(value, np.ndarray):
+            return cls._json_safe(value.tolist())
+        if isinstance(value, np.generic):
+            return cls._json_safe(value.item())
+        if isinstance(value, dict):
+            return {str(key): cls._json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._json_safe(item) for item in value]
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, (str, int, bool)) or value is None:
+            return value
+        return str(value)
+
+    def record(self, event_type: str, **payload: Any) -> None:
+        if self._closed or not self._accepting:
+            return
+        row = {
+            "event_index": self.event_count,
+            "event_type": str(event_type),
+            "recorded_at": time.time(),
+            "recorded_monotonic": time.monotonic(),
+            **self._json_safe(payload),
+        }
+        self.event_count += 1
+        try:
+            self._queue.put_nowait(row)
+        except queue.Full:
+            self.dropped_event_count += 1
+            if self.dropped_event_count == 1 or self.dropped_event_count % 100 == 0:
+                logging.warning(
+                    "Monitoring queue full; dropped events=%d",
+                    self.dropped_event_count,
+                )
+        except Exception:
+            # Monitoring must not become a new reason to stop or alter control.
+            logging.exception("Monitoring recorder failed for event=%s", event_type)
+
+    def close(self, *, reason: str = "stopped") -> None:
+        if self._closed:
+            return
+        try:
+            self.record(
+                "session_finished",
+                reason=reason,
+                event_count=self.event_count,
+                dropped_event_count=self.dropped_event_count,
+            )
+            self._accepting = False
+            self._queue.put(None, timeout=5.0)
+            self._writer_thread.join(timeout=5.0)
+        finally:
+            self._closed = True
+            try:
+                self._file.flush()
+                self._file.close()
+            except Exception:
+                logging.exception("Failed to close monitoring recorder")
+
+
+@dataclass(frozen=True)
+class PolicyProtocol:
+    """Validated observation/action contract advertised by one policy server."""
+
+    schema: str
+    state_dim: int
+    action_dim: int
+    arm_side: str
+    action_semantics: str
+    camera_keys: tuple[str, ...]
+    arm_mode: str = "single"
+    # Dataset/action sampling frequency. Older servers may omit it.
+    action_hz: float | None = None
+    # Old 8_3_64eps delivery checkpoints use closed fraction; v3 and joint
+    # policies use opening fraction. The policy metadata selects the branch.
+    gripper_semantics: str = GRIPPER_OPENING_FRACTION
+    state_gripper_semantics: str = GRIPPER_OPENING_FRACTION
+    metadata_gripper_semantics_explicit: bool = False
+    contract_version: int | None = None
+    action_horizon: int = DEFAULT_OPENPI_CHUNK_STEPS
+
+
+def connect_piper(can_name: str) -> Any:
+    """Connect for feedback; this alone does not enable or command the arm."""
+    from piper_sdk import C_PiperInterface_V2
+
+    require_can_interface_up(can_name)
+    piper = C_PiperInterface_V2(can_name, judge_flag=False, can_auto_init=False)
+    piper.CreateCanBus(
+        can_name=can_name,
+        bustype="socketcan",
+        expected_bitrate=1_000_000,
+        judge_flag=False,
+    )
+    piper.ConnectPort(can_init=True, piper_init=True)
+    time.sleep(0.5)
+    return piper
+
+
+def _qpos_from_feedback(joints_message: Any, gripper_message: Any) -> np.ndarray:
+    joints = joints_message.joint_state
+    gripper = gripper_message.gripper_state
+    values = np.array(
+        [
+            joints.joint_1,
+            joints.joint_2,
+            joints.joint_3,
+            joints.joint_4,
+            joints.joint_5,
+            joints.joint_6,
+        ],
+        dtype=np.float32,
+    ) / RAD_FACTOR
+    return np.append(values, float(gripper.grippers_angle) / GRIPPER_FACTOR).astype(np.float32)
+
+
+def _require_fresh_feedback(
+    messages: dict[str, Any],
+    *,
+    max_age_s: float | None = PIPER_FEEDBACK_MAX_AGE_S,
+) -> None:
+    if max_age_s is None:
+        return
+    now = time.time()
+    failures = []
+    for name, message in messages.items():
+        timestamp = float(getattr(message, "time_stamp", 0.0) or 0.0)
+        hz = float(getattr(message, "Hz", 0.0) or 0.0)
+        age_s = now - timestamp if timestamp > 0 else float("inf")
+        if timestamp <= 0 or age_s > max_age_s or age_s < -1.0:
+            failures.append(f"{name}: age={age_s:.3f}s Hz={hz:.1f}")
+    if failures:
+        raise PiperFeedbackStaleError(
+            "Piper CAN feedback is missing or stale: " + "; ".join(failures)
+        )
+
+
+def read_output_qpos(
+    piper: Any,
+    *,
+    max_feedback_age_s: float | None = PIPER_FEEDBACK_MAX_AGE_S,
+) -> np.ndarray:
+    """Read measured joints/gripper in physical units (radians/metres)."""
+    joints_message = piper.GetArmJointMsgs()
+    gripper_message = piper.GetArmGripperMsgs()
+    _require_fresh_feedback(
+        {"joint": joints_message, "gripper": gripper_message},
+        max_age_s=max_feedback_age_s,
+    )
+    return _qpos_from_feedback(joints_message, gripper_message)
+
+
+def rotation_from_state(state: np.ndarray) -> np.ndarray:
+    """Recover an orthonormal rotation matrix from the delivery rotation6d."""
+    c0 = np.asarray(state[3:6], dtype=np.float64)
+    c1 = np.asarray(state[6:9], dtype=np.float64)
+    norm0 = float(np.linalg.norm(c0))
+    if norm0 < 1e-6:
+        raise ExecutionBlocked("invalid current rotation6d first column")
+    c0 /= norm0
+    c1 -= c0 * float(np.dot(c0, c1))
+    norm1 = float(np.linalg.norm(c1))
+    if norm1 < 1e-6:
+        raise ExecutionBlocked("invalid current rotation6d second column")
+    c1 /= norm1
+    return np.column_stack((c0, c1, np.cross(c0, c1)))
+
+
+@dataclass(frozen=True)
+class PiperIKSolveResult:
+    """Full numerical IK solution and the bounded command sent this control tick."""
+
+    solution_joints_rad: np.ndarray
+    command_joints_rad: np.ndarray
+    rate_limited: bool | None
+    solution_position_error_m: float | None = None
+    solution_rotation_error_rad: float | None = None
+    solution_max_joint_step_rad: float | None = None
+    command_position_error_m: float | None = None
+    command_rotation_error_rad: float | None = None
+    optimizer_success: bool | None = None
+    optimizer_status: int | None = None
+    optimizer_nfev: int | None = None
+
+
+class PiperContinuousIK:
+    """Numerical Piper IK constrained to the branch near current feedback."""
+
+    def __init__(self, fk: Any | None = None) -> None:
+        if fk is None:
+            from piper_sdk import C_PiperForwardKinematics
+
+            fk = C_PiperForwardKinematics()
+        self._fk = fk
+
+    def pose(self, joints_rad: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        joints = np.asarray(joints_rad, dtype=np.float64)
+        if joints.shape != (6,) or not np.all(np.isfinite(joints)):
+            raise ExecutionBlocked(f"IK joints must be finite 6D, got {joints.shape}")
+        pose = np.asarray(self._fk.CalFK(joints.tolist())[-1], dtype=np.float64)
+        xyz_m = pose[:3] / 1000.0
+        rotation = Rotation.from_euler("xyz", pose[3:6], degrees=True).as_matrix()
+        return xyz_m, rotation
+
+    def solve(
+        self,
+        current_joints_rad: np.ndarray,
+        target_xyz_m: np.ndarray,
+        target_rpy_deg: np.ndarray,
+        *,
+        max_joint_step_rad: float,
+        position_tolerance_m: float,
+        rotation_tolerance_rad: float,
+        max_nfev: int,
+        search_joint_radius_rad: float | None = None,
+        joint_regularization_weight: float = DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT,
+    ) -> np.ndarray:
+        return self.solve_with_diagnostics(
+            current_joints_rad,
+            target_xyz_m,
+            target_rpy_deg,
+            max_joint_step_rad=max_joint_step_rad,
+            position_tolerance_m=position_tolerance_m,
+            rotation_tolerance_rad=rotation_tolerance_rad,
+            max_nfev=max_nfev,
+            search_joint_radius_rad=search_joint_radius_rad,
+            joint_regularization_weight=joint_regularization_weight,
+        ).command_joints_rad.copy()
+
+    def solve_with_diagnostics(
+        self,
+        current_joints_rad: np.ndarray,
+        target_xyz_m: np.ndarray,
+        target_rpy_deg: np.ndarray,
+        *,
+        max_joint_step_rad: float,
+        position_tolerance_m: float,
+        rotation_tolerance_rad: float,
+        max_nfev: int,
+        search_joint_radius_rad: float | None = None,
+        joint_regularization_weight: float = DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT,
+    ) -> PiperIKSolveResult:
+        current = np.asarray(current_joints_rad, dtype=np.float64)
+        target_xyz = np.asarray(target_xyz_m, dtype=np.float64)
+        target_rpy = np.asarray(target_rpy_deg, dtype=np.float64)
+        if current.shape != (6,) or not np.all(np.isfinite(current)):
+            raise ExecutionBlocked("current IK joints are not finite 6D")
+        if target_xyz.shape != (3,) or not np.all(np.isfinite(target_xyz)):
+            raise ExecutionBlocked("IK target xyz is not finite 3D")
+        if target_rpy.shape != (3,) or not np.all(np.isfinite(target_rpy)):
+            raise ExecutionBlocked("IK target rpy is not finite 3D")
+        if not math.isfinite(max_joint_step_rad) or max_joint_step_rad <= 0:
+            raise ExecutionBlocked("IK maximum command joint step must be positive")
+        search_radius = (
+            max_joint_step_rad
+            if search_joint_radius_rad is None
+            else float(search_joint_radius_rad)
+        )
+        if not math.isfinite(search_radius) or search_radius < max_joint_step_rad:
+            raise ExecutionBlocked(
+                "IK search joint radius must be finite and at least the command step"
+            )
+        regularization_weight = float(joint_regularization_weight)
+        if not math.isfinite(regularization_weight) or regularization_weight < 0:
+            raise ExecutionBlocked("IK joint regularization weight must be non-negative")
+
+        hard_lower = JOINT_LIMITS_RAD[:, 0] + IK_JOINT_LIMIT_MARGIN_RAD
+        hard_upper = JOINT_LIMITS_RAD[:, 1] - IK_JOINT_LIMIT_MARGIN_RAD
+        if np.any(current < hard_lower - IK_FEEDBACK_LIMIT_TOLERANCE_RAD) or np.any(
+            current > hard_upper + IK_FEEDBACK_LIMIT_TOLERANCE_RAD
+        ):
+            raise ExecutionBlocked("current joints are too far outside IK limits")
+        # Keep the measured pose itself in the numerical interval when a joint
+        # is just beyond a nominal zero limit.  The interval only extends from
+        # that measured value back toward the nominal range, so IK cannot drive
+        # an already-outside joint farther outward.
+        feedback_lower = np.minimum(hard_lower, current)
+        feedback_upper = np.maximum(hard_upper, current)
+        lower = np.maximum(feedback_lower, current - search_radius)
+        upper = np.minimum(feedback_upper, current + search_radius)
+        if np.any(lower >= upper):
+            raise ExecutionBlocked("continuous IK has no valid local joint interval")
+        initial = np.clip(current, lower + 1e-8, upper - 1e-8)
+        target_rotation = Rotation.from_euler("xyz", target_rpy, degrees=True).as_matrix()
+
+        def residual(candidate: np.ndarray) -> np.ndarray:
+            xyz, rotation = self.pose(candidate)
+            rotation_error = Rotation.from_matrix(target_rotation @ rotation.T).as_rotvec()
+            task_error = np.concatenate(
+                (
+                    (xyz - target_xyz) / position_tolerance_m,
+                    rotation_error / rotation_tolerance_rad,
+                )
+            )
+            if regularization_weight == 0:
+                return task_error
+            joint_regularization = (
+                math.sqrt(regularization_weight)
+                * (candidate - current)
+                / IK_JOINT_REGULARIZATION_SCALE_RAD
+            )
+            return np.concatenate((task_error, joint_regularization))
+
+        result = least_squares(
+            residual,
+            initial,
+            bounds=(lower, upper),
+            max_nfev=max_nfev,
+            xtol=1e-8,
+            ftol=1e-8,
+            gtol=1e-8,
+        )
+        solved = np.asarray(result.x, dtype=np.float64)
+        solved_xyz, solved_rotation = self.pose(solved)
+        position_error = float(np.linalg.norm(solved_xyz - target_xyz))
+        rotation_error = float(
+            np.linalg.norm(Rotation.from_matrix(target_rotation @ solved_rotation.T).as_rotvec())
+        )
+        solved_joint_step = float(np.max(np.abs(solved - current)))
+        if np.any(solved < hard_lower - IK_FEEDBACK_LIMIT_TOLERANCE_RAD) or np.any(
+            solved > hard_upper + IK_FEEDBACK_LIMIT_TOLERANCE_RAD
+        ):
+            raise ExecutionBlocked("continuous IK target is outside tolerated joint limits")
+        if position_error > position_tolerance_m or rotation_error > rotation_tolerance_rad:
+            raise ExecutionBlocked(
+                "continuous IK could not reach a nearby solution: "
+                f"position_error={position_error:.5f}m, "
+                f"rotation_error={rotation_error:.5f}rad, "
+                f"search_joint_step={solved_joint_step:.5f}rad"
+            )
+        if solved_joint_step > search_radius + 1e-6:
+            raise ExecutionBlocked(
+                f"continuous IK search step {solved_joint_step:.5f}rad exceeds "
+                f"{search_radius:.5f}rad"
+            )
+        if solved_joint_step <= max_joint_step_rad + 1e-9:
+            return PiperIKSolveResult(
+                solution_joints_rad=solved.copy(),
+                command_joints_rad=solved.copy(),
+                rate_limited=False,
+                solution_position_error_m=position_error,
+                solution_rotation_error_rad=rotation_error,
+                solution_max_joint_step_rad=solved_joint_step,
+                command_position_error_m=position_error,
+                command_rotation_error_rad=rotation_error,
+                optimizer_success=bool(result.success),
+                optimizer_status=int(result.status),
+                optimizer_nfev=int(result.nfev),
+            )
+
+        # Follow the regularized solution direction with a bounded 20 Hz servo
+        # step. Requiring the whole future EEF target to be reached in one tick
+        # caused either 0.08 rad wrist jumps or a complete queue stop.
+        scale = max_joint_step_rad / solved_joint_step
+        command = current + scale * (solved - current)
+        command_xyz, command_rotation = self.pose(command)
+        current_xyz, current_rotation = self.pose(current)
+        current_task_error = float(
+            np.linalg.norm((current_xyz - target_xyz) / position_tolerance_m) ** 2
+            + np.linalg.norm(
+                Rotation.from_matrix(target_rotation @ current_rotation.T).as_rotvec()
+                / rotation_tolerance_rad
+            )
+            ** 2
+        )
+        command_task_error = float(
+            np.linalg.norm((command_xyz - target_xyz) / position_tolerance_m) ** 2
+            + np.linalg.norm(
+                Rotation.from_matrix(target_rotation @ command_rotation.T).as_rotvec()
+                / rotation_tolerance_rad
+            )
+            ** 2
+        )
+        if command_task_error >= current_task_error - 1e-9:
+            raise ExecutionBlocked(
+                "continuous IK rate-limited step does not make progress toward target"
+            )
+        command_position_error = float(np.linalg.norm(command_xyz - target_xyz))
+        command_rotation_error = float(
+            np.linalg.norm(
+                Rotation.from_matrix(target_rotation @ command_rotation.T).as_rotvec()
+            )
+        )
+        return PiperIKSolveResult(
+            solution_joints_rad=solved.copy(),
+            command_joints_rad=command.copy(),
+            rate_limited=True,
+            solution_position_error_m=position_error,
+            solution_rotation_error_rad=rotation_error,
+            solution_max_joint_step_rad=solved_joint_step,
+            command_position_error_m=command_position_error,
+            command_rotation_error_rad=command_rotation_error,
+            optimizer_success=bool(result.success),
+            optimizer_status=int(result.status),
+            optimizer_nfev=int(result.nfev),
+        )
+
+
+
+
+def read_output_state(
+    piper: Any,
+    *,
+    max_feedback_age_s: float | None = PIPER_FEEDBACK_MAX_AGE_S,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return physical feedback as v3 opening-fraction delivery state and qpos.
+
+    ``policy_observation_state`` applies the policy-advertised gripper
+    convention before inference and action decoding.
+    """
+    joints_message = piper.GetArmJointMsgs()
+    gripper_message = piper.GetArmGripperMsgs()
+    pose_message = piper.GetArmEndPoseMsgs()
+    _require_fresh_feedback(
+        {"joint": joints_message, "gripper": gripper_message, "end_pose": pose_message},
+        max_age_s=max_feedback_age_s,
+    )
+    qpos = _qpos_from_feedback(joints_message, gripper_message)
+    pose = pose_message.end_pose
+    xyz_m = np.array([pose.X_axis, pose.Y_axis, pose.Z_axis], dtype=np.float64) / 1_000_000.0
+    rpy_rad = np.deg2rad(
+        np.array([pose.RX_axis, pose.RY_axis, pose.RZ_axis], dtype=np.float64) / 1000.0
+    )
+    rotation = Rotation.from_euler("xyz", rpy_rad).as_matrix()
+    return build_delivery_state(xyz_m, rotation, float(qpos[6])), qpos
+
+
+def _canonical_gripper_semantics(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    aliases = {
+        GRIPPER_OPENING_FRACTION: GRIPPER_OPENING_FRACTION,
+        "absolute_opening_fraction": GRIPPER_OPENING_FRACTION,
+        "opening_fraction": GRIPPER_OPENING_FRACTION,
+        GRIPPER_CLOSED_FRACTION: GRIPPER_CLOSED_FRACTION,
+        "absolute_closed_fraction": GRIPPER_CLOSED_FRACTION,
+        "closed_fraction": GRIPPER_CLOSED_FRACTION,
+        GRIPPER_OPENING_METRES: GRIPPER_OPENING_METRES,
+        "absolute_opening_meters": GRIPPER_OPENING_METRES,
+        "opening_m": GRIPPER_OPENING_METRES,
+    }
+    return aliases.get(normalized)
+
+
+def policy_observation_state(
+    raw_delivery_state: np.ndarray,
+    qpos_m: np.ndarray,
+    protocol: PolicyProtocol,
+) -> np.ndarray:
+    """Adapt physical feedback to the state convention advertised by policy."""
+    if protocol.schema == "delivery":
+        state = np.asarray(raw_delivery_state, dtype=np.float32).copy()
+        for arm_index in range(2 if protocol.arm_mode == "bimanual" else 1):
+            index = arm_index * 10 + 9
+            if protocol.state_gripper_semantics == GRIPPER_CLOSED_FRACTION:
+                state[index] = 1.0 - state[index]
+        return state
+    state = np.asarray(qpos_m, dtype=np.float32).copy()
+    for arm_index in range(2 if protocol.arm_mode == "bimanual" else 1):
+        index = arm_index * 7 + 6
+        if protocol.state_gripper_semantics == GRIPPER_OPENING_FRACTION:
+            state[index] = state[index] / GRIPPER_MAX_M
+    return state
+
+
+def arm_status_dict(piper: Any) -> dict[str, Any]:
+    message = piper.GetArmStatus()
+    feedback = message.arm_status
+    has_timestamp = hasattr(message, "time_stamp")
+    timestamp = float(getattr(message, "time_stamp", 0.0) or 0.0)
+    hz = float(getattr(message, "Hz", 0.0) or 0.0)
+    feedback_age_s = time.time() - timestamp if timestamp > 0 else None
+    feedback_fresh = (
+        None
+        if not has_timestamp
+        else bool(
+            timestamp > 0
+            and feedback_age_s is not None
+            and -1.0 <= feedback_age_s <= PIPER_FEEDBACK_MAX_AGE_S
+        )
+    )
+    return {
+        "ctrl_mode": int(feedback.ctrl_mode),
+        "arm_status": int(feedback.arm_status),
+        "mode_feed": int(feedback.mode_feed),
+        "motion_status": int(feedback.motion_status),
+        "err_code": int(feedback.err_code),
+        "feedback_timestamp": timestamp if has_timestamp else None,
+        "feedback_age_s": feedback_age_s,
+        "feedback_hz": hz if has_timestamp else None,
+        "feedback_fresh": feedback_fresh,
+    }
+
+
+def driver_enable_status_dict(piper: Any) -> dict[str, Any]:
+    getter = getattr(piper, "GetArmLowSpdInfoMsgs", None)
+    if not callable(getter):
+        return {
+            "available": False,
+            "faulted": None,
+            "healthy": None,
+            "ready": None,
+            "feedback_timestamp": None,
+            "feedback_age_s": None,
+            "feedback_hz": None,
+            "enabled": None,
+            "received": None,
+            "faults": None,
+        }
+    try:
+        message = getter()
+        timestamp = float(getattr(message, "time_stamp", 0.0) or 0.0)
+        hz = float(getattr(message, "Hz", 0.0) or 0.0)
+        feedback_age_s = time.time() - timestamp if timestamp > 0 else None
+        fresh = bool(
+            timestamp > 0
+            and feedback_age_s is not None
+            and -1.0 <= feedback_age_s <= PIPER_FEEDBACK_MAX_AGE_S
+        )
+        enabled: list[bool] = []
+        received: list[bool] = []
+        faults: list[list[str]] = []
+        fault_fields = (
+            "voltage_too_low",
+            "motor_overheating",
+            "driver_overcurrent",
+            "driver_overheating",
+            "collision_status",
+            "driver_error_status",
+            "stall_status",
+        )
+        for motor_index in range(1, 7):
+            motor = getattr(message, f"motor_{motor_index}")
+            foc = motor.foc_status
+            enabled.append(bool(foc.driver_enable_status))
+            received.append(bool(getattr(motor, "can_id", 0)))
+            faults.append(
+                [name for name in fault_fields if bool(getattr(foc, name, False))]
+            )
+        faulted = bool(any(faults))
+        healthy = bool(fresh and all(received) and not faulted)
+        ready = bool(healthy and all(enabled))
+        return {
+            "available": True,
+            "faulted": faulted,
+            "healthy": healthy,
+            "ready": ready,
+            "feedback_timestamp": timestamp,
+            "feedback_age_s": feedback_age_s,
+            "feedback_hz": hz,
+            "enabled": enabled,
+            "received": received,
+            "faults": faults,
+        }
+    except Exception as exc:
+        return {
+            "available": True,
+            "faulted": True,
+            "healthy": False,
+            "ready": False,
+            "feedback_timestamp": None,
+            "feedback_age_s": None,
+            "feedback_hz": None,
+            "enabled": None,
+            "received": None,
+            "faults": [[f"feedback_error:{type(exc).__name__}:{exc}"]],
+        }
+
+
+def _metadata_contract_version(metadata: dict[str, Any], errors: list[str]) -> int | None:
+    raw = metadata.get("contract_version")
+    if raw is None:
+        return None
+    try:
+        version = int(raw)
+    except (TypeError, ValueError):
+        errors.append(f"contract_version={raw!r} must be an integer")
+        return None
+    if version <= 0:
+        errors.append(f"contract_version={raw!r} must be positive")
+        return None
+    return version
+
+
+def _joint_gripper_semantics_from_metadata(
+    metadata: dict[str, Any],
+    action_semantics: Any,
+    errors: list[str],
+) -> tuple[str | None, bool]:
+    raw = (
+        metadata.get("wire_gripper_semantics")
+        or metadata.get("model_gripper_semantics")
+        or metadata.get("gripper_semantics")
+    )
+    explicit = raw is not None
+    semantics = _canonical_gripper_semantics(raw)
+    if explicit and semantics is None:
+        errors.append(f"unsupported gripper_semantics={raw!r}")
+        return None, True
+    if semantics is not None:
+        return semantics, True
+    if action_semantics == WIRE_JOINT_ACTION_SEMANTICS:
+        return GRIPPER_OPENING_FRACTION, False
+
+    names: list[str] = []
+    for key in ("wire_action_names", "model_action_names", "action_names"):
+        value = metadata.get(key)
+        if isinstance(value, (list, tuple)):
+            names.extend(str(item).lower() for item in value)
+    if any("gripper_opening_fraction" in name for name in names):
+        return GRIPPER_OPENING_FRACTION, False
+    if any("gripper_opening_m" in name or "gripper_opening_metre" in name for name in names):
+        return GRIPPER_OPENING_METRES, False
+
+    raw_version = metadata.get("contract_version")
+    try:
+        version = int(raw_version) if raw_version is not None else None
+    except (TypeError, ValueError):
+        version = None
+    if version is not None:
+        return (
+            GRIPPER_OPENING_FRACTION
+            if version >= CONTRACT_VERSION
+            else GRIPPER_OPENING_METRES
+        ), False
+
+    errors.append(
+        "legacy joint checkpoint omits gripper_semantics and has no decisive "
+        "contract_version/action_names; refusing to guess metres versus fraction"
+    )
+    return None, False
+
+
+def _joint_state_gripper_semantics_from_metadata(
+    metadata: dict[str, Any],
+    action_semantics: Any,
+    errors: list[str],
+) -> str | None:
+    raw = metadata.get("state_gripper_semantics") or metadata.get(
+        "raw_gripper_semantics"
+    )
+    semantics = _canonical_gripper_semantics(raw)
+    if raw is not None:
+        if semantics is None:
+            errors.append(f"unsupported state_gripper_semantics={raw!r}")
+        return semantics
+    names = metadata.get("state_names")
+    if isinstance(names, (list, tuple)):
+        lowered = [str(item).lower() for item in names]
+        if any("gripper_opening_fraction" in name for name in lowered):
+            return GRIPPER_OPENING_FRACTION
+        if any("gripper_opening_m" in name or "gripper_opening_metre" in name for name in lowered):
+            return GRIPPER_OPENING_METRES
+    if not metadata.get("wire_gripper_semantics") and not metadata.get(
+        "model_gripper_semantics"
+    ):
+        action_names = metadata.get("action_names")
+        if isinstance(action_names, (list, tuple)):
+            lowered = [str(item).lower() for item in action_names]
+            if any("gripper_opening_fraction" in name for name in lowered):
+                return GRIPPER_OPENING_FRACTION
+            if any(
+                "gripper_opening_m" in name or "gripper_opening_metre" in name
+                for name in lowered
+            ):
+                return GRIPPER_OPENING_METRES
+    try:
+        version = int(metadata.get("contract_version"))
+    except (TypeError, ValueError):
+        version = None
+    if version is not None:
+        return GRIPPER_OPENING_FRACTION if version >= CONTRACT_VERSION else GRIPPER_OPENING_METRES
+    if action_semantics == WIRE_JOINT_ACTION_SEMANTICS:
+        return GRIPPER_OPENING_FRACTION
+    errors.append(
+        "joint state omits state_gripper_semantics and has no decisive "
+        "contract_version/state_names; refusing to guess metres versus fraction"
+    )
+    return None
+
+
+def validate_policy_metadata(
+    metadata: dict[str, Any],
+    arm_side: str,
+    arm_mode: str = "single",
+    output_mode: str = "auto",
+) -> PolicyProtocol:
+    """Validate server dimensions/cameras before any robot command is possible.
+
+    ``output_mode`` is an operator-facing contract lock.  ``auto`` keeps the
+    historical behavior and follows the server handshake; ``joint`` and
+    ``delivery`` require the server to advertise the corresponding schema.
+    An explicit mode never reinterprets an untrusted 7D vector locally: a
+    mismatch is rejected before observations or robot commands are accepted.
+    """
+    output_mode = str(output_mode or "auto").strip().lower()
+    if output_mode not in {"auto", "joint", "delivery"}:
+        raise ValueError(
+            f"output_mode must be one of 'auto', 'joint', or 'delivery', got {output_mode!r}"
+        )
+    advertised_mode = str(metadata.get("arm_mode") or "single")
+    expected_side = "both" if arm_mode == "bimanual" else arm_side
+    expected_action_dim = 14 if arm_mode == "bimanual" else 7
+    advertised_action_dim = (
+        metadata.get("wire_action_dim")
+        or metadata.get("model_action_dim")
+        or metadata.get("action_dim")
+    )
+    common_expected = {
+        "transport": "openpi_websocket_v1",
+        "arm_mode": arm_mode,
+        "action_dim": expected_action_dim,
+        "arm_side": expected_side,
+    }
+    comparable = dict(metadata, arm_mode=advertised_mode, action_dim=advertised_action_dim)
+    errors = [
+        f"{key}={comparable.get(key)!r}, expected {value!r}"
+        for key, value in common_expected.items()
+        if comparable.get(key) != value
+    ]
+
+    schema = metadata.get("schema")
+    if output_mode != "auto" and schema != output_mode:
+        errors.append(
+            f"server schema={schema!r} conflicts with --output-mode={output_mode!r}; "
+            "refusing to reinterpret policy outputs"
+        )
+    advertised_action_semantics = (
+        metadata.get("wire_action_semantics")
+        or metadata.get("model_action_semantics")
+        or metadata.get("action_semantics")
+    )
+    if schema == "delivery":
+        expected_state_dim = 20 if arm_mode == "bimanual" else 10
+        expected_semantics = {
+            DELIVERY_STEP_ACTION_SEMANTICS,
+            DELIVERY_CHUNK_ORIGIN_ACTION_SEMANTICS,
+            DELIVERY_MODEL_ACTION_SEMANTICS,
+        }
+    elif schema == "joint":
+        expected_state_dim = 14 if arm_mode == "bimanual" else 7
+        expected_semantics = JOINT_ACTION_SEMANTICS
+    else:
+        expected_state_dim = None
+        expected_semantics = set()
+        errors.append(f"schema={schema!r}, expected 'delivery' or 'joint'")
+
+    if arm_mode == "bimanual":
+        expected_camera_key_sets = (
+            {"cam_high", "cam_left_wrist", "cam_right_wrist"},
+        )
+    elif schema == "delivery":
+        # Legacy delivery datasets expose the generic ``cam_wrist`` alias,
+        # while canonical v3 datasets preserve the physical arm side in the
+        # wire key. Both identify the same locally captured wrist stream.
+        expected_camera_key_sets = (
+            {"cam_high", "cam_wrist"},
+            {"cam_high", f"cam_{arm_side}_wrist"},
+        )
+    else:
+        expected_camera_key_sets = (
+            {"cam_high", f"cam_{arm_side}_wrist"},
+        )
+
+    if expected_state_dim is not None and metadata.get("state_dim") != expected_state_dim:
+        errors.append(f"state_dim={metadata.get('state_dim')!r}, expected {expected_state_dim!r}")
+    action_semantics = advertised_action_semantics
+    if expected_semantics and advertised_action_semantics not in expected_semantics:
+        errors.append(
+            f"wire/action_semantics={advertised_action_semantics!r}, expected one of "
+            f"{sorted(expected_semantics)!r}"
+        )
+    if schema == "delivery" and advertised_action_semantics == DELIVERY_STEP_ACTION_SEMANTICS:
+        expected_gripper_semantics = GRIPPER_CLOSED_FRACTION
+        expected_delivery_convention = "step"
+        action_semantics = DELIVERY_STEP_ACTION_SEMANTICS
+        raw_gripper_semantics = (
+            metadata.get("wire_gripper_semantics")
+            or metadata.get("model_gripper_semantics")
+            or metadata.get("gripper_semantics")
+        )
+        gripper_semantics = _canonical_gripper_semantics(raw_gripper_semantics)
+    elif schema == "delivery":
+        expected_gripper_semantics = (
+            GRIPPER_OPENING_FRACTION
+            if advertised_action_semantics == DELIVERY_MODEL_ACTION_SEMANTICS
+            else None
+        )
+        expected_delivery_convention = "chunk_origin"
+        action_semantics = DELIVERY_CHUNK_ORIGIN_ACTION_SEMANTICS
+        raw_gripper_semantics = (
+            metadata.get("wire_gripper_semantics")
+            or metadata.get("model_gripper_semantics")
+            or metadata.get("gripper_semantics")
+        )
+        gripper_semantics = _canonical_gripper_semantics(raw_gripper_semantics)
+    else:
+        expected_gripper_semantics = GRIPPER_OPENING_FRACTION
+        expected_delivery_convention = None
+        raw_gripper_semantics = (
+            metadata.get("wire_gripper_semantics")
+            or metadata.get("model_gripper_semantics")
+            or metadata.get("gripper_semantics")
+        )
+        gripper_semantics, _ = _joint_gripper_semantics_from_metadata(
+            metadata, advertised_action_semantics, errors
+        )
+    if raw_gripper_semantics is not None and gripper_semantics is None:
+        errors.append(
+            f"gripper_semantics={raw_gripper_semantics!r}, expected opening_fraction "
+            "or closed_fraction"
+        )
+    elif (
+        schema == "delivery"
+        and expected_gripper_semantics is not None
+        and gripper_semantics is not None
+        and gripper_semantics != expected_gripper_semantics
+    ):
+        errors.append(
+            f"gripper_semantics={gripper_semantics!r} conflicts with "
+            f"action_semantics={action_semantics!r}; expected {expected_gripper_semantics!r}"
+        )
+    if gripper_semantics is None and schema == "delivery":
+        # Backward compatibility is still explicit: the advertised delivery
+        # action semantics is the marker that selects 8_3_64eps (step/closed)
+        # versus v3 (chunk-origin/opening). New servers should also publish
+        # gripper_semantics for easier operator inspection.
+        if expected_gripper_semantics is not None:
+            gripper_semantics = expected_gripper_semantics
+        else:
+            try:
+                delivery_version = int(metadata.get("contract_version"))
+            except (TypeError, ValueError):
+                delivery_version = None
+            if metadata.get("legacy_delivery_v2") is True or (
+                delivery_version is not None and delivery_version < CONTRACT_VERSION
+            ):
+                gripper_semantics = GRIPPER_CLOSED_FRACTION
+            elif delivery_version is not None and delivery_version >= CONTRACT_VERSION:
+                gripper_semantics = GRIPPER_OPENING_FRACTION
+            else:
+                errors.append(
+                    "chunk-origin delivery metadata omits gripper_semantics and contract version; "
+                    "refusing to guess legacy closed versus v3 opening fraction"
+                )
+    raw_state_gripper_semantics = metadata.get("state_gripper_semantics") or metadata.get(
+        "raw_gripper_semantics"
+    )
+    state_gripper_semantics = _canonical_gripper_semantics(raw_state_gripper_semantics)
+    if raw_state_gripper_semantics is not None and state_gripper_semantics is None:
+        errors.append(f"unsupported state_gripper_semantics={raw_state_gripper_semantics!r}")
+    if state_gripper_semantics is None:
+        if schema == "delivery":
+            state_gripper_semantics = gripper_semantics
+        else:
+            state_gripper_semantics = _joint_state_gripper_semantics_from_metadata(
+                metadata, advertised_action_semantics, errors
+            )
+    advertised_delivery_convention = metadata.get("delivery_action_convention") or metadata.get(
+        "model_action_convention"
+    )
+    if (
+        expected_delivery_convention is not None
+        and advertised_delivery_convention is not None
+        and advertised_delivery_convention != expected_delivery_convention
+    ):
+        errors.append(
+            f"delivery_action_convention={advertised_delivery_convention!r} conflicts with "
+            f"action_semantics={action_semantics!r}; expected {expected_delivery_convention!r}"
+        )
+    camera_keys = metadata.get("camera_keys")
+    raw_action_hz = metadata.get("action_hz")
+    contract_version = _metadata_contract_version(metadata, errors)
+    raw_action_horizon = metadata.get("action_horizon", DEFAULT_OPENPI_CHUNK_STEPS)
+    try:
+        action_horizon = int(raw_action_horizon)
+    except (TypeError, ValueError):
+        errors.append(f"action_horizon={raw_action_horizon!r} must be a positive integer")
+        action_horizon = DEFAULT_OPENPI_CHUNK_STEPS
+    else:
+        if action_horizon <= 0:
+            errors.append(f"action_horizon={raw_action_horizon!r} must be a positive integer")
+    action_hz: float | None = None
+    if raw_action_hz is not None:
+        try:
+            action_hz = float(raw_action_hz)
+        except (TypeError, ValueError):
+            errors.append(f"action_hz={raw_action_hz!r} must be a positive number")
+        else:
+            if not math.isfinite(action_hz) or action_hz <= 0:
+                errors.append(f"action_hz={raw_action_hz!r} must be a positive number")
+    camera_key_set = set(camera_keys) if isinstance(camera_keys, (list, tuple)) else set()
+    if (
+        not isinstance(camera_keys, (list, tuple))
+        or len(camera_keys) != len(camera_key_set)
+        or camera_key_set not in expected_camera_key_sets
+    ):
+        expected_camera_keys = [sorted(keys) for keys in expected_camera_key_sets]
+        errors.append(f"camera_keys={camera_keys!r}, expected one of {expected_camera_keys!r}")
+    if errors:
+        raise RuntimeError("incompatible policy metadata: " + "; ".join(errors))
+
+    return PolicyProtocol(
+        schema=str(schema),
+        arm_mode=advertised_mode,
+        state_dim=int(metadata["state_dim"]),
+        action_dim=int(advertised_action_dim),
+        arm_side=str(metadata["arm_side"]),
+        action_semantics=str(action_semantics),
+        camera_keys=tuple(str(key) for key in camera_keys),
+        action_hz=action_hz,
+        gripper_semantics=gripper_semantics,
+        state_gripper_semantics=state_gripper_semantics,
+        metadata_gripper_semantics_explicit=raw_gripper_semantics is not None,
+        contract_version=contract_version,
+        action_horizon=action_horizon,
+    )
+
+
+def resolve_action_chunk_steps(
+    *,
+    action_hz: float,
+    command_hz: float,
+    override: int | None = None,
+) -> int:
+    """Return which future action row matches one robot command interval.
+
+    For a 20 Hz policy and a 4 Hz compatibility command loop, row 5 (index 4)
+    is the target for the end of the next 250 ms command interval. The current
+    asynchronous runtime instead commands at 20 Hz and uses latency-prefix
+    skipping. New delivery
+    policies express every row relative to the same current observation.
+    """
+    if override is not None:
+        if int(override) != override or int(override) <= 0:
+            raise ValueError(f"action chunk steps must be a positive integer, got {override!r}")
+        return int(override)
+    if not math.isfinite(float(action_hz)) or float(action_hz) <= 0:
+        raise ValueError(f"action_hz must be positive, got {action_hz!r}")
+    if not math.isfinite(float(command_hz)) or float(command_hz) <= 0:
+        raise ValueError(f"command_hz must be positive, got {command_hz!r}")
+    return max(1, int(math.floor(float(action_hz) / float(command_hz) + 0.5)))
+
+
+def aggregate_action_chunk(
+    actions: np.ndarray,
+    protocol: PolicyProtocol,
+    steps: int,
+) -> tuple[np.ndarray, int]:
+    """Convert a model-rate action chunk into one robot command.
+
+    Joint actions and new chunk-origin delivery actions already contain future
+    targets aligned to the current observation, so row ``steps - 1`` is selected
+    directly. Legacy step-delta delivery checkpoints are still supported by
+    composing their consumed prefix. Gripper is absolute in every convention.
+    """
+    values = np.asarray(actions, dtype=np.float64)
+    if values.ndim == 1:
+        values = values[None, :]
+    if values.ndim != 2 or values.shape[1] != protocol.action_dim or values.shape[0] <= 0:
+        raise ExecutionBlocked(
+            f"action chunk must have shape (T,{protocol.action_dim}), got {values.shape}"
+        )
+    if not np.all(np.isfinite(values)):
+        raise ExecutionBlocked("action chunk contains non-finite values")
+    if int(steps) <= 0:
+        raise ExecutionBlocked(f"action chunk steps must be positive, got {steps!r}")
+    used_steps = min(int(steps), values.shape[0])
+    prefix = values[:used_steps]
+    if protocol.schema == "joint":
+        return prefix[-1].copy(), used_steps
+    if protocol.schema != "delivery":
+        raise ExecutionBlocked(f"unsupported action schema: {protocol.schema}")
+    if protocol.action_semantics == DELIVERY_CHUNK_ORIGIN_ACTION_SEMANTICS:
+        return prefix[-1].copy(), used_steps
+    if protocol.action_semantics != DELIVERY_STEP_ACTION_SEMANTICS:
+        raise ExecutionBlocked(
+            f"unsupported delivery action semantics: {protocol.action_semantics!r}"
+        )
+
+    # Compatibility path for markerless/explicit legacy checkpoints whose
+    # predicted rows are chained frame-to-frame deltas.
+    command = np.empty(protocol.action_dim, dtype=np.float64)
+    arm_count = 2 if protocol.arm_mode == "bimanual" else 1
+    for arm_index in range(arm_count):
+        offset = arm_index * 7
+        command[offset : offset + 3] = prefix[:, offset : offset + 3].sum(axis=0)
+        total_rotation = np.eye(3, dtype=np.float64)
+        for rotvec in prefix[:, offset + 3 : offset + 6]:
+            total_rotation = Rotation.from_rotvec(rotvec).as_matrix() @ total_rotation
+        command[offset + 3 : offset + 6] = Rotation.from_matrix(total_rotation).as_rotvec()
+        command[offset + 6] = prefix[-1, offset + 6]
+    return command, used_steps
+
+
+def connect_policy(
+    host: str,
+    port: int,
+    arm_side: str,
+    arm_mode: str = "single",
+    output_mode: str = "auto",
+) -> tuple[Any, PolicyProtocol]:
+    """Create the official OpenPI client and validate the server handshake."""
+    from openpi_client.websocket_client_policy import WebsocketClientPolicy
+
+    logging.info("Connecting to official OpenPI policy at ws://%s:%d ...", host, port)
+    policy = WebsocketClientPolicy(host=host, port=port)
+    try:
+        metadata = policy.get_server_metadata()
+        if not isinstance(metadata, dict):
+            raise RuntimeError(f"invalid policy metadata: {type(metadata).__name__}")
+        protocol = validate_policy_metadata(metadata, arm_side, arm_mode, output_mode)
+    except Exception:
+        close_policy(policy)
+        raise
+    logging.info("Policy connected: %s", metadata)
+    return policy, protocol
+
+
+def close_policy(policy: Any | None) -> None:
+    if policy is None:
+        return
+    connection = getattr(policy, "_ws", None)
+    if connection is not None:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
+def first_action(result: dict[str, Any], action_dim: int = 7) -> np.ndarray:
+    """Return the first raw model action for backward-compatible callers."""
+    actions = np.asarray(result.get("actions"), dtype=np.float64)
+    if actions.ndim == 1:
+        action = actions
+    elif actions.ndim == 2 and len(actions):
+        action = actions[0]
+    else:
+        raise ExecutionBlocked(f"invalid action chunk shape {actions.shape}")
+    if action.shape != (action_dim,) or not np.all(np.isfinite(action)):
+        raise ExecutionBlocked(f"first action must be finite {action_dim}D, got {action.shape}")
+    return action
+
+
+@dataclass(frozen=True)
+class TimedTarget:
+    """One decoded absolute target on the policy's monotonic action timeline."""
+
+    queue_index: int
+    wire_action: np.ndarray
+    absolute_target: np.ndarray
+    target_monotonic: float
+    generation: int = 0
+    source_index: int | None = None
+    blended: bool = False
+    blend_step: int | None = None
+    hold: bool = False
+
+
+# Compatibility name retained for existing callers and telemetry consumers.
+DecodedQueuedAction = TimedTarget
+
+
+def _finite_action_chunk(actions: Any, action_dim: int) -> np.ndarray:
+    values = np.asarray(actions, dtype=np.float64)
+    if values.ndim == 1:
+        values = values[None, :]
+    if values.ndim != 2 or values.shape[1] != action_dim or values.shape[0] <= 0:
+        raise ExecutionBlocked(f"action chunk must have shape (T,{action_dim}), got {values.shape}")
+    if not np.all(np.isfinite(values)):
+        raise ExecutionBlocked("action chunk contains non-finite values")
+    return values
+
+
+def _opening_fraction(
+    value: float,
+    *,
+    semantics: str,
+    tolerance: float,
+) -> float:
+    raw = float(value)
+    if raw < -tolerance or raw > 1.0 + tolerance:
+        raise ExecutionBlocked(
+            f"gripper target {raw:.5f} exceeds [0,1] tolerance {tolerance:.5f}"
+        )
+    normalized = float(np.clip(raw, 0.0, 1.0))
+    if semantics == GRIPPER_OPENING_FRACTION:
+        return normalized
+    if semantics == GRIPPER_CLOSED_FRACTION:
+        return 1.0 - normalized
+    if semantics == GRIPPER_OPENING_METRES:
+        metre_tolerance = tolerance * GRIPPER_MAX_M
+        if raw < -metre_tolerance or raw > GRIPPER_MAX_M + metre_tolerance:
+            raise ExecutionBlocked(
+                f"gripper target {raw:.5f}m exceeds [0,{GRIPPER_MAX_M:.5f}]m "
+                f"tolerance {metre_tolerance:.5f}m"
+            )
+        return float(np.clip(raw, 0.0, GRIPPER_MAX_M) / GRIPPER_MAX_M)
+    raise ExecutionBlocked(f"unsupported gripper semantics: {semantics!r}")
+
+
+def decode_action_queue(
+    actions: Any,
+    protocol: PolicyProtocol,
+    raw_delivery_state: np.ndarray,
+    qpos_m: np.ndarray,
+    *,
+    steps: int | None = None,
+    generation: int = 0,
+    observation_capture_monotonic: float | None = None,
+    action_hz: float | None = None,
+    gripper_range_tolerance: float = DEFAULT_GRIPPER_RANGE_TOLERANCE,
+) -> tuple[np.ndarray, list[DecodedQueuedAction]]:
+    """Decode the first action rows against one immutable inference anchor.
+
+    v3 delivery rows are independently decoded by the shared root-contract
+    helper. Legacy 8_3_64eps rows are first composed from one-step deltas to
+    chunk-origin deltas, then passed through the same absolute-target helper.
+    """
+    values = _finite_action_chunk(actions, protocol.action_dim)
+    capture_monotonic = (
+        time.monotonic()
+        if observation_capture_monotonic is None
+        else float(observation_capture_monotonic)
+    )
+    target_hz = float(action_hz or protocol.action_hz or DEFAULT_ACTION_HZ)
+    if not math.isfinite(capture_monotonic) or capture_monotonic < 0:
+        raise ExecutionBlocked(
+            f"observation capture monotonic time is invalid: {capture_monotonic!r}"
+        )
+    if not math.isfinite(target_hz) or target_hz <= 0:
+        raise ExecutionBlocked(f"action_hz must be positive, got {target_hz!r}")
+    if steps is None:
+        used_steps = len(values)
+    else:
+        if int(steps) <= 0:
+            raise ExecutionBlocked(f"action chunk steps must be positive, got {steps!r}")
+        used_steps = min(int(steps), len(values))
+    wire = values[:used_steps].copy()
+    arm_count = 2 if protocol.arm_mode == "bimanual" else 1
+    for arm_index in range(arm_count):
+        gripper_index = arm_index * 7 + 6
+        for row in wire:
+            _opening_fraction(
+                row[gripper_index],
+                semantics=protocol.gripper_semantics,
+                tolerance=gripper_range_tolerance,
+            )
+
+    anchor = policy_observation_state(raw_delivery_state, qpos_m, protocol).astype(np.float64)
+    if anchor.shape != (protocol.state_dim,) or not np.all(np.isfinite(anchor)):
+        raise ExecutionBlocked(
+            f"inference anchor must be finite {protocol.state_dim}D, got {anchor.shape}"
+        )
+    try:
+        if protocol.schema == "delivery":
+            if protocol.action_semantics == DELIVERY_STEP_ACTION_SEMANTICS:
+                model_actions = step_deltas_to_chunk_origin(wire, arm_count=arm_count)
+            elif protocol.action_semantics == DELIVERY_CHUNK_ORIGIN_ACTION_SEMANTICS:
+                model_actions = wire
+            else:
+                raise ExecutionBlocked(
+                    f"unsupported delivery action semantics: {protocol.action_semantics!r}"
+                )
+            absolute = chunk_origin_deltas_to_absolute_eef_targets(
+                anchor, model_actions, arm_count=arm_count
+            )
+        elif protocol.schema == "joint":
+            absolute = wire
+        else:
+            raise ExecutionBlocked(f"unsupported execution schema: {protocol.schema}")
+    except (ValueError, FloatingPointError) as exc:
+        raise ExecutionBlocked(f"cannot decode action chunk: {exc}") from exc
+
+    absolute = np.asarray(absolute, dtype=np.float64)
+    if absolute.ndim == 1:
+        absolute = absolute[None, :]
+    expected_absolute_dim = 10 * arm_count if protocol.schema == "delivery" else 7 * arm_count
+    if absolute.shape != (used_steps, expected_absolute_dim) or not np.all(np.isfinite(absolute)):
+        raise ExecutionBlocked(
+            f"decoded absolute targets must have shape ({used_steps},{expected_absolute_dim}), "
+            f"got {absolute.shape}"
+        )
+    decoded = [
+        DecodedQueuedAction(
+            index,
+            wire[index].copy(),
+            absolute[index].copy(),
+            capture_monotonic + (index + 1) / target_hz,
+            generation=generation,
+            source_index=index,
+        )
+        for index in range(used_steps)
+    ]
+    return anchor, decoded
+
+
+@dataclass(frozen=True)
+class InferenceLaunch:
+    generation: int
+    captured_at: float
+    captured_monotonic: float
+    launched_at: float
+    launched_monotonic: float
+    raw_delivery_state: np.ndarray
+    qpos_m: np.ndarray
+    image_timestamps: dict[str, float]
+    # Number of non-hold policy targets that had actually reached the robot at
+    # observation capture.  The completed inference may only skip a delayed
+    # prefix when the old plan really progressed while inference was running.
+    executed_plan_command_count: int = 0
+
+
+@dataclass(frozen=True)
+class InferenceCompletion:
+    launch: InferenceLaunch
+    result: dict[str, Any] | None
+    arrived_at: float
+    arrived_monotonic: float
+    error: BaseException | None = None
+
+
+@dataclass(frozen=True)
+class InferenceWorkerResult:
+    """Inference result plus camera/transport timing captured off the control thread."""
+
+    result: dict[str, Any]
+    image_timestamps: dict[str, float]
+    client_timing: dict[str, Any] | None = None
+
+
+class AsyncPolicyInference:
+    """Single-in-flight inference worker; polling never blocks the control loop."""
+
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="piper-policy")
+        self._future: Future | None = None
+        self._launch: InferenceLaunch | None = None
+
+    @property
+    def in_flight(self) -> bool:
+        return self._future is not None
+
+    def launch(
+        self,
+        policy: Any,
+        observation: dict[str, Any],
+        launch: InferenceLaunch,
+    ) -> bool:
+        return self.launch_callable(lambda: policy.infer(observation), launch)
+
+    def launch_callable(
+        self,
+        task: Callable[[], Any],
+        launch: InferenceLaunch,
+    ) -> bool:
+        """Submit capture/inference work without waiting on the control thread."""
+        if self._future is not None:
+            return False
+        self._launch = launch
+        self._future = self._executor.submit(task)
+        return True
+
+    def poll(self) -> InferenceCompletion | None:
+        future = self._future
+        launch = self._launch
+        if future is None or launch is None or not future.done():
+            return None
+        arrived_at = time.time()
+        arrived_monotonic = time.monotonic()
+        self._future = None
+        self._launch = None
+        try:
+            result = future.result()
+        except BaseException as exc:  # surfaced on the 20 Hz control thread
+            return InferenceCompletion(
+                launch, None, arrived_at, arrived_monotonic, error=exc
+            )
+        if isinstance(result, InferenceWorkerResult):
+            launch = replace(
+                launch,
+                image_timestamps={
+                    key: float(value)
+                    for key, value in result.image_timestamps.items()
+                },
+            )
+            payload = dict(result.result)
+            if isinstance(result.client_timing, dict):
+                payload["_client_transport_timing"] = dict(result.client_timing)
+            result = payload
+        return InferenceCompletion(launch, result, arrived_at, arrived_monotonic, error=None)
+
+    def shutdown(self) -> None:
+        if self._future is not None:
+            self._future.cancel()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+
+@dataclass
+class PeriodicSchedule:
+    """Drift-resistant periodic launch schedule used by deterministic tests/run."""
+
+    frequency_hz: float
+    next_at: float
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.frequency_hz) or self.frequency_hz <= 0:
+            raise ValueError("frequency_hz must be positive")
+
+    @property
+    def period_s(self) -> float:
+        return 1.0 / self.frequency_hz
+
+    def due(self, now: float) -> bool:
+        if now + 1e-9 < self.next_at:
+            return False
+        elapsed = max(0.0, now - self.next_at)
+        periods = int(math.floor(elapsed / self.period_s)) + 1
+        self.next_at += periods * self.period_s
+        return True
+
+
+def _blend_absolute_target(
+    old_target: np.ndarray,
+    new_target: np.ndarray,
+    protocol: PolicyProtocol,
+    alpha: float,
+) -> np.ndarray:
+    """Interpolate absolute targets; delivery rotations follow SO(3)."""
+    old = np.asarray(old_target, dtype=np.float64)
+    new = np.asarray(new_target, dtype=np.float64)
+    if old.shape != new.shape or not np.all(np.isfinite(old)) or not np.all(np.isfinite(new)):
+        raise ExecutionBlocked("blend targets must have matching finite shapes")
+    alpha = float(alpha)
+    if not 0.0 <= alpha <= 1.0:
+        raise ExecutionBlocked(f"blend alpha must be in [0,1], got {alpha!r}")
+    if protocol.schema == "joint":
+        arm_count = 2 if protocol.arm_mode == "bimanual" else 1
+        output = np.empty_like(old)
+        for arm_index in range(arm_count):
+            offset = arm_index * 7
+            output[offset : offset + 6] = old[offset : offset + 6] + alpha * (
+                new[offset : offset + 6] - old[offset : offset + 6]
+            )
+            # Gripper is never interpolated with pose/joints. During the blend
+            # it stays on the old trajectory; the execution filter handles the
+            # later opening transition with confirmation and a step limit.
+            output[offset + 6] = old[offset + 6]
+        return output
+    if protocol.schema != "delivery":
+        raise ExecutionBlocked(f"unsupported blend schema: {protocol.schema}")
+    arm_count = 2 if protocol.arm_mode == "bimanual" else 1
+    output = np.empty_like(old)
+    for arm_index in range(arm_count):
+        offset = arm_index * 10
+        old_arm = old[offset : offset + 10]
+        new_arm = new[offset : offset + 10]
+        output[offset : offset + 3] = old_arm[:3] + alpha * (
+            new_arm[:3] - old_arm[:3]
+        )
+        old_rotation = rotation_from_state(old_arm)
+        new_rotation = rotation_from_state(new_arm)
+        relative_rotvec = Rotation.from_matrix(
+            new_rotation @ old_rotation.T
+        ).as_rotvec()
+        blended_rotation = (
+            Rotation.from_rotvec(alpha * relative_rotvec).as_matrix() @ old_rotation
+        )
+        output[offset + 3 : offset + 9] = matrix_to_rotation6d(blended_rotation)
+        output[offset + 9] = old_arm[9]
+    return output
+
+
+def blend_absolute_trajectories(
+    old_actions: list[DecodedQueuedAction],
+    new_actions: list[DecodedQueuedAction],
+    protocol: PolicyProtocol,
+    *,
+    blend_steps: int,
+) -> list[DecodedQueuedAction]:
+    """Build a complete candidate queue, then callers atomically swap it in."""
+    if not old_actions:
+        return list(new_actions)
+    if blend_steps not in {2, 3, 4}:
+        raise ExecutionBlocked(f"blend_steps must be 2, 3, or 4, got {blend_steps!r}")
+    if len(new_actions) < blend_steps:
+        raise ExecutionBlocked(
+            f"new trajectory has {len(new_actions)} rows, fewer than {blend_steps} blend rows"
+        )
+    blended: list[DecodedQueuedAction] = []
+    for index in range(blend_steps):
+        old_action = old_actions[min(index, len(old_actions) - 1)]
+        new_action = new_actions[index]
+        alpha = (index + 1) / blend_steps
+        blended.append(
+            DecodedQueuedAction(
+                queue_index=new_action.queue_index,
+                wire_action=new_action.wire_action.copy(),
+                absolute_target=_blend_absolute_target(
+                    old_action.absolute_target,
+                    new_action.absolute_target,
+                    protocol,
+                    alpha,
+                ),
+                target_monotonic=new_action.target_monotonic,
+                generation=new_action.generation,
+                source_index=new_action.source_index,
+                blended=True,
+                blend_step=index + 1,
+            )
+        )
+    blended.extend(new_actions[blend_steps:])
+    return blended
+
+
+def _check_delivery_absolute_target(
+    current_state: np.ndarray,
+    current_gripper_m: float,
+    absolute_target: np.ndarray,
+    *,
+    gripper_semantics: str,
+    max_translation_step_m: float,
+    max_rotation_step_rad: float,
+    max_gripper_step: float,
+    gripper_range_tolerance: float,
+    workspace_x: tuple[float, float],
+    workspace_y: tuple[float, float],
+    workspace_z: tuple[float, float],
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Validate an already-decoded absolute EEF target against fresh feedback."""
+    current_state = np.asarray(current_state, dtype=np.float64)
+    target = np.asarray(absolute_target, dtype=np.float64)
+    if current_state.shape != (len(STATE_NAMES),) or not np.all(np.isfinite(current_state)):
+        raise ExecutionBlocked("current delivery state is not finite 10D")
+    if target.shape != (len(STATE_NAMES),) or not np.all(np.isfinite(target)):
+        raise ExecutionBlocked("decoded absolute delivery target is not finite 10D")
+
+    target_xyz = target[:3]
+    current_rotation = rotation_from_state(current_state)
+    target_rotation = rotation_from_state(target)
+    translation_step = float(np.linalg.norm(target_xyz - current_state[:3]))
+    rotation_step = float(
+        Rotation.from_matrix(target_rotation @ current_rotation.T).magnitude()
+    )
+    if translation_step > max_translation_step_m + 1e-9:
+        raise ExecutionBlocked(
+            f"translation step {translation_step:.5f}m exceeds {max_translation_step_m:.5f}m"
+        )
+    if rotation_step > max_rotation_step_rad + 1e-9:
+        raise ExecutionBlocked(
+            f"rotation step {rotation_step:.5f}rad exceeds {max_rotation_step_rad:.5f}rad"
+        )
+    for axis, value, bounds in zip("xyz", target_xyz, (workspace_x, workspace_y, workspace_z)):
+        if not bounds[0] <= float(value) <= bounds[1]:
+            raise ExecutionBlocked(
+                f"target {axis}={value:.5f}m outside workspace "
+                f"[{bounds[0]:.5f}, {bounds[1]:.5f}]"
+            )
+
+    opening_fraction = _opening_fraction(
+        target[9], semantics=gripper_semantics, tolerance=gripper_range_tolerance
+    )
+    current_opening_fraction = float(current_gripper_m) / GRIPPER_MAX_M
+    gripper_step = abs(opening_fraction - current_opening_fraction)
+    if gripper_step > max_gripper_step + 1e-9:
+        raise ExecutionBlocked(
+            f"gripper step {gripper_step:.5f} exceeds {max_gripper_step:.5f}"
+        )
+    target_gripper_m = opening_fraction * GRIPPER_MAX_M
+    target_rpy_deg = Rotation.from_matrix(target_rotation).as_euler("xyz", degrees=True)
+    return target_xyz.copy(), target_rpy_deg, target_gripper_m, opening_fraction
+
+
+def build_checked_target(
+    state: np.ndarray,
+    action: np.ndarray,
+    *,
+    max_translation_step_m: float,
+    max_rotation_step_rad: float,
+    max_gripper_step: float,
+    gripper_range_tolerance: float,
+    workspace_x: tuple[float, float],
+    workspace_y: tuple[float, float],
+    workspace_z: tuple[float, float],
+    gripper_semantics: str = GRIPPER_CLOSED_FRACTION,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Backward-compatible single-action decode/check helper."""
+    state = np.asarray(state, dtype=np.float64)
+    action = np.asarray(action, dtype=np.float64)
+    if state.shape != (len(STATE_NAMES),) or not np.all(np.isfinite(state)):
+        raise ExecutionBlocked("current delivery state is not finite 10D")
+    if action.shape != (7,) or not np.all(np.isfinite(action)):
+        raise ExecutionBlocked("delivery action is not finite 7D")
+    _opening_fraction(
+        action[6], semantics=gripper_semantics, tolerance=gripper_range_tolerance
+    )
+    try:
+        absolute = chunk_origin_deltas_to_absolute_eef_targets(state, action, arm_count=1)
+    except ValueError as exc:
+        raise ExecutionBlocked(f"cannot decode delivery action: {exc}") from exc
+    current_opening = _opening_fraction(
+        state[9], semantics=gripper_semantics, tolerance=gripper_range_tolerance
+    )
+    checked = _check_delivery_absolute_target(
+        state,
+        current_opening * GRIPPER_MAX_M,
+        absolute,
+        gripper_semantics=gripper_semantics,
+        max_translation_step_m=max_translation_step_m,
+        max_rotation_step_rad=max_rotation_step_rad,
+        max_gripper_step=max_gripper_step,
+        gripper_range_tolerance=gripper_range_tolerance,
+        workspace_x=workspace_x,
+        workspace_y=workspace_y,
+        workspace_z=workspace_z,
+    )
+    return checked[0], checked[1], checked[2]
+
+
+def build_checked_joint_target(
+    qpos: np.ndarray,
+    action: np.ndarray,
+    *,
+    max_joint_step_rad: float,
+    max_gripper_step: float | None = None,
+    max_gripper_step_m: float | None = None,
+    joint_limit_tolerance_rad: float = 0.0,
+    gripper_range_tolerance: float = DEFAULT_GRIPPER_RANGE_TOLERANCE,
+    gripper_semantics: str = GRIPPER_OPENING_FRACTION,
+) -> tuple[np.ndarray, float]:
+    """Validate absolute joints + opening fraction and return Piper units in SI."""
+    qpos = np.asarray(qpos, dtype=np.float64)
+    action = np.asarray(action, dtype=np.float64)
+    if qpos.shape != (7,) or not np.all(np.isfinite(qpos)):
+        raise ExecutionBlocked("current joint state is not finite 7D")
+    if action.shape != (7,) or not np.all(np.isfinite(action)):
+        raise ExecutionBlocked("joint action is not finite 7D")
+
+    if joint_limit_tolerance_rad < 0:
+        raise ValueError("joint_limit_tolerance_rad must be non-negative")
+    checked_joints = action[:6].copy()
+    for index, (value, bounds) in enumerate(zip(checked_joints, JOINT_LIMITS_RAD), start=1):
+        value = float(value)
+        if value < bounds[0] - joint_limit_tolerance_rad or value > bounds[1] + joint_limit_tolerance_rad:
+            raise ExecutionBlocked(
+                f"joint{index} target {value:.5f}rad outside "
+                f"[{bounds[0]:.5f}, {bounds[1]:.5f}]"
+            )
+        # Policies can emit tiny numerical overshoots at a hard mechanical
+        # limit (the trained joint-3 baseline is exactly 0 rad).  Accept only
+        # the configured tolerance and clip to the physical limit before
+        # converting to Piper units.
+        checked_joints[index - 1] = np.clip(value, bounds[0], bounds[1])
+    opening_fraction = _opening_fraction(
+        action[6],
+        semantics=gripper_semantics,
+        tolerance=gripper_range_tolerance,
+    )
+    gripper_m = opening_fraction * GRIPPER_MAX_M
+
+    joint_deltas = np.abs(checked_joints - qpos[:6])
+    worst_joint = int(np.argmax(joint_deltas))
+    if float(joint_deltas[worst_joint]) > max_joint_step_rad + 1e-9:
+        raise ExecutionBlocked(
+            f"joint{worst_joint + 1} step {joint_deltas[worst_joint]:.5f}rad exceeds "
+            f"{max_joint_step_rad:.5f}rad"
+        )
+    if max_gripper_step is None:
+        max_gripper_step = (
+            float(max_gripper_step_m) / GRIPPER_MAX_M
+            if max_gripper_step_m is not None
+            else 0.25
+        )
+    current_opening_fraction = float(qpos[6]) / GRIPPER_MAX_M
+    gripper_delta = abs(opening_fraction - current_opening_fraction)
+    if gripper_delta > max_gripper_step + 1e-9:
+        raise ExecutionBlocked(
+            f"gripper step {gripper_delta:.5f} exceeds {max_gripper_step:.5f}"
+        )
+    return checked_joints, gripper_m
+
+
+class ExecutionController:
+    def __init__(self, piper: Any | dict[str, Any], args: argparse.Namespace):
+        self.args = args
+        self.arm_mode = getattr(args, "arm_mode", "single")
+        self.arm_side = getattr(args, "arm_side", "right")
+        self.pipers = piper if isinstance(piper, dict) else {self.arm_side: piper}
+        self.piper = next(iter(self.pipers.values()))
+        self.robot_enabled: set[str] = set()
+        allow_execution = bool(getattr(args, "allow_execution", False))
+        self.state = "client_disabled" if not allow_execution else "shadow"
+        self.blocked_reason = (
+            "local --allow-execution is absent" if not allow_execution else "dashboard is shadow"
+        )
+        self.last_command_at: float | None = None
+        self.control_revision: int | None = None
+        self.robot_status: dict[str, Any] | None = None
+        self.inference_hz = float(getattr(args, "hz", DEFAULT_INFERENCE_HZ))
+        self.policy_action_hz = float(getattr(args, "action_hz", None) or DEFAULT_ACTION_HZ)
+        self.control_hz = float(getattr(args, "control_hz", DEFAULT_ACTION_HZ))
+        self.min_action_chunk_steps = int(
+            getattr(args, "min_action_chunk_steps", DEFAULT_MIN_ACTION_CHUNK_STEPS)
+        )
+        self.action_chunk_steps = self.min_action_chunk_steps  # legacy telemetry alias
+        self.blend_steps = int(getattr(args, "blend_steps", DEFAULT_BLEND_STEPS))
+        self.latency_skip_compensation_steps = int(
+            getattr(args, "latency_skip_compensation_steps", 0)
+        )
+        self.estimated_actuator_delay_s = float(
+            getattr(args, "actuator_delay_s", DEFAULT_ACTUATOR_DELAY_S)
+        )
+        self.gripper_lowpass_alpha = float(
+            getattr(args, "gripper_lowpass_alpha", DEFAULT_GRIPPER_LOWPASS_ALPHA)
+        )
+        self.gripper_hysteresis = float(
+            getattr(args, "gripper_hysteresis", DEFAULT_GRIPPER_HYSTERESIS)
+        )
+        self.gripper_confirm_steps = int(
+            getattr(args, "gripper_confirm_steps", DEFAULT_GRIPPER_CONFIRM_STEPS)
+        )
+        self.expected_action_horizon = DEFAULT_OPENPI_CHUNK_STEPS
+        self.pending_actions: list[DecodedQueuedAction] = []
+        self.last_safe_target: DecodedQueuedAction | None = None
+        self.hold_active = False
+        self.hold_count = 0
+        self.hold_started_at: float | None = None
+        self.current_timed_target: dict[str, Any] | None = None
+        # Keep the decoded target object so telemetry can recompute its signed
+        # age against the current snapshot time instead of freezing the value at
+        # the last command tick.
+        self.current_timed_target_action: DecodedQueuedAction | None = None
+        self._filtered_gripper_opening: dict[str, float] = {}
+        self._gripper_extreme_candidate: dict[str, str | None] = {}
+        self._gripper_extreme_count: dict[str, int] = {}
+        self._gripper_extreme_latch: dict[str, str | None] = {}
+        self.active_generation = 0
+        self._next_inference_generation = 1
+        self.waiting_fresh_after_enable = False
+        self.fresh_inference_required_after_monotonic: float | None = None
+        self.enable_hold_settled_at: float | None = None
+        self.enable_staged_generation: int | None = None
+
+        self.last_action_chunk_steps = 0
+        self.last_composed_action: list[float] | None = None
+        self.last_composed_action_at: float | None = None
+        self.queue_anchor_state: list[float] | None = None
+        self.queue_anchor_qpos_m: list[float] | None = None
+        self.queue_anchor_at: float | None = None
+        self.queue_loaded_at: float | None = None
+        self.queue_image_timestamps: dict[str, float] = {}
+        self.queue_control: dict[str, Any] | None = None
+        self.authorization_deadline_monotonic: float | None = None
+        self.queued_action_index: int | None = None
+        self.last_queued_action_index: int | None = None
+        self.last_wire_action: list[float] | None = None
+        self.last_decoded_absolute_target: dict[str, Any] | None = None
+        self.last_feedback_at: float | None = None
+        self.dropped_action_count = 0
+        self.unsafe_drop_count = 0
+        self.expired_drop_count = 0
+        self.other_drop_count = 0
+        self.last_queue_drop_reason = ""
+        self.last_queue_drop_kind: str | None = None
+        self.unsafe_active = False
+        self.executed_plan_command_count = 0
+        self.inference_progress_steps = 0
+        self.inference_timeline_resynced = False
+        self.timeline_resync_active = False
+
+        self.inference_launch_at: float | None = None
+        self.inference_capture_at: float | None = None
+        self.inference_capture_monotonic: float | None = None
+        self.inference_arrival_at: float | None = None
+        self.inference_arrival_monotonic: float | None = None
+        self.inference_latency_s: float | None = None
+        self.inference_skip_steps = 0
+        self.inference_elapsed_prefix_steps = 0
+        self.inference_blend_steps = 0
+        self.inference_generation: int | None = None
+        self.inference_old_remaining = 0
+        self.inference_launch_count = 0
+        self.inference_launch_deferred_count = 0
+        self.last_client_transport_timing: dict[str, Any] = {}
+        self.last_client_timing_source: str | None = None
+        self.last_client_one_way_clock: str | None = None
+        self.last_client_one_way_clock_sync_required: bool | None = None
+        self.last_transport_generation: int | None = None
+        self.last_transport_first_command_generation: int | None = None
+        self.rejected_result: dict[str, Any] | None = None
+        self.rejected_result_count = 0
+        self.queue_underrun = False
+        self.queue_underrun_count = 0
+        self.queue_underrun_at: float | None = None
+        self.control_tick_count = 0
+        self.control_overrun_count = 0
+        self.command_sequence = 0
+        self.last_actuator_command: dict[str, Any] | None = None
+        self.last_command_feedback: dict[str, Any] | None = None
+        self._pending_feedback_command: dict[str, Any] | None = None
+        self.arm_hold_targets: dict[str, np.ndarray] = {}
+        self.arm_hold_gripper_targets: dict[str, float] = {}
+        self.arm_hold_started_at: dict[str, float] = {}
+        self.arm_hold_stable_since: dict[str, float] = {}
+        self.robot_driver_enable_status: dict[str, dict[str, Any]] = {}
+        self.ik_solver: PiperContinuousIK | None = None
+
+    def configure_protocol(self, protocol: PolicyProtocol) -> None:
+        action_hz = getattr(self.args, "action_hz", None) or protocol.action_hz or DEFAULT_ACTION_HZ
+        self.policy_action_hz = float(action_hz)
+        self.control_hz = float(
+            getattr(self.args, "control_hz", DEFAULT_ACTION_HZ)
+        )
+        self.inference_hz = float(getattr(self.args, "hz", DEFAULT_INFERENCE_HZ))
+        self.min_action_chunk_steps = int(
+            getattr(self.args, "min_action_chunk_steps", DEFAULT_MIN_ACTION_CHUNK_STEPS)
+        )
+        legacy_override = getattr(self.args, "action_chunk_steps", None)
+        if legacy_override is not None:
+            self.min_action_chunk_steps = int(legacy_override)
+        self.action_chunk_steps = self.min_action_chunk_steps
+        self.blend_steps = int(getattr(self.args, "blend_steps", DEFAULT_BLEND_STEPS))
+        self.latency_skip_compensation_steps = int(
+            getattr(self.args, "latency_skip_compensation_steps", 0)
+        )
+        self.estimated_actuator_delay_s = float(
+            getattr(self.args, "actuator_delay_s", DEFAULT_ACTUATOR_DELAY_S)
+        )
+        self.gripper_lowpass_alpha = float(
+            getattr(
+                self.args,
+                "gripper_lowpass_alpha",
+                DEFAULT_GRIPPER_LOWPASS_ALPHA,
+            )
+        )
+        self.gripper_hysteresis = float(
+            getattr(self.args, "gripper_hysteresis", DEFAULT_GRIPPER_HYSTERESIS)
+        )
+        self.gripper_confirm_steps = int(
+            getattr(self.args, "gripper_confirm_steps", DEFAULT_GRIPPER_CONFIRM_STEPS)
+        )
+        self.expected_action_horizon = int(protocol.action_horizon)
+        self.pending_actions.clear()
+        if self.arm_hold_targets:
+            # A policy reconnect must not cancel a physical measured-pose hold.
+            # Keep the enable barrier and require a fresh result on the new link.
+            self.enable_staged_generation = None
+            self.waiting_fresh_after_enable = True
+        else:
+            self.enable_staged_generation = None
+            self.waiting_fresh_after_enable = False
+            self.fresh_inference_required_after_monotonic = None
+            self.enable_hold_settled_at = None
+        self.timeline_resync_active = False
+        self.queue_underrun = False
+        logging.info(
+            "Async action timing: control=%.3g Hz inference=%.3g Hz expected_chunk=%d "
+            "minimum_chunk=%d blend=%d actuator_delay=%.4fs latency_compensation=%d",
+            self.control_hz,
+            self.inference_hz,
+            self.expected_action_horizon,
+            self.min_action_chunk_steps,
+            self.blend_steps,
+            self.estimated_actuator_delay_s,
+            self.latency_skip_compensation_steps,
+        )
+        if not math.isclose(self.policy_action_hz, self.control_hz):
+            logging.warning(
+                "Policy action rate %.3g Hz differs from control rate %.3g Hz; "
+                "control remains independently scheduled while timed targets use policy action Hz",
+                self.policy_action_hz,
+                self.control_hz,
+            )
+
+    @property
+    def pending_action_count(self) -> int:
+        return len(self.pending_actions)
+
+    def allocate_inference_generation(self) -> int:
+        generation = self._next_inference_generation
+        self._next_inference_generation += 1
+        return generation
+
+    def record_inference_launch(self, launch: InferenceLaunch) -> None:
+        self.inference_generation = launch.generation
+        self.inference_capture_at = launch.captured_at
+        self.inference_capture_monotonic = launch.captured_monotonic
+        self.inference_launch_at = launch.launched_at
+        self.inference_launch_count += 1
+
+    def record_launch_deferred(self) -> None:
+        self.inference_launch_deferred_count += 1
+
+    def record_control_tick(self, *, overrun: bool = False) -> None:
+        self.control_tick_count += 1
+        if overrun:
+            self.control_overrun_count += 1
+
+    @staticmethod
+    def _finite_timing_value(value: Any, *, allow_negative: bool = False) -> float | None:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(result) or (result < 0 and not allow_negative):
+            return None
+        return result
+
+    def _record_client_transport_timing(
+        self, result: dict[str, Any], *, generation: int
+    ) -> None:
+        if not isinstance(result, dict):
+            return
+        raw = result.get("_client_transport_timing")
+        if not isinstance(raw, dict):
+            self.last_client_transport_timing = {}
+            self.last_client_timing_source = None
+            self.last_client_one_way_clock = None
+            self.last_client_one_way_clock_sync_required = None
+            self.last_transport_generation = int(generation)
+            self.last_transport_first_command_generation = None
+            return
+        allowed = {
+            "camera_capture_ms",
+            "observation_upload_ms",
+            "model_inference_ms",
+            "result_download_ms",
+            "network_transport_total_ms",
+            "round_trip_ms",
+            "request_sent_at",
+            "server_request_received_at",
+            "server_model_completed_at",
+            "server_response_ready_at",
+            "response_received_at",
+            "response_received_monotonic",
+            "inference_generation",
+            "client_observation_upload_ms",
+            "client_result_download_ms",
+            "client_network_transport_total_ms",
+            "non_model_rtt_ms",
+        }
+        cleaned = {
+            key: value
+            for key in allowed
+            if (value := self._finite_timing_value(raw.get(key))) is not None
+        }
+        if not cleaned:
+            self.last_client_transport_timing = {}
+            self.last_client_timing_source = None
+            self.last_client_one_way_clock = None
+            self.last_client_one_way_clock_sync_required = None
+            self.last_transport_generation = int(generation)
+            self.last_transport_first_command_generation = None
+            return
+        cleaned["generation"] = int(generation)
+        cleaned["timing_valid"] = True
+        self.last_client_timing_source = str(raw.get("timing_source") or "") or None
+        self.last_client_one_way_clock = str(raw.get("one_way_timing_clock") or "") or None
+        sync_required = raw.get("one_way_timing_requires_clock_sync")
+        self.last_client_one_way_clock_sync_required = (
+            bool(sync_required) if isinstance(sync_required, bool) else None
+        )
+        self.last_client_transport_timing = cleaned
+        self.last_transport_generation = int(generation)
+        self.last_transport_first_command_generation = None
+
+    def metadata(self) -> dict[str, Any]:
+        timing_snapshot_at = time.time()
+        timing_snapshot_monotonic = time.monotonic()
+        # Prefer the target that was actually sent on the most recent 20 Hz
+        # control tick. ``last_safe_target`` is the fallback hold target and
+        # can legitimately have ``hold=False`` while the controller is already
+        # holding it after a queue underrun.
+        if self.current_timed_target_action is not None:
+            current_target = self._timed_target_telemetry(
+                self.current_timed_target_action,
+                now_monotonic=timing_snapshot_monotonic,
+                now_wall=timing_snapshot_at,
+            )
+        else:
+            current_target = self.current_timed_target
+            if current_target is None:
+                current_target = self._timed_target_telemetry(
+                    self.last_safe_target,
+                    now_monotonic=timing_snapshot_monotonic,
+                    now_wall=timing_snapshot_at,
+                )
+        plan_target_times = [
+            timing_snapshot_at
+            + (float(target.target_monotonic) - timing_snapshot_monotonic)
+            for target in self.pending_actions
+        ]
+        return {
+            "timing_snapshot_at": timing_snapshot_at,
+            "allow_execution": bool(getattr(self.args, "allow_execution", False)),
+            "execution_state": self.state,
+            "blocked_reason": self.blocked_reason,
+            "last_command_at": self.last_command_at,
+            "control_revision": self.control_revision,
+            "robot_arm_status": self.robot_status,
+            "robot_enabled_sides": sorted(self.robot_enabled),
+            "robot_driver_enable_status": self.robot_driver_enable_status,
+            "robot_enable_hold": {
+                "active": bool(self.arm_hold_targets),
+                "sides": sorted(self.arm_hold_targets),
+                "waiting_fresh_inference": self.waiting_fresh_after_enable,
+                "staged_generation": self.enable_staged_generation,
+                "settled": self.fresh_inference_required_after_monotonic is not None,
+                "settled_at": self.enable_hold_settled_at,
+                "hold_age_s": {
+                    side: max(
+                        0.0, timing_snapshot_monotonic - self.arm_hold_started_at[side]
+                    )
+                    for side in self.arm_hold_targets
+                    if side in self.arm_hold_started_at
+                },
+                "stable_age_s": {
+                    side: max(
+                        0.0, timing_snapshot_monotonic - self.arm_hold_stable_since[side]
+                    )
+                    for side in self.arm_hold_targets
+                    if side in self.arm_hold_stable_since
+                },
+            },
+            "policy_action_hz": self.policy_action_hz,
+            "command_hz": self.control_hz,
+            "control_hz": self.control_hz,
+            "inference_hz": self.inference_hz,
+            "expected_action_horizon": self.expected_action_horizon,
+            "min_action_chunk_steps": self.min_action_chunk_steps,
+            "action_chunk_steps": self.action_chunk_steps,
+            "last_action_chunk_steps": self.last_action_chunk_steps,
+            "last_composed_action": self.last_composed_action,
+            "last_composed_action_at": self.last_composed_action_at,
+            "queue_anchor_state": self.queue_anchor_state,
+            "queue_anchor_qpos_m": self.queue_anchor_qpos_m,
+            "queue_anchor_at": self.queue_anchor_at,
+            "queue_loaded_at": self.queue_loaded_at,
+            "queued_action_count": len(self.pending_actions),
+            "queued_action_index": self.queued_action_index,
+            "last_queued_action_index": self.last_queued_action_index,
+            "last_wire_action": self.last_wire_action,
+            "last_decoded_absolute_target": self.last_decoded_absolute_target,
+            "last_feedback_at": self.last_feedback_at,
+            "dropped_action_count": self.dropped_action_count,
+            "unsafe_drop_count": self.unsafe_drop_count,
+            "expired_drop_count": self.expired_drop_count,
+            "other_drop_count": self.other_drop_count,
+            "last_queue_drop_reason": self.last_queue_drop_reason,
+            "last_queue_drop_kind": self.last_queue_drop_kind,
+            "unsafe_active": self.unsafe_active,
+            "executed_plan_command_count": self.executed_plan_command_count,
+            "inference_progress_steps": self.inference_progress_steps,
+            "inference_timeline_resynced": self.inference_timeline_resynced,
+            "timeline_resync_active": self.timeline_resync_active,
+            "inference_launch_at": self.inference_launch_at,
+            "inference_capture_at": self.inference_capture_at,
+            "inference_capture_monotonic": self.inference_capture_monotonic,
+            "inference_arrival_at": self.inference_arrival_at,
+            "inference_arrival_monotonic": self.inference_arrival_monotonic,
+            "inference_latency_s": self.inference_latency_s,
+            "inference_skip_steps": self.inference_skip_steps,
+            "inference_elapsed_prefix_steps": self.inference_elapsed_prefix_steps,
+            "inference_blend_steps": self.inference_blend_steps,
+            "inference_generation": self.inference_generation,
+            "action_generation": self.active_generation,
+            "inference_old_remaining": self.inference_old_remaining,
+            "old_remaining": self.inference_old_remaining,
+            "inference_launch_count": self.inference_launch_count,
+            "inference_launch_deferred_count": self.inference_launch_deferred_count,
+            "queue_underrun": self.queue_underrun,
+            "queue_underrun_count": self.queue_underrun_count,
+            "queue_underrun_at": self.queue_underrun_at,
+            "hold_active": self.hold_active,
+            "hold_count": self.hold_count,
+            "hold_started_at": self.hold_started_at,
+            "last_safe_target": self._timed_target_telemetry(
+                self.last_safe_target,
+                now_monotonic=timing_snapshot_monotonic,
+                now_wall=timing_snapshot_at,
+            ),
+            "timed_target": current_target,
+            "current_timed_target": current_target,
+            "plan_target_times": plan_target_times,
+            "client_transport_timing": dict(self.last_client_transport_timing),
+            "timing_generation": self.last_transport_generation,
+            "transport_timing_generation": self.last_transport_generation,
+            "transport_timing_valid": bool(self.last_client_transport_timing.get("timing_valid", False)),
+            "client_timing_source": self.last_client_timing_source,
+            "one_way_timing_clock": self.last_client_one_way_clock,
+            "one_way_timing_requires_clock_sync": self.last_client_one_way_clock_sync_required,
+            "camera_capture_ms": self.last_client_transport_timing.get("camera_capture_ms"),
+            "observation_upload_ms": self.last_client_transport_timing.get("observation_upload_ms"),
+            "client_observation_upload_ms": self.last_client_transport_timing.get("client_observation_upload_ms"),
+            "model_inference_ms": self.last_client_transport_timing.get("model_inference_ms"),
+            "result_download_ms": self.last_client_transport_timing.get("result_download_ms"),
+            "client_result_download_ms": self.last_client_transport_timing.get("client_result_download_ms"),
+            "network_transport_total_ms": self.last_client_transport_timing.get("network_transport_total_ms"),
+            "client_network_transport_total_ms": self.last_client_transport_timing.get("client_network_transport_total_ms"),
+            "non_model_rtt_ms": self.last_client_transport_timing.get("non_model_rtt_ms"),
+            "round_trip_ms": self.last_client_transport_timing.get("round_trip_ms"),
+            "request_sent_at": self.last_client_transport_timing.get("request_sent_at"),
+            "server_request_received_at": self.last_client_transport_timing.get("server_request_received_at"),
+            "server_model_completed_at": self.last_client_transport_timing.get("server_model_completed_at"),
+            "server_response_ready_at": self.last_client_transport_timing.get("server_response_ready_at"),
+            "response_received_at": self.last_client_transport_timing.get("response_received_at"),
+            "result_to_first_command_ms": self.last_client_transport_timing.get("result_to_first_command_ms"),
+            "observation_to_first_command_ms": self.last_client_transport_timing.get("observation_to_first_command_ms"),
+            "rejected_result": self.rejected_result,
+            "rejected_result_count": self.rejected_result_count,
+            "control_tick_count": self.control_tick_count,
+            "control_overrun_count": self.control_overrun_count,
+            "command_sequence": self.command_sequence,
+            "last_actuator_command": self.last_actuator_command,
+            "last_command_feedback": self.last_command_feedback,
+            "estimated_actuator_delay_s": self.estimated_actuator_delay_s,
+            "gripper_filter": {
+                "lowpass_alpha": self.gripper_lowpass_alpha,
+                "hysteresis": self.gripper_hysteresis,
+                "confirm_steps": self.gripper_confirm_steps,
+                "opening_fraction": dict(self._filtered_gripper_opening),
+                "extreme_latch": dict(self._gripper_extreme_latch),
+            },
+            "safety_profile": SAFETY_PROFILE,
+            "delivery_command_mode": "continuous_ik_joint",
+            "continuous_ik": {
+                "max_joint_step_rad": float(getattr(self.args, "ik_max_joint_step_rad", DEFAULT_IK_MAX_JOINT_STEP_RAD)),
+                "search_joint_radius_rad": float(getattr(self.args, "ik_search_joint_radius_rad", DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD)),
+                "joint_regularization_weight": float(getattr(self.args, "ik_joint_regularization_weight", DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT)),
+                "position_tolerance_m": float(getattr(self.args, "ik_position_tolerance_m", DEFAULT_IK_POSITION_TOLERANCE_M)),
+                "rotation_tolerance_rad": float(getattr(self.args, "ik_rotation_tolerance_rad", DEFAULT_IK_ROTATION_TOLERANCE_RAD)),
+                "max_nfev": int(getattr(self.args, "ik_max_nfev", DEFAULT_IK_MAX_NFEV)),
+            },
+            "delivery_safety_limits": {
+                "max_translation_step_m": float(
+                    getattr(self.args, "max_translation_step_m", DEFAULT_MAX_TRANSLATION_STEP_M)
+                ),
+                "max_rotation_step_rad": float(
+                    getattr(self.args, "max_rotation_step_rad", DEFAULT_MAX_ROTATION_STEP_RAD)
+                ),
+                "max_gripper_step": float(
+                    getattr(self.args, "max_gripper_step", DEFAULT_MAX_GRIPPER_STEP)
+                ),
+                "workspace_x_m": list(getattr(self.args, "workspace_x", DEFAULT_WORKSPACE_X_M)),
+                "workspace_y_m": list(getattr(self.args, "workspace_y", DEFAULT_WORKSPACE_Y_M)),
+                "workspace_z_m": list(getattr(self.args, "workspace_z", DEFAULT_WORKSPACE_Z_M)),
+                "blend_targets_rechecked_each_control_step": True,
+            },
+        }
+
+    def _block(self, state: str, reason: str) -> bool:
+        self.state = state
+        self.blocked_reason = reason[:500]
+        # Safety failures used to be visible only in Dashboard telemetry. Emit
+        # a rate-limited local message as well so an operator can distinguish
+        # "chunk accepted" from "robot command actually sent" at the terminal.
+        reason_class = re.sub(r"[-+]?\d+(?:\.\d+)?", "#", self.blocked_reason)
+        log_key = (self.state, reason_class)
+        now = time.monotonic()
+        last_key = getattr(self, "_last_block_log_key", None)
+        last_at = float(getattr(self, "_last_block_log_at", 0.0))
+        if log_key != last_key or now - last_at >= 2.0:
+            logging.warning(
+                "Robot command not sent: state=%s reason=%s",
+                self.state,
+                self.blocked_reason,
+            )
+            self._last_block_log_key = log_key
+            self._last_block_log_at = now
+        return False
+
+    def _reject_result(self, generation: int, reason: str, arrived_at: float) -> bool:
+        self.rejected_result_count += 1
+        self.rejected_result = {
+            "generation": int(generation),
+            "arrived_at": float(arrived_at),
+            "reason": str(reason)[:500],
+        }
+        logging.warning("Rejected inference generation %d: %s", generation, reason)
+        return False
+
+    @staticmethod
+    def _piper_can_joint_mode_ready(status: dict[str, Any]) -> bool:
+        return (
+            status.get("ctrl_mode") == PIPER_CTRL_MODE_CAN
+            and status.get("mode_feed") == PIPER_MOVE_MODE_J
+            and status.get("arm_status") == 0
+            and status.get("err_code") == 0
+            and status.get("feedback_fresh") is not False
+        )
+
+    def _send_enable_hold(
+        self,
+        side: str,
+        piper: Any,
+        hold_joints: np.ndarray,
+        hold_gripper_m: float,
+    ) -> None:
+        """Refresh CAN joint mode and the measured enable-time hold target."""
+        raw_joints = np.rint(hold_joints * RAD_FACTOR).astype(np.int64)
+        piper.ModeCtrl(
+            PIPER_CTRL_MODE_CAN,
+            PIPER_MOVE_MODE_J,
+            int(getattr(self.args, "speed_pct", 10)),
+            0x00,
+        )
+        piper.JointCtrl(*map(int, raw_joints))
+        piper.GripperCtrl(
+            round(float(hold_gripper_m) * GRIPPER_FACTOR),
+            int(getattr(self.args, "gripper_effort", 1000)),
+            0x01,
+            0,
+        )
+
+    def _refresh_known_enable_holds(self, *, exclude_side: str | None = None) -> None:
+        """Keep an already-enabled sibling arm held during a second arm handshake."""
+        for known_side, hold_joints in self.arm_hold_targets.items():
+            if known_side == exclude_side:
+                continue
+            piper = self.pipers.get(known_side)
+            hold_gripper_m = self.arm_hold_gripper_targets.get(known_side)
+            if piper is None or hold_gripper_m is None:
+                continue
+            self._send_enable_hold(
+                known_side, piper, hold_joints, hold_gripper_m
+            )
+
+    def _enable_robot(self, side: str, piper: Any, hold_qpos: np.ndarray) -> None:
+        """Enable Piper only after CAN joint mode accepts a repeated pose hold.
+
+        ``EnablePiper()`` reports the enable state sampled before its own enable
+        frame is sent.  A single subsequent ``JointCtrl`` can therefore arrive
+        while feedback still says STANDBY and be ignored exactly when the motor
+        brake is released.  Repeat enable, mode, and measured-pose hold commands
+        until feedback confirms CAN/MOVE_J for consecutive cycles.
+        """
+        hold_qpos = np.asarray(hold_qpos, dtype=np.float64)
+        if hold_qpos.shape != (7,) or not np.all(np.isfinite(hold_qpos)):
+            raise ExecutionBlocked(f"{side} Piper hold qpos is not finite 7D")
+        lower = JOINT_LIMITS_RAD[:, 0]
+        upper = JOINT_LIMITS_RAD[:, 1]
+        excess = np.maximum(lower - hold_qpos[:6], hold_qpos[:6] - upper)
+        if float(np.max(excess)) > IK_FEEDBACK_LIMIT_TOLERANCE_RAD:
+            raise ExecutionBlocked(
+                f"{side} Piper measured joints are too far outside limits to hold safely"
+            )
+        # Hold the measured pose exactly.  Clipping a calibrated zero-offset
+        # feedback value to the SDK's nominal limits would itself create an
+        # unsolicited enable-time motion.
+        hold_joints = hold_qpos[:6].copy()
+        hold_gripper_m = float(np.clip(hold_qpos[6], 0.0, GRIPPER_MAX_M))
+        enable_timeout_s = float(getattr(self.args, "enable_timeout_s", 3.0))
+        deadline = time.monotonic() + enable_timeout_s
+        ready_cycles = 0
+        last_status: dict[str, Any] | None = None
+        last_status_timestamp: float | None = None
+        last_driver_timestamp: float | None = None
+        last_driver_status: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            enabled_feedback = bool(piper.EnablePiper())
+            self._send_enable_hold(side, piper, hold_joints, hold_gripper_m)
+            self._refresh_known_enable_holds(exclude_side=side)
+            last_status = arm_status_dict(piper)
+            driver_status = driver_enable_status_dict(piper)
+            last_driver_status = driver_status
+            self.robot_driver_enable_status[side] = driver_status
+            if (
+                last_status.get("feedback_fresh") is True
+                and (
+                    last_status["arm_status"]
+                    not in {
+                        PIPER_ARM_STATUS_NORMAL,
+                        PIPER_ARM_STATUS_JOINT_BRAKE_NOT_RELEASED,
+                    }
+                    or last_status["err_code"] != 0
+                )
+            ) or driver_status["faulted"] is True:
+                raise ExecutionBlocked(
+                    f"{side} Piper became unhealthy during enable: "
+                    f"arm_status={last_status} driver_status={driver_status}"
+                )
+            status_timestamp = last_status.get("feedback_timestamp")
+            status_advanced = (
+                status_timestamp is None
+                or last_status_timestamp is None
+                or float(status_timestamp) > float(last_status_timestamp) + 1e-9
+            )
+            driver_timestamp = driver_status.get("feedback_timestamp")
+            driver_advanced = (
+                driver_timestamp is None
+                or last_driver_timestamp is None
+                or float(driver_timestamp) > float(last_driver_timestamp) + 1e-9
+            )
+            mode_ready = self._piper_can_joint_mode_ready(last_status)
+            drivers_ready = (
+                enabled_feedback
+                if driver_status["ready"] is None
+                else bool(driver_status["ready"])
+            )
+            if (
+                drivers_ready
+                and mode_ready
+                and status_advanced
+                and driver_advanced
+            ):
+                ready_cycles += 1
+                if ready_cycles >= PIPER_ENABLE_CONFIRM_CYCLES:
+                    confirmed_at = time.monotonic()
+                    self.arm_hold_targets[side] = hold_joints.copy()
+                    self.arm_hold_gripper_targets[side] = hold_gripper_m
+                    self.arm_hold_started_at[side] = confirmed_at
+                    self.arm_hold_stable_since.pop(side, None)
+                    self.robot_enabled.add(side)
+                    return
+            elif not mode_ready or not drivers_ready:
+                ready_cycles = 0
+            if status_timestamp is not None:
+                last_status_timestamp = float(status_timestamp)
+            if driver_timestamp is not None:
+                last_driver_timestamp = float(driver_timestamp)
+            time.sleep(PIPER_ENABLE_RETRY_S)
+        raise ExecutionBlocked(
+            f"{side} Piper enable timed out after {enable_timeout_s:.1f}s; "
+            f"last_status={last_status} last_driver_status={last_driver_status}"
+        )
+
+    def _maintain_post_enable_hold(
+        self,
+        sides: tuple[str, ...],
+        qpos_m: np.ndarray,
+        statuses: dict[str, dict[str, Any]],
+        *,
+        now_monotonic: float,
+    ) -> bool:
+        """Refresh enable holds before timed-plan ageing and wait for fresh data."""
+        hold_sides = [side for side in sides if side in self.arm_hold_targets]
+        if not hold_sides:
+            return False
+        if self.enable_staged_generation is not None:
+            return False
+
+        waiting_for_hold: list[str] = []
+        for index, side in enumerate(sides):
+            if side not in self.arm_hold_targets:
+                continue
+            status = statuses[side]
+            driver_status = driver_enable_status_dict(self.pipers[side])
+            self.robot_driver_enable_status[side] = driver_status
+            if (
+                status["arm_status"] != 0
+                or status["err_code"] != 0
+                or status.get("feedback_fresh") is False
+                or driver_status["ready"] is False
+            ):
+                raise ExecutionBlocked(
+                    f"{side} Piper became unhealthy during enable hold: "
+                    f"arm_status={status} driver_status={driver_status}"
+                )
+            hold_target = self.arm_hold_targets[side]
+            hold_gripper_m = self.arm_hold_gripper_targets[side]
+            self._send_enable_hold(
+                side, self.pipers[side], hold_target, hold_gripper_m
+            )
+            qpos_slice = np.asarray(qpos_m, dtype=np.float64)[
+                index * 7 : (index + 1) * 7
+            ]
+            hold_age = now_monotonic - self.arm_hold_started_at[side]
+            hold_error = float(np.max(np.abs(qpos_slice[:6] - hold_target)))
+            mode_ready = self._piper_can_joint_mode_ready(status)
+            within_tolerance = hold_error <= float(
+                getattr(
+                    self.args,
+                    "arm_hold_tolerance_rad",
+                    DEFAULT_ARM_HOLD_TOLERANCE_RAD,
+                )
+            )
+            if mode_ready and within_tolerance and driver_status["ready"] is not False:
+                self.arm_hold_stable_since.setdefault(side, now_monotonic)
+            else:
+                self.arm_hold_stable_since.pop(side, None)
+            stable_since = self.arm_hold_stable_since.get(side)
+            stable_age = (
+                now_monotonic - stable_since if stable_since is not None else 0.0
+            )
+            if (
+                not mode_ready
+                or not within_tolerance
+                or stable_since is None
+                or stable_age < float(getattr(self.args, "arm_settle_s", 0.0))
+            ):
+                waiting_for_hold.append(
+                    f"{side}: ctrl={status['ctrl_mode']} mode={status['mode_feed']} "
+                    f"age={hold_age:.2f}s stable={stable_age:.2f}s "
+                    f"joint_error={hold_error:.4f}rad"
+                )
+
+        if waiting_for_hold:
+            self.state = "armed"
+            self.blocked_reason = (
+                "waiting for enable hold to settle: " + "; ".join(waiting_for_hold)
+            )
+            return True
+
+        if self.fresh_inference_required_after_monotonic is None:
+            self.fresh_inference_required_after_monotonic = now_monotonic
+            self.enable_hold_settled_at = time.time()
+            # Any result captured before this barrier describes the robot before
+            # its controller was confirmed stable.  Keep holding and require a
+            # post-settle observation instead of activating that old timeline.
+            self.discard_pending_actions(
+                "post-enable hold settled; discarded pre-settle trajectory",
+                kind="other",
+            )
+        self.waiting_fresh_after_enable = True
+        self.state = "armed"
+        self.blocked_reason = (
+            "Piper enable hold is stable; waiting for inference captured after settle"
+        )
+        return True
+
+    def _cancel_staged_enable_plan(self, reason: str, *, kind: str = "other") -> bool:
+        if self.enable_staged_generation is None or not self.arm_hold_targets:
+            return False
+        self.enable_staged_generation = None
+        self.waiting_fresh_after_enable = True
+        self.fresh_inference_required_after_monotonic = time.monotonic()
+        self.enable_hold_settled_at = time.time()
+        self.discard_pending_actions(reason, kind=kind)
+        self.state = "armed"
+        self.blocked_reason = f"{reason}; continuing measured-pose hold"
+        return True
+
+    def _commit_staged_enable_plan(self, generation: int) -> None:
+        if self.enable_staged_generation != int(generation):
+            return
+        self.enable_staged_generation = None
+        self.waiting_fresh_after_enable = False
+        self.arm_hold_targets.clear()
+        self.arm_hold_gripper_targets.clear()
+        self.arm_hold_started_at.clear()
+        self.arm_hold_stable_since.clear()
+
+    def _candidate_execution_control(
+        self,
+        control: Any,
+        *,
+        arrived_monotonic: float,
+    ) -> tuple[int, float]:
+        if not isinstance(control, dict):
+            raise ExecutionBlocked("policy response has no execution_control")
+        if control.get("mode") != "execute":
+            reason = "dashboard authorization expired" if control.get("expired") else "dashboard is shadow"
+            raise PermissionError(reason)
+        if not control.get("task_id") or not control.get("session_id"):
+            raise ExecutionBlocked("execution authorization has no task/session identity")
+        try:
+            revision = int(control.get("revision", 0))
+            remaining_s = float(control["expires_at"]) - float(control["server_time"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ExecutionBlocked("execution authorization has no valid expiry") from exc
+        if remaining_s <= 0:
+            raise PermissionError("execution authorization expired")
+        return revision, arrived_monotonic + remaining_s
+
+    def _target_telemetry(
+        self, protocol: PolicyProtocol, absolute_target: np.ndarray
+    ) -> dict[str, Any]:
+        sides = ("left", "right") if protocol.arm_mode == "bimanual" else (protocol.arm_side,)
+        targets: dict[str, Any] = {}
+        for index, side in enumerate(sides):
+            if protocol.schema == "delivery":
+                target = absolute_target[index * 10 : (index + 1) * 10]
+                rotation = rotation_from_state(target)
+                opening = _opening_fraction(
+                    target[9],
+                    semantics=protocol.gripper_semantics,
+                    tolerance=float(
+                        getattr(
+                            self.args,
+                            "gripper_range_tolerance",
+                            DEFAULT_GRIPPER_RANGE_TOLERANCE,
+                        )
+                    ),
+                )
+                targets[side] = {
+                    "xyz_m": target[:3].tolist(),
+                    "rotation6d": target[3:9].tolist(),
+                    "rpy_deg": Rotation.from_matrix(rotation).as_euler("xyz", degrees=True).tolist(),
+                    "wire_gripper_target": float(target[9]),
+                    "gripper_opening_fraction": opening,
+                    "gripper_opening_m": opening * GRIPPER_MAX_M,
+                }
+            else:
+                target = absolute_target[index * 7 : (index + 1) * 7]
+                opening = _opening_fraction(
+                    target[6],
+                    semantics=protocol.gripper_semantics,
+                    tolerance=float(
+                        getattr(
+                            self.args,
+                            "gripper_range_tolerance",
+                            DEFAULT_GRIPPER_RANGE_TOLERANCE,
+                        )
+                    ),
+                )
+                targets[side] = {
+                    "joints_rad": target[:6].tolist(),
+                    "wire_gripper_target": float(target[6]),
+                    "gripper_opening_fraction": opening,
+                    "gripper_opening_m": opening * GRIPPER_MAX_M,
+                }
+        return targets
+
+    def _timed_target_telemetry(
+        self,
+        target: DecodedQueuedAction | None,
+        *,
+        now_monotonic: float | None = None,
+        now_wall: float | None = None,
+    ) -> dict[str, Any] | None:
+        if target is None:
+            return None
+        now_monotonic = (
+            time.monotonic() if now_monotonic is None else float(now_monotonic)
+        )
+        now_wall = time.time() if now_wall is None else float(now_wall)
+        target_age_s = now_monotonic - float(target.target_monotonic)
+        return {
+            "target_monotonic": float(target.target_monotonic),
+            "target_at": now_wall - target_age_s,
+            "target_age_s": target_age_s,
+            "target_time_error_s": target_age_s,
+            "source_generation": int(target.generation),
+            "source_index": target.source_index,
+            "queue_index": int(target.queue_index),
+            "blended": bool(target.blended),
+            "blend_step": target.blend_step,
+            "hold": bool(target.hold),
+        }
+
+    def _estimated_execution_time(self, now_monotonic: float) -> float:
+        fixed_compensation_s = (
+            self.latency_skip_compensation_steps / self.policy_action_hz
+            if self.policy_action_hz > 0
+            else 0.0
+        )
+        return (
+            float(now_monotonic)
+            + self.estimated_actuator_delay_s
+            + fixed_compensation_s
+        )
+
+    @staticmethod
+    def _first_future_target_index(
+        targets: list[DecodedQueuedAction], execution_time: float
+    ) -> int | None:
+        for index, target in enumerate(targets):
+            if target.target_monotonic + 1e-9 >= execution_time:
+                return index
+        return None
+
+    def _retime_actions_from(
+        self,
+        actions: list[DecodedQueuedAction],
+        start_monotonic: float,
+    ) -> list[DecodedQueuedAction]:
+        """Place retained rows on a fresh action timeline.
+
+        If the old plan didn't actually progress during inference, retaining
+        observation-relative timestamps would make the control tick discard the
+        same prefix that result acceptance intentionally kept.
+        """
+        period_s = 1.0 / self.policy_action_hz
+        return [
+            replace(
+                action,
+                target_monotonic=float(start_monotonic) + (index + 1) * period_s,
+            )
+            for index, action in enumerate(actions)
+        ]
+
+    def _record_queue_drop(self, count: int, reason: str, *, kind: str) -> None:
+        if kind not in {"unsafe", "expired", "other"}:
+            raise ValueError(f"unsupported queue drop kind: {kind!r}")
+        count = max(0, int(count))
+        self.dropped_action_count += count
+        if kind == "unsafe":
+            self.unsafe_drop_count += count
+            self.unsafe_active = True
+        elif kind == "expired":
+            self.expired_drop_count += count
+        else:
+            self.other_drop_count += count
+        self.last_queue_drop_reason = str(reason)[:500]
+        self.last_queue_drop_kind = kind
+
+    @staticmethod
+    def _gripper_slot(protocol: PolicyProtocol, arm_index: int) -> int:
+        return arm_index * (10 if protocol.schema == "delivery" else 7) + (
+            9 if protocol.schema == "delivery" else 6
+        )
+
+    @staticmethod
+    def _opening_to_wire(opening: float, semantics: str) -> float:
+        opening = float(np.clip(opening, 0.0, 1.0))
+        if semantics == GRIPPER_OPENING_FRACTION:
+            return opening
+        if semantics == GRIPPER_CLOSED_FRACTION:
+            return 1.0 - opening
+        if semantics == GRIPPER_OPENING_METRES:
+            return opening * GRIPPER_MAX_M
+        raise ExecutionBlocked(f"unsupported gripper semantics: {semantics!r}")
+
+    def _confirmed_gripper_desired(
+        self,
+        side: str,
+        desired: float,
+        previous: float,
+    ) -> float:
+        """Apply open/closed hysteresis and consecutive-command confirmation."""
+        hysteresis = self.gripper_hysteresis
+        latch = self._gripper_extreme_latch.get(side)
+        extreme: str | None = None
+        if latch == "closed" and desired <= min(1.0, 2.0 * hysteresis):
+            extreme = "closed"
+        elif latch == "open" and desired >= max(0.0, 1.0 - 2.0 * hysteresis):
+            extreme = "open"
+        elif desired <= hysteresis:
+            extreme = "closed"
+        elif desired >= 1.0 - hysteresis:
+            extreme = "open"
+
+        if extreme is None:
+            self._gripper_extreme_candidate[side] = None
+            self._gripper_extreme_count[side] = 0
+            self._gripper_extreme_latch[side] = None
+            return desired
+        if latch == extreme:
+            return 0.0 if extreme == "closed" else 1.0
+
+        if self._gripper_extreme_candidate.get(side) == extreme:
+            count = self._gripper_extreme_count.get(side, 0) + 1
+        else:
+            self._gripper_extreme_candidate[side] = extreme
+            count = 1
+        self._gripper_extreme_count[side] = count
+        if count < self.gripper_confirm_steps:
+            return previous
+        self._gripper_extreme_latch[side] = extreme
+        self._gripper_extreme_candidate[side] = None
+        self._gripper_extreme_count[side] = 0
+        return 0.0 if extreme == "closed" else 1.0
+
+    def _filter_gripper_target(
+        self,
+        queued: DecodedQueuedAction,
+        qpos_m: np.ndarray,
+        protocol: PolicyProtocol,
+    ) -> DecodedQueuedAction:
+        """Filter gripper opening independently from joint/EEF trajectory blend."""
+        if queued.hold:
+            return queued
+        output = queued.absolute_target.copy()
+        sides = ("left", "right") if protocol.arm_mode == "bimanual" else (protocol.arm_side,)
+        tolerance = float(
+            getattr(
+                self.args,
+                "gripper_range_tolerance",
+                DEFAULT_GRIPPER_RANGE_TOLERANCE,
+            )
+        )
+        for arm_index, side in enumerate(sides):
+            slot = self._gripper_slot(protocol, arm_index)
+            desired = _opening_fraction(
+                output[slot],
+                semantics=protocol.gripper_semantics,
+                tolerance=tolerance,
+            )
+            qpos_slice = np.asarray(qpos_m, dtype=np.float64)[
+                arm_index * 7 : (arm_index + 1) * 7
+            ]
+            current = float(np.clip(qpos_slice[6] / GRIPPER_MAX_M, 0.0, 1.0))
+            previous = self._filtered_gripper_opening.get(side, current)
+            confirmed = self._confirmed_gripper_desired(side, desired, previous)
+            filtered = previous + self.gripper_lowpass_alpha * (confirmed - previous)
+            if protocol.schema == "delivery":
+                max_step_value = getattr(
+                    self.args, "max_gripper_step", DEFAULT_MAX_GRIPPER_STEP
+                )
+            else:
+                max_step_value = getattr(self.args, "max_joint_gripper_step", None)
+                if max_step_value is None:
+                    legacy_m = getattr(self.args, "max_joint_gripper_step_m", None)
+                    max_step_value = (
+                        float(legacy_m) / GRIPPER_MAX_M
+                        if legacy_m is not None
+                        else 0.25
+                    )
+            max_step = float(max_step_value)
+            filtered = float(
+                np.clip(filtered, current - max_step, current + max_step)
+            )
+            filtered = float(np.clip(filtered, 0.0, 1.0))
+            self._filtered_gripper_opening[side] = filtered
+            output[slot] = self._opening_to_wire(filtered, protocol.gripper_semantics)
+        return replace(queued, absolute_target=output)
+
+    def _solve_delivery_ik(
+        self,
+        current_joints_rad: np.ndarray,
+        target_xyz_m: np.ndarray,
+        target_rpy_deg: np.ndarray,
+    ) -> PiperIKSolveResult:
+        """Run IK with diagnostics while preserving compatibility with test/custom solvers."""
+        if self.ik_solver is None:
+            self.ik_solver = PiperContinuousIK()
+        kwargs = {
+            "max_joint_step_rad": float(
+                getattr(self.args, "ik_max_joint_step_rad", DEFAULT_IK_MAX_JOINT_STEP_RAD)
+            ),
+            "search_joint_radius_rad": float(
+                getattr(
+                    self.args,
+                    "ik_search_joint_radius_rad",
+                    DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD,
+                )
+            ),
+            "joint_regularization_weight": float(
+                getattr(
+                    self.args,
+                    "ik_joint_regularization_weight",
+                    DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT,
+                )
+            ),
+            "position_tolerance_m": float(
+                getattr(
+                    self.args,
+                    "ik_position_tolerance_m",
+                    DEFAULT_IK_POSITION_TOLERANCE_M,
+                )
+            ),
+            "rotation_tolerance_rad": float(
+                getattr(
+                    self.args,
+                    "ik_rotation_tolerance_rad",
+                    DEFAULT_IK_ROTATION_TOLERANCE_RAD,
+                )
+            ),
+            "max_nfev": int(getattr(self.args, "ik_max_nfev", DEFAULT_IK_MAX_NFEV)),
+        }
+        solve_with_diagnostics = getattr(self.ik_solver, "solve_with_diagnostics", None)
+        if callable(solve_with_diagnostics):
+            result = solve_with_diagnostics(
+                current_joints_rad,
+                target_xyz_m,
+                target_rpy_deg,
+                **kwargs,
+            )
+            if not isinstance(result, PiperIKSolveResult):
+                raise ExecutionBlocked(
+                    "continuous IK diagnostics solver returned an invalid result"
+                )
+            return result
+
+        command = np.asarray(
+            self.ik_solver.solve(
+                current_joints_rad,
+                target_xyz_m,
+                target_rpy_deg,
+                **kwargs,
+            ),
+            dtype=np.float64,
+        )
+        if command.shape != (6,) or not np.all(np.isfinite(command)):
+            raise ExecutionBlocked(
+                f"continuous IK command must be finite 6D, got {command.shape}"
+            )
+        # Custom/test solvers using the legacy interface cannot expose the
+        # unconstrained solution separately; retain a valid, explicitly unknown
+        # diagnostic record instead of inventing a different joint target.
+        return PiperIKSolveResult(
+            solution_joints_rad=command.copy(),
+            command_joints_rad=command.copy(),
+            rate_limited=None,
+        )
+
+    def _complete_pending_command_feedback(
+        self,
+        raw_delivery_state: np.ndarray,
+        qpos_m: np.ndarray,
+        protocol: PolicyProtocol,
+        *,
+        feedback_at: float,
+    ) -> None:
+        """Attach the next control-cycle feedback to the preceding command trace."""
+        pending = self._pending_feedback_command
+        if pending is None:
+            return
+        self._pending_feedback_command = None
+        current_sides = (
+            ("left", "right") if protocol.arm_mode == "bimanual" else (protocol.arm_side,)
+        )
+        pending_sides = pending.get("sides")
+        if not isinstance(pending_sides, dict) or set(pending_sides) != set(current_sides):
+            self.last_command_feedback = {
+                **pending,
+                "feedback_status": "unavailable",
+                "feedback_error": "command/feedback arm layout changed before the next cycle",
+                "feedback_at": float(feedback_at),
+            }
+            return
+
+        qpos = np.asarray(qpos_m, dtype=np.float64)
+        delivery = np.asarray(raw_delivery_state, dtype=np.float64)
+        expected_qpos_dim = 7 * len(current_sides)
+        expected_delivery_dim = 10 * len(current_sides)
+        if (
+            qpos.shape != (expected_qpos_dim,)
+            or delivery.shape != (expected_delivery_dim,)
+            or not np.all(np.isfinite(qpos))
+            or not np.all(np.isfinite(delivery))
+        ):
+            self.last_command_feedback = {
+                **pending,
+                "feedback_status": "unavailable",
+                "feedback_error": (
+                    f"next-cycle feedback must be finite {expected_qpos_dim}D qpos and "
+                    f"{expected_delivery_dim}D delivery state"
+                ),
+                "feedback_at": float(feedback_at),
+            }
+            return
+
+        completed_sides: dict[str, Any] = {}
+        max_joint_errors: list[float] = []
+        gripper_errors: list[float] = []
+        eef_translation_errors: list[float] = []
+        eef_rotation_errors: list[float] = []
+        for index, side in enumerate(current_sides):
+            issued = pending_sides[side]
+            issued = issued if isinstance(issued, dict) else {}
+            measured_qpos = qpos[index * 7 : (index + 1) * 7]
+            measured_delivery = delivery[index * 10 : (index + 1) * 10]
+            commanded_joints = np.asarray(
+                issued.get("commanded_joints_rad"), dtype=np.float64
+            )
+            commanded_gripper_m = self._finite_timing_value(
+                issued.get("commanded_gripper_m")
+            )
+            if commanded_joints.shape == (6,) and np.all(np.isfinite(commanded_joints)):
+                joint_error = measured_qpos[:6] - commanded_joints
+                joint_abs_error = np.abs(joint_error)
+                max_joint_error = float(np.max(joint_abs_error))
+                rms_joint_error = float(np.sqrt(np.mean(joint_error**2)))
+                max_joint_errors.append(max_joint_error)
+                joint_error_values: list[float] | None = joint_error.tolist()
+                joint_abs_error_values: list[float] | None = joint_abs_error.tolist()
+            else:
+                max_joint_error = None
+                rms_joint_error = None
+                joint_error_values = None
+                joint_abs_error_values = None
+
+            if commanded_gripper_m is not None:
+                gripper_error_m = float(measured_qpos[6] - commanded_gripper_m)
+                gripper_errors.append(abs(gripper_error_m))
+            else:
+                gripper_error_m = None
+
+            eef_translation_error_m = None
+            eef_rotation_error_rad = None
+            measured_eef_rpy_deg = None
+            try:
+                measured_rotation = rotation_from_state(measured_delivery)
+                measured_eef_rpy_deg = Rotation.from_matrix(measured_rotation).as_euler(
+                    "xyz", degrees=True
+                ).tolist()
+            except (ExecutionBlocked, ValueError, FloatingPointError):
+                measured_rotation = None
+            pre_ik = issued.get("pre_ik_eef_target")
+            if isinstance(pre_ik, dict):
+                absolute_target = np.asarray(
+                    pre_ik.get("absolute_target"), dtype=np.float64
+                )
+                if absolute_target.shape == (10,) and np.all(np.isfinite(absolute_target)):
+                    eef_translation_error_m = float(
+                        np.linalg.norm(measured_delivery[:3] - absolute_target[:3])
+                    )
+                    try:
+                        if measured_rotation is not None:
+                            eef_rotation_error_rad = float(
+                                Rotation.from_matrix(
+                                    rotation_from_state(absolute_target)
+                                    @ measured_rotation.T
+                                ).magnitude()
+                            )
+                    except (ExecutionBlocked, ValueError, FloatingPointError):
+                        eef_rotation_error_rad = None
+                    eef_translation_errors.append(eef_translation_error_m)
+                    if eef_rotation_error_rad is not None:
+                        eef_rotation_errors.append(eef_rotation_error_rad)
+
+            completed_sides[side] = {
+                **issued,
+                "next_cycle_feedback": {
+                    "feedback_at": float(feedback_at),
+                    "joints_rad": measured_qpos[:6].tolist(),
+                    "gripper_opening_m": float(measured_qpos[6]),
+                    "eef_state": measured_delivery.tolist(),
+                    "eef_xyz_m": measured_delivery[:3].tolist(),
+                    "eef_rotation6d": measured_delivery[3:9].tolist(),
+                    "eef_rpy_deg": measured_eef_rpy_deg,
+                    "gripper_opening_fraction": float(
+                        np.clip(measured_qpos[6] / GRIPPER_MAX_M, 0.0, 1.0)
+                    ),
+                },
+                "command_feedback_error": {
+                    "joint_error_definition": "feedback_minus_command",
+                    "joint_error_rad": joint_error_values,
+                    "joint_abs_error_rad": joint_abs_error_values,
+                    "max_joint_abs_error_rad": max_joint_error,
+                    "rms_joint_error_rad": rms_joint_error,
+                    "gripper_error_definition": "feedback_minus_command",
+                    "gripper_error_m": gripper_error_m,
+                    "eef_translation_error_m": eef_translation_error_m,
+                    "eef_rotation_error_rad": eef_rotation_error_rad,
+                },
+            }
+
+        command_at = self._finite_timing_value(pending.get("command_at"))
+        self.last_command_feedback = {
+            **pending,
+            "feedback_status": "complete",
+            "feedback_cycle_offset": 1,
+            "feedback_at": float(feedback_at),
+            "command_to_feedback_ms": (
+                max(0.0, (float(feedback_at) - command_at) * 1000.0)
+                if command_at is not None
+                else None
+            ),
+            "max_joint_abs_error_rad": max(max_joint_errors) if max_joint_errors else None,
+            "max_gripper_abs_error_m": max(gripper_errors) if gripper_errors else None,
+            "max_eef_translation_error_m": (
+                max(eef_translation_errors) if eef_translation_errors else None
+            ),
+            "max_eef_rotation_error_rad": (
+                max(eef_rotation_errors) if eef_rotation_errors else None
+            ),
+            "sides": completed_sides,
+        }
+
+    def accept_inference_result(
+        self,
+        result: Any,
+        launch: InferenceLaunch,
+        protocol: PolicyProtocol,
+        *,
+        arrived_at: float | None = None,
+        arrived_monotonic: float | None = None,
+        min_steps_override: int | None = None,
+        skip_steps_override: int | None = None,
+        blend_steps_override: int | None = None,
+    ) -> bool:
+        """Validate a completed result and atomically replace the active queue."""
+        arrived_at = time.time() if arrived_at is None else float(arrived_at)
+        arrived_monotonic = (
+            time.monotonic() if arrived_monotonic is None else float(arrived_monotonic)
+        )
+        latency_s = arrived_monotonic - float(launch.captured_monotonic)
+        self.inference_generation = launch.generation
+        self.inference_capture_at = launch.captured_at
+        self.inference_capture_monotonic = launch.captured_monotonic
+        self.inference_launch_at = launch.launched_at
+        self.inference_arrival_at = arrived_at
+        self.inference_arrival_monotonic = arrived_monotonic
+        self.inference_latency_s = latency_s
+        self._record_client_transport_timing(result, generation=launch.generation)
+        self.inference_old_remaining = len(self.pending_actions)
+        self.inference_skip_steps = 0
+        self.inference_elapsed_prefix_steps = 0
+        self.inference_blend_steps = 0
+        self.inference_progress_steps = max(
+            0,
+            self.executed_plan_command_count
+            - int(getattr(launch, "executed_plan_command_count", 0)),
+        )
+        self.inference_timeline_resynced = False
+        if not math.isfinite(latency_s) or latency_s < 0:
+            return self._reject_result(
+                launch.generation, f"invalid capture-to-arrival latency {latency_s!r}", arrived_at
+            )
+        if not isinstance(result, dict) or "actions" not in result:
+            return self._reject_result(launch.generation, "result has no actions", arrived_at)
+
+        control = result.get("execution_control")
+        try:
+            revision, authorization_deadline = self._candidate_execution_control(
+                control, arrived_monotonic=arrived_monotonic
+            )
+        except PermissionError as exc:
+            self.discard_pending_actions(str(exc), kind="expired")
+            state = "shadow" if "shadow" in str(exc) else "blocked"
+            return self._block(state, str(exc))
+        except ExecutionBlocked as exc:
+            return self._reject_result(launch.generation, str(exc), arrived_at)
+
+        if self.waiting_fresh_after_enable:
+            barrier = self.fresh_inference_required_after_monotonic
+            if barrier is None:
+                return self._reject_result(
+                    launch.generation,
+                    "discarded inference captured before post-enable hold settled",
+                    arrived_at,
+                )
+            if float(launch.captured_monotonic) < barrier:
+                return self._reject_result(
+                    launch.generation,
+                    "discarded pre-settle inference; waiting for a post-enable observation",
+                    arrived_at,
+                )
+
+        max_action_age_s = float(getattr(self.args, "max_action_age_s", 2.0))
+        stale_images = {
+            key: launch.captured_at - float(timestamp)
+            for key, timestamp in launch.image_timestamps.items()
+            if launch.captured_at - float(timestamp) > max_action_age_s
+        }
+        if stale_images:
+            return self._reject_result(
+                launch.generation, f"launch used stale camera frames: {stale_images}", arrived_at
+            )
+
+        try:
+            values = _finite_action_chunk(result.get("actions"), protocol.action_dim)
+        except ExecutionBlocked as exc:
+            return self._reject_result(launch.generation, str(exc), arrived_at)
+        minimum = self.min_action_chunk_steps if min_steps_override is None else int(min_steps_override)
+        if len(values) < minimum:
+            return self._reject_result(
+                launch.generation,
+                f"action chunk has {len(values)} rows; client requires at least {minimum}",
+                arrived_at,
+            )
+        try:
+            anchor, decoded = decode_action_queue(
+                values,
+                protocol,
+                launch.raw_delivery_state,
+                launch.qpos_m,
+                steps=None,
+                generation=launch.generation,
+                observation_capture_monotonic=launch.captured_monotonic,
+                action_hz=self.policy_action_hz,
+                gripper_range_tolerance=float(
+                    getattr(
+                        self.args,
+                        "gripper_range_tolerance",
+                        DEFAULT_GRIPPER_RANGE_TOLERANCE,
+                    )
+                ),
+            )
+        except ExecutionBlocked as exc:
+            return self._reject_result(launch.generation, str(exc), arrived_at)
+        retime_from_arrival = False
+        if skip_steps_override is not None:
+            skip_steps = max(0, int(skip_steps_override))
+            if skip_steps >= len(decoded):
+                self.inference_skip_steps = skip_steps
+                return self._reject_result(
+                    launch.generation,
+                    f"result fully stale: skip={skip_steps}, chunk={len(decoded)}",
+                    arrived_at,
+                )
+        else:
+            execution_time = self._estimated_execution_time(arrived_monotonic)
+            future_index = self._first_future_target_index(decoded, execution_time)
+            if future_index is None:
+                self.inference_skip_steps = len(decoded)
+                return self._reject_result(
+                    launch.generation,
+                    f"result fully stale at execution_time={execution_time:.6f}; "
+                    f"last_target={decoded[-1].target_monotonic:.6f}",
+                    arrived_at,
+                )
+            self.inference_elapsed_prefix_steps = future_index
+            # Time passing alone isn't sufficient evidence that a delayed
+            # prefix was executed.  In cold start, hold, blocked, or underrun
+            # recovery, the robot may not have advanced at all.  Skip no more
+            # rows than the old plan actually sent after this observation was
+            # captured.  If execution lagged behind wall time, place the
+            # retained rows on a fresh timeline so execute_next won't discard
+            # them again on the following control tick.
+            skip_steps = min(future_index, self.inference_progress_steps)
+            retime_from_arrival = skip_steps < future_index
+        self.inference_skip_steps = skip_steps
+        fresh_actions = decoded[skip_steps:]
+        if retime_from_arrival:
+            fresh_actions = self._retime_actions_from(
+                fresh_actions, arrived_monotonic
+            )
+            self.inference_timeline_resynced = True
+            # Pending rows weren't consumed on schedule, so they aren't a valid
+            # trajectory to blend against.  The last command that really
+            # reached the robot is the only safe transition anchor.
+            old_actions = (
+                [self.last_safe_target] if self.last_safe_target is not None else []
+            )
+        else:
+            old_actions = list(self.pending_actions)
+        if not old_actions and self.last_safe_target is not None and self.hold_active:
+            old_actions = [self.last_safe_target]
+        blend_steps = self.blend_steps if blend_steps_override is None else int(blend_steps_override)
+        if old_actions and blend_steps:
+            if len(fresh_actions) < blend_steps:
+                return self._reject_result(
+                    launch.generation,
+                    f"only {len(fresh_actions)} fresh rows remain after skip={skip_steps}; "
+                    f"need {blend_steps} blend rows",
+                    arrived_at,
+                )
+            try:
+                candidate = blend_absolute_trajectories(
+                    old_actions,
+                    fresh_actions,
+                    protocol,
+                    blend_steps=blend_steps,
+                )
+            except ExecutionBlocked as exc:
+                return self._reject_result(launch.generation, str(exc), arrived_at)
+            self.inference_blend_steps = blend_steps
+        else:
+            candidate = list(fresh_actions)
+        if not candidate:
+            return self._reject_result(launch.generation, "result has no executable rows", arrived_at)
+
+        # All decoding/blending/authorization checks finished. The control thread
+        # performs one atomic list replacement; inference never mutates this queue.
+        self.pending_actions = candidate
+        self.timeline_resync_active = retime_from_arrival
+        self.active_generation = launch.generation
+        self.control_revision = revision
+        self.authorization_deadline_monotonic = authorization_deadline
+        self.queue_control = control
+        self.queue_anchor_state = anchor.tolist()
+        self.queue_anchor_qpos_m = np.asarray(launch.qpos_m, dtype=np.float64).tolist()
+        self.queue_anchor_at = launch.captured_at
+        self.queue_loaded_at = arrived_at
+        self.queue_image_timestamps = dict(launch.image_timestamps)
+        self.queued_action_index = candidate[0].queue_index
+        self.last_action_chunk_steps = len(values)
+        self.last_composed_action = candidate[0].wire_action.tolist()
+        self.last_composed_action_at = arrived_at
+        self.last_decoded_absolute_target = self._target_telemetry(
+            protocol, candidate[0].absolute_target
+        )
+        self.queue_underrun = False
+        self.hold_active = False
+        self.hold_started_at = None
+        if self.arm_hold_targets:
+            # This is only a staged plan until its first checked command is
+            # actually published.  Keep refreshing the physical hold if that
+            # first row later fails safety, authorization, IK, or queue timing.
+            self.enable_staged_generation = launch.generation
+        self.waiting_fresh_after_enable = False
+        self.rejected_result = None
+        if bool(getattr(self.args, "allow_execution", False)):
+            self.state = "ready"
+            self.blocked_reason = ""
+        else:
+            self.state = "client_disabled"
+            self.blocked_reason = "local --allow-execution is absent"
+        return True
+
+    def reject_inference_completion(self, completion: InferenceCompletion) -> bool:
+        reason = f"inference failed: {completion.error}"
+        self.inference_generation = completion.launch.generation
+        self.inference_capture_at = completion.launch.captured_at
+        self.inference_capture_monotonic = completion.launch.captured_monotonic
+        self.inference_launch_at = completion.launch.launched_at
+        self.inference_arrival_at = completion.arrived_at
+        self.inference_arrival_monotonic = completion.arrived_monotonic
+        self.inference_latency_s = (
+            completion.arrived_monotonic - completion.launch.captured_monotonic
+        )
+        self.inference_old_remaining = len(self.pending_actions)
+        return self._reject_result(
+            completion.launch.generation, reason, completion.arrived_at
+        )
+
+    def queue_result(
+        self,
+        result: dict[str, Any],
+        raw_delivery_state: np.ndarray,
+        qpos_m: np.ndarray,
+        protocol: PolicyProtocol,
+        image_timestamps: dict[str, float],
+        infer_elapsed_s: float,
+    ) -> int:
+        """Compatibility helper for tests/callers; production uses async completion."""
+        now = time.time()
+        now_monotonic = time.monotonic()
+        launch = InferenceLaunch(
+            generation=self.allocate_inference_generation(),
+            captured_at=now - float(infer_elapsed_s),
+            captured_monotonic=now_monotonic - float(infer_elapsed_s),
+            launched_at=now - float(infer_elapsed_s),
+            launched_monotonic=now_monotonic - float(infer_elapsed_s),
+            raw_delivery_state=np.asarray(raw_delivery_state).copy(),
+            qpos_m=np.asarray(qpos_m).copy(),
+            image_timestamps={key: float(value) for key, value in image_timestamps.items()},
+        )
+        accepted = self.accept_inference_result(
+            result,
+            launch,
+            protocol,
+            arrived_at=now,
+            min_steps_override=1,
+            skip_steps_override=0,
+            blend_steps_override=0,
+        )
+        return len(self.pending_actions) if accepted else 0
+
+    def discard_pending_actions(self, reason: str, *, kind: str = "other") -> None:
+        count = len(self.pending_actions)
+        if count:
+            self._record_queue_drop(count, reason, kind=kind)
+            self.pending_actions.clear()
+        else:
+            self.last_queue_drop_reason = str(reason)[:500]
+            self.last_queue_drop_kind = kind
+        self.queued_action_index = None
+        self.timeline_resync_active = False
+
+    def _mark_queue_underrun(self, *, holding: bool) -> bool:
+        if not self.queue_underrun:
+            self.queue_underrun = True
+            self.queue_underrun_count += 1
+            self.queue_underrun_at = time.time()
+        if holding:
+            if not self.hold_active:
+                self.hold_started_at = time.time()
+            self.hold_active = True
+            self.state = "holding"
+            self.blocked_reason = (
+                "action queue underrun: holding last safe absolute target until a valid plan arrives"
+            )
+            return True
+        return self._block(
+            "blocked",
+            "action queue underrun: no last safe target is available for hold",
+        )
+
+    def execute_next(
+        self,
+        raw_delivery_state: np.ndarray,
+        qpos_m: np.ndarray,
+        protocol: PolicyProtocol,
+        *,
+        feedback_captured_at: float | None = None,
+    ) -> bool:
+        """Execute one time-selected target or hold the last safe absolute target."""
+        feedback_at = time.time() if feedback_captured_at is None else float(feedback_captured_at)
+        self.last_feedback_at = feedback_at
+        self._complete_pending_command_feedback(
+            raw_delivery_state,
+            qpos_m,
+            protocol,
+            feedback_at=feedback_at,
+        )
+        now_monotonic = time.monotonic()
+        feedback_age = time.time() - feedback_at
+        max_feedback_age_s = float(
+            getattr(self.args, "max_feedback_age_s", DEFAULT_FEEDBACK_MAX_AGE_S)
+        )
+        if feedback_age < -1.0 or feedback_age > max_feedback_age_s:
+            return self._block(
+                "blocked",
+                f"Piper feedback age {feedback_age:.3f}s exceeds {max_feedback_age_s:.3f}s",
+            )
+
+        sides = ("left", "right") if protocol.arm_mode == "bimanual" else (protocol.arm_side,)
+        if set(self.pipers) != set(sides):
+            return self._block(
+                "blocked",
+                f"connected Piper sides {sorted(self.pipers)} do not match policy sides {list(sides)}",
+            )
+
+        safety_hold_only = False
+        # Enable and post-enable hold are handled before timed-plan selection.
+        # Otherwise the queue advances by wall time while the controller is still
+        # switching out of STANDBY, and the first real command can jump deep into
+        # a chunk even though no earlier target reached the robot.
+        try:
+            statuses = {side: arm_status_dict(self.pipers[side]) for side in sides}
+            self.robot_status = (
+                statuses if protocol.arm_mode == "bimanual" else statuses[sides[0]]
+            )
+            bad_status = {
+                side: status
+                for side, status in statuses.items()
+                if (
+                    side in self.robot_enabled
+                    or side in self.arm_hold_targets
+                )
+                and (
+                    status["arm_status"] != PIPER_ARM_STATUS_NORMAL
+                    or status["err_code"] != 0
+                    or status.get("feedback_fresh") is False
+                )
+            }
+            if bad_status:
+                raise ExecutionBlocked(f"Piper status is not normal: {bad_status}")
+
+            if self.arm_hold_targets:
+                driver_statuses = {
+                    side: driver_enable_status_dict(self.pipers[side])
+                    for side in sides
+                    if side in self.arm_hold_targets
+                }
+                self.robot_driver_enable_status.update(driver_statuses)
+                staged_hold_invalid = bool(
+                    self.enable_staged_generation is not None
+                    and any(
+                        not self._piper_can_joint_mode_ready(statuses[side])
+                        or driver_statuses[side]["ready"] is False
+                        for side in driver_statuses
+                    )
+                )
+                if staged_hold_invalid:
+                    self._cancel_staged_enable_plan(
+                        "staged post-enable plan lost CAN/MOVE_J or driver enable"
+                    )
+                if self.enable_staged_generation is None:
+                    if self._maintain_post_enable_hold(
+                        sides, qpos_m, statuses, now_monotonic=now_monotonic
+                    ):
+                        return False
+
+            allow_execution = bool(getattr(self.args, "allow_execution", False))
+            gate_reason = None
+            gate_state = None
+            if not allow_execution:
+                gate_reason = "local --allow-execution is absent"
+                gate_state = "client_disabled"
+            elif self.state in {"shadow", "client_disabled"}:
+                gate_reason = self.blocked_reason or "dashboard is shadow"
+                gate_state = self.state
+            elif self.state == "blocked":
+                gate_reason = self.blocked_reason or "execution is blocked"
+                gate_state = "blocked"
+            elif (
+                self.authorization_deadline_monotonic is None
+                or now_monotonic >= self.authorization_deadline_monotonic
+            ):
+                gate_reason = "execution authorization expired"
+                gate_state = "blocked"
+
+            if gate_reason is not None:
+                if self._cancel_staged_enable_plan(
+                    gate_reason,
+                    kind="expired" if "expired" in gate_reason else "other",
+                ):
+                    self._maintain_post_enable_hold(
+                        sides, qpos_m, statuses, now_monotonic=now_monotonic
+                    )
+                    return False
+                self.discard_pending_actions(
+                    gate_reason,
+                    kind="expired" if "expired" in gate_reason else "other",
+                )
+                if self.last_safe_target is not None and self.robot_enabled:
+                    safety_hold_only = True
+                    self.state = "holding"
+                    self.blocked_reason = (
+                        f"policy execution disabled ({gate_reason}); holding last safe target"
+                    )
+                else:
+                    return self._block(gate_state or "blocked", gate_reason)
+
+            active_driver_statuses = {
+                side: driver_enable_status_dict(self.pipers[side])
+                for side in sides
+                if side in self.robot_enabled and side not in self.arm_hold_targets
+            }
+            self.robot_driver_enable_status.update(active_driver_statuses)
+            lost_control_mode = [
+                side
+                for side in sides
+                if side in self.robot_enabled
+                and side not in self.arm_hold_targets
+                and (
+                    not self._piper_can_joint_mode_ready(statuses[side])
+                    or active_driver_statuses[side]["ready"] is False
+                )
+            ]
+            for side in lost_control_mode:
+                logging.warning(
+                    "%s Piper left CAN/MOVE_J mode; restarting measured-pose enable hold",
+                    side,
+                )
+                self.robot_enabled.discard(side)
+
+            missing_enabled = [side for side in sides if side not in self.robot_enabled]
+            if missing_enabled:
+                if not self.pending_actions and not safety_hold_only:
+                    return self._mark_queue_underrun(holding=False)
+                for side in missing_enabled:
+                    side_index = sides.index(side)
+                    hold_qpos = np.asarray(qpos_m, dtype=np.float64)[
+                        side_index * 7 : (side_index + 1) * 7
+                    ]
+                    self._enable_robot(side, self.pipers[side], hold_qpos)
+                statuses = {side: arm_status_dict(self.pipers[side]) for side in sides}
+                self.robot_status = (
+                    statuses if protocol.arm_mode == "bimanual" else statuses[sides[0]]
+                )
+                self.discard_pending_actions(
+                    "Piper enabled; discarded pre-enable trajectory and waiting for stable hold",
+                    kind="other",
+                )
+                self.enable_staged_generation = None
+                self.waiting_fresh_after_enable = True
+                self.fresh_inference_required_after_monotonic = None
+                self.enable_hold_settled_at = None
+                self.state = "armed"
+                self.blocked_reason = "Piper enabled; stabilizing measured-pose hold"
+                return False
+
+        except ExecutionBlocked as exc:
+            self.discard_pending_actions(str(exc), kind="other")
+            return self._block("blocked", str(exc))
+        except Exception as exc:
+            logging.exception("Piper enable/hold handshake failed")
+            self.discard_pending_actions(
+                f"Piper enable/hold handshake failed: {exc}", kind="other"
+            )
+            return self._block(
+                "blocked", f"Piper enable/hold handshake failed: {exc}"
+            )
+
+        execution_time = self._estimated_execution_time(now_monotonic)
+        if self.pending_actions:
+            future_index = self._first_future_target_index(
+                self.pending_actions, execution_time
+            )
+            if future_index is None:
+                reason = (
+                    "active timed plan exhausted before the estimated actuator execution time"
+                )
+                self._record_queue_drop(
+                    len(self.pending_actions), reason, kind="expired"
+                )
+                self.pending_actions.clear()
+                self.queued_action_index = None
+                self.timeline_resync_active = False
+            elif future_index:
+                reason = (
+                    f"dropped {future_index} targets older than execution_time={execution_time:.6f}"
+                )
+                self._record_queue_drop(future_index, reason, kind="expired")
+                del self.pending_actions[:future_index]
+
+        if self.enable_staged_generation is not None and not self.pending_actions:
+            self._cancel_staged_enable_plan(
+                "staged post-enable plan expired before its first command",
+                kind="expired",
+            )
+            self._maintain_post_enable_hold(
+                sides, qpos_m, statuses, now_monotonic=now_monotonic
+            )
+            return False
+
+        holding = False
+        if self.pending_actions:
+            queued = self.pending_actions[0]
+        else:
+            if self.waiting_fresh_after_enable:
+                self.state = "armed"
+                self.blocked_reason = "Piper enabled; waiting for a fresh inference result"
+                return False
+            if self.last_safe_target is None:
+                return self._mark_queue_underrun(holding=False)
+            self._mark_queue_underrun(holding=True)
+            queued = replace(self.last_safe_target, hold=True)
+            holding = True
+
+        filter_snapshot = (
+            dict(self._filtered_gripper_opening),
+            dict(self._gripper_extreme_candidate),
+            dict(self._gripper_extreme_count),
+            dict(self._gripper_extreme_latch),
+        )
+        target_prevalidation = False
+        try:
+            target_prevalidation = True
+            queued = self._filter_gripper_target(queued, qpos_m, protocol)
+            prepared: dict[str, tuple[Any, ...]] = {}
+            command_pipeline: dict[str, dict[str, Any]] = {}
+            for index, side in enumerate(sides):
+                qpos_slice = np.asarray(qpos_m, dtype=np.float64)[
+                    index * 7 : (index + 1) * 7
+                ]
+                if protocol.schema == "delivery":
+                    current_state = np.asarray(raw_delivery_state, dtype=np.float64)[
+                        index * 10 : (index + 1) * 10
+                    ]
+                    target = np.asarray(
+                        queued.absolute_target[index * 10 : (index + 1) * 10],
+                        dtype=np.float64,
+                    )
+                    checked = _check_delivery_absolute_target(
+                        current_state,
+                        float(qpos_slice[6]),
+                        target,
+                        gripper_semantics=protocol.gripper_semantics,
+                        max_translation_step_m=float(
+                            getattr(
+                                self.args,
+                                "max_translation_step_m",
+                                DEFAULT_MAX_TRANSLATION_STEP_M,
+                            )
+                        ),
+                        max_rotation_step_rad=float(
+                            getattr(
+                                self.args,
+                                "max_rotation_step_rad",
+                                DEFAULT_MAX_ROTATION_STEP_RAD,
+                            )
+                        ),
+                        max_gripper_step=float(
+                            getattr(self.args, "max_gripper_step", DEFAULT_MAX_GRIPPER_STEP)
+                        ),
+                        gripper_range_tolerance=float(
+                            getattr(
+                                self.args,
+                                "gripper_range_tolerance",
+                                DEFAULT_GRIPPER_RANGE_TOLERANCE,
+                            )
+                        ),
+                        workspace_x=tuple(
+                            getattr(self.args, "workspace_x", DEFAULT_WORKSPACE_X_M)
+                        ),
+                        workspace_y=tuple(
+                            getattr(self.args, "workspace_y", DEFAULT_WORKSPACE_Y_M)
+                        ),
+                        workspace_z=tuple(
+                            getattr(self.args, "workspace_z", DEFAULT_WORKSPACE_Z_M)
+                        ),
+                    )
+                    target_xyz, target_rpy_deg, target_gripper_m, opening_fraction = checked
+                    ik_result = self._solve_delivery_ik(
+                        qpos_slice[:6],
+                        target_xyz,
+                        target_rpy_deg,
+                    )
+                    target_joints = ik_result.command_joints_rad.copy()
+                    prepared[side] = (target_joints, target_gripper_m)
+                    command_pipeline[side] = {
+                        "control_path": "delivery_continuous_ik_joint",
+                        "command_input_feedback": {
+                            "feedback_at": float(feedback_at),
+                            "joints_rad": qpos_slice[:6].tolist(),
+                            "gripper_opening_m": float(qpos_slice[6]),
+                            "eef_state": current_state.tolist(),
+                            "eef_xyz_m": current_state[:3].tolist(),
+                            "eef_rotation6d": current_state[3:9].tolist(),
+                        },
+                        "pre_ik_eef_target": {
+                            "absolute_target": target.tolist(),
+                            "xyz_m": target_xyz.tolist(),
+                            "rotation6d": target[3:9].tolist(),
+                            "rpy_deg": np.asarray(target_rpy_deg, dtype=np.float64).tolist(),
+                            "gripper_opening_fraction": float(opening_fraction),
+                            "gripper_opening_m": float(target_gripper_m),
+                        },
+                        "full_ik_solution_joints_rad": ik_result.solution_joints_rad.tolist(),
+                        "commanded_joints_rad": target_joints.tolist(),
+                        "commanded_gripper_m": float(target_gripper_m),
+                        "ik_rate_limited": ik_result.rate_limited,
+                        "ik_diagnostics": {
+                            "solution_position_error_m": ik_result.solution_position_error_m,
+                            "solution_rotation_error_rad": ik_result.solution_rotation_error_rad,
+                            "solution_max_joint_step_rad": ik_result.solution_max_joint_step_rad,
+                            "command_position_error_m": ik_result.command_position_error_m,
+                            "command_rotation_error_rad": ik_result.command_rotation_error_rad,
+                            "optimizer_success": ik_result.optimizer_success,
+                            "optimizer_status": ik_result.optimizer_status,
+                            "optimizer_nfev": ik_result.optimizer_nfev,
+                        },
+                    }
+                elif protocol.schema == "joint":
+                    target = np.asarray(
+                        queued.absolute_target[index * 7 : (index + 1) * 7],
+                        dtype=np.float64,
+                    )
+                    target_joints, target_gripper_m = build_checked_joint_target(
+                        qpos_slice,
+                        target,
+                        max_joint_step_rad=float(getattr(self.args, "max_joint_step_rad", 0.3)),
+                        max_gripper_step=getattr(self.args, "max_joint_gripper_step", None),
+                        max_gripper_step_m=getattr(self.args, "max_joint_gripper_step_m", None),
+                        joint_limit_tolerance_rad=float(
+                            getattr(
+                                self.args,
+                                "joint_limit_tolerance_rad",
+                                DEFAULT_JOINT_LIMIT_TOLERANCE_RAD,
+                            )
+                        ),
+                        gripper_range_tolerance=float(
+                            getattr(
+                                self.args,
+                                "gripper_range_tolerance",
+                                DEFAULT_GRIPPER_RANGE_TOLERANCE,
+                            )
+                        ),
+                        gripper_semantics=protocol.gripper_semantics,
+                    )
+                    prepared[side] = (target_joints, target_gripper_m)
+                    command_pipeline[side] = {
+                        "control_path": "joint_absolute",
+                        "command_input_feedback": {
+                            "feedback_at": float(feedback_at),
+                            "joints_rad": qpos_slice[:6].tolist(),
+                            "gripper_opening_m": float(qpos_slice[6]),
+                        },
+                        "pre_ik_eef_target": None,
+                        "full_ik_solution_joints_rad": None,
+                        "commanded_joints_rad": target_joints.tolist(),
+                        "commanded_gripper_m": float(target_gripper_m),
+                        "ik_rate_limited": None,
+                        "ik_diagnostics": None,
+                    }
+                else:
+                    raise ExecutionBlocked(f"unsupported execution schema: {protocol.schema}")
+            target_prevalidation = False
+
+            # Blend and hold never bypass safety: both arms are fully prevalidated
+            # against the same fresh feedback before either arm receives a command.
+            command_started_at = time.time()
+            command_started_monotonic = time.monotonic()
+            for side in sides:
+                piper = self.pipers[side]
+                target_joints, target_gripper_m = prepared[side]
+                raw_joints = np.rint(target_joints * RAD_FACTOR).astype(np.int64)
+                raw_gripper = round(target_gripper_m * GRIPPER_FACTOR)
+                command_pipeline[side]["piper_jointctrl_units"] = raw_joints.tolist()
+                command_pipeline[side]["piper_gripperctrl_units"] = int(raw_gripper)
+                command_pipeline[side]["piper_speed_pct"] = int(
+                    getattr(self.args, "speed_pct", 10)
+                )
+                command_pipeline[side]["piper_gripper_effort"] = int(
+                    getattr(self.args, "gripper_effort", 1000)
+                )
+                piper.ModeCtrl(
+                    0x01, 0x01, int(getattr(self.args, "speed_pct", 10)), 0x00
+                )
+                piper.JointCtrl(*map(int, raw_joints))
+                piper.GripperCtrl(
+                    int(raw_gripper), int(getattr(self.args, "gripper_effort", 1000)), 0x01, 0
+                )
+        except ExecutionBlocked as exc:
+            staged_enable_failure = bool(
+                self.enable_staged_generation == queued.generation
+                and self.arm_hold_targets
+            )
+            (
+                self._filtered_gripper_opening,
+                self._gripper_extreme_candidate,
+                self._gripper_extreme_count,
+                self._gripper_extreme_latch,
+            ) = filter_snapshot
+            if target_prevalidation and self.pending_actions:
+                # Do not chase later cumulative targets after the robot failed
+                # to execute this row.  They assume this target was reached and
+                # can create a self-sustaining unsafe-drop loop.  Drop the bad
+                # row, abandon the dependent suffix, and hold the last safe
+                # command until a fresh observation produces a new plan.
+                self.pending_actions.pop(0)
+                self._record_queue_drop(1, str(exc), kind="unsafe")
+                if self.pending_actions:
+                    suffix_count = len(self.pending_actions)
+                    self._record_queue_drop(
+                        suffix_count,
+                        f"abandoned {suffix_count} dependent targets after unsafe target: {exc}",
+                        kind="other",
+                    )
+                    self.pending_actions.clear()
+                # Preserve the unsafe event as the latest classification even
+                # though the dependent suffix was abandoned for another reason.
+                self.last_queue_drop_reason = str(exc)[:500]
+                self.last_queue_drop_kind = "unsafe"
+                self.unsafe_active = True
+                self.queued_action_index = None
+                self.timeline_resync_active = False
+                if staged_enable_failure:
+                    self._cancel_staged_enable_plan(
+                        f"staged post-enable target was unsafe: {exc}",
+                        kind="unsafe",
+                    )
+                    return False
+                return self._block("ready", f"dropped unsafe queued target: {exc}")
+            if staged_enable_failure:
+                self._cancel_staged_enable_plan(
+                    f"staged post-enable target was rejected: {exc}", kind="other"
+                )
+                return False
+            self.discard_pending_actions(str(exc), kind="other")
+            return self._block("blocked", str(exc))
+        except Exception as exc:
+            (
+                self._filtered_gripper_opening,
+                self._gripper_extreme_candidate,
+                self._gripper_extreme_count,
+                self._gripper_extreme_latch,
+            ) = filter_snapshot
+            logging.exception("robot command failed")
+            if (
+                self.enable_staged_generation == queued.generation
+                and self.arm_hold_targets
+            ):
+                self._cancel_staged_enable_plan(
+                    f"staged post-enable robot command failed: {exc}", kind="other"
+                )
+                return False
+            self.discard_pending_actions(f"robot command failed: {exc}", kind="other")
+            return self._block("blocked", f"robot command failed: {exc}")
+
+        self._commit_staged_enable_plan(queued.generation)
+        if not holding:
+            self.pending_actions.pop(0)
+            self.last_safe_target = replace(queued, hold=False)
+            self.executed_plan_command_count += 1
+            if not self.pending_actions:
+                self.timeline_resync_active = False
+        self.last_queued_action_index = queued.queue_index
+        self.queued_action_index = self.pending_actions[0].queue_index if self.pending_actions else None
+        self.last_wire_action = queued.wire_action.tolist()
+        decoded_absolute_target = self._target_telemetry(
+            protocol, queued.absolute_target
+        )
+        self.last_decoded_absolute_target = decoded_absolute_target
+        command_at = time.time()
+        command_monotonic = time.monotonic()
+        self.current_timed_target_action = replace(queued, hold=holding)
+        self.current_timed_target = self._timed_target_telemetry(
+            self.current_timed_target_action,
+            now_monotonic=now_monotonic,
+            now_wall=command_at,
+        )
+        self.command_sequence += 1
+        command_trace = {
+            "trace_version": 1,
+            "command_sequence": self.command_sequence,
+            "generation": int(queued.generation),
+            "source_index": queued.source_index,
+            "queue_index": int(queued.queue_index),
+            "correlation": {
+                "generation": int(queued.generation),
+                "source_index": queued.source_index,
+                "queue_index": int(queued.queue_index),
+                "inference_generation": self.inference_generation,
+                "timing_generation": self.last_transport_generation,
+                "control_revision": self.control_revision,
+            },
+            "schema": protocol.schema,
+            "arm_mode": protocol.arm_mode,
+            "arm_side": protocol.arm_side,
+            "action_semantics": protocol.action_semantics,
+            "gripper_semantics": protocol.gripper_semantics,
+            "wire_action": queued.wire_action.tolist(),
+            "decoded_absolute_target": decoded_absolute_target,
+            "target_timing": dict(self.current_timed_target or {}),
+            "blended": bool(queued.blended),
+            "blend_step": queued.blend_step,
+            "hold": bool(holding),
+            "command_started_at": float(command_started_at),
+            "command_at": float(command_at),
+            "command_started_monotonic": float(command_started_monotonic),
+            "command_monotonic": float(command_monotonic),
+            "command_publish_duration_ms": max(
+                0.0, (command_monotonic - command_started_monotonic) * 1000.0
+            ),
+            "queue_anchor_at": self.queue_anchor_at,
+            "queue_loaded_at": self.queue_loaded_at,
+            "sides": command_pipeline,
+        }
+        self.last_actuator_command = command_trace
+        self._pending_feedback_command = command_trace
+        self.last_command_at = command_at
+        self.unsafe_active = False
+        if (
+            queued.generation == self.last_transport_generation
+            and self.last_transport_first_command_generation != queued.generation
+        ):
+            response_received_monotonic = self._finite_timing_value(
+                self.last_client_transport_timing.get("response_received_monotonic")
+            )
+            if response_received_monotonic is not None:
+                self.last_client_transport_timing["result_to_first_command_ms"] = max(
+                    0.0, (now_monotonic - response_received_monotonic) * 1000.0
+                )
+            if self.inference_capture_monotonic is not None:
+                self.last_client_transport_timing["observation_to_first_command_ms"] = max(
+                    0.0, (now_monotonic - self.inference_capture_monotonic) * 1000.0
+                )
+            self.last_transport_first_command_generation = queued.generation
+        if holding:
+            self.hold_count += 1
+            self.state = "holding"
+        else:
+            self.state = "executing"
+            self.blocked_reason = ""
+        return True
+
+    def process(
+        self,
+        result: dict[str, Any],
+        delivery_state: np.ndarray,
+        qpos: np.ndarray,
+        protocol: PolicyProtocol,
+        image_timestamps: dict[str, float],
+        infer_elapsed_s: float,
+    ) -> bool:
+        self.queue_result(
+            result, delivery_state, qpos, protocol, image_timestamps, infer_elapsed_s
+        )
+        return self.execute_next(
+            delivery_state, qpos, protocol, feedback_captured_at=time.time()
+        )
+
+
+def build_observation(
+    *,
+    delivery_state: np.ndarray,
+    qpos: np.ndarray,
+    protocol: PolicyProtocol,
+    images: dict[str, np.ndarray],
+    image_timestamps: dict[str, float],
+    instruction: str,
+    source_name: str,
+    args: argparse.Namespace,
+    execution: ExecutionController,
+    captured_at: float | None = None,
+    captured_monotonic: float | None = None,
+    execution_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    captured_at = time.time() if captured_at is None else float(captured_at)
+    captured_monotonic = (
+        time.monotonic()
+        if captured_monotonic is None
+        else float(captured_monotonic)
+    )
+    state = policy_observation_state(delivery_state, qpos, protocol)
+    if state.shape != (protocol.state_dim,) or not np.all(np.isfinite(state)):
+        raise RuntimeError(
+            f"{protocol.arm_mode} {protocol.schema} observation state must be finite "
+            f"{protocol.state_dim}D, got {state.shape}"
+        )
+    if protocol.arm_mode == "bimanual":
+        observation_images = {
+            key: np.asarray(images[key], dtype=np.uint8) for key in protocol.camera_keys
+        }
+        can_names = {"left": args.left_can, "right": args.right_can}
+        camera_devices = {
+            "cam_high": str(args.cam_high_device),
+            "cam_left_wrist": str(args.cam_left_wrist_device),
+            "cam_right_wrist": str(args.cam_right_wrist_device),
+        }
+    else:
+        wrist_key = next(key for key in protocol.camera_keys if "wrist" in key)
+        observation_images = {
+            "cam_high": np.asarray(images["cam_high"], dtype=np.uint8),
+            wrist_key: np.asarray(images["cam_wrist"], dtype=np.uint8),
+        }
+        can_names = {protocol.arm_side: args.can}
+        camera_devices = {
+            "cam_high": str(args.cam_high_device),
+            wrist_key: str(args.cam_wrist_device),
+        }
+    return {
+        "state": state,
+        "images": observation_images,
+        "prompt": instruction,
+        "client_metadata": {
+            "captured_at": captured_at,
+            "captured_monotonic": captured_monotonic,
+            "source_name": source_name,
+            "arm_mode": protocol.arm_mode,
+            "arm_side": protocol.arm_side,
+            "can_names": can_names,
+            "camera_devices": camera_devices,
+            "image_captured_at": {
+                key: float(image_timestamps["cam_wrist"] if protocol.arm_mode == "single" and "wrist" in key else image_timestamps[key])
+                for key in protocol.camera_keys
+            },
+            # Preserve old single-arm telemetry fields.
+            "can_name": next(iter(can_names.values())) if protocol.arm_mode == "single" else "",
+            "cam_high_device": str(args.cam_high_device),
+            "cam_wrist_device": str(args.cam_wrist_device) if protocol.arm_mode == "single" else "",
+            "policy_schema": protocol.schema,
+            "policy_action_semantics": protocol.action_semantics,
+            "policy_gripper_semantics": protocol.gripper_semantics,
+            "policy_state_gripper_semantics": protocol.state_gripper_semantics,
+            "policy_contract_version": protocol.contract_version,
+            "policy_gripper_semantics_explicit": protocol.metadata_gripper_semantics_explicit,
+            **(
+                execution.metadata()
+                if execution_metadata is None
+                else execution_metadata
+            ),
+        },
+    }
+
+
+def print_result(
+    count: int,
+    state: np.ndarray,
+    qpos: np.ndarray,
+    protocol: PolicyProtocol,
+    result: dict[str, Any],
+    elapsed_s: float,
+    execution: ExecutionController,
+    command_sent: bool,
+) -> None:
+    actions = np.asarray(result.get("actions"), dtype=np.float32)
+    first = actions[0] if actions.ndim > 1 and len(actions) else actions
+    try:
+        command_action, used_steps = aggregate_action_chunk(
+            actions, protocol, execution.action_chunk_steps
+        )
+    except ExecutionBlocked as exc:
+        command_action, used_steps = np.asarray([], dtype=np.float64), 0
+        logging.warning("Cannot summarize command action: %s", exc)
+    control = result.get("execution_control", {})
+    if protocol.schema == "delivery":
+        state_summary = " ".join(
+            f"{side}_eef={np.array2string(state[i * 10:i * 10 + 3], precision=4)}"
+            for i, side in enumerate(("left", "right") if protocol.arm_mode == "bimanual" else (protocol.arm_side,))
+        )
+    else:
+        state_summary = " ".join(
+            f"{side}_joints={np.array2string(qpos[i * 7:i * 7 + 6], precision=4)}"
+            for i, side in enumerate(("left", "right") if protocol.arm_mode == "bimanual" else (protocol.arm_side,))
+        )
+    print(
+        f"infer={count} mode={protocol.arm_mode} schema={protocol.schema} elapsed={elapsed_s * 1000:.1f}ms "
+        f"{state_summary} actions={actions.shape}\n"
+        f"  first_action={np.array2string(first, precision=5, suppress_small=True)}\n"
+        f"  command_action[{used_steps} steps]={np.array2string(command_action, precision=5, suppress_small=True)}\n"
+        f"  queue_last={execution.last_queued_action_index} queue_next={execution.queued_action_index} "
+        f"remaining={execution.pending_action_count} decoded={execution.last_decoded_absolute_target}\n"
+        f"  server_mode={control.get('mode', 'missing')} "
+        f"local_allow={getattr(execution.args, 'allow_execution', False)} "
+        f"client_state={execution.state} command_sent={command_sent} "
+        f"reason={execution.blocked_reason or '-'}",
+        flush=True,
+    )
+
+
+def build_client_transport_timing(
+    *,
+    request_sent_at: float,
+    request_sent_monotonic: float,
+    response_received_at: float,
+    response_received_monotonic: float,
+    server_timing: dict[str, Any] | None,
+    camera_capture_ms: float | None,
+    inference_generation: int,
+) -> dict[str, Any]:
+    """Measure and report transport timing from the client side.
+
+    The client owns the send/receive boundaries and computes the two one-way
+    values from server timestamps echoed in the response. Those values are
+    still estimates when the two machines' wall clocks are not synchronized,
+    so the payload explicitly records that measurement contract. RTT and all
+    local intervals use monotonic clocks.
+    """
+    server_timing = server_timing if isinstance(server_timing, dict) else {}
+
+    def finite(value: Any) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) and number >= 0 else None
+
+    def interval(end: Any, start: Any) -> float | None:
+        end_value = finite(end)
+        start_value = finite(start)
+        if end_value is None or start_value is None or end_value < start_value:
+            return None
+        return (end_value - start_value) * 1000.0
+
+    server_request_received_at = finite(server_timing.get("server_request_received_at"))
+    server_response_ready_at = finite(server_timing.get("server_response_ready_at"))
+    model_inference_ms = finite(server_timing.get("model_inference_ms"))
+    upload_ms = interval(server_request_received_at, request_sent_at)
+    download_ms = interval(response_received_at, server_response_ready_at)
+    round_trip_ms = max(
+        0.0, (float(response_received_monotonic) - float(request_sent_monotonic)) * 1000.0
+    )
+    one_way_total_ms = (
+        upload_ms + download_ms
+        if upload_ms is not None and download_ms is not None
+        else None
+    )
+    non_model_rtt_ms = (
+        max(0.0, round_trip_ms - model_inference_ms)
+        if model_inference_ms is not None
+        else None
+    )
+    return {
+        "camera_capture_ms": finite(camera_capture_ms),
+        "observation_upload_ms": upload_ms,
+        "client_observation_upload_ms": upload_ms,
+        "model_inference_ms": model_inference_ms,
+        "result_download_ms": download_ms,
+        "client_result_download_ms": download_ms,
+        "network_transport_total_ms": one_way_total_ms,
+        "client_network_transport_total_ms": one_way_total_ms,
+        "non_model_rtt_ms": non_model_rtt_ms,
+        "round_trip_ms": round_trip_ms,
+        "request_sent_at": finite(request_sent_at),
+        "server_request_received_at": server_request_received_at,
+        "server_model_completed_at": finite(server_timing.get("server_model_completed_at")),
+        "server_response_ready_at": server_response_ready_at,
+        "response_received_at": finite(response_received_at),
+        "response_received_monotonic": finite(response_received_monotonic),
+        "inference_generation": int(inference_generation),
+        "timing_source": "client_wall_clock_echo",
+        "one_way_timing_clock": "wall_clock",
+        "one_way_timing_requires_clock_sync": True,
+    }
+
+
+def run_rtc_client(args: argparse.Namespace) -> None:
+    """Run the physical robot RTC control loop, never a GUI inference preview.
+
+    The loop keeps actuator feedback/command publication on the control thread
+    while camera capture and Policy inference run asynchronously.  All action
+    chunks enter the timestamped queue only after schema, freshness, execution
+    authorization, workspace, IK, and Piper-status checks pass.
+    """
+    output_mode = getattr(args, "output_mode", "auto")
+    for key in ("NO_PROXY", "no_proxy"):
+        entries = [item.strip() for item in os.environ.get(key, "").split(",") if item.strip()]
+        if args.host not in entries:
+            entries.append(args.host)
+        os.environ[key] = ",".join(entries)
+
+    source_name = args.source_name or socket.gethostname()
+    if args.arm_mode == "bimanual":
+        logging.info(
+            "Connecting Piper feedback: left=%s right=%s ...",
+            args.left_can,
+            args.right_can,
+        )
+        pipers = {"left": connect_piper(args.left_can), "right": connect_piper(args.right_can)}
+        camera_ids = {
+            "cam_high": args.cam_high_device,
+            "cam_left_wrist": args.cam_left_wrist_device,
+            "cam_right_wrist": args.cam_right_wrist_device,
+        }
+    else:
+        logging.info("Connecting Piper feedback on %s ...", args.can)
+        pipers = {args.arm_side: connect_piper(args.can)}
+        camera_ids = {"cam_high": args.cam_high_device, "cam_wrist": args.cam_wrist_device}
+
+    monitoring = MonitoringRecorder(args.monitoring_dir, args)
+    monitoring.record(
+        "piper_connected",
+        can_interfaces={side: getattr(piper, "can_name", None) for side, piper in pipers.items()},
+        arm_mode=args.arm_mode,
+        arm_side=args.arm_side,
+    )
+    execution = ExecutionController(pipers, args)
+    cameras = CameraCapture(
+        cam_ids=camera_ids,
+        fps=args.camera_fps,
+        image_hw=IMAGE_HW,
+        capture_hw=CAMERA_SOURCE_HW,
+        parallel_reads=True,
+    )
+    preview = CameraPreview(
+        enabled=bool(getattr(args, "camera_preview", False)),
+        fps=float(getattr(args, "camera_preview_fps", 8.0)),
+    )
+    worker = AsyncPolicyInference()
+    recorder = DeploymentRunRecorder(
+        args.record_root,
+        video_fps=(args.record_video_fps or args.camera_fps),
+        enabled=not args.no_recording,
+    )
+    policy = None
+    protocol = None
+    count = 0
+    command_count = 0
+    once_result_accepted = False
+    last_reconnect_attempt = 0.0
+    control_period = 1.0 / float(getattr(args, "control_hz", DEFAULT_ACTION_HZ))
+    try:
+        cameras.open()
+        camera_checks = cameras.verify()
+        for key, info in camera_checks.items():
+            selected_device = str(
+                info.get("selected_device")
+                or info.get("configured_device")
+                or camera_ids[key]
+            )
+            video_device = str(info.get("video_device") or selected_device)
+            if key == "cam_high":
+                args.cam_high_device = selected_device
+            elif key == "cam_wrist":
+                args.cam_wrist_device = selected_device
+            elif key == "cam_left_wrist":
+                args.cam_left_wrist_device = selected_device
+            elif key == "cam_right_wrist":
+                args.cam_right_wrist_device = selected_device
+            logging.info(
+                "Camera %s: %s selected=%s video=%s shape=%s latency=%sms",
+                key,
+                "OK" if info["ok"] else "FAIL",
+                selected_device,
+                video_device,
+                info["shape"],
+                info["latency_ms"],
+            )
+        recorder.start(
+            {
+                "source_name": source_name,
+                "policy_host": args.host,
+                "policy_port": int(args.port),
+                "instruction": args.instruction,
+                "arm_mode": args.arm_mode,
+                "arm_side": args.arm_side,
+                "can_interfaces": (
+                    {"left": args.left_can, "right": args.right_can}
+                    if args.arm_mode == "bimanual"
+                    else {args.arm_side: args.can}
+                ),
+                "camera_devices": {key: str(value) for key, value in camera_ids.items()},
+                "camera_checks": camera_checks,
+                "control_hz": float(args.control_hz),
+                "inference_hz": float(args.hz),
+                "recording_video_source": "camera_stream",
+                "camera_capture_fps": float(args.camera_fps),
+            }
+        )
+        if recorder.is_active:
+            def record_camera_stream(
+                images: dict[str, np.ndarray],
+                image_timestamps: dict[str, float],
+                captured_monotonic: float,
+            ) -> None:
+                try:
+                    recorder.record_camera_frames(
+                        images,
+                        image_timestamps,
+                        monotonic_timestamp=captured_monotonic,
+                    )
+                except Exception:
+                    logging.exception("Failed to record background camera frames")
+
+            try:
+                cameras.start_background_capture(
+                    record_camera_stream, fps=args.camera_fps
+                )
+            except Exception:
+                logging.exception(
+                    "Could not start background camera recording; "
+                    "continuing with direct inference capture"
+                )
+        logging.info(
+            "Deployment recording: %s",
+            recorder.run_dir if recorder.is_active else "disabled",
+        )
+        monitoring.record("camera_ready", camera_checks=camera_checks, camera_ids=camera_ids)
+        logging.warning(
+            "%s %s client: output_mode=%s control=%.3g Hz inference=%.3g Hz "
+            "expected_chunk=%d minimum_chunk=%d. Robot commands still require Dashboard EXECUTE.",
+            "EXECUTION-CAPABLE" if args.allow_execution else "SHADOW-ONLY",
+            args.arm_mode,
+            output_mode,
+            args.control_hz,
+            args.hz,
+            DEFAULT_OPENPI_CHUNK_STEPS,
+            args.min_action_chunk_steps,
+        )
+
+        next_control_at = time.monotonic()
+        launch_schedule = PeriodicSchedule(args.hz, next_at=next_control_at)
+        while True:
+            tick_started = time.monotonic()
+            execution.record_control_tick(overrun=tick_started > next_control_at + control_period)
+            if preview.enabled:
+                preview.update(cameras.latest_preview_images)
+            command_sent = False
+            completion: InferenceCompletion | None = None
+            try:
+                if (
+                    policy is None
+                    and not worker.in_flight
+                    and (protocol is None or not execution.pending_action_count)
+                ):
+                    if tick_started - last_reconnect_attempt >= args.reconnect_delay:
+                        last_reconnect_attempt = tick_started
+                        try:
+                            policy, protocol = connect_policy(
+                                args.host,
+                                args.port,
+                                args.arm_side,
+                                args.arm_mode,
+                                output_mode,
+                            )
+                            execution.configure_protocol(protocol)
+                            recorder.update_metadata({
+                                "policy_protocol": {
+                                    "requested_output_mode": output_mode,
+                                    "schema": protocol.schema,
+                                    "state_dim": protocol.state_dim,
+                                    "action_dim": protocol.action_dim,
+                                    "arm_mode": protocol.arm_mode,
+                                    "arm_side": protocol.arm_side,
+                                    "action_semantics": protocol.action_semantics,
+                                    "camera_keys": list(protocol.camera_keys),
+                                    "action_hz": protocol.action_hz,
+                                    "gripper_semantics": protocol.gripper_semantics,
+                                    "state_gripper_semantics": protocol.state_gripper_semantics,
+                                    "contract_version": protocol.contract_version,
+                                    "action_horizon": protocol.action_horizon,
+                                }
+                            })
+                            control_period = 1.0 / execution.control_hz
+                            launch_schedule = PeriodicSchedule(
+                                execution.inference_hz, next_at=tick_started
+                            )
+                            monitoring.record(
+                                "policy_connected",
+                                requested_output_mode=output_mode,
+                                protocol=vars(protocol),
+                                metadata=execution.metadata(),
+                            )
+                        except Exception as exc:
+                            execution._block("blocked", f"policy connection unavailable: {exc}")
+                            monitoring.record(
+                                "policy_connection_error",
+                                error=repr(exc),
+                                execution=execution.metadata(),
+                            )
+                            logging.warning("Policy connection unavailable: %s", exc)
+
+                if protocol is not None:
+                    sides = (
+                        ("left", "right") if args.arm_mode == "bimanual" else (args.arm_side,)
+                    )
+                    states = {
+                        side: read_output_state(
+                            pipers[side], max_feedback_age_s=args.max_feedback_age_s
+                        )
+                        for side in sides
+                    }
+                    delivery_state = np.concatenate([states[side][0] for side in sides]).astype(
+                        np.float32
+                    )
+                    qpos = np.concatenate([states[side][1] for side in sides]).astype(np.float32)
+                    observation_captured_at = time.time()
+                    observation_captured_monotonic = time.monotonic()
+
+                    completion = worker.poll()
+                    if completion is not None:
+                        if completion.error is not None:
+                            execution.reject_inference_completion(completion)
+                            try:
+                                recorder.record_model_result(
+                                    launch=completion.launch,
+                                    result=None,
+                                    arrived_at=completion.arrived_at,
+                                    arrived_monotonic=completion.arrived_monotonic,
+                                    protocol=protocol,
+                                    accepted=False,
+                                    rejection=execution.rejected_result,
+                                    error=completion.error,
+                                )
+                            except Exception:
+                                logging.exception("Failed to record failed model inference")
+                            monitoring.record(
+                                "inference_error",
+                                generation=completion.launch.generation,
+                                captured_at=completion.launch.captured_at,
+                                launched_at=completion.launch.launched_at,
+                                arrived_at=completion.arrived_at,
+                                image_timestamps=completion.launch.image_timestamps,
+                                error=repr(completion.error),
+                                execution=execution.metadata(),
+                            )
+                            if policy is not None:
+                                close_policy(policy)
+                            policy = None
+                            logging.warning(
+                                "Inference generation %d failed; old queue remains active: %s",
+                                completion.launch.generation,
+                                completion.error,
+                            )
+                        else:
+                            accepted = execution.accept_inference_result(
+                                completion.result,
+                                completion.launch,
+                                protocol,
+                                arrived_at=completion.arrived_at,
+                                arrived_monotonic=completion.arrived_monotonic,
+                            )
+                            try:
+                                recorder.record_model_result(
+                                    launch=completion.launch,
+                                    result=completion.result,
+                                    arrived_at=completion.arrived_at,
+                                    arrived_monotonic=completion.arrived_monotonic,
+                                    protocol=protocol,
+                                    accepted=accepted,
+                                    rejection=None if accepted else execution.rejected_result,
+                                )
+                            except Exception:
+                                logging.exception("Failed to record model action chunk")
+                            monitoring.record(
+                                "inference_result",
+                                generation=completion.launch.generation,
+                                captured_at=completion.launch.captured_at,
+                                launched_at=completion.launch.launched_at,
+                                arrived_at=completion.arrived_at,
+                                image_timestamps=completion.launch.image_timestamps,
+                                accepted=accepted,
+                                result=completion.result,
+                                execution=execution.metadata(),
+                            )
+                            logging.info(
+                                "Inference generation=%d arrival latency=%.3fs skip=%d "
+                                "blend=%d old_remaining=%d accepted=%s queue=%d rejected=%s",
+                                completion.launch.generation,
+                                execution.inference_latency_s or 0.0,
+                                execution.inference_skip_steps,
+                                execution.inference_blend_steps,
+                                execution.inference_old_remaining,
+                                accepted,
+                                execution.pending_action_count,
+                                execution.rejected_result,
+                            )
+                            count += 1
+                            if args.once and accepted:
+                                once_result_accepted = True
+
+                    # This is the only robot command path and runs every control tick.
+                    command_sent = execution.execute_next(
+                        delivery_state,
+                        qpos,
+                        protocol,
+                        feedback_captured_at=observation_captured_at,
+                    )
+                    monitoring.record(
+                        "control_tick",
+                        command_sent=command_sent,
+                        control_tick_count=execution.control_tick_count,
+                        captured_at=observation_captured_at,
+                        captured_monotonic=observation_captured_monotonic,
+                        raw_delivery_state=delivery_state,
+                        qpos_m=qpos,
+                        execution=execution.metadata(),
+                    )
+                    if command_sent:
+                        command_count += 1
+                    if (
+                        args.once
+                        and once_result_accepted
+                        and (not args.allow_execution or command_sent)
+                    ):
+                        return
+                    command_target = execution.current_timed_target_action
+                    try:
+                        recorder.record_control_tick(
+                            timestamp=observation_captured_at,
+                            monotonic_timestamp=observation_captured_monotonic,
+                            delivery_state=delivery_state,
+                            qpos=qpos,
+                            command_sent=command_sent,
+                            action_dim=protocol.action_dim,
+                            absolute_dim=(10 if protocol.schema == "delivery" else 7)
+                            * (2 if protocol.arm_mode == "bimanual" else 1),
+                            command_action=(
+                                None
+                                if not command_sent or execution.last_wire_action is None
+                                else np.asarray(execution.last_wire_action, dtype=np.float32)
+                            ),
+                            command_absolute_target=(
+                                None
+                                if not command_sent or command_target is None
+                                else np.asarray(command_target.absolute_target, dtype=np.float32)
+                            ),
+                            command_generation=(
+                                None
+                                if not command_sent or command_target is None
+                                else command_target.generation
+                            ),
+                            command_queue_index=(
+                                None if not command_sent else execution.last_queued_action_index
+                            ),
+                            command_hold=(
+                                False
+                                if not command_sent or command_target is None
+                                else command_target.hold
+                            ),
+                            execution_state=execution.state,
+                            blocked_reason=execution.blocked_reason,
+                        )
+                    except Exception:
+                        # Recording must never turn a safety-checked control tick
+                        # into a robot-control failure.
+                        logging.exception("Failed to record control tick")
+                    if command_sent and args.max_commands is not None and command_count >= args.max_commands:
+                        logging.warning(
+                            "Reached --max-commands=%d; stopping after the checked command.",
+                            args.max_commands,
+                        )
+                        return
+
+                    if launch_schedule.due(tick_started):
+                        if worker.in_flight:
+                            execution.record_launch_deferred()
+                        elif policy is not None:
+                            # The control thread snapshots the 20 Hz robot state and
+                            # immediately returns to scheduling. Camera I/O, observation
+                            # formatting, transport, and policy inference all run on the
+                            # single worker thread.
+                            captured_at = observation_captured_at
+                            captured_monotonic = observation_captured_monotonic
+                            delivery_anchor = delivery_state.copy()
+                            qpos_anchor = qpos.copy()
+                            execution_metadata = execution.metadata()
+                            generation = execution.allocate_inference_generation()
+                            launch = InferenceLaunch(
+                                generation=generation,
+                                captured_at=captured_at,
+                                captured_monotonic=captured_monotonic,
+                                launched_at=time.time(),
+                                launched_monotonic=time.monotonic(),
+                                raw_delivery_state=delivery_anchor,
+                                qpos_m=qpos_anchor,
+                                image_timestamps={},
+                                executed_plan_command_count=(
+                                    execution.executed_plan_command_count
+                                ),
+                            )
+
+                            def capture_and_infer(
+                                *,
+                                policy_ref=policy,
+                                protocol_ref=protocol,
+                                delivery_ref=delivery_anchor,
+                                qpos_ref=qpos_anchor,
+                                metadata_ref=execution_metadata,
+                                launch_ref=launch,
+                            ) -> InferenceWorkerResult:
+                                camera_started_at = time.time()
+                                camera_started_monotonic = time.monotonic()
+                                images, image_timestamps = cameras.read()
+                                camera_finished_at = time.time()
+                                camera_finished_monotonic = time.monotonic()
+                                observation = build_observation(
+                                    delivery_state=delivery_ref,
+                                    qpos=qpos_ref,
+                                    protocol=protocol_ref,
+                                    images=images,
+                                    image_timestamps=image_timestamps,
+                                    instruction=args.instruction,
+                                    source_name=source_name,
+                                    args=args,
+                                    execution=execution,
+                                    captured_at=launch_ref.captured_at,
+                                    captured_monotonic=launch_ref.captured_monotonic,
+                                    execution_metadata=metadata_ref,
+                                )
+                                request_sent_at = time.time()
+                                request_sent_monotonic = time.monotonic()
+                                observation["client_metadata"].update({
+                                    "request_sent_at": request_sent_at,
+                                    "camera_capture_started_at": camera_started_at,
+                                    "camera_capture_finished_at": camera_finished_at,
+                                    "inference_generation": launch_ref.generation,
+                                })
+                                result = dict(policy_ref.infer(observation))
+                                response_received_at = time.time()
+                                response_received_monotonic = time.monotonic()
+                                server_timing = result.get("transport_timing")
+                                server_timing = server_timing if isinstance(server_timing, dict) else {}
+
+                                client_timing = build_client_transport_timing(
+                                    request_sent_at=request_sent_at,
+                                    request_sent_monotonic=request_sent_monotonic,
+                                    response_received_at=response_received_at,
+                                    response_received_monotonic=response_received_monotonic,
+                                    server_timing=server_timing,
+                                    camera_capture_ms=(camera_finished_monotonic - camera_started_monotonic) * 1000.0,
+                                    inference_generation=launch_ref.generation,
+                                )
+                                return InferenceWorkerResult(
+                                    result=result,
+                                    image_timestamps=image_timestamps,
+                                    client_timing=client_timing,
+                                )
+
+                            if worker.launch_callable(capture_and_infer, launch):
+                                execution.record_inference_launch(launch)
+                            else:  # defensive; the control thread owns launch()
+                                execution.record_launch_deferred()
+                        elif not execution.pending_action_count:
+                            # Reconnect only after the active queue reaches hold/
+                            # underrun; it cannot interrupt a live trajectory.
+                            logging.info("Retrying policy connection after queue underrun")
+
+                # Launch retries happen on the next tick; no synchronous infer call.
+            except ExecutionBlocked as exc:
+                execution._block("blocked", str(exc))
+                monitoring.record(
+                    "control_tick_blocked",
+                    error=repr(exc),
+                    execution=execution.metadata(),
+                )
+                logging.warning("20 Hz feedback/safety check blocked: %s", exc)
+            except Exception as exc:
+                execution._block("blocked", f"control tick failed: {exc}")
+                monitoring.record(
+                    "control_tick_error",
+                    error=repr(exc),
+                    execution=execution.metadata(),
+                )
+                logging.exception("20 Hz control tick failed")
+
+            next_control_at += control_period
+            now = time.monotonic()
+            if now > next_control_at:
+                missed = int(math.floor((now - next_control_at) / control_period)) + 1
+                next_control_at += missed * control_period
+            sleep_s = next_control_at - time.monotonic()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+    except KeyboardInterrupt:
+        logging.info("Stopped; no further robot commands will be published.")
+    finally:
+        worker.shutdown()
+        try:
+            recorder.stop(reason="client_stopped")
+        except Exception:
+            logging.exception("Failed to finalize deployment recording")
+        close_policy(policy)
+        preview.close()
+        cameras.close()
+        for piper in pipers.values():
+            piper.DisconnectPort()
+        monitoring.close(reason="stopped")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default=os.environ.get("BIMANUAL_VLA_POLICY_HOST", DEFAULT_POLICY_HOST))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("BIMANUAL_VLA_POLICY_PORT", DEFAULT_POLICY_PORT)))
+    parser.add_argument("--arm-mode", choices=("single", "bimanual"), default="single")
+    parser.add_argument(
+        "--output-mode",
+        "--policy-schema",
+        dest="output_mode",
+        choices=("auto", "joint", "delivery"),
+        default="auto",
+        help=(
+            "policy output contract: auto follows server metadata; joint requires "
+            "7D/14D joint targets; delivery requires EEF delivery targets. "
+            "An explicit mode fails closed if the server advertises another schema."
+        ),
+    )
+    parser.add_argument("--can", default=DEFAULT_CAN, help="single-arm CAN interface")
+    parser.add_argument("--left-can", default=DEFAULT_LEFT_CAN)
+    parser.add_argument("--right-can", default=DEFAULT_RIGHT_CAN)
+    parser.add_argument("--arm-side", choices=("left", "right", "both"), default="right")
+    parser.add_argument("--cam-high-device", default=DEFAULT_HIGH_DEVICE)
+    parser.add_argument("--cam-wrist-device", default=DEFAULT_WRIST_DEVICE, help="single-arm wrist camera")
+    parser.add_argument(
+        "--camera-preview",
+        "--show-cameras",
+        dest="camera_preview",
+        action="store_true",
+        help="show a low-resolution native-aspect live preview of the camera feeds",
+    )
+    parser.add_argument(
+        "--camera-preview-fps",
+        type=float,
+        default=8.0,
+        help="preview refresh rate; capture/inference rates are unchanged (default 8 FPS)",
+    )
+    parser.add_argument("--cam-left-wrist-device", default=DEFAULT_LEFT_WRIST_DEVICE)
+    parser.add_argument("--cam-right-wrist-device", default=DEFAULT_RIGHT_WRIST_DEVICE)
+    parser.add_argument(
+        "--camera-fps",
+        type=int,
+        default=DEFAULT_CAMERA_FPS,
+        help="camera acquisition rate (default 20 Hz; independent of 4 Hz inference launches)",
+    )
+    parser.add_argument(
+        "--hz",
+        type=float,
+        default=DEFAULT_INFERENCE_HZ,
+        help=(
+            "asynchronous policy launch frequency (default 4 Hz / every 250 ms); "
+            "robot control remains independently configured by --control-hz"
+        ),
+    )
+    parser.add_argument(
+        "--control-hz",
+        type=float,
+        default=DEFAULT_ACTION_HZ,
+        help="continuous robot control frequency (default 20 Hz)",
+    )
+    parser.add_argument(
+        "--action-hz",
+        type=float,
+        default=None,
+        help=f"override model/dataset action rate; default uses policy metadata or {DEFAULT_ACTION_HZ:g} Hz",
+    )
+    parser.add_argument(
+        "--action-chunk-steps",
+        type=int,
+        default=None,
+        help="deprecated alias for --min-action-chunk-steps",
+    )
+    parser.add_argument(
+        "--min-action-chunk-steps",
+        type=int,
+        default=DEFAULT_MIN_ACTION_CHUNK_STEPS,
+        help="reject OpenPI results shorter than this many rows (default 16; expected chunk 50)",
+    )
+    parser.add_argument(
+        "--blend-steps",
+        type=int,
+        choices=(2, 3, 4),
+        default=DEFAULT_BLEND_STEPS,
+        help="pose/joint old/new blend length (default 3; gripper is not interpolated)",
+    )
+    parser.add_argument(
+        "--actuator-delay-s",
+        type=float,
+        default=DEFAULT_ACTUATOR_DELAY_S,
+        help=(
+            "estimated command-to-actuation delay used for monotonic future-target "
+            "selection (default 0)"
+        ),
+    )
+    parser.add_argument(
+        "--latency-skip-compensation-steps",
+        type=int,
+        default=0,
+        help=(
+            "deprecated fixed compensation expressed on the timed action horizon; "
+            "prefer --actuator-delay-s"
+        ),
+    )
+    parser.add_argument(
+        "--gripper-lowpass-alpha",
+        type=float,
+        default=DEFAULT_GRIPPER_LOWPASS_ALPHA,
+        help="independent gripper opening low-pass alpha in (0,1]",
+    )
+    parser.add_argument(
+        "--gripper-hysteresis",
+        type=float,
+        default=DEFAULT_GRIPPER_HYSTERESIS,
+        help="opening-fraction hysteresis around fully closed/open endpoints",
+    )
+    parser.add_argument(
+        "--gripper-confirm-steps",
+        type=int,
+        default=DEFAULT_GRIPPER_CONFIRM_STEPS,
+        help="consecutive endpoint requests required before open/closed transition",
+    )
+    parser.add_argument("--instruction", default="pick up the cube")
+    parser.add_argument("--source-name", default=None)
+    parser.add_argument(
+        "--monitoring-dir",
+        default=os.environ.get("BIMANUAL_VLA_MONITORING_DIR", DEFAULT_MONITORING_DIR),
+        help="local root for per-run monitoring_data/<session>/events.jsonl",
+    )
+    parser.add_argument("--reconnect-delay", type=float, default=2.0)
+    parser.add_argument("--once", action="store_true", help="run one successful inference and exit")
+    parser.add_argument(
+        "--allow-execution",
+        action="store_true",
+        help="enable the client-side safety gate; Dashboard EXECUTE is still required",
+    )
+    parser.add_argument("--max-action-age-s", type=float, default=2.0)
+    parser.add_argument(
+        "--max-feedback-age-s",
+        type=float,
+        default=DEFAULT_FEEDBACK_MAX_AGE_S,
+        help="maximum age of Piper CAN feedback before each queued command",
+    )
+    parser.add_argument(
+        "--max-translation-step-m",
+        type=float,
+        default=DEFAULT_MAX_TRANSLATION_STEP_M,
+        help=f"delivery translation step limit; {SAFETY_PROFILE} default",
+    )
+    parser.add_argument(
+        "--max-rotation-step-rad",
+        type=float,
+        default=DEFAULT_MAX_ROTATION_STEP_RAD,
+        help=f"delivery rotation step limit; {SAFETY_PROFILE} default",
+    )
+    parser.add_argument(
+        "--max-gripper-step",
+        type=float,
+        default=DEFAULT_MAX_GRIPPER_STEP,
+        help=f"delivery gripper fraction step limit; {SAFETY_PROFILE} default",
+    )
+    parser.add_argument(
+        "--gripper-range-tolerance",
+        type=float,
+        default=DEFAULT_GRIPPER_RANGE_TOLERANCE,
+        help="accept and clip small delivery gripper overshoot outside [0,1]",
+    )
+    parser.add_argument(
+        "--max-joint-step-rad",
+        type=float,
+        default=0.3,
+        help="maximum joint-schema absolute target delta per joint",
+    )
+    parser.add_argument(
+        "--joint-limit-tolerance-rad",
+        type=float,
+        default=DEFAULT_JOINT_LIMIT_TOLERANCE_RAD,
+        help="clip numerical joint-target overshoot at Piper hard limits (default 0.05 rad)",
+    )
+    parser.add_argument(
+        "--max-joint-gripper-step",
+        type=float,
+        default=None,
+        help="maximum joint-schema gripper opening-fraction change per command",
+    )
+    parser.add_argument(
+        "--max-joint-gripper-step-m",
+        type=float,
+        default=None,
+        help="deprecated metre-based joint gripper step override",
+    )
+    parser.add_argument(
+        "--ik-max-joint-step-rad", type=float, default=DEFAULT_IK_MAX_JOINT_STEP_RAD,
+        help="maximum commanded per-joint change on one 20 Hz delivery control tick",
+    )
+    parser.add_argument(
+        "--ik-search-joint-radius-rad",
+        type=float,
+        default=DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD,
+        help="near-current joint radius used to find the regularized EEF IK direction",
+    )
+    parser.add_argument(
+        "--ik-joint-regularization-weight",
+        type=float,
+        default=DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT,
+        help="penalty on unnecessary joint motion in delivery IK (0 disables it)",
+    )
+    parser.add_argument(
+        "--ik-position-tolerance-m", type=float, default=DEFAULT_IK_POSITION_TOLERANCE_M,
+        help="maximum accepted local IK position error",
+    )
+    parser.add_argument(
+        "--ik-rotation-tolerance-rad", type=float, default=DEFAULT_IK_ROTATION_TOLERANCE_RAD,
+        help="maximum accepted local IK rotation error",
+    )
+    parser.add_argument(
+        "--ik-max-nfev", type=int, default=DEFAULT_IK_MAX_NFEV,
+        help="maximum numerical IK function evaluations per command",
+    )
+    parser.add_argument(
+        "--max-commands", type=int, default=None,
+        help="stop after this many checked robot commands",
+    )
+    parser.add_argument(
+        "--record-root",
+        default=os.environ.get("BIMANUAL_VLA_RECORD_ROOT", "deployment_runs"),
+        help="directory where one trajectory/model/video folder is created per run",
+    )
+    parser.add_argument(
+        "--record-video-fps",
+        type=float,
+        default=None,
+        help="nominal FPS for recorded MP4; default is --camera-fps",
+    )
+    parser.add_argument(
+        "--no-recording",
+        action="store_true",
+        help="disable deployment trajectory, model-command, and video recording",
+    )
+    parser.add_argument(
+        "--arm-settle-s", type=float, default=0.75,
+        help="minimum joint-hold settling time after enabling Piper",
+    )
+    parser.add_argument(
+        "--arm-hold-tolerance-rad", type=float, default=DEFAULT_ARM_HOLD_TOLERANCE_RAD,
+        help="maximum joint error before leaving the post-enable hold (default 0.05 rad)",
+    )
+    parser.add_argument(
+        "--workspace-x", type=float, nargs=2, default=DEFAULT_WORKSPACE_X_M, metavar=("MIN", "MAX"),
+        help=f"delivery EEF x bounds; {SAFETY_PROFILE} envelope with margin",
+    )
+    parser.add_argument(
+        "--workspace-y", type=float, nargs=2, default=DEFAULT_WORKSPACE_Y_M, metavar=("MIN", "MAX"),
+        help=f"delivery EEF y bounds; {SAFETY_PROFILE} envelope with margin",
+    )
+    parser.add_argument(
+        "--workspace-z", type=float, nargs=2, default=DEFAULT_WORKSPACE_Z_M, metavar=("MIN", "MAX"),
+        help=f"delivery EEF z bounds; {SAFETY_PROFILE} envelope with margin",
+    )
+    parser.add_argument("--speed-pct", type=int, default=10)
+    parser.add_argument("--gripper-effort", type=int, default=1000)
+    parser.add_argument("--enable-timeout-s", type=float, default=3.0)
+    args = parser.parse_args()
+    if args.max_joint_gripper_step is not None and args.max_joint_gripper_step_m is not None:
+        parser.error(
+            "use only one of --max-joint-gripper-step or --max-joint-gripper-step-m"
+        )
+    if args.max_joint_gripper_step is None:
+        args.max_joint_gripper_step = (
+            args.max_joint_gripper_step_m / GRIPPER_MAX_M
+            if args.max_joint_gripper_step_m is not None
+            else 0.25
+        )
+    if not 1 <= args.port <= 65535:
+        parser.error("port must be in [1, 65535]")
+    if args.action_chunk_steps is not None:
+        args.min_action_chunk_steps = args.action_chunk_steps
+    positive = (
+        args.hz,
+        args.control_hz,
+        args.camera_fps,
+        args.camera_preview_fps,
+        args.action_hz if args.action_hz is not None else 1.0,
+        args.max_action_age_s,
+        args.max_feedback_age_s,
+        args.max_translation_step_m,
+        args.max_rotation_step_rad,
+        args.max_gripper_step,
+        args.gripper_range_tolerance,
+        args.max_joint_step_rad,
+        args.max_joint_gripper_step,
+        args.ik_max_joint_step_rad,
+        args.ik_search_joint_radius_rad,
+        args.ik_position_tolerance_m,
+        args.ik_rotation_tolerance_rad,
+        args.gripper_lowpass_alpha,
+        args.gripper_hysteresis,
+        args.arm_settle_s,
+        args.arm_hold_tolerance_rad,
+        args.enable_timeout_s,
+        args.record_video_fps if args.record_video_fps is not None else 1.0,
+    )
+    if any(value <= 0 for value in positive) or args.reconnect_delay < 0:
+        parser.error("frequencies, freshness/safety limits, and timeout must be positive")
+    if args.ik_search_joint_radius_rad < args.ik_max_joint_step_rad:
+        parser.error("ik-search-joint-radius-rad must be at least ik-max-joint-step-rad")
+    if args.ik_joint_regularization_weight < 0:
+        parser.error("ik-joint-regularization-weight must be non-negative")
+    if args.joint_limit_tolerance_rad < 0:
+        parser.error("joint-limit-tolerance-rad must be non-negative")
+    if args.action_chunk_steps is not None and args.action_chunk_steps <= 0:
+        parser.error("action-chunk-steps must be positive")
+    if args.ik_max_nfev <= 0:
+        parser.error("ik-max-nfev must be positive")
+    if args.max_commands is not None and args.max_commands <= 0:
+        parser.error("max-commands must be positive")
+    if args.min_action_chunk_steps <= 0:
+        parser.error("min-action-chunk-steps must be positive")
+    if args.latency_skip_compensation_steps < 0:
+        parser.error("latency-skip-compensation-steps must be non-negative")
+    if args.actuator_delay_s < 0:
+        parser.error("actuator-delay-s must be non-negative")
+    if args.gripper_lowpass_alpha > 1:
+        parser.error("gripper-lowpass-alpha must be in (0,1]")
+    if not 0 < args.gripper_hysteresis < 0.5:
+        parser.error("gripper-hysteresis must be in (0,0.5)")
+    if args.gripper_confirm_steps < 1:
+        parser.error("gripper-confirm-steps must be positive")
+    if not 1 <= args.speed_pct <= 100:
+        parser.error("speed-pct must be in [1,100]")
+    if not 0 <= args.gripper_effort <= 5000:
+        parser.error("gripper-effort must be in [0,5000]")
+    for name in ("workspace_x", "workspace_y", "workspace_z"):
+        bounds = getattr(args, name)
+        if bounds[0] >= bounds[1]:
+            parser.error(f"{name.replace('_', '-')} MIN must be less than MAX")
+    if args.arm_mode == "bimanual":
+        if args.arm_side not in {"both", "right"}:
+            parser.error("bimanual mode requires --arm-side both")
+        args.arm_side = "both"
+        if args.left_can == args.right_can:
+            parser.error("--left-can and --right-can must differ in bimanual mode")
+        if len({args.cam_high_device, args.cam_left_wrist_device, args.cam_right_wrist_device}) != 3:
+            parser.error("bimanual camera devices must be distinct")
+    elif args.arm_side not in {"left", "right"}:
+        parser.error("single mode requires --arm-side left or right")
+    if not args.instruction.strip():
+        parser.error("instruction must not be empty")
+    args.instruction = args.instruction.strip()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    run_rtc_client(args)
+
+
+# Backward-compatible import/entry-point name used by older scripts and tests.
+run = run_rtc_client
+
+
+if __name__ == "__main__":
+    main()

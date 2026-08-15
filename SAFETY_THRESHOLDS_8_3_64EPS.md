@@ -4,7 +4,7 @@
 
 数据集：`8_3_64eps`（83 episodes，18,034 frames，20 Hz，legacy delivery v2）
 
-该数据集的 action 是相邻 20 Hz 帧之间的 EEF one-step delta，夹爪是下一帧绝对 closed fraction。以下统计用于确定 `robot_observation_bridge.py` 的默认 delivery 安全门；CLI 仍可针对新任务收紧。
+该数据集的 action 是相邻 20 Hz 帧之间的 EEF one-step delta，夹爪是下一帧绝对 closed fraction。以下统计用于确定 `rtc_client.py` 的默认 delivery 安全门；CLI 仍可针对新任务收紧。
 
 ## 20 Hz 单步动作分布
 
