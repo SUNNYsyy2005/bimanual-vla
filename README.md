@@ -542,7 +542,7 @@ python upload_dataset_4090.py episodes_piper_v21 \
 真实推理数据面不经过 Dashboard。机械臂控制电脑使用官方 `openpi_client.WebsocketClientPolicy` 直接连接 Policy 端口：
 
 ```bash
-python robot_observation_bridge.py \
+python rtc_client.py \
   --host 192.168.101.9 \
   --port 8000 \
   --arm-mode single \
@@ -558,7 +558,7 @@ python robot_observation_bridge.py \
 双臂客户端示例：
 
 ```bash
-python robot_observation_bridge.py \
+python rtc_client.py \
   --host 192.168.101.9 \
   --port 8000 \
   --arm-mode bimanual \
@@ -571,7 +571,7 @@ python robot_observation_bridge.py \
   --instruction "handover the object"
 ```
 
-bridge 会同时读取每条机械臂的 10D EEF delivery state 与 7D 实测 joint qpos，
+RTC 客户端会同时读取每条机械臂的 10D EEF delivery state 与 7D 实测 joint qpos，
 根据服务端 metadata 自动选择单臂 7D/10D 或双臂 14D/20D state、相机 wire key
 和 7D/14D action 执行方式，并严格校验 `arm_mode`、维度、左右顺序和相机集合。
 也可以用 `--output-mode joint` 或 `--output-mode delivery` 显式锁定输出合同；
@@ -587,7 +587,7 @@ bridge 会同时读取每条机械臂的 10D EEF delivery state 与 7D 实测 jo
 模型切换导致连接断开后客户端会自动重连、重新协商
 schema，并回到 SHADOW。
 
-每次启动 `robot_observation_bridge.py` 默认都会在 `deployment_runs/` 下创建一个独立
+每次启动 `rtc_client.py` 默认都会在 `deployment_runs/` 下创建一个独立
 运行目录，异步保存：
 
 - `trajectory.npz`：每个控制 tick 的实际 Piper 反馈、delivery state、是否真正下发
@@ -609,7 +609,7 @@ Dashboard Token 只保护管理 API，机械臂客户端不需要 Dashboard URL 
 ## 9. 相关脚本
 
 - `serve_piper.py`：加载 pi0.5 / openpi policy 并启动服务
-- `robot_observation_bridge.py`：正式实机客户端，记录机械臂轨迹、模型 action chunk 和同步视频
+- `rtc_client.py`：正式实机客户端，记录机械臂轨迹、模型 action chunk 和同步视频
 - `run.py`：旧版简化实机循环，读取观测并请求 policy 动作
 - `robot_smoke_test.py`：机械臂 / 相机 smoke 测试
 - `policy_server_smoke_test.py`：与远程 policy server 联合推理 smoke 测试
