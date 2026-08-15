@@ -127,7 +127,7 @@ Dashboard 均使用同一份 `EpisodeContract` 元数据。输出臂反馈采集
 
 - 轨迹保存 / 回放：`trajectory.py`
 - 导出可直接用于 pi0.5 / openpi 训练的 LeRobot 风格数据集：`pi0_dataset.py`
-- openpi / pi0.5 实机推理桥接：`serve_piper.py`、`run.py`
+- openpi / pi0.5 实机推理桥接：Dashboard 的 `server_4090/openpi_single_arm.py` 与 `rtc_client.py`；`serve_piper.py`、`run.py` 为 legacy 入口
 
 ---
 
@@ -541,6 +541,13 @@ python upload_dataset_4090.py episodes_piper_v21 \
 
 真实推理数据面不经过 Dashboard。机械臂控制电脑使用官方 `openpi_client.WebsocketClientPolicy` 直接连接 Policy 端口：
 
+这里的 RTC 是 **Real-Time Chunking**：服务端在 flow-matching denoising 内使用上一
+action chunk 尚未执行的 normalized prefix 做 guidance，补偿相机、传输和推理延迟；
+不是只在客户端对 old/new action 做插值。Dashboard 创建 Policy 时默认启用
+`--rtc-enabled`，Policy metadata 会声明 `rtc_algorithm=real_time_chunking_prefix_guidance`
+及 `rtc_backend=jax|pytorch`。客户端只发送 session、generation、offset 和 latency
+估计，默认 `--rtc-client-blend-steps 0`，避免重复引入轨迹切换延迟。
+
 ```bash
 python rtc_client.py \
   --host 192.168.101.9 \
@@ -608,7 +615,7 @@ Dashboard Token 只保护管理 API，机械臂客户端不需要 Dashboard URL 
 
 ## 9. 相关脚本
 
-- `serve_piper.py`：加载 pi0.5 / openpi policy 并启动服务
+- `serve_piper.py`：旧版独立 Policy server；不包含模型侧 RTC。需要实机 RTC 时使用 Dashboard 启动的 `server_4090/openpi_single_arm.py serve --rtc-enabled`
 - `rtc_client.py`：正式实机客户端，记录机械臂轨迹、模型 action chunk 和同步视频
 - `run.py`：旧版简化实机循环，读取观测并请求 policy 动作
 - `robot_smoke_test.py`：机械臂 / 相机 smoke 测试

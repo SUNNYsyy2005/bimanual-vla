@@ -95,6 +95,8 @@ DEFAULT_CAMERA_FPS = 20
 DEFAULT_OPENPI_CHUNK_STEPS = 50
 DEFAULT_MIN_ACTION_CHUNK_STEPS = 16
 DEFAULT_BLEND_STEPS = 3
+DEFAULT_RTC_EXECUTION_HORIZON = 8
+DEFAULT_RTC_MAX_GUIDANCE_WEIGHT = 5.0
 DEFAULT_ACTUATOR_DELAY_S = 0.0
 DEFAULT_GRIPPER_LOWPASS_ALPHA = 0.5
 DEFAULT_GRIPPER_HYSTERESIS = 0.05
@@ -298,6 +300,10 @@ class PolicyProtocol:
     metadata_gripper_semantics_explicit: bool = False
     contract_version: int | None = None
     action_horizon: int = DEFAULT_OPENPI_CHUNK_STEPS
+    rtc_enabled: bool = False
+    rtc_execution_horizon: int = DEFAULT_RTC_EXECUTION_HORIZON
+    rtc_max_guidance_weight: float = DEFAULT_RTC_MAX_GUIDANCE_WEIGHT
+    rtc_prefix_attention_schedule: str = "linear"
 
 
 def connect_piper(can_name: str) -> Any:
@@ -1118,6 +1124,43 @@ def validate_policy_metadata(
     ):
         expected_camera_keys = [sorted(keys) for keys in expected_camera_key_sets]
         errors.append(f"camera_keys={camera_keys!r}, expected one of {expected_camera_keys!r}")
+    rtc_enabled = bool(metadata.get("rtc_enabled", False))
+    raw_rtc_execution_horizon = metadata.get(
+        "rtc_execution_horizon", DEFAULT_RTC_EXECUTION_HORIZON
+    )
+    try:
+        rtc_execution_horizon = int(raw_rtc_execution_horizon)
+    except (TypeError, ValueError):
+        rtc_execution_horizon = DEFAULT_RTC_EXECUTION_HORIZON
+        if rtc_enabled:
+            errors.append(
+                "rtc_execution_horizon must be a positive integer, got "
+                f"{raw_rtc_execution_horizon!r}"
+            )
+    raw_rtc_max_guidance_weight = metadata.get(
+        "rtc_max_guidance_weight", DEFAULT_RTC_MAX_GUIDANCE_WEIGHT
+    )
+    try:
+        rtc_max_guidance_weight = float(raw_rtc_max_guidance_weight)
+    except (TypeError, ValueError):
+        rtc_max_guidance_weight = DEFAULT_RTC_MAX_GUIDANCE_WEIGHT
+        if rtc_enabled:
+            errors.append(
+                "rtc_max_guidance_weight must be a positive number, got "
+                f"{raw_rtc_max_guidance_weight!r}"
+            )
+    rtc_prefix_attention_schedule = str(
+        metadata.get("rtc_prefix_attention_schedule", "linear")
+    )
+    if rtc_enabled:
+        if rtc_execution_horizon <= 0:
+            errors.append("rtc_execution_horizon must be positive")
+        if not math.isfinite(rtc_max_guidance_weight) or rtc_max_guidance_weight <= 0:
+            errors.append("rtc_max_guidance_weight must be positive")
+        if rtc_prefix_attention_schedule not in {"zeros", "ones", "linear", "exp"}:
+            errors.append(
+                "rtc_prefix_attention_schedule must be one of zeros, ones, linear, exp"
+            )
     if errors:
         raise RuntimeError("incompatible policy metadata: " + "; ".join(errors))
 
@@ -1135,6 +1178,10 @@ def validate_policy_metadata(
         metadata_gripper_semantics_explicit=raw_gripper_semantics is not None,
         contract_version=contract_version,
         action_horizon=action_horizon,
+        rtc_enabled=rtc_enabled,
+        rtc_execution_horizon=rtc_execution_horizon,
+        rtc_max_guidance_weight=rtc_max_guidance_weight,
+        rtc_prefix_attention_schedule=rtc_prefix_attention_schedule,
     )
 
 
@@ -1925,6 +1972,10 @@ class ExecutionController:
         self.arm_hold_stable_since: dict[str, float] = {}
         self.robot_driver_enable_status: dict[str, dict[str, Any]] = {}
         self.ik_solver: PiperContinuousIK | None = None
+        self.rtc_enabled = False
+        self.rtc_execution_horizon = DEFAULT_RTC_EXECUTION_HORIZON
+        self.rtc_max_guidance_weight = DEFAULT_RTC_MAX_GUIDANCE_WEIGHT
+        self.rtc_prefix_attention_schedule = "linear"
 
     def configure_protocol(self, protocol: PolicyProtocol) -> None:
         action_hz = getattr(self.args, "action_hz", None) or protocol.action_hz or DEFAULT_ACTION_HZ
@@ -1940,7 +1991,34 @@ class ExecutionController:
         if legacy_override is not None:
             self.min_action_chunk_steps = int(legacy_override)
         self.action_chunk_steps = self.min_action_chunk_steps
-        self.blend_steps = int(getattr(self.args, "blend_steps", DEFAULT_BLEND_STEPS))
+        requested_blend_steps = int(getattr(self.args, "blend_steps", DEFAULT_BLEND_STEPS))
+        self.rtc_enabled = bool(
+            getattr(self.args, "rtc_enabled", True) and protocol.rtc_enabled
+        )
+        self.rtc_execution_horizon = max(
+            1, min(
+                int(getattr(self.args, "rtc_execution_horizon", protocol.rtc_execution_horizon)),
+                int(protocol.action_horizon),
+            )
+        )
+        self.rtc_max_guidance_weight = float(
+            getattr(self.args, "rtc_max_guidance_weight", protocol.rtc_max_guidance_weight)
+        )
+        self.rtc_prefix_attention_schedule = str(
+            getattr(
+                self.args,
+                "rtc_prefix_attention_schedule",
+                protocol.rtc_prefix_attention_schedule,
+            )
+        )
+        # Model-side RTC already aligns the new chunk during denoising.  A
+        # second default client trajectory blend would reintroduce avoidable
+        # latency; keep it opt-in through --rtc-client-blend-steps.
+        self.blend_steps = (
+            int(getattr(self.args, "rtc_client_blend_steps", 0))
+            if self.rtc_enabled
+            else requested_blend_steps
+        )
         self.latency_skip_compensation_steps = int(
             getattr(self.args, "latency_skip_compensation_steps", 0)
         )
@@ -2185,6 +2263,15 @@ class ExecutionController:
             "inference_blend_steps": self.inference_blend_steps,
             "inference_generation": self.inference_generation,
             "action_generation": self.active_generation,
+            "rtc": {
+                "enabled": self.rtc_enabled,
+                "algorithm": "real_time_chunking_prefix_guidance",
+                "session_id": str(getattr(self.args, "rtc_session_id", "")),
+                "execution_horizon": self.rtc_execution_horizon,
+                "max_guidance_weight": self.rtc_max_guidance_weight,
+                "prefix_attention_schedule": self.rtc_prefix_attention_schedule,
+                **self.rtc_request_metadata(None),
+            },
             "inference_old_remaining": self.inference_old_remaining,
             "old_remaining": self.inference_old_remaining,
             "inference_launch_count": self.inference_launch_count,
@@ -2267,6 +2354,53 @@ class ExecutionController:
                 "workspace_z_m": list(getattr(self.args, "workspace_z", DEFAULT_WORKSPACE_Z_M)),
                 "blend_targets_rechecked_each_control_step": True,
             },
+        }
+
+    def rtc_request_metadata(self, protocol: PolicyProtocol | None) -> dict[str, Any]:
+        """Describe the previous model chunk at the next inference launch.
+
+        The server keeps the previous normalized chunk per WebSocket session.
+        The client only sends the source offset and a latency-based delay
+        estimate, so normalized model actions never cross the robot wire.
+        """
+        if not self.rtc_enabled:
+            return {
+                "enabled": False,
+                "inference_delay_steps": 0,
+                "previous_chunk_offset_steps": 0,
+                "previous_chunk_generation": None,
+            }
+        offset = 0
+        previous_generation = self.active_generation or None
+        if self.pending_actions:
+            same_generation = [
+                target
+                for target in self.pending_actions
+                if target.generation == self.active_generation
+            ]
+            if same_generation:
+                source_index = same_generation[0].source_index
+                if source_index is not None:
+                    offset = max(offset, int(source_index))
+        if (
+            self.last_safe_target is not None
+            and self.last_safe_target.generation == self.active_generation
+            and self.last_safe_target.source_index is not None
+        ):
+            offset = max(offset, int(self.last_safe_target.source_index) + 1)
+
+        latency_s = self.inference_latency_s
+        if latency_s is None or not math.isfinite(float(latency_s)) or latency_s <= 0:
+            latency_s = 1.0 / max(self.inference_hz, 1.0)
+        delay = max(0, int(math.ceil(float(latency_s) * self.policy_action_hz)))
+        if protocol is not None:
+            delay = min(delay, max(0, int(protocol.action_horizon) - 1))
+        return {
+            "enabled": True,
+            "inference_delay_steps": delay,
+            "previous_chunk_offset_steps": offset,
+            "previous_chunk_generation": previous_generation,
+            "predicted_capture_to_result_s": float(latency_s),
         }
 
     def _block(self, state: str, reason: str) -> bool:
@@ -4029,6 +4163,18 @@ def build_observation(
                 if execution_metadata is None
                 else execution_metadata
             ),
+            "rtc": {
+                **(
+                    execution.rtc_request_metadata(protocol)
+                    if callable(getattr(execution, "rtc_request_metadata", None))
+                    else {"enabled": False, "inference_delay_steps": 0, "previous_chunk_offset_steps": 0}
+                ),
+                "enabled": bool(getattr(execution, "rtc_enabled", False)),
+                "session_id": str(getattr(args, "rtc_session_id", "")),
+                "inference_generation": execution_metadata.get("inference_generation")
+                if isinstance(execution_metadata, dict)
+                else getattr(execution, "inference_generation", None),
+            },
         },
     }
 
@@ -4170,6 +4316,8 @@ def run_rtc_client(args: argparse.Namespace) -> None:
         os.environ[key] = ",".join(entries)
 
     source_name = args.source_name or socket.gethostname()
+    if not getattr(args, "rtc_session_id", None):
+        args.rtc_session_id = uuid.uuid4().hex
     if args.arm_mode == "bimanual":
         logging.info(
             "Connecting Piper feedback: left=%s right=%s ...",
@@ -4606,6 +4754,14 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                     "camera_capture_finished_at": camera_finished_at,
                                     "inference_generation": launch_ref.generation,
                                 })
+                                # Keep the RTC generation in its namespaced
+                                # payload too. The server uses this value to
+                                # match the previous normalized chunk; the
+                                # legacy top-level field is retained for
+                                # transport telemetry compatibility.
+                                observation["client_metadata"].setdefault("rtc", {})[
+                                    "inference_generation"
+                                ] = launch_ref.generation
                                 result = dict(policy_ref.infer(observation))
                                 response_received_at = time.time()
                                 response_received_monotonic = time.monotonic()
@@ -4742,6 +4898,26 @@ def main() -> None:
         type=float,
         default=None,
         help=f"override model/dataset action rate; default uses policy metadata or {DEFAULT_ACTION_HZ:g} Hz",
+    )
+    parser.add_argument(
+        "--rtc-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="use model-side Real-Time Chunking when the Policy advertises it (default: enabled)",
+    )
+    parser.add_argument("--rtc-execution-horizon", type=int, default=DEFAULT_RTC_EXECUTION_HORIZON)
+    parser.add_argument("--rtc-max-guidance-weight", type=float, default=DEFAULT_RTC_MAX_GUIDANCE_WEIGHT)
+    parser.add_argument(
+        "--rtc-prefix-attention-schedule",
+        choices=("zeros", "ones", "linear", "exp"),
+        default="linear",
+    )
+    parser.add_argument(
+        "--rtc-client-blend-steps",
+        type=int,
+        default=0,
+        choices=(0, 2, 3, 4),
+        help="optional extra client blend after model-side RTC; default 0 to avoid adding latency",
     )
     parser.add_argument(
         "--action-chunk-steps",
@@ -4959,6 +5135,8 @@ def main() -> None:
         args.camera_fps,
         args.camera_preview_fps,
         args.action_hz if args.action_hz is not None else 1.0,
+        args.rtc_execution_horizon,
+        args.rtc_max_guidance_weight,
         args.max_action_age_s,
         args.max_feedback_age_s,
         args.max_translation_step_m,

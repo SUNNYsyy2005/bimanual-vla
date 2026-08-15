@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Policy server for axiboai/pi05-piper-bimanual-v1.
+"""Legacy Policy server for axiboai/pi05-piper-bimanual-v1.
+
+This standalone entrypoint does not install model-side Real-Time Chunking.
+For real-robot deployment with RTC, use Dashboard's
+``server_4090/openpi_single_arm.py serve --rtc-enabled`` instead.
 
 Run on 192.168.101.9 (4x4090 server):
     ssh 4x4090
