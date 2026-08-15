@@ -7351,6 +7351,7 @@ print(json.dumps(rows, ensure_ascii=False))
             "--checkpoint", str(checkpoint),
             "--port", str(port),
             "--telemetry-dir", str(telemetry_dir),
+            "--rtc-enabled",
         ] + action_contract_command_args(model_contract)
         default_prompt = str(payload.get("default_prompt", "")).strip()
         if default_prompt:
@@ -7378,6 +7379,8 @@ print(json.dumps(rows, ensure_ascii=False))
                 "ws_url": f"ws://{request.host.split(':')[0]}:{port}",
                 "telemetry_session": telemetry_session,
                 "telemetry_dir": str(telemetry_dir),
+                "rtc_enabled": True,
+                "rtc_algorithm": "real_time_chunking_prefix_guidance",
                 "replaced_task_id": replace_task_id or None,
             },
         )

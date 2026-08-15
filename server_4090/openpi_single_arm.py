@@ -200,6 +200,8 @@ try:
 except ImportError:  # Keep the OpenPI helper usable while collection code is staged separately.
     _piper_action_conventions = None
 
+from rtc_openpi import RTCConfig, build_rtc_policy
+
 
 def _convention_value(name: str, default: str) -> str:
     return str(getattr(_piper_action_conventions, name, default))
@@ -1686,6 +1688,12 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
             "action_source": contract.action_source,
             "action_alignment": contract.action_alignment,
             "transport": "openpi_websocket_v1",
+            "rtc_enabled": bool(getattr(args, "rtc_enabled", False)),
+            "rtc_execution_horizon": int(getattr(args, "rtc_execution_horizon", 8)),
+            "rtc_max_guidance_weight": float(getattr(args, "rtc_max_guidance_weight", 5.0)),
+            "rtc_prefix_attention_schedule": str(
+                getattr(args, "rtc_prefix_attention_schedule", "linear")
+            ),
         },
     )
 
@@ -2987,14 +2995,36 @@ def run_serve(args: argparse.Namespace) -> None:
         Path(args.checkpoint).expanduser().resolve(),
         default_prompt=args.default_prompt,
     )
+    policy_metadata = dict(config.policy_metadata)
+    if args.rtc_enabled:
+        rtc_backend = "pytorch" if bool(getattr(policy, "_is_pytorch_model", False)) else "jax"
+        rtc_config = RTCConfig(
+            enabled=True,
+            execution_horizon=args.rtc_execution_horizon,
+            max_guidance_weight=args.rtc_max_guidance_weight,
+            prefix_attention_schedule=args.rtc_prefix_attention_schedule,
+        )
+        policy = build_rtc_policy(policy, rtc_config)
+        policy_metadata.update(
+            {
+                "rtc_enabled": True,
+                "rtc_algorithm": "real_time_chunking_prefix_guidance",
+                "rtc_backend": rtc_backend,
+                "rtc_execution_horizon": rtc_config.execution_horizon,
+                "rtc_max_guidance_weight": rtc_config.max_guidance_weight,
+                "rtc_prefix_attention_schedule": rtc_config.prefix_attention_schedule,
+            }
+        )
+    else:
+        policy_metadata["rtc_enabled"] = False
     if args.telemetry_dir:
-        telemetry = PolicyTelemetry(Path(args.telemetry_dir).expanduser().resolve(), config.policy_metadata)
+        telemetry = PolicyTelemetry(Path(args.telemetry_dir).expanduser().resolve(), policy_metadata)
         policy = TelemetryPolicy(policy, telemetry)
         server = TelemetryWebsocketPolicyServer(
             policy=policy,
             host="0.0.0.0",
             port=args.port,
-            metadata=config.policy_metadata,
+            metadata=policy_metadata,
             telemetry=telemetry,
         )
     else:
@@ -3002,7 +3032,7 @@ def run_serve(args: argparse.Namespace) -> None:
             policy=policy,
             host="0.0.0.0",
             port=args.port,
-            metadata=config.policy_metadata,
+            metadata=policy_metadata,
         )
     server.serve_forever()
 
@@ -3103,6 +3133,19 @@ def parse_args() -> argparse.Namespace:
     serve.add_argument("--port", type=int, default=8000)
     serve.add_argument("--default-prompt", default=None)
     serve.add_argument("--telemetry-dir", default=None)
+    serve.add_argument(
+        "--rtc-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable model-side Real-Time Chunking prefix guidance (JAX and PyTorch checkpoints)",
+    )
+    serve.add_argument("--rtc-execution-horizon", type=int, default=8)
+    serve.add_argument("--rtc-max-guidance-weight", type=float, default=5.0)
+    serve.add_argument(
+        "--rtc-prefix-attention-schedule",
+        choices=("zeros", "ones", "linear", "exp"),
+        default="linear",
+    )
 
     args = parser.parse_args()
     if not args.dataset_id or "/" in args.dataset_id or ".." in args.dataset_id:
@@ -3117,6 +3160,10 @@ def parse_args() -> argparse.Namespace:
             args.keep_period = None
     if hasattr(args, "test_ratio") and args.test_ratio is not None and not 0.0 <= args.test_ratio < 1.0:
         parser.error("--test-ratio must be in [0, 1)")
+    if hasattr(args, "rtc_execution_horizon") and args.rtc_execution_horizon <= 0:
+        parser.error("--rtc-execution-horizon must be positive")
+    if hasattr(args, "rtc_max_guidance_weight") and args.rtc_max_guidance_weight <= 0:
+        parser.error("--rtc-max-guidance-weight must be positive")
     return args
 
 

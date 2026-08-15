@@ -272,6 +272,13 @@ POST   /api/tasks/batch-delete
 
 ## 机械臂电脑：RTC 实时控制客户端
 
+本项目中的 RTC 指 **Real-Time Chunking**。`rtc_openpi.py` 在服务端的
+flow-matching denoising 阶段，用上一 action chunk 尚未执行的 normalized prefix
+对新 chunk 做 guidance，以补偿推理/传输延迟；它不是单纯的客户端 action 插值。
+Dashboard 启动 Policy 时默认传递 `--rtc-enabled`，JAX/Orbax 与 PyTorch
+checkpoint 都走模型侧 RTC。客户端只传 session、generation、offset 和 latency
+估计，默认关闭额外的客户端 old/new blend。
+
 脚本必须运行在物理连接 Piper CAN 和相机的电脑，而不是 4×4090；单臂使用一个 CAN 和两路相机：
 
 ```bash

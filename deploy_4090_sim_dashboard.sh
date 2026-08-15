@@ -27,6 +27,7 @@ rsync -av --relative \
   "$LOCAL_ROOT/./check_pi05_dataset.py" \
   "$LOCAL_ROOT/./download_openpi_checkpoint.py" \
   "$LOCAL_ROOT/./upload_dataset_4090.py" \
+  "$LOCAL_ROOT/./rtc_openpi.py" \
   "$LOCAL_ROOT/./piper_action_conventions.py" \
   "$LOCAL_ROOT/./piper_data_contract.py" \
   "$LOCAL_ROOT/./camera.py" \

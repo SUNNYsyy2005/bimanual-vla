@@ -35,6 +35,7 @@ rsync -av --relative \
   "$LOCAL_ROOT/./upload_dataset_4090.py" \
   "$LOCAL_ROOT/./rtc_client.py" \
   "$LOCAL_ROOT/./robot_observation_bridge.py" \
+  "$LOCAL_ROOT/./rtc_openpi.py" \
   "$LOCAL_ROOT/./piper_action_conventions.py" \
   "$LOCAL_ROOT/./piper_data_contract.py" \
   "$LOCAL_ROOT/./camera.py" \
