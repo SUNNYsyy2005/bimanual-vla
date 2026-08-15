@@ -711,6 +711,9 @@ class AsyncPolicyDashboardContractTest(unittest.TestCase):
         readme = (Path(__file__).parent / "server_4090/README.md").read_text(encoding="utf-8")
         for marker in (
             "client_inference_launch_hz",
+            "client_inference_result_hz",
+            "client_configured_inference_hz",
+            "client_inference_single_inflight_ceiling_hz",
             "client_control_hz",
             "client_chunk_rows",
             "minimum_horizon",

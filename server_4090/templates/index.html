@@ -2788,7 +2788,10 @@ function telemetrySummary(t) {
   if (!t) return '<span class="muted">客户端未连接，尚无 telemetry</span>';
   const control = t.execution_control || {};
   const age = finiteMetric(t.age_s);
-  const launchHz = t.client_inference_launch_hz ?? t.client_inference_hz ?? t.recommended_inference_launch_hz ?? 4;
+  const configuredHz = t.client_configured_inference_hz ?? t.client_inference_hz ?? t.recommended_inference_launch_hz ?? 4;
+  const launchHz = t.client_inference_launch_hz;
+  const resultHz = t.client_inference_result_hz;
+  const observedHz = resultHz ?? launchHz;
   const actionHz = t.client_policy_action_hz ?? t.action_hz ?? 20;
   const controlHz = t.client_control_hz ?? t.client_command_hz ?? actionHz;
   const chunkRows = t.client_chunk_rows ?? ((t.actions_shape || [])[0] ?? '-');
@@ -2836,6 +2839,7 @@ function telemetrySummary(t) {
       ? '<span class="ok">当前无安全阻断</span>'
       : '<span class="muted">安全状态未上报</span>';
   const details = `
+    <div>推理频率：配置=${esc(configuredHz)} Hz · 实际启动=${esc(launchHz ?? '-')} Hz · 实际完成=${esc(resultHz ?? '-')} Hz · 单在途延迟上限=${esc(t.client_inference_single_inflight_ceiling_hz ?? '-')} Hz</div>
     <div>推理时序：launch/capture/arrival=${esc(fmtTime(t.client_launch_at))}/${esc(fmtTime(t.client_capture_at ?? t.captured_at))}/${esc(fmtTime(t.client_arrival_at))}</div>
     <div>异步延迟：capture→result=${esc(metricMs(t.client_latency_ms))} · 上传=${esc(uploadTiming)} · 模型=${esc(metricMs(t.server_model_inference_ms ?? t.client_model_inference_ms))} · 下行=${esc(downloadTiming)} · RTT=${esc(metricMs(t.client_round_trip_ms))}</div>
     <div>客户端网络总传输=${esc(transportTiming)} · 单向测量来源=${esc(t.client_timing_source || '未上报')} · 时钟=${esc(t.client_one_way_timing_clock || '-')} · 需同步=${esc(t.client_one_way_timing_requires_clock_sync ?? '-')}</div>
@@ -2857,7 +2861,8 @@ function telemetrySummary(t) {
     <div class="telemetry-badges">${connection}${freshness}${serverGate}${clientGate}${dualGate}${safetyBadge}</div>
     <div class="telemetry-grid">
       ${item('实际状态', `<code>${esc(t.client_execution_state || 'unknown')}</code>`, t.client_execution_state === 'ready' || t.client_execution_state === 'executing' ? 'ok' : '')}
-      ${item('推理 / 控制频率', `${esc(launchHz)} / ${esc(controlHz)} Hz`)}
+      ${item('推理频率（配置/启动/完成）', `${esc(configuredHz)} / ${esc(launchHz ?? '-')} / ${esc(resultHz ?? '-')} Hz`)}
+      ${item('单在途上限（由延迟决定）', `${esc(t.client_inference_single_inflight_ceiling_hz ?? '-')} Hz`, observedHz != null && t.client_inference_single_inflight_ceiling_hz != null && observedHz > t.client_inference_single_inflight_ceiling_hz * 1.1 ? 'warn' : '')}
       ${item('动作频率 / chunk', `${esc(actionHz)} Hz · ${esc(chunkRows)}×${esc(t.model_action_dim || '?')}`)}
       ${item('horizon', `${esc(horizon)} / min ${esc(minHorizon)} · ${horizonState}`)}
       ${item('当前 plan', `gen ${esc(activeGeneration)} · ${esc(activeIndex)} / ${esc(activeRemaining)}`)}
@@ -3384,7 +3389,9 @@ function fillObservation(obs) {
   const jointDelta = telemetryJointDeltaSummary(obs, firstAction);
   document.getElementById('policyFirstActionTitle').textContent = `${obs.model_action_dim || firstAction.length || '?'}D ${obs.arm_mode === 'bimanual' ? '双臂' : '单臂'}首条 wire action`;
   document.getElementById('policyFirstAction').textContent = `shape=${JSON.stringify(obs.actions_shape || [])}\nwire=${obs.wire_action_semantics || '-'} · ${obs.wire_action_convention || '-'}\nrange=${compactNumber(obs.action_min)} .. ${compactNumber(obs.action_max)}\n\n${formatTelemetryVector(obs, firstAction, 'action')}${jointDelta ? `\n\n[相对当前 state]\n${jointDelta}` : ''}`;
-  const launchHz = obs.client_inference_launch_hz ?? obs.client_inference_hz ?? obs.recommended_inference_launch_hz ?? 4;
+  const configuredHz = obs.client_configured_inference_hz ?? obs.client_inference_hz ?? obs.recommended_inference_launch_hz ?? 4;
+  const launchHz = obs.client_inference_launch_hz;
+  const resultHz = obs.client_inference_result_hz;
   const actionHz = obs.client_policy_action_hz ?? obs.action_hz ?? 20;
   const controlHz = obs.client_control_hz ?? obs.client_command_hz ?? actionHz;
   const chunkRows = obs.client_chunk_rows ?? ((obs.actions_shape || [])[0] ?? '-');
@@ -3418,7 +3425,8 @@ wire semantics: ${obs.wire_action_semantics || '-'} · ${obs.wire_action_convent
 gripper: raw=${obs.raw_gripper_semantics || '-'} · state=${obs.state_gripper_semantics || '-'} · wire=${obs.wire_gripper_semantics || '-'}
 cameras: ${cameraSummary}
 actions shape / chunk rows: ${JSON.stringify(obs.actions_shape || [])} / ${chunkRows}
-action_hz / control_hz / inference launch_hz: ${actionHz ?? '-'} / ${controlHz ?? '-'} / ${launchHz ?? '-'} Hz
+inference Hz configured / launch / result / single-inflight ceiling: ${configuredHz ?? '-'} / ${launchHz ?? '-'} / ${resultHz ?? '-'} / ${obs.client_inference_single_inflight_ceiling_hz ?? '-'}
+action_hz / control_hz: ${actionHz ?? '-'} / ${controlHz ?? '-'} Hz
 action_horizon / min horizon: ${obs.action_horizon ?? '-'} / ${obs.minimum_horizon ?? 16} (client=${obs.client_minimum_horizon ?? '-'}) · ${horizonStatus}
 time contract: offset=${obs.action_offset ?? '-'} · model/wire start=${obs.model_action_start_offset ?? '-'}/${obs.action_start_offset_steps ?? '-'} · dt=${obs.action_time_step_s ?? '-'}s · ${obs.time_contract_ready ? 'ready' : ('BLOCKED: ' + (obs.time_contract_error || 'invalid'))}
 in-flight: ${obs.client_in_flight ?? '-'} · actuator delay=${obs.client_actuator_delay_ms ?? '-'} ms / ${obs.client_actuator_delay_steps ?? '-'} steps

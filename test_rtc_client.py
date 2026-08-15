@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import rtc_client
+from rtc_client import estimate_event_rate_hz, estimate_single_inflight_ceiling_hz
 from robot_observation_bridge import run as legacy_run
 from robot_observation_bridge import run_rtc_client
 
@@ -21,6 +22,20 @@ class RTCClientEntrypointTest(unittest.TestCase):
         run_client.assert_called_once()
         args = run_client.call_args.args[0]
         self.assertEqual(args.instruction, "test")
+
+    def test_estimate_event_rate_uses_observed_timestamps(self):
+        self.assertAlmostEqual(
+            estimate_event_rate_hz([0.0, 0.25, 0.5, 0.75]),
+            4.0,
+        )
+        self.assertAlmostEqual(
+            estimate_event_rate_hz([0.0, 0.55, 1.10]),
+            1.8181818,
+            places=5,
+        )
+        self.assertIsNone(estimate_event_rate_hz([1.0]))
+        self.assertAlmostEqual(estimate_single_inflight_ceiling_hz(0.55), 1.8181818, places=5)
+        self.assertIsNone(estimate_single_inflight_ceiling_hz(0.0))
 
 
 if __name__ == "__main__":

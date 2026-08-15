@@ -413,15 +413,18 @@ def _rtc_sample_actions_jax(
 
     def step(carry):
         x_t, time = carry
-        v_t = denoise(x_t, time)
         if rtc_active:
-            x1_t = x_t - time * v_t
-            error = (previous - x1_t) * weights
-
+            # ``has_aux=True`` returns the denoiser velocity as an auxiliary
+            # value from the same forward pass used to build x1_t.  The old
+            # implementation evaluated denoise() once for v_t and once again
+            # inside jax.vjp(), needlessly doubling the forward cost of every
+            # RTC denoising step.
             def clean_action(x):
-                return x - time * denoise(x, time)
+                velocity = denoise(x, time)
+                return x - time * velocity, velocity
 
-            _, pullback = jax.vjp(clean_action, x_t)
+            x1_t, pullback, v_t = jax.vjp(clean_action, x_t, has_aux=True)
+            error = (previous - x1_t) * weights
             correction = pullback(error)[0]
             tau = 1.0 - time
             eps = jnp.finfo(x_t.dtype).eps
@@ -438,6 +441,8 @@ def _rtc_sample_actions_jax(
             )
             guidance_weight = jnp.clip(guidance_weight, 0.0, self._rtc_max_guidance_weight)
             v_t = v_t - guidance_weight * correction
+        else:
+            v_t = denoise(x_t, time)
         return x_t + dt * v_t, time + dt
 
     def cond(carry):

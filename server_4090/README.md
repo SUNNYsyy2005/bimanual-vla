@@ -348,8 +348,12 @@ Policy metadata 会继续发布：`action_hz` 等于数据集 `meta/info.json` �
 并校验 raw `action_offset` 与固定的 model/wire 起点；缺失或不一致时保持 SHADOW / fail closed。
 
 异步执行采用长 chunk 流水切换：控制循环持续以 20 Hz 消费旧 chunk，
-而推理默认以 4 Hz 启动，推理与传输通常约 200 ms；旧 chunk 在 inference launch 到
-result arrival 期间继续执行。新 chunk 到达后，根据每行绝对目标时间、
+而推理默认以 4 Hz **尝试启动**，不是吞吐保证；客户端故意只允许一个请求在途。
+因此实际启动/完成频率受完整 capture→result 延迟限制，近似满足
+`actual_hz <= 1 / latency_s`。例如一次延迟 550 ms 时，单在途上限只有约 1.82 Hz，
+即使配置仍是 4 Hz。Dashboard 分开显示配置频率、实际 launch/result 频率和该上限；
+`server_model_inference_ms` 只代表服务端模型计算，不等于端到端吞吐。旧 chunk 在
+inference launch 到 result arrival 期间继续执行。新 chunk 到达后，根据每行绝对目标时间、
 launch/capture/arrival、actuator delay 和当前 20 Hz control tick 动态计算已过期 prefix；
 过期行数不是固定常量。随后用 2~4 步做 old/new blend，融合完成后才切换到新的 queue
 `generation`。`chunk rows` 是返回 chunk 的实际行数，`active plan`、`hold`、`blend`、
