@@ -55,6 +55,7 @@ from collect_output_arm import (
 from piper_data_contract import BIMANUAL, DELIVERY_SCHEMA, JOINT_SCHEMA, SINGLE_ARM, EpisodeContract
 from piper_action_conventions import rotation6d_to_matrix
 from upload_dataset_4090 import DEFAULT_SERVER, safe_dataset_name
+from data_process_panel import DataProcessPanel
 
 
 # ``CameraCapture`` keeps the model/data contract at 256x256 by letterboxing
@@ -716,6 +717,8 @@ class CollectorGUI:
         self.inference_log_widget: tk.Text | None = None
         self.inference_mode_frame: ttk.Frame | None = None
         self.collection_mode_frame: ttk.Frame | None = None
+        self.data_process_frame: ttk.Frame | None = None
+        self.data_process_panel: DataProcessPanel | None = None
         self.inference_mode_selectors: list[ttk.Combobox] = []
         self.inference_mode_display_vars: list[tk.StringVar] = []
         self.inference_start_button: ttk.Button | None = None
@@ -854,9 +857,17 @@ class CollectorGUI:
             "camera": "#16181c",
         }
         self.root.configure(bg=colors["window"])
-        ui_font = "Ubuntu"
+        available_fonts = set(tkfont.families(self.root))
+        ui_font = (
+            "Times New Roman"
+            if "Times New Roman" in available_fonts
+            else "Liberation Serif"
+            if "Liberation Serif" in available_fonts
+            else "DejaVu Serif"
+        )
+        self.ui_font = ui_font
         tkfont.nametofont("TkDefaultFont").configure(family=ui_font, size=10)
-        tkfont.nametofont("TkTextFont").configure(family="Noto Sans CJK SC", size=10)
+        tkfont.nametofont("TkTextFont").configure(family=ui_font, size=10)
         tkfont.nametofont("TkHeadingFont").configure(family=ui_font, size=12, weight="bold")
         style = ttk.Style()
         try:
@@ -1005,6 +1016,22 @@ class CollectorGUI:
             font=(ui_font, 10, "bold"),
         )
         self.inference_mode_button.pack(side="left")
+        self.data_process_button = tk.Button(
+            mode_switch,
+            text="Data process",
+            command=lambda: self.set_app_mode("data_process"),
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=7,
+            takefocus=0,
+            bg="#44517e",
+            fg="#ffffff",
+            activebackground="#5a69a0",
+            activeforeground="#ffffff",
+            font=(ui_font, 10, "bold"),
+        )
+        self.data_process_button.pack(side="left", padx=(4, 0))
         for color in (colors["accent"], colors["accent_teal"], colors["accent_coral"], colors["accent_violet"]):
             tk.Frame(banner, bg=color, width=10).pack(side="right", fill="y")
 
@@ -1289,6 +1316,7 @@ class CollectorGUI:
             self.preview_text_items[slot] = text_item
 
         self._build_inference_mode_ui()
+        self._build_data_process_mode_ui()
 
     def _build_inference_mode_ui(self) -> None:
         """Build the separate policy/inference page.
@@ -1311,7 +1339,7 @@ class CollectorGUI:
             text="Model inference",
             bg="#ffffff",
             fg="#202124",
-            font=("Ubuntu", 16, "bold"),
+            font=(self.ui_font, 16, "bold"),
             anchor="w",
         ).pack(fill="x", padx=18, pady=(14, 2))
         tk.Label(
@@ -1319,7 +1347,7 @@ class CollectorGUI:
             text="Run the RTC robot client with the current CAN and camera mapping.",
             bg="#ffffff",
             fg="#68707d",
-            font=("Ubuntu", 10),
+            font=(self.ui_font, 10),
             anchor="w",
         ).pack(fill="x", padx=18, pady=(0, 14))
 
@@ -1469,7 +1497,7 @@ class CollectorGUI:
         ttk.Label(
             action,
             textvariable=self.inference_status_var,
-            font=("Ubuntu", 11, "bold"),
+            font=(self.ui_font, 11, "bold"),
         ).grid(row=1, column=0, sticky="w", pady=(12, 2))
         ttk.Label(action, textvariable=self.inference_pid_var, foreground="#68707d").grid(
             row=1, column=0, sticky="e", pady=(12, 2)
@@ -1487,6 +1515,23 @@ class CollectorGUI:
             pady=8,
         )
         self.inference_log_widget.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        frame.pack_forget()
+
+    def _data_process_roots(self) -> tuple[pathlib.Path, ...]:
+        """Return read-only roots visible to the Data process page."""
+        project_root = pathlib.Path(__file__).resolve().parent
+        dataset_root = pathlib.Path(self.out_var.get()).expanduser()
+        if not dataset_root.is_absolute():
+            dataset_root = project_root / dataset_root
+        return (project_root / "deployment_runs", dataset_root)
+
+    def _build_data_process_mode_ui(self) -> None:
+        frame = ttk.Frame(self.root)
+        self.data_process_frame = frame
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self.data_process_panel = DataProcessPanel(frame, self._data_process_roots)
+        self.data_process_panel.grid(row=0, column=0, sticky="nsew")
         frame.pack_forget()
 
     def _set_arm_mode_from_display(self, value: str) -> None:
@@ -1628,7 +1673,7 @@ class CollectorGUI:
         return process is not None and process.poll() is None
 
     def set_app_mode(self, mode: str) -> None:
-        if mode not in {"collection", "inference"} or mode == self.app_mode:
+        if mode not in {"collection", "inference", "data_process"} or mode == self.app_mode:
             return
         if self.recording:
             messagebox.showwarning("Mode locked", "Stop and save the current episode first.")
@@ -1642,26 +1687,46 @@ class CollectorGUI:
                 "Disconnect collection devices before starting model inference.",
             )
             return
+        if mode == "data_process" and self.piper is not None:
+            messagebox.showwarning(
+                "Mode locked",
+                "Disconnect collection devices before opening Data process.",
+            )
+            return
         self.app_mode = mode
         if mode == "collection":
             self.inference_mode_frame.pack_forget()
+            self.data_process_frame.pack_forget()
             self.collection_mode_frame.pack(fill="both", expand=True)
+        elif mode == "inference":
+            self.collection_mode_frame.pack_forget()
+            self.data_process_frame.pack_forget()
+            self.inference_mode_frame.pack(fill="both", expand=True)
         else:
             self.collection_mode_frame.pack_forget()
-            self.inference_mode_frame.pack(fill="both", expand=True)
+            self.inference_mode_frame.pack_forget()
+            self.data_process_frame.pack(fill="both", expand=True)
+            if self.data_process_panel is not None:
+                self.data_process_panel.refresh_sources()
         self._update_mode_controls()
 
     def _update_mode_controls(self) -> None:
         running = self._inference_running()
         collection_active = self.app_mode == "collection"
+        inference_active = self.app_mode == "inference"
+        data_process_active = self.app_mode == "data_process"
         if hasattr(self, "collection_mode_button"):
             self.collection_mode_button.configure(
                 bg="#ffffff" if collection_active else "#44517e",
                 fg="#25315b" if collection_active else "#ffffff",
             )
             self.inference_mode_button.configure(
-                bg="#ffffff" if not collection_active else "#44517e",
-                fg="#25315b" if not collection_active else "#ffffff",
+                bg="#ffffff" if inference_active else "#44517e",
+                fg="#25315b" if inference_active else "#ffffff",
+            )
+            self.data_process_button.configure(
+                bg="#ffffff" if data_process_active else "#44517e",
+                fg="#25315b" if data_process_active else "#ffffff",
             )
         if self.inference_start_button is not None:
             self.inference_start_button.configure(state="disabled" if running else "normal")
@@ -2968,7 +3033,7 @@ class CollectorGUI:
         log_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        log = tk.Text(log_frame, wrap="word", font=("Ubuntu Mono", 10), state="disabled")
+        log = tk.Text(log_frame, wrap="word", font=(self.ui_font, 10), state="disabled")
         log.grid(row=0, column=0, sticky="nsew")
         log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=log.yview)
         log_scroll.grid(row=0, column=1, sticky="ns")

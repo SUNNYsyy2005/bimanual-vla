@@ -28,12 +28,14 @@ from queue import Full, Queue
 import threading
 import time
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
 
 LOGGER = logging.getLogger(__name__)
 RECORDING_VERSION = 1
+RECORDING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 _STOP = object()
@@ -75,7 +77,7 @@ class DeploymentRunRecorder:
 
     The default layout is::
 
-        deployment_runs/<UTC timestamp>_<pid>/
+        deployment_runs/<Beijing timestamp>_<pid>/
           metadata.json
           trajectory.npz
           trajectory.jsonl
@@ -136,7 +138,12 @@ class DeploymentRunRecorder:
         if self.is_active:
             raise RuntimeError("deployment recorder is already active")
         self.root.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        started_at_utc = datetime.now(timezone.utc)
+        started_at_local = started_at_utc.astimezone(RECORDING_TIMEZONE)
+        # Use an explicit UTC offset in the directory name so it is readable
+        # locally without pretending that the timestamp is UTC (the old format
+        # ended in ``Z`` and was easy to misread as Beijing time).
+        stamp = started_at_local.strftime("%Y%m%dT%H%M%S.%f%z")
         run_dir = self.root / f"{stamp}_{os.getpid()}"
         run_dir.mkdir(parents=True, exist_ok=False)
         (run_dir / "model_commands").mkdir()
@@ -146,8 +153,10 @@ class DeploymentRunRecorder:
         self.run_dir = run_dir
         self._metadata = {
             "recording_version": RECORDING_VERSION,
-            "started_at": time.time(),
-            "started_at_utc": datetime.now(timezone.utc).isoformat(),
+            "started_at": started_at_utc.timestamp(),
+            "started_at_utc": started_at_utc.isoformat(),
+            "started_at_local": started_at_local.isoformat(),
+            "directory_timezone": "Asia/Shanghai",
             "video_nominal_fps": self.video_fps,
             "video_timestamp_index": "videos/timestamps.jsonl",
             **_json_safe(dict(metadata or {})),

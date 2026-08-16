@@ -19,6 +19,7 @@ class DeploymentRunRecorderTest(unittest.TestCase):
             recorder = DeploymentRunRecorder(tmp, video_fps=4.0)
             run_dir = recorder.start({"instruction": "test task"})
             assert run_dir is not None
+            self.assertRegex(run_dir.name, r"^\d{8}T\d{6}\.\d{6}\+0800_\d+$")
 
             image = np.zeros((3, 32, 32), dtype=np.uint8)
             image[0, 4:12, 4:12] = 255
@@ -103,6 +104,9 @@ class DeploymentRunRecorderTest(unittest.TestCase):
             video_path = run_dir / frame_record["storage"]
             self.assertTrue(video_path.exists())
             self.assertTrue((run_dir / "metadata.json").exists())
+            metadata = json.loads((run_dir / "metadata.json").read_text())
+            self.assertEqual(metadata["directory_timezone"], "Asia/Shanghai")
+            self.assertIn("+08:00", metadata["started_at_local"])
 
             capture = cv2.VideoCapture(str(video_path))
             try:
