@@ -4664,6 +4664,14 @@ def run(args: argparse.Namespace) -> None:
         monitoring.close(reason="stopped")
 
 
+# RTC is the canonical deployment entrypoint after the GitHub merge.  Keep the
+# historical module and CLI name import-compatible, while the GUI and new
+# scripts can call rtc_client.py directly.
+from rtc_client import run_rtc_client
+
+run = run_rtc_client
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default=os.environ.get("BIMANUAL_VLA_POLICY_HOST", DEFAULT_POLICY_HOST))

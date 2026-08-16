@@ -321,13 +321,17 @@ unset BIMANUAL_VLA_SERVER_TOKEN
 顶部的 `Data collection` 和 `Model inference` 用于切换工作模式。两种模式互斥：
 采集设备连接后不能启动推理，推理进程运行时也不能连接采集设备、修改设备配置或交换腕部相机。
 
-推理页对应 `robot_observation_bridge.py`。Policy host、port、推理频率、Arm mode、Arm side
+推理页默认启动 `rtc_client.py`。Policy host、port、推理频率、Arm mode、Arm side
 和 Instruction 都可以在页面修改；CAN 与三路相机沿用 `Device settings...` 中的当前配置。
 `Activate CAN` 会同时激活当前配置的左、右 CAN 接口。启动前确认两个接口均为 `UP` 并有反馈。
 如果左右腕部画面对应反了，点击 `Swap left/right wrist cameras`；推理运行中确认重启后，新的映射才会传给桥接器。
 
-`Allow execution` 默认开启。开启只表示允许本地桥接器在 Dashboard 授权和自身安全检查均通过时执行动作，
-不会绕过服务器授权、反馈新鲜度、限位或工作空间检查。关闭时桥接器只观察和请求推理，不发送机器人动作。
+`Allow execution` 默认开启。开启只表示允许本地 RTC 客户端在 Dashboard 授权和自身安全检查均通过时执行动作，
+不会绕过服务器授权、反馈新鲜度、限位或工作空间检查。关闭时客户端只观察和请求推理，不发送机器人动作。
+
+`Model-side RTC` 默认开启。它会通过 `rtc_client.py` 将上一 action chunk 的未执行前缀和延迟信息
+传给服务端，由服务端在 flow-matching denoising 阶段做 Real-Time Chunking；这不是客户端简单插值。
+如果当前 Policy 服务没有发布 RTC metadata，可以关闭该选项使用兼容模式。
 
 停止推理会先向桥接器发送 `SIGINT`，等待其正常清理；页面下方日志会显示桥接器输出和退出码。
 

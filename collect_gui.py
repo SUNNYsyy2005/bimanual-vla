@@ -491,6 +491,7 @@ def build_inference_bridge_command(
     instruction: str,
     allow_execution: bool,
     camera_preview: bool = False,
+    rtc_enabled: bool = True,
 ) -> list[str]:
     """Build the local robot-observation bridge command without shell quoting."""
     if not host.strip():
@@ -551,6 +552,7 @@ def build_inference_bridge_command(
         command.append("--camera-preview")
     if allow_execution:
         command.append("--allow-execution")
+    command.append("--rtc-enabled" if rtc_enabled else "--no-rtc-enabled")
     return command
 
 
@@ -806,6 +808,9 @@ class CollectorGUI:
         )
         self.inference_camera_preview_var = tk.BooleanVar(
             value=bool(self.gui_preferences.get("inference_camera_preview", False))
+        )
+        self.inference_rtc_enabled_var = tk.BooleanVar(
+            value=bool(self.gui_preferences.get("inference_rtc_enabled", True))
         )
         self.inference_status_var = tk.StringVar(value="Inference idle")
         self.inference_pid_var = tk.StringVar(value="No inference process")
@@ -1311,7 +1316,7 @@ class CollectorGUI:
         ).pack(fill="x", padx=18, pady=(14, 2))
         tk.Label(
             intro,
-            text="Run robot_observation_bridge with the current CAN and camera mapping.",
+            text="Run the RTC robot client with the current CAN and camera mapping.",
             bg="#ffffff",
             fg="#68707d",
             font=("Ubuntu", 10),
@@ -1390,6 +1395,12 @@ class CollectorGUI:
             options,
             text="Camera preview",
             variable=self.inference_camera_preview_var,
+        ).pack(side="left", padx=(18, 0))
+        ttk.Checkbutton(
+            options,
+            text="Model-side RTC",
+            variable=self.inference_rtc_enabled_var,
+            takefocus=False,
         ).pack(side="left", padx=(18, 0))
 
         devices = ttk.LabelFrame(frame, text="Devices", padding=14)
@@ -1755,6 +1766,7 @@ class CollectorGUI:
             "inference_hz": self.inference_hz_var.get().strip(),
             "inference_allow_execution": bool(self.inference_allow_execution_var.get()),
             "inference_camera_preview": bool(self.inference_camera_preview_var.get()),
+            "inference_rtc_enabled": bool(self.inference_rtc_enabled_var.get()),
             "left_wrist_device": self.left_wrist_var.get().strip(),
             "right_wrist_device": self.right_wrist_var.get().strip(),
             "swap_wrist_cameras": bool(self.swap_wrist_cameras_var.get()),
@@ -2267,7 +2279,7 @@ class CollectorGUI:
             raise ValueError("Policy port and inference rate must be numeric") from exc
         command = build_inference_bridge_command(
             python_executable=sys.executable,
-            script_path=pathlib.Path(__file__).with_name("robot_observation_bridge.py"),
+            script_path=pathlib.Path(__file__).with_name("rtc_client.py"),
             host=self.inference_host_var.get(),
             port=port,
             hz=hz,
@@ -2283,6 +2295,7 @@ class CollectorGUI:
             instruction=self.instruction_var.get(),
             allow_execution=bool(self.inference_allow_execution_var.get()),
             camera_preview=bool(self.inference_camera_preview_var.get()),
+            rtc_enabled=bool(self.inference_rtc_enabled_var.get()),
         )
         return command, f"{self.inference_host_var.get().strip()}:{port} @ {hz:g} Hz"
 

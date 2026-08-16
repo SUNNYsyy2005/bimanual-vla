@@ -239,11 +239,17 @@ class InferenceCommandTest(unittest.TestCase):
     def test_bimanual_command_defaults_to_execution_enabled(self):
         command = self._command()
         self.assertIn("--allow-execution", command)
+        self.assertIn("--rtc-enabled", command)
         self.assertEqual(command[command.index("--left-can") + 1], "can0")
         self.assertEqual(command[command.index("--right-can") + 1], "can1")
 
     def test_execution_flag_can_be_disabled(self):
         self.assertNotIn("--allow-execution", self._command(allow_execution=False))
+
+    def test_rtc_can_be_disabled(self):
+        command = self._command(rtc_enabled=False)
+        self.assertIn("--no-rtc-enabled", command)
+        self.assertNotIn("--rtc-enabled", command)
 
     def test_bimanual_rejects_duplicate_devices(self):
         with self.assertRaises(ValueError):
