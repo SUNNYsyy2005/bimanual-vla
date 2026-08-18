@@ -2,10 +2,11 @@
 """Model-side Real-Time Chunking (RTC) for the OpenPI flow-matching policy.
 
 RTC is not a client-side action interpolation.  During flow-matching denoising,
-this module guides the new chunk toward the still-unexecuted prefix of the
-previous normalized chunk.  The guide is applied through the Jacobian of the
-predicted clean action, so the model itself resolves inference latency before
-the action chunk is unnormalized and sent back to the robot.
+this module guides the new chunk toward the still-unexecuted physical targets
+of the previous chunk.  Origin-dependent joint deltas are re-encoded around
+the current observation before the guide is applied through the Jacobian of
+the predicted clean action, so the model itself resolves inference latency
+before the action chunk is unnormalized and sent back to the robot.
 
 The repository's OpenPI checkout is kept external by deployment policy.  The
 runtime adapter below patches its PyTorch ``PI0Pytorch`` or JAX/NNX ``Pi0``
@@ -34,6 +35,8 @@ class RTCConfig:
     execution_horizon: int = 8
     max_guidance_weight: float = 5.0
     prefix_attention_schedule: str = "linear"
+    physical_action_dim: int | None = None
+    reanchor_action_mask: tuple[bool, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.execution_horizon <= 0:
@@ -44,6 +47,111 @@ class RTCConfig:
             raise ValueError(
                 "RTC prefix_attention_schedule must be one of zeros, ones, linear, exp"
             )
+        if self.physical_action_dim is not None and self.physical_action_dim <= 0:
+            raise ValueError("RTC physical_action_dim must be positive when provided")
+        if self.reanchor_action_mask is not None:
+            mask = tuple(bool(value) for value in self.reanchor_action_mask)
+            if not mask or not any(mask):
+                raise ValueError("RTC reanchor_action_mask must select at least one action dimension")
+            object.__setattr__(self, "reanchor_action_mask", mask)
+            if self.physical_action_dim is None:
+                object.__setattr__(self, "physical_action_dim", len(mask))
+            elif len(mask) != self.physical_action_dim:
+                raise ValueError(
+                    "RTC reanchor_action_mask length must equal physical_action_dim"
+                )
+
+
+def _physical_action_mask_numpy(config: RTCConfig, action_dim: int) -> np.ndarray:
+    """Return the model-head mask corresponding to executable robot actions."""
+    physical_action_dim = config.physical_action_dim
+    if physical_action_dim is None:
+        physical_action_dim = action_dim
+    if physical_action_dim > action_dim:
+        raise ValueError(
+            f"RTC physical_action_dim={physical_action_dim} exceeds model action_dim={action_dim}"
+        )
+    mask = np.zeros(action_dim, dtype=np.float32)
+    mask[:physical_action_dim] = 1.0
+    return mask
+
+
+def _reanchor_normalized_actions(
+    policy: Any,
+    observation: dict[str, Any],
+    previous_normalized: np.ndarray,
+    previous_absolute: np.ndarray,
+    reanchor_action_mask: tuple[bool, ...],
+) -> np.ndarray:
+    """Re-encode absolute overlap targets around the current observation state.
+
+    The policy input transform is the source of truth for DeltaActions,
+    normalization, and model-head padding.  Only origin-dependent dimensions
+    are copied from the re-encoded chunk; grippers and padded dimensions retain
+    their previous normalized values.
+    """
+    previous_normalized = np.asarray(previous_normalized, dtype=np.float32)
+    previous_absolute = np.asarray(previous_absolute, dtype=np.float32)
+    if previous_normalized.ndim != 2 or previous_absolute.ndim != 2:
+        raise ValueError("RTC previous action chunks must both have shape (T,A)")
+    if previous_normalized.shape[0] != previous_absolute.shape[0]:
+        raise ValueError(
+            "RTC normalized and absolute overlap chunks must have the same length"
+        )
+
+    physical_action_dim = len(reanchor_action_mask)
+    if previous_absolute.shape[1] < physical_action_dim:
+        raise ValueError(
+            "RTC absolute action dimension is smaller than the re-anchor mask: "
+            f"absolute={previous_absolute.shape[1]} mask={physical_action_dim}"
+        )
+    if previous_normalized.shape[1] < physical_action_dim:
+        raise ValueError(
+            "RTC normalized action dimension is smaller than the re-anchor mask: "
+            f"normalized={previous_normalized.shape[1]} mask={physical_action_dim}"
+        )
+
+    input_transform = getattr(policy, "_input_transform", None)
+    if not callable(input_transform):
+        raise TypeError("OpenPI Policy does not expose its input transform for RTC re-anchoring")
+
+    rtc_input = dict(observation)
+    rtc_input["actions"] = previous_absolute.copy()
+    transformed = input_transform(rtc_input)
+    if not isinstance(transformed, dict) or "actions" not in transformed:
+        raise ValueError("OpenPI input transform did not return encoded RTC actions")
+    encoded = np.asarray(transformed["actions"], dtype=np.float32)
+    if encoded.ndim != 2 or encoded.shape != previous_normalized.shape:
+        raise ValueError(
+            "RTC re-encoded action shape does not match normalized model actions: "
+            f"encoded={encoded.shape} normalized={previous_normalized.shape}"
+        )
+    if not np.all(np.isfinite(encoded)):
+        raise ValueError("RTC re-encoded actions contain NaN or Inf")
+
+    model_mask = np.zeros(previous_normalized.shape[1], dtype=bool)
+    model_mask[:physical_action_dim] = np.asarray(reanchor_action_mask, dtype=bool)
+    reanchored = previous_normalized.copy()
+    reanchored[:, model_mask] = encoded[:, model_mask]
+    return reanchored
+
+
+def _masked_l2(
+    lhs: np.ndarray | None,
+    rhs: np.ndarray | None,
+    mask: tuple[bool, ...] | None,
+) -> float | None:
+    """Return a finite masked L2 distance for RTC boundary telemetry."""
+    if lhs is None or rhs is None or mask is None:
+        return None
+    left = np.asarray(lhs, dtype=np.float32).reshape(-1)
+    right = np.asarray(rhs, dtype=np.float32).reshape(-1)
+    dims = len(mask)
+    if left.size < dims or right.size < dims:
+        return None
+    selected = np.asarray(mask, dtype=bool)
+    distance = float(np.linalg.norm(left[:dims][selected] - right[:dims][selected]))
+    return distance if np.isfinite(distance) else None
 
 
 def _prefix_weights(
@@ -96,6 +204,7 @@ class RTCProcessor:
         time,
         original_denoise_step,
         execution_horizon: int | None = None,
+        previous_left_over_steps: int | None = None,
     ):
         """Return a guided velocity for one reverse-flow denoising step.
 
@@ -137,6 +246,11 @@ class RTCProcessor:
                 f"current={action_dim}"
             )
         previous_length = int(prev_chunk_left_over.shape[1])
+        if previous_left_over_steps is not None:
+            previous_length = max(
+                0,
+                min(int(previous_left_over_steps), previous_length),
+            )
         if prev_chunk_left_over.shape[1] > action_horizon:
             prev_chunk_left_over = prev_chunk_left_over[:, :action_horizon]
             previous_length = action_horizon
@@ -160,6 +274,11 @@ class RTCProcessor:
             dtype=x_t.dtype,
             device=x_t.device,
         ).view(1, action_horizon, 1)
+        action_mask = torch.as_tensor(
+            _physical_action_mask_numpy(self.config, action_dim),
+            dtype=x_t.dtype,
+            device=x_t.device,
+        ).view(1, 1, action_dim)
 
         # This is the key RTC operation.  We need the Jacobian of the predicted
         # clean action x_1(t) with respect to the current noisy sample x_t.
@@ -167,7 +286,7 @@ class RTCProcessor:
         with torch.enable_grad():
             velocity = original_denoise_step(x_t)
             x1_t = x_t - time * velocity
-            error = (prev_chunk_left_over - x1_t) * weights
+            error = (prev_chunk_left_over - x1_t) * weights * action_mask
             correction = torch.autograd.grad(
                 outputs=x1_t,
                 inputs=x_t,
@@ -216,6 +335,7 @@ def _rtc_sample_actions_pytorch(
     prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
     inference_delay = kwargs.get("inference_delay")
     execution_horizon = kwargs.get("execution_horizon")
+    previous_left_over_steps = kwargs.get("previous_left_over_steps")
     bsize = observation.state.shape[0]
     if noise is None:
         actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
@@ -266,6 +386,7 @@ def _rtc_sample_actions_pytorch(
                 time=time,
                 original_denoise_step=denoise,
                 execution_horizon=execution_horizon,
+                previous_left_over_steps=previous_left_over_steps,
             )
         else:
             with torch.no_grad():
@@ -290,20 +411,25 @@ def patch_pytorch_model(model: Any, config: RTCConfig) -> None:
     model.sample_actions = types.MethodType(_rtc_sample_actions_pytorch, model)
 
 
-def _jax_prefix_weights(start: int, end: int, total: int, schedule: str):
-    """Build RTC prefix weights without introducing a data-dependent shape."""
+def _jax_prefix_weights(start: Any, end: Any, total: int, schedule: str):
+    """Build RTC prefix weights with tracer-safe scalar operations."""
     import jax.numpy as jnp
 
-    start = max(0, min(int(start), int(end), int(total)))
-    end = max(start, min(int(end), int(total)))
+    start = jnp.asarray(start, dtype=jnp.int32)
+    end = jnp.asarray(end, dtype=jnp.int32)
+    total_value = jnp.asarray(total, dtype=jnp.int32)
+    end = jnp.clip(end, 0, total_value)
+    start = jnp.clip(start, 0, end)
     positions = jnp.arange(total)
     if schedule == "zeros":
         return (positions < start).astype(jnp.float32)
     if schedule == "ones":
         return (positions < end).astype(jnp.float32)
-    span = max(1, end - start)
+    span = jnp.maximum(jnp.asarray(1, dtype=jnp.int32), end - start)
     # Match the PyTorch implementation's open interval linspace(1, 0).
-    middle = (end - positions) / float(span + 1)
+    middle = (end.astype(jnp.float32) - positions.astype(jnp.float32)) / (
+        span.astype(jnp.float32) + 1.0
+    )
     middle = jnp.clip(middle, 0.0, 1.0)
     if schedule == "exp":
         middle = middle * jnp.expm1(middle) / (np.e - 1.0)
@@ -320,6 +446,7 @@ def _rtc_sample_actions_jax(
     prev_chunk_left_over=None,
     inference_delay=None,
     execution_horizon=None,
+    previous_left_over_steps=None,
 ):
     """JAX counterpart of the RTC flow-matching denoiser hook.
 
@@ -363,6 +490,16 @@ def _rtc_sample_actions_jax(
         elif previous.shape[0] != batch_size:
             raise ValueError("RTC previous chunk batch dimension does not match current batch")
         previous_length = int(previous.shape[1])
+        if previous_left_over_steps is not None:
+            previous_steps = jnp.clip(
+                jnp.asarray(previous_left_over_steps, dtype=jnp.int32),
+                0,
+                min(self.action_horizon, previous_length),
+            )
+        else:
+            previous_steps = jnp.asarray(
+                min(self.action_horizon, previous_length), dtype=jnp.int32
+            )
         if previous.shape[1] > self.action_horizon:
             previous = previous[:, : self.action_horizon]
             previous_length = self.action_horizon
@@ -371,26 +508,42 @@ def _rtc_sample_actions_jax(
                 previous,
                 ((0, 0), (0, self.action_horizon - previous.shape[1]), (0, 0)),
             )
-        delay = max(0, int(inference_delay or 0))
-        horizon = max(
-            1,
-            min(
-                int(execution_horizon or self.action_horizon),
-                self.action_horizon,
-                previous_length,
-            ),
+        delay = jnp.asarray(
+            0 if inference_delay is None else inference_delay,
+            dtype=jnp.int32,
         )
+        delay = jnp.maximum(delay, 0)
+        requested_horizon = jnp.asarray(
+            self.action_horizon if execution_horizon is None else execution_horizon,
+            dtype=jnp.int32,
+        )
+        horizon = jnp.clip(
+            requested_horizon,
+            1,
+            min(self.action_horizon, previous_length),
+        )
+        horizon = jnp.maximum(1, jnp.minimum(horizon, previous_steps))
         weights = _jax_prefix_weights(
             delay,
             horizon,
             self.action_horizon,
             getattr(self, "_rtc_prefix_attention_schedule", "linear"),
         ).reshape(1, self.action_horizon, 1).astype(noise.dtype)
+        physical_action_dim = getattr(self, "_rtc_physical_action_dim", None)
+        if physical_action_dim is None:
+            physical_action_dim = self.action_dim
+        if physical_action_dim > self.action_dim:
+            raise ValueError(
+                f"RTC physical_action_dim={physical_action_dim} exceeds "
+                f"model action_dim={self.action_dim}"
+            )
+        action_mask = (
+            jnp.arange(self.action_dim) < int(physical_action_dim)
+        ).reshape(1, 1, self.action_dim).astype(noise.dtype)
     else:
         previous = None
         weights = None
-        delay = 0
-        horizon = int(execution_horizon or self.action_horizon)
+        action_mask = None
 
     def denoise(x_t, time):
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
@@ -424,7 +577,7 @@ def _rtc_sample_actions_jax(
                 return x - time * velocity, velocity
 
             x1_t, pullback, v_t = jax.vjp(clean_action, x_t, has_aux=True)
-            error = (previous - x1_t) * weights
+            error = (previous - x1_t) * weights * action_mask
             correction = pullback(error)[0]
             tau = 1.0 - time
             eps = jnp.finfo(x_t.dtype).eps
@@ -460,6 +613,7 @@ def patch_jax_model(model: Any, config: RTCConfig) -> None:
         raise TypeError("RTC requires an OpenPI Pi0 JAX/NNX flow-matching model")
     model._rtc_max_guidance_weight = float(config.max_guidance_weight)
     model._rtc_prefix_attention_schedule = str(config.prefix_attention_schedule)
+    model._rtc_physical_action_dim = config.physical_action_dim
     model._rtc_original_sample_actions = getattr(model, "sample_actions", None)
     model.sample_actions = types.MethodType(_rtc_sample_actions_jax, model)
 
@@ -467,6 +621,8 @@ def patch_jax_model(model: Any, config: RTCConfig) -> None:
 @dataclass
 class _RTCSession:
     normalized_actions: np.ndarray | None = None
+    absolute_actions: np.ndarray | None = None
+    origin_state: np.ndarray | None = None
     generation: int | None = None
 
 
@@ -539,9 +695,29 @@ class RTCAwarePolicy:
         except (TypeError, ValueError):
             client_previous_generation = None
 
+        requested_generation = rtc.get("inference_generation")
+        try:
+            requested_generation = (
+                None if requested_generation is None else int(requested_generation)
+            )
+        except (TypeError, ValueError):
+            requested_generation = None
+
+        old_generation = None
+        old_origin_state = None
+        current_origin_state = None
+        expected_absolute_first = None
+        reanchored_first = None
+        reanchored = False
+        reanchor_error = None
+
         with self._lock:
             session = self._sessions.setdefault(session_id, _RTCSession())
             previous = session.normalized_actions
+            previous_absolute = session.absolute_actions
+            old_generation = session.generation
+            if session.origin_state is not None:
+                old_origin_state = session.origin_state.copy()
             previous_left_over = None
             generation_matches = (
                 previous is not None
@@ -551,19 +727,62 @@ class RTCAwarePolicy:
             if enabled and generation_matches:
                 offset = min(offset, len(previous))
                 previous_left_over = previous[offset:].copy()
+                if previous_left_over.size and self.config.reanchor_action_mask is not None:
+                    try:
+                        if previous_absolute is None:
+                            raise ValueError("previous absolute action chunk is unavailable")
+                        if len(previous_absolute) != len(previous):
+                            raise ValueError(
+                                "previous normalized and absolute action chunks have different lengths"
+                            )
+                        remaining_absolute = previous_absolute[offset:].copy()
+                        if len(remaining_absolute) != len(previous_left_over):
+                            raise ValueError("previous absolute overlap does not match RTC offset")
+                        previous_left_over = _reanchor_normalized_actions(
+                            self.policy,
+                            observation,
+                            previous_left_over,
+                            remaining_absolute,
+                            self.config.reanchor_action_mask,
+                        )
+                        reanchored = True
+                        expected_absolute_first = remaining_absolute[0].copy()
+                        reanchored_first = previous_left_over[0].copy()
+                    except Exception as exc:
+                        # Reusing the old-origin normalized prefix is unsafe for
+                        # chunk-origin actions.  Fail this request open (normal
+                        # inference without RTC guidance) instead.
+                        reanchor_error = f"{type(exc).__name__}: {exc}"
+                        logger.warning(
+                            "RTC re-anchoring disabled for session %s generation %s: %s",
+                            session_id,
+                            client_previous_generation,
+                            reanchor_error,
+                        )
+                        previous_left_over = None
             previous_steps = 0 if previous_left_over is None else len(previous_left_over)
+            if previous_left_over is not None and previous_steps:
+                # Keep the JAX sampler's input shape fixed.  Passing a sliced
+                # chunk directly would trigger a new jit compilation whenever
+                # the client offset changes.  The explicit step count keeps
+                # padded rows out of RTC guidance.
+                padded_previous = np.zeros_like(previous)
+                padded_previous[:previous_steps] = previous_left_over
+                previous_left_over = padded_previous
 
             sample_kwargs = dict(getattr(self.policy, "_sample_kwargs", {}) or {})
             if enabled and previous_left_over is not None and previous_steps:
                 sample_kwargs.update(
                     {
                         "prev_chunk_left_over": previous_left_over,
+                        "previous_left_over_steps": previous_steps,
                         "inference_delay": delay,
                         "execution_horizon": execution_horizon,
                     }
                 )
             else:
                 sample_kwargs.pop("prev_chunk_left_over", None)
+                sample_kwargs.pop("previous_left_over_steps", None)
                 sample_kwargs.pop("inference_delay", None)
                 sample_kwargs.pop("execution_horizon", None)
             old_kwargs = getattr(self.policy, "_sample_kwargs", {})
@@ -581,19 +800,106 @@ class RTCAwarePolicy:
                 normalized = normalized[0]
             if normalized.ndim != 2 or not np.all(np.isfinite(normalized)):
                 raise RuntimeError(f"RTC normalized action chunk is invalid: {normalized.shape}")
+
+            absolute = np.asarray(result.get("actions"), dtype=np.float32)
+            if absolute.ndim == 3 and absolute.shape[0] == 1:
+                absolute = absolute[0]
+            absolute_valid = (
+                absolute.ndim == 2
+                and absolute.shape[0] == normalized.shape[0]
+                and np.all(np.isfinite(absolute))
+            )
+            if self.config.reanchor_action_mask is not None:
+                required_dim = len(self.config.reanchor_action_mask)
+                absolute_valid = absolute_valid and absolute.shape[1] >= required_dim
+                if not absolute_valid:
+                    raise RuntimeError(
+                        "RTC absolute action chunk is invalid for re-anchoring: "
+                        f"absolute={absolute.shape} normalized={normalized.shape} "
+                        f"required_dim={required_dim}"
+                    )
+
+            raw_origin_state = observation.get("state")
+            if raw_origin_state is not None:
+                candidate_origin = np.asarray(raw_origin_state, dtype=np.float32)
+                if candidate_origin.ndim == 1 and np.all(np.isfinite(candidate_origin)):
+                    current_origin_state = candidate_origin.copy()
+
             session.normalized_actions = normalized.copy()
-            generation = rtc.get("inference_generation")
-            session.generation = int(generation) if generation is not None else None
+            session.absolute_actions = absolute.copy() if absolute_valid else None
+            session.origin_state = (
+                current_origin_state.copy() if current_origin_state is not None else None
+            )
+
+            # Keep the local RTC generation contract backward compatible.  The
+            # robot client normally sends ``inference_generation`` in the
+            # request, but older/alternate policy wrappers may return the
+            # generation in the inference result instead.  Losing that value
+            # silently disables prefix reuse on the next request.
+            result_generation = result.get("inference_generation")
+            result_rtc = result.get("rtc")
+            if result_generation is None and isinstance(result_rtc, dict):
+                result_generation = result_rtc.get("inference_generation")
+            if result_generation is None:
+                result_generation = requested_generation
+            try:
+                session.generation = (
+                    None if result_generation is None else int(result_generation)
+                )
+            except (TypeError, ValueError):
+                session.generation = requested_generation
+
+        new_absolute_first = None
+        result_actions = np.asarray(result.get("actions"), dtype=np.float32)
+        if result_actions.ndim == 3 and result_actions.shape[0] == 1:
+            result_actions = result_actions[0]
+        if result_actions.ndim == 2 and len(result_actions):
+            new_absolute_first = result_actions[0].copy()
+
+        origin_shift_l2 = _masked_l2(
+            old_origin_state,
+            current_origin_state,
+            self.config.reanchor_action_mask,
+        )
+        position_boundary_jump_l2 = _masked_l2(
+            expected_absolute_first,
+            new_absolute_first,
+            self.config.reanchor_action_mask,
+        )
 
         result["rtc"] = {
             "enabled": bool(enabled and previous_left_over is not None and previous_steps),
             "algorithm": "real_time_chunking_prefix_guidance",
+            "reanchored": reanchored,
+            "reanchor_error": reanchor_error,
+            "physical_action_dim": self.config.physical_action_dim,
+            "old_generation": old_generation,
+            "new_generation": requested_generation,
             "inference_delay_steps": delay,
             "previous_chunk_offset_steps": offset,
             "previous_chunk_left_over_steps": previous_steps,
             "execution_horizon": execution_horizon,
             "prefix_attention_schedule": self.config.prefix_attention_schedule,
             "max_guidance_weight": self.config.max_guidance_weight,
+            "old_origin_state": (
+                old_origin_state.tolist() if old_origin_state is not None else None
+            ),
+            "new_origin_state": (
+                current_origin_state.tolist() if current_origin_state is not None else None
+            ),
+            "origin_shift_l2": origin_shift_l2,
+            "old_absolute_overlap_target": (
+                expected_absolute_first.tolist()
+                if expected_absolute_first is not None
+                else None
+            ),
+            "reanchored_normalized_first_target": (
+                reanchored_first.tolist() if reanchored_first is not None else None
+            ),
+            "new_absolute_first_target": (
+                new_absolute_first.tolist() if new_absolute_first is not None else None
+            ),
+            "position_boundary_jump_l2": position_boundary_jump_l2,
         }
         return result
 
