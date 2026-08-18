@@ -2111,6 +2111,28 @@ class ExecutionController:
         self.last_actuator_command: dict[str, Any] | None = None
         self.last_command_feedback: dict[str, Any] | None = None
         self._pending_feedback_command: dict[str, Any] | None = None
+        self.tracking_lag_threshold_rad = float(
+            getattr(
+                args,
+                "tracking_lag_threshold_rad",
+                DEFAULT_TRACKING_LAG_THRESHOLD_RAD,
+            )
+        )
+        self.tracking_lag_confirm_cycles = int(
+            getattr(
+                args,
+                "tracking_lag_confirm_cycles",
+                DEFAULT_TRACKING_LAG_CONFIRM_CYCLES,
+            )
+        )
+        self.tracking_lag_consecutive_cycles = 0
+        self.tracking_lag_active = False
+        self.tracking_lag_started_at: float | None = None
+        self.tracking_lag_required_after_monotonic: float | None = None
+        self.tracking_lag_peak_error_rad = 0.0
+        self.tracking_lag_trigger_count = 0
+        self.tracking_lag_trigger_generation: int | None = None
+        self.tracking_lag_recovered_generation: int | None = None
         self.arm_hold_targets: dict[str, np.ndarray] = {}
         self.arm_hold_gripper_targets: dict[str, float] = {}
         self.arm_hold_started_at: dict[str, float] = {}
@@ -2183,8 +2205,28 @@ class ExecutionController:
         self.gripper_confirm_steps = int(
             getattr(self.args, "gripper_confirm_steps", DEFAULT_GRIPPER_CONFIRM_STEPS)
         )
+        self.tracking_lag_threshold_rad = float(
+            getattr(
+                self.args,
+                "tracking_lag_threshold_rad",
+                DEFAULT_TRACKING_LAG_THRESHOLD_RAD,
+            )
+        )
+        self.tracking_lag_confirm_cycles = int(
+            getattr(
+                self.args,
+                "tracking_lag_confirm_cycles",
+                DEFAULT_TRACKING_LAG_CONFIRM_CYCLES,
+            )
+        )
         self.expected_action_horizon = int(protocol.action_horizon)
         self.pending_actions.clear()
+        self.tracking_lag_consecutive_cycles = 0
+        self.tracking_lag_active = False
+        self.tracking_lag_started_at = None
+        self.tracking_lag_required_after_monotonic = None
+        self.tracking_lag_peak_error_rad = 0.0
+        self.tracking_lag_trigger_generation = None
         if self.arm_hold_targets:
             # A policy reconnect must not cancel a physical measured-pose hold.
             # Keep the enable barrier and require a fresh result on the new link.
@@ -2208,12 +2250,16 @@ class ExecutionController:
             self.estimated_actuator_delay_s,
             self.latency_skip_compensation_steps,
         )
-        if not math.isclose(self.policy_action_hz, self.control_hz):
-            logging.warning(
-                "Policy action rate %.3g Hz differs from control rate %.3g Hz; "
-                "control remains independently scheduled while timed targets use policy action Hz",
-                self.policy_action_hz,
-                self.control_hz,
+        if not math.isclose(
+            self.policy_action_hz,
+            self.control_hz,
+            rel_tol=1e-3,
+            abs_tol=1e-3,
+        ):
+            raise ValueError(
+                "control_hz must match policy_action_hz until trajectory resampling is "
+                f"implemented: control={self.control_hz:.6g}Hz "
+                f"policy={self.policy_action_hz:.6g}Hz"
             )
 
     @property
@@ -2313,9 +2359,16 @@ class ExecutionController:
         self.last_transport_generation = int(generation)
         self.last_transport_first_command_generation = None
 
-    def metadata(self) -> dict[str, Any]:
+    def metadata(
+        self, *, rtc_metadata: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
         timing_snapshot_at = time.time()
         timing_snapshot_monotonic = time.monotonic()
+        rtc_snapshot = (
+            self.rtc_request_metadata(None)
+            if rtc_metadata is None
+            else dict(rtc_metadata)
+        )
         # Prefer the target that was actually sent on the most recent 20 Hz
         # control tick. ``last_safe_target`` is the fallback hold target and
         # can legitimately have ``hold=False`` while the controller is already
@@ -2426,7 +2479,7 @@ class ExecutionController:
                 "execution_horizon": self.rtc_execution_horizon,
                 "max_guidance_weight": self.rtc_max_guidance_weight,
                 "prefix_attention_schedule": self.rtc_prefix_attention_schedule,
-                **self.rtc_request_metadata(None),
+                **rtc_snapshot,
             },
             "inference_old_remaining": self.inference_old_remaining,
             "old_remaining": self.inference_old_remaining,
@@ -4791,6 +4844,154 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                             if args.once and accepted:
                                 once_result_accepted = True
 
+                    launch_candidate: tuple[InferenceLaunch, Callable[[], InferenceWorkerResult]] | None = None
+                    if launch_schedule.due(tick_started):
+                        if worker.in_flight:
+                            execution.record_launch_deferred()
+                        elif policy is not None:
+                            camera_selection_started_at = time.time()
+                            camera_selection_started_monotonic = time.monotonic()
+                            try:
+                                frame_set = cameras.read_nearest(
+                                    observation_captured_monotonic
+                                )
+                                generation = execution.allocate_inference_generation()
+                                rtc_snapshot = execution.rtc_request_metadata(protocol)
+                                execution_snapshot = execution.metadata(
+                                    rtc_metadata=rtc_snapshot
+                                )
+                                snapshot = make_observation_snapshot(
+                                    generation=generation,
+                                    raw_delivery_state=delivery_state,
+                                    qpos_m=qpos,
+                                    protocol=protocol,
+                                    captured_at=observation_captured_at,
+                                    captured_monotonic=observation_captured_monotonic,
+                                    frame_set=frame_set,
+                                    rtc_metadata=rtc_snapshot,
+                                    execution_metadata=execution_snapshot,
+                                    executed_plan_command_count=(
+                                        execution.executed_plan_command_count
+                                    ),
+                                    max_image_state_skew_s=float(
+                                        getattr(
+                                            args,
+                                            "max_image_state_skew_s",
+                                            DEFAULT_MAX_IMAGE_STATE_SKEW_S,
+                                        )
+                                    ),
+                                )
+                                camera_selection_finished_at = time.time()
+                                camera_selection_finished_monotonic = time.monotonic()
+                                launch = InferenceLaunch(
+                                    generation=generation,
+                                    captured_at=snapshot.captured_at,
+                                    captured_monotonic=snapshot.captured_monotonic,
+                                    launched_at=camera_selection_finished_at,
+                                    launched_monotonic=camera_selection_finished_monotonic,
+                                    raw_delivery_state=np.array(
+                                        snapshot.raw_delivery_state, copy=True
+                                    ),
+                                    qpos_m=np.array(snapshot.qpos_m, copy=True),
+                                    image_timestamps={
+                                        key: float(value)
+                                        for key, value in snapshot.image_timestamps.items()
+                                    },
+                                    executed_plan_command_count=(
+                                        snapshot.executed_plan_command_count
+                                    ),
+                                    observation_snapshot=snapshot,
+                                )
+
+                                def infer_snapshot(
+                                    *,
+                                    policy_ref=policy,
+                                    protocol_ref=protocol,
+                                    snapshot_ref=snapshot,
+                                    launch_ref=launch,
+                                    camera_started_at=camera_selection_started_at,
+                                    camera_started_monotonic=(
+                                        camera_selection_started_monotonic
+                                    ),
+                                    camera_finished_at=camera_selection_finished_at,
+                                    camera_finished_monotonic=(
+                                        camera_selection_finished_monotonic
+                                    ),
+                                ) -> InferenceWorkerResult:
+                                    observation = build_observation(
+                                        snapshot=snapshot_ref,
+                                        protocol=protocol_ref,
+                                        instruction=args.instruction,
+                                        source_name=source_name,
+                                        args=args,
+                                    )
+                                    request_sent_at = time.time()
+                                    request_sent_monotonic = time.monotonic()
+                                    observation["client_metadata"].update(
+                                        {
+                                            "request_sent_at": request_sent_at,
+                                            "camera_capture_started_at": camera_started_at,
+                                            "camera_capture_finished_at": camera_finished_at,
+                                            "camera_selection_started_monotonic": (
+                                                camera_started_monotonic
+                                            ),
+                                            "camera_selection_finished_monotonic": (
+                                                camera_finished_monotonic
+                                            ),
+                                            "inference_generation": launch_ref.generation,
+                                        }
+                                    )
+                                    result = dict(policy_ref.infer(observation))
+                                    response_received_at = time.time()
+                                    response_received_monotonic = time.monotonic()
+                                    server_timing = result.get("transport_timing")
+                                    server_timing = (
+                                        server_timing
+                                        if isinstance(server_timing, dict)
+                                        else {}
+                                    )
+                                    client_timing = build_client_transport_timing(
+                                        request_sent_at=request_sent_at,
+                                        request_sent_monotonic=request_sent_monotonic,
+                                        response_received_at=response_received_at,
+                                        response_received_monotonic=(
+                                            response_received_monotonic
+                                        ),
+                                        server_timing=server_timing,
+                                        camera_capture_ms=(
+                                            camera_finished_monotonic
+                                            - camera_started_monotonic
+                                        )
+                                        * 1000.0,
+                                        inference_generation=launch_ref.generation,
+                                    )
+                                    return InferenceWorkerResult(
+                                        result=result,
+                                        image_timestamps={
+                                            key: float(value)
+                                            for key, value in snapshot_ref.image_timestamps.items()
+                                        },
+                                        client_timing=client_timing,
+                                    )
+
+                                launch_candidate = (launch, infer_snapshot)
+                            except Exception as exc:
+                                execution.record_launch_deferred()
+                                launch_schedule.next_at = min(
+                                    launch_schedule.next_at,
+                                    tick_started + control_period,
+                                )
+                                monitoring.record(
+                                    "observation_snapshot_error",
+                                    captured_at=observation_captured_at,
+                                    captured_monotonic=observation_captured_monotonic,
+                                    error=repr(exc),
+                                    execution=execution.metadata(),
+                                )
+                                logging.warning(
+                                    "Inference snapshot skipped: %s", exc
+                                )
+
                     # This is the only robot command path and runs every control tick.
                     command_sent = execution.execute_next(
                         delivery_state,
@@ -4864,107 +5065,12 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                         )
                         return
 
-                    if launch_schedule.due(tick_started):
-                        if worker.in_flight:
+                    if launch_candidate is not None:
+                        launch, inference_task = launch_candidate
+                        if worker.launch_callable(inference_task, launch):
+                            execution.record_inference_launch(launch)
+                        else:  # defensive; the control thread owns launch()
                             execution.record_launch_deferred()
-                        elif policy is not None:
-                            # The control thread snapshots the 20 Hz robot state and
-                            # immediately returns to scheduling. Camera I/O, observation
-                            # formatting, transport, and policy inference all run on the
-                            # single worker thread.
-                            captured_at = observation_captured_at
-                            captured_monotonic = observation_captured_monotonic
-                            delivery_anchor = delivery_state.copy()
-                            qpos_anchor = qpos.copy()
-                            execution_metadata = execution.metadata()
-                            generation = execution.allocate_inference_generation()
-                            launch = InferenceLaunch(
-                                generation=generation,
-                                captured_at=captured_at,
-                                captured_monotonic=captured_monotonic,
-                                launched_at=time.time(),
-                                launched_monotonic=time.monotonic(),
-                                raw_delivery_state=delivery_anchor,
-                                qpos_m=qpos_anchor,
-                                image_timestamps={},
-                                executed_plan_command_count=(
-                                    execution.executed_plan_command_count
-                                ),
-                            )
-
-                            def capture_and_infer(
-                                *,
-                                policy_ref=policy,
-                                protocol_ref=protocol,
-                                delivery_ref=delivery_anchor,
-                                qpos_ref=qpos_anchor,
-                                metadata_ref=execution_metadata,
-                                launch_ref=launch,
-                            ) -> InferenceWorkerResult:
-                                camera_started_at = time.time()
-                                camera_started_monotonic = time.monotonic()
-                                images, image_timestamps = cameras.read()
-                                camera_finished_at = time.time()
-                                camera_finished_monotonic = time.monotonic()
-                                observation = build_observation(
-                                    delivery_state=delivery_ref,
-                                    qpos=qpos_ref,
-                                    protocol=protocol_ref,
-                                    images=images,
-                                    image_timestamps=image_timestamps,
-                                    instruction=args.instruction,
-                                    source_name=source_name,
-                                    args=args,
-                                    execution=execution,
-                                    captured_at=launch_ref.captured_at,
-                                    captured_monotonic=launch_ref.captured_monotonic,
-                                    execution_metadata=metadata_ref,
-                                )
-                                request_sent_at = time.time()
-                                request_sent_monotonic = time.monotonic()
-                                observation["client_metadata"].update({
-                                    "request_sent_at": request_sent_at,
-                                    "camera_capture_started_at": camera_started_at,
-                                    "camera_capture_finished_at": camera_finished_at,
-                                    "inference_generation": launch_ref.generation,
-                                })
-                                # Keep the RTC generation in its namespaced
-                                # payload too. The server uses this value to
-                                # match the previous normalized chunk; the
-                                # legacy top-level field is retained for
-                                # transport telemetry compatibility.
-                                observation["client_metadata"].setdefault("rtc", {})[
-                                    "inference_generation"
-                                ] = launch_ref.generation
-                                result = dict(policy_ref.infer(observation))
-                                response_received_at = time.time()
-                                response_received_monotonic = time.monotonic()
-                                server_timing = result.get("transport_timing")
-                                server_timing = server_timing if isinstance(server_timing, dict) else {}
-
-                                client_timing = build_client_transport_timing(
-                                    request_sent_at=request_sent_at,
-                                    request_sent_monotonic=request_sent_monotonic,
-                                    response_received_at=response_received_at,
-                                    response_received_monotonic=response_received_monotonic,
-                                    server_timing=server_timing,
-                                    camera_capture_ms=(camera_finished_monotonic - camera_started_monotonic) * 1000.0,
-                                    inference_generation=launch_ref.generation,
-                                )
-                                return InferenceWorkerResult(
-                                    result=result,
-                                    image_timestamps=image_timestamps,
-                                    client_timing=client_timing,
-                                )
-
-                            if worker.launch_callable(capture_and_infer, launch):
-                                execution.record_inference_launch(launch)
-                            else:  # defensive; the control thread owns launch()
-                                execution.record_launch_deferred()
-                        elif not execution.pending_action_count:
-                            # Reconnect only after the active queue reaches hold/
-                            # underrun; it cannot interrupt a live trajectory.
-                            logging.info("Retrying policy connection after queue underrun")
 
                 # Launch retries happen on the next tick; no synchronous infer call.
             except ExecutionBlocked as exc:
