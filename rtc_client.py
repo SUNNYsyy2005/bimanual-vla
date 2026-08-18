@@ -3579,7 +3579,7 @@ class ExecutionController:
 
         if self.tracking_lag_active:
             barrier = self.tracking_lag_required_after_monotonic
-            if barrier is None or float(launch.captured_monotonic) < barrier:
+            if barrier is None or float(launch.captured_monotonic) <= barrier:
                 return self._reject_result(
                     launch.generation,
                     "discarded inference captured before tracking-lag guard triggered; "
@@ -5238,7 +5238,29 @@ def run_rtc_client(args: argparse.Namespace) -> None:
 
                     if launch_candidate is not None:
                         launch, inference_task = launch_candidate
-                        if worker.launch_callable(inference_task, launch):
+                        lag_barrier = execution.tracking_lag_required_after_monotonic
+                        stale_for_lag_guard = execution.tracking_lag_active and (
+                            lag_barrier is None
+                            or float(launch.captured_monotonic) <= lag_barrier
+                        )
+                        if stale_for_lag_guard:
+                            # This snapshot was frozen before execute_next() saw
+                            # the third lagging feedback cycle.  Do not waste one
+                            # serialized inference slot on a result that the
+                            # post-trigger acceptance barrier must reject.
+                            execution.record_launch_deferred()
+                            launch_schedule.next_at = min(
+                                launch_schedule.next_at,
+                                tick_started + control_period,
+                            )
+                            monitoring.record(
+                                "inference_launch_suppressed",
+                                generation=launch.generation,
+                                captured_monotonic=launch.captured_monotonic,
+                                reason="snapshot predates tracking-lag trigger",
+                                execution=execution.metadata(),
+                            )
+                        elif worker.launch_callable(inference_task, launch):
                             execution.record_inference_launch(launch)
                         else:  # defensive; the control thread owns launch()
                             execution.record_launch_deferred()
