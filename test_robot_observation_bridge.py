@@ -25,7 +25,8 @@ from piper_data_contract import (
     GRIPPER_MAX_M,
     LEGACY_GRIPPER_OPENING_METRES_SEMANTICS,
 )
-from robot_observation_bridge import (
+from camera import CameraFrameSet
+from rtc_client import (
     AsyncPolicyInference,
     DEFAULT_BLEND_STEPS,
     DEFAULT_INFERENCE_HZ,
@@ -57,6 +58,7 @@ from robot_observation_bridge import (
     build_client_transport_timing,
     build_observation,
     decode_action_queue,
+    make_observation_snapshot,
     policy_observation_state,
     resolve_action_chunk_steps,
     rotation_from_state,
@@ -116,6 +118,8 @@ def execution_args(**overrides):
         max_gripper_step=DEFAULT_MAX_GRIPPER_STEP,
         gripper_range_tolerance=0.02,
         max_joint_step_rad=0.3,
+        tracking_lag_threshold_rad=0.10,
+        tracking_lag_confirm_cycles=3,
         max_joint_gripper_step=0.25,
         max_joint_gripper_step_m=None,
         workspace_x=DEFAULT_WORKSPACE_X_M,
@@ -253,11 +257,6 @@ BIMANUAL_DELIVERY_METADATA = dict(
 )
 
 
-class FakeExecution:
-    def metadata(self):
-        return {"allow_execution": False, "execution_state": "client_disabled"}
-
-
 class FakePiper:
     def __init__(
         self,
@@ -268,6 +267,8 @@ class FakePiper:
         mode_feed=1,
         ctrl_mode_ready_after_status_reads=0,
         status_timestamp=None,
+        side=None,
+        event_log=None,
     ):
         self.calls = []
         self.arm_status = arm_status
@@ -280,6 +281,8 @@ class FakePiper:
         self.status_read_count = 0
         self.status_ctrl_modes = []
         self.joint_ctrl_modes = []
+        self.side = side
+        self.event_log = event_log
 
     def GetArmStatus(self):
         if self.enable_requested:
@@ -307,10 +310,14 @@ class FakePiper:
 
     def ModeCtrl(self, *args):
         self.calls.append(("ModeCtrl", *args))
+        if self.event_log is not None:
+            self.event_log.append((self.side, "ModeCtrl"))
 
     def JointCtrl(self, *args):
         self.calls.append(("JointCtrl", *args))
         self.joint_ctrl_modes.append(self.current_ctrl_mode)
+        if self.event_log is not None:
+            self.event_log.append((self.side, "JointCtrl"))
 
     def EndPoseCtrl(self, *args):
         self.calls.append(("EndPoseCtrl", *args))
@@ -320,6 +327,8 @@ class FakePiper:
 
     def GripperCtrl(self, *args):
         self.calls.append(("GripperCtrl", *args))
+        if self.event_log is not None:
+            self.event_log.append((self.side, "GripperCtrl"))
 
 
 class RecordingContinuousIK:
@@ -492,7 +501,7 @@ class EnableHoldTest(unittest.TestCase):
             piper, execution_args(enable_timeout_s=0.5)
         )
         measured = np.array([1.0, -0.0345, 0.0491, 0.1, 0.2, -0.3, 0.035])
-        with patch("robot_observation_bridge.time.sleep", return_value=None):
+        with patch("rtc_client.time.sleep", return_value=None):
             execution._enable_robot("right", piper, measured)
 
         joint_calls = [call for call in piper.calls if call[0] == "JointCtrl"]
@@ -514,7 +523,7 @@ class EnableHoldTest(unittest.TestCase):
         piper = FakePiper(status_timestamp=time.time() - 1.0)
         execution = ExecutionController(piper, execution_args(enable_timeout_s=0.03))
         measured = np.array([0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.035])
-        with patch("robot_observation_bridge.time.sleep", return_value=None):
+        with patch("rtc_client.time.sleep", return_value=None):
             with self.assertRaisesRegex(ExecutionBlocked, "enable timed out"):
                 execution._enable_robot("right", piper, measured)
         self.assertNotIn("right", execution.robot_enabled)
@@ -535,7 +544,7 @@ class EnableHoldTest(unittest.TestCase):
             piper, execution_args(enable_timeout_s=0.03)
         )
         measured = np.array([0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.035])
-        with patch("robot_observation_bridge.time.sleep", return_value=None):
+        with patch("rtc_client.time.sleep", return_value=None):
             with self.assertRaisesRegex(ExecutionBlocked, "enable timed out"):
                 execution._enable_robot("right", piper, measured)
         self.assertNotIn("right", execution.robot_enabled)
@@ -573,7 +582,7 @@ class EnableHoldTest(unittest.TestCase):
             piper, execution_args(enable_timeout_s=0.5)
         )
         measured = np.array([0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.035])
-        with patch("robot_observation_bridge.time.sleep", return_value=None):
+        with patch("rtc_client.time.sleep", return_value=None):
             execution._enable_robot("right", piper, measured)
         self.assertGreaterEqual(piper.driver_reads, 4)
         self.assertTrue(
@@ -831,25 +840,69 @@ class ObservationConventionTest(unittest.TestCase):
             cam_wrist_device="/dev/video16",
         )
         now = time.time()
-        observation = build_observation(
-            delivery_state=delivery_state(opening_fraction=0.75),
-            qpos=np.array([0, 1, -1, 0, 0, 0, 0.0525]),
+        monotonic_now = time.monotonic()
+        rtc_metadata = {
+            "enabled": True,
+            "previous_chunk_offset_steps": 5,
+            "previous_chunk_generation": 3,
+            "inference_delay_steps": 1,
+        }
+        execution_metadata = {
+            "allow_execution": False,
+            "execution_state": "client_disabled",
+        }
+        snapshot = make_observation_snapshot(
+            generation=4,
+            raw_delivery_state=delivery_state(opening_fraction=0.75),
+            qpos_m=np.array([0, 1, -1, 0, 0, 0, 0.0525]),
             protocol=validate_policy_metadata(DELIVERY_METADATA, "right"),
-            images={
-                "cam_high": np.zeros((4, 4, 3), dtype=np.uint8),
-                "cam_wrist": np.zeros((4, 4, 3), dtype=np.uint8),
-            },
-            image_timestamps={"cam_high": now, "cam_wrist": now},
+            captured_at=now,
+            captured_monotonic=monotonic_now,
+            frame_set=CameraFrameSet(
+                images={
+                    "cam_high": np.zeros((3, 4, 4), dtype=np.uint8),
+                    "cam_wrist": np.zeros((3, 4, 4), dtype=np.uint8),
+                },
+                timestamps={"cam_high": now, "cam_wrist": now},
+                monotonic_timestamps={
+                    "cam_high": monotonic_now,
+                    "cam_wrist": monotonic_now,
+                },
+                captured_monotonic=monotonic_now,
+            ),
+            rtc_metadata=rtc_metadata,
+            execution_metadata=execution_metadata,
+            executed_plan_command_count=2,
+        )
+
+        # Mutating live controller-like data after launch cannot change this
+        # inference payload.
+        rtc_metadata["previous_chunk_offset_steps"] = 7
+        execution_metadata["execution_state"] = "executing"
+        observation = build_observation(
+            snapshot=snapshot,
+            protocol=validate_policy_metadata(DELIVERY_METADATA, "right"),
             instruction="pick",
             source_name="robot",
             args=args,
-            execution=FakeExecution(),
         )
         self.assertAlmostEqual(observation["state"][9], 0.75)
         self.assertEqual(
             observation["client_metadata"]["policy_gripper_semantics"],
             NEW_GRIPPER_SEMANTICS,
         )
+        self.assertEqual(
+            observation["client_metadata"]["rtc"]["previous_chunk_offset_steps"],
+            5,
+        )
+        self.assertEqual(
+            observation["client_metadata"]["execution_state"], "client_disabled"
+        )
+        self.assertAlmostEqual(observation["client_metadata"]["image_state_skew_ms"], 0.0)
+        with self.assertRaises(ValueError):
+            snapshot.state[0] = 123.0
+        with self.assertRaises(ValueError):
+            snapshot.images["cam_high"][0, 0, 0] = 255
 
 
 class TargetSafetyTest(unittest.TestCase):
@@ -1135,7 +1188,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
             )
         )
 
-        with patch("robot_observation_bridge.time.monotonic", return_value=base), patch(
+        with patch("rtc_client.time.monotonic", return_value=base), patch(
             "robot_observation_bridge.time.sleep", return_value=None
         ):
             self.assertFalse(
@@ -1173,7 +1226,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         self.assertEqual(execution.pending_action_count, 0)
 
         for tick in (base + 0.10, base + 0.20):
-            with patch("robot_observation_bridge.time.monotonic", return_value=tick):
+            with patch("rtc_client.time.monotonic", return_value=tick):
                 self.assertFalse(
                     execution.execute_next(
                         self.raw_state,
@@ -1257,7 +1310,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
             (base + 0.40, self.qpos),
             (base + 0.60, self.qpos),
         ):
-            with patch("robot_observation_bridge.time.monotonic", return_value=tick):
+            with patch("rtc_client.time.monotonic", return_value=tick):
                 self.assertFalse(
                     execution.execute_next(
                         self.raw_state, qpos, self.joint_protocol,
@@ -1715,7 +1768,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         )
         self.assertEqual(execution.pending_actions[0].source_index, 0)
 
-        with patch("robot_observation_bridge.time.monotonic", return_value=100.01):
+        with patch("rtc_client.time.monotonic", return_value=100.01):
             self.assertTrue(
                 execution.execute_next(
                     self.raw_state,
@@ -1726,7 +1779,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
             )
         self.assertEqual(execution.last_queued_action_index, 0)
 
-        with patch("robot_observation_bridge.time.monotonic", return_value=100.18):
+        with patch("rtc_client.time.monotonic", return_value=100.18):
             self.assertTrue(
                 execution.execute_next(
                     self.raw_state,
