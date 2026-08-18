@@ -60,6 +60,7 @@ from rtc_client import (
     decode_action_queue,
     make_observation_snapshot,
     policy_observation_state,
+    read_output_qpos,
     resolve_action_chunk_steps,
     rotation_from_state,
     validate_policy_metadata,
@@ -375,6 +376,38 @@ class FeedbackFreshnessTest(unittest.TestCase):
         message.time_stamp -= 1.0
         with self.assertRaises(PiperFeedbackStaleError):
             _require_fresh_feedback({"joint": message})
+
+    def test_joint_qpos_feedback_does_not_read_eef_pose(self):
+        timestamp = time.time()
+
+        class JointOnlyPiper:
+            def GetArmJointMsgs(self):
+                return SimpleNamespace(
+                    time_stamp=timestamp,
+                    Hz=100.0,
+                    joint_state=SimpleNamespace(
+                        joint_1=0,
+                        joint_2=RAD_FACTOR,
+                        joint_3=-RAD_FACTOR,
+                        joint_4=0,
+                        joint_5=0,
+                        joint_6=0,
+                    ),
+                )
+
+            def GetArmGripperMsgs(self):
+                return SimpleNamespace(
+                    time_stamp=timestamp,
+                    Hz=100.0,
+                    gripper_state=SimpleNamespace(grippers_angle=35_000),
+                )
+
+            def GetArmEndPoseMsgs(self):
+                raise AssertionError("joint policies must not request EEF feedback")
+
+        qpos = read_output_qpos(JointOnlyPiper())
+        np.testing.assert_allclose(qpos[:6], [0, 1, -1, 0, 0, 0])
+        self.assertAlmostEqual(float(qpos[6]), 0.035)
 
 
 class ContinuousIKTest(unittest.TestCase):
@@ -1189,7 +1222,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         )
 
         with patch("rtc_client.time.monotonic", return_value=base), patch(
-            "robot_observation_bridge.time.sleep", return_value=None
+            "rtc_client.time.sleep", return_value=None
         ):
             self.assertFalse(
                 execution.execute_next(
@@ -1236,7 +1269,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
                     )
                 )
         with patch(
-            "robot_observation_bridge.time.monotonic", return_value=base + 0.36
+            "rtc_client.time.monotonic", return_value=base + 0.36
         ):
             self.assertFalse(
                 execution.execute_next(
@@ -1281,7 +1314,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         self.assertTrue(enable_hold["active"])
         self.assertEqual(enable_hold["staged_generation"], 12)
         with patch(
-            "robot_observation_bridge.time.monotonic", return_value=base + 0.37
+            "rtc_client.time.monotonic", return_value=base + 0.37
         ):
             self.assertTrue(
                 execution.execute_next(
@@ -1319,7 +1352,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
                 )
             self.assertIsNone(execution.fresh_inference_required_after_monotonic)
         with patch(
-            "robot_observation_bridge.time.monotonic", return_value=base + 0.66
+            "rtc_client.time.monotonic", return_value=base + 0.66
         ):
             self.assertFalse(
                 execution.execute_next(
@@ -1349,7 +1382,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         )
         self.assertEqual(execution.enable_staged_generation, 20)
         with patch(
-            "robot_observation_bridge.time.monotonic", return_value=base + 0.01
+            "rtc_client.time.monotonic", return_value=base + 0.01
         ):
             self.assertFalse(
                 execution.execute_next(
@@ -1363,7 +1396,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         self.assertEqual(execution.last_queue_drop_kind, "unsafe")
         sent_before_hold = len([c for c in piper.calls if c[0] == "JointCtrl"] )
         with patch(
-            "robot_observation_bridge.time.monotonic", return_value=base + 0.02
+            "rtc_client.time.monotonic", return_value=base + 0.02
         ):
             self.assertFalse(
                 execution.execute_next(
@@ -1396,7 +1429,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         )
         execution.authorization_deadline_monotonic = base + 0.015
         with patch(
-            "robot_observation_bridge.time.monotonic", return_value=base + 0.02
+            "rtc_client.time.monotonic", return_value=base + 0.02
         ):
             self.assertFalse(
                 execution.execute_next(
@@ -1452,7 +1485,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         execution.state = "blocked"
         execution.blocked_reason = "policy connection unavailable"
         with patch(
-            "robot_observation_bridge.time.monotonic", return_value=base + 0.02
+            "rtc_client.time.monotonic", return_value=base + 0.02
         ):
             self.assertFalse(
                 execution.execute_next(
@@ -1687,7 +1720,7 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         for now_monotonic, row_index in ((100.24, 0), (100.29, 1), (100.34, 2)):
             with self.subTest(now_monotonic=now_monotonic):
                 with patch(
-                    "robot_observation_bridge.time.monotonic",
+                    "rtc_client.time.monotonic",
                     return_value=now_monotonic,
                 ):
                     self.assertTrue(
