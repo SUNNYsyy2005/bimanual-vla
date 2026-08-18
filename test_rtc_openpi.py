@@ -6,7 +6,12 @@ import numpy as np
 import torch
 import rtc_openpi
 
-from rtc_openpi import RTCConfig, RTCProcessor, _prefix_weights
+from rtc_openpi import (
+    RTCConfig,
+    RTCProcessor,
+    _prefix_weights,
+    _reanchor_normalized_actions,
+)
 
 
 class RTCProcessorTest(unittest.TestCase):
@@ -65,6 +70,107 @@ class RTCProcessorTest(unittest.TestCase):
             )
         )
 
+    def test_unused_model_dimensions_do_not_affect_guidance(self):
+        processor = RTCProcessor(
+            RTCConfig(
+                execution_horizon=2,
+                prefix_attention_schedule="ones",
+                physical_action_dim=2,
+            )
+        )
+        x_t = torch.tensor([[[0.4, -0.2, 0.3, -0.1], [0.2, 0.3, -0.4, 0.6]]])
+        previous_a = torch.zeros_like(x_t)
+        previous_b = previous_a.clone()
+        previous_b[..., 2:] = 1_000.0
+
+        def denoise(x):
+            return 0.25 * x
+
+        guided_a = processor.denoise_step(
+            x_t,
+            previous_a,
+            inference_delay=0,
+            time=torch.tensor(0.5),
+            original_denoise_step=denoise,
+            execution_horizon=2,
+        )
+        guided_b = processor.denoise_step(
+            x_t,
+            previous_b,
+            inference_delay=0,
+            time=torch.tensor(0.5),
+            original_denoise_step=denoise,
+            execution_horizon=2,
+        )
+        self.assertTrue(torch.allclose(guided_a, guided_b))
+
+
+class RTCReanchorTest(unittest.TestCase):
+    @staticmethod
+    def _encoder(mask, mean, std, model_action_dim):
+        mask = np.asarray(mask, dtype=bool)
+        mean = np.asarray(mean, dtype=np.float32)
+        std = np.asarray(std, dtype=np.float32)
+
+        def transform(data):
+            state = np.asarray(data["state"], dtype=np.float32)
+            actions = np.asarray(data["actions"], dtype=np.float32).copy()
+            actions[..., mask] -= state[: len(mask)][mask]
+            normalized = (actions - mean) / std
+            padded = np.zeros((len(normalized), model_action_dim), dtype=np.float32)
+            padded[:, : len(mask)] = normalized
+            return {"actions": padded}
+
+        return transform
+
+    @staticmethod
+    def _decode(encoded, state, mask, mean, std):
+        mask = np.asarray(mask, dtype=bool)
+        decoded = np.asarray(encoded, dtype=np.float32)[..., : len(mask)] * std + mean
+        decoded = decoded.copy()
+        decoded[..., mask] += np.asarray(state, dtype=np.float32)[: len(mask)][mask]
+        return decoded
+
+    def test_bimanual_multistep_reanchor_preserves_physical_targets(self):
+        mask = (True,) * 6 + (False,) + (True,) * 6 + (False,)
+        old_state = np.array(
+            [0.50, 0.40, 0.30, 0.20, 0.10, 0.00, 0.25,
+             -0.50, -0.40, -0.30, -0.20, -0.10, 0.00, 0.75],
+            dtype=np.float32,
+        )
+        new_state = np.array(
+            [0.56, 0.43, 0.28, 0.24, 0.08, 0.03, 0.90,
+             -0.46, -0.44, -0.25, -0.18, -0.14, 0.02, 0.10],
+            dtype=np.float32,
+        )
+        targets = np.stack(
+            [old_state + 0.02, old_state + 0.06, old_state + 0.10], axis=0
+        )
+        targets[:, 6] = [0.2, 0.4, 0.8]
+        targets[:, 13] = [0.9, 0.6, 0.3]
+        mean = np.linspace(-0.2, 0.2, 14, dtype=np.float32)
+        std = np.linspace(0.5, 1.5, 14, dtype=np.float32)
+        policy = type("Policy", (), {})()
+        policy._input_transform = self._encoder(mask, mean, std, model_action_dim=32)
+
+        old_encoded = policy._input_transform(
+            {"state": old_state, "actions": targets.copy()}
+        )["actions"]
+        old_encoded[:, 14:] = np.linspace(3.0, 4.0, 18, dtype=np.float32)
+        reanchored = _reanchor_normalized_actions(
+            policy,
+            {"state": new_state},
+            old_encoded,
+            targets,
+            mask,
+        )
+        decoded = self._decode(reanchored, new_state, mask, mean, std)
+
+        np.testing.assert_allclose(decoded, targets, atol=1e-6)
+        np.testing.assert_array_equal(reanchored[:, 6], old_encoded[:, 6])
+        np.testing.assert_array_equal(reanchored[:, 13], old_encoded[:, 13])
+        np.testing.assert_array_equal(reanchored[:, 14:], old_encoded[:, 14:])
+
 
 class _FakePyTorchModel:
     def denoise_step(self, *args, **kwargs):  # pragma: no cover - constructor contract only
@@ -85,8 +191,15 @@ class _FakePolicy:
         self._sample_kwargs = {}
         self.seen_sample_kwargs = []
         self.next_normalized = None
+        self.next_absolute = None
+        self.input_transform = None
         self.adapter = None
         self.call_sampler = False
+
+    def _input_transform(self, data):
+        if self.input_transform is None:
+            raise AssertionError("fake input transform was not configured")
+        return self.input_transform(data)
 
     def infer(self, observation):
         self.seen_sample_kwargs.append(dict(self._sample_kwargs))
@@ -96,21 +209,31 @@ class _FakePolicy:
             self.adapter._last_normalized_actions = np.asarray(
                 self.next_normalized, dtype=np.float32
             )
-        return {"actions": np.zeros((4, 2), dtype=np.float32)}
+        if self.next_absolute is not None:
+            actions = np.asarray(self.next_absolute, dtype=np.float32)
+        else:
+            actions = np.zeros_like(np.asarray(self.next_normalized, dtype=np.float32))
+        return {"actions": actions}
 
 
 class RTCAwarePolicyTest(unittest.TestCase):
-    def _make(self):
+    def _make(self, config=None):
         from rtc_openpi import RTCAwarePolicy
 
         policy = _FakePolicy()
-        adapter = RTCAwarePolicy(policy, RTCConfig(execution_horizon=3))
+        adapter = RTCAwarePolicy(
+            policy,
+            config or RTCConfig(execution_horizon=3),
+        )
         policy.adapter = adapter
         return adapter, policy
 
     @staticmethod
-    def _observation(*, generation, previous_generation=None, offset=0, delay=0):
+    def _observation(
+        *, generation, previous_generation=None, offset=0, delay=0, state=None
+    ):
         return {
+            **({"state": np.asarray(state, dtype=np.float32)} if state is not None else {}),
             "client_metadata": {
                 "rtc": {
                     "enabled": True,
@@ -134,6 +257,105 @@ class RTCAwarePolicyTest(unittest.TestCase):
         self.assertFalse(result["rtc"]["enabled"])
         self.assertEqual(result["rtc"]["previous_chunk_left_over_steps"], 0)
 
+    def test_result_generation_is_preserved_for_legacy_policy_wrappers(self):
+        adapter, policy = self._make()
+        policy.next_normalized = np.arange(8, dtype=np.float32).reshape(4, 2)
+
+        original_infer = policy.infer
+
+        def infer_with_result_generation(observation):
+            result = original_infer(observation)
+            result["inference_generation"] = 11
+            return result
+
+        policy.infer = infer_with_result_generation
+        adapter.infer(self._observation(generation=None))
+
+        policy.next_normalized = np.ones((4, 2), dtype=np.float32)
+        result = adapter.infer(
+            self._observation(
+                generation=12,
+                previous_generation=11,
+                offset=1,
+                delay=1,
+            )
+        )
+
+        self.assertIn("prev_chunk_left_over", policy.seen_sample_kwargs[1])
+        self.assertTrue(result["rtc"]["enabled"])
+
+    def test_session_reanchors_joint_prefix_to_current_observation(self):
+        mask = (True, False)
+        config = RTCConfig(
+            execution_horizon=3,
+            physical_action_dim=2,
+            reanchor_action_mask=mask,
+        )
+        adapter, policy = self._make(config)
+        policy.input_transform = RTCReanchorTest._encoder(
+            mask,
+            mean=np.array([0.0, 0.0], dtype=np.float32),
+            std=np.array([1.0, 1.0], dtype=np.float32),
+            model_action_dim=2,
+        )
+        old_state = np.array([0.50, 0.10], dtype=np.float32)
+        old_absolute = np.array(
+            [[0.52, 0.2], [0.54, 0.3], [0.58, 0.4], [0.60, 0.5]],
+            dtype=np.float32,
+        )
+        policy.next_absolute = old_absolute
+        policy.next_normalized = policy.input_transform(
+            {"state": old_state, "actions": old_absolute}
+        )["actions"]
+        adapter.infer(self._observation(generation=1, state=old_state))
+
+        new_state = np.array([0.56, 0.90], dtype=np.float32)
+        policy.next_absolute = np.zeros((4, 2), dtype=np.float32)
+        policy.next_normalized = np.zeros((4, 2), dtype=np.float32)
+        result = adapter.infer(
+            self._observation(
+                generation=2,
+                previous_generation=1,
+                offset=2,
+                delay=1,
+                state=new_state,
+            )
+        )
+
+        prefix = policy.seen_sample_kwargs[1]["prev_chunk_left_over"]
+        np.testing.assert_allclose(prefix[:2, 0], [0.02, 0.04], atol=1e-6)
+        np.testing.assert_allclose(prefix[:2, 1], [0.4, 0.5], atol=1e-6)
+        np.testing.assert_array_equal(prefix[2:], np.zeros((2, 2), dtype=np.float32))
+        self.assertTrue(result["rtc"]["enabled"])
+        self.assertTrue(result["rtc"]["reanchored"])
+        self.assertAlmostEqual(result["rtc"]["origin_shift_l2"], 0.06, places=6)
+
+    def test_reanchor_failure_disables_rtc_instead_of_reusing_old_origin(self):
+        config = RTCConfig(
+            execution_horizon=3,
+            physical_action_dim=2,
+            reanchor_action_mask=(True, False),
+        )
+        adapter, policy = self._make(config)
+        policy.next_absolute = np.zeros((4, 2), dtype=np.float32)
+        policy.next_normalized = np.zeros((4, 2), dtype=np.float32)
+        adapter.infer(self._observation(generation=1, state=[0.0, 0.0]))
+        policy.input_transform = lambda data: (_ for _ in ()).throw(RuntimeError("boom"))
+
+        result = adapter.infer(
+            self._observation(
+                generation=2,
+                previous_generation=1,
+                offset=1,
+                state=[0.1, 0.0],
+            )
+        )
+
+        self.assertNotIn("prev_chunk_left_over", policy.seen_sample_kwargs[1])
+        self.assertFalse(result["rtc"]["enabled"])
+        self.assertFalse(result["rtc"]["reanchored"])
+        self.assertIn("RuntimeError: boom", result["rtc"]["reanchor_error"])
+
     def test_matching_generation_uses_offset_and_latency_metadata(self):
         adapter, policy = self._make()
         first = np.arange(8, dtype=np.float32).reshape(4, 2)
@@ -152,7 +374,12 @@ class RTCAwarePolicyTest(unittest.TestCase):
         )
 
         kwargs = policy.seen_sample_kwargs[1]
-        np.testing.assert_array_equal(kwargs["prev_chunk_left_over"], first[2:])
+        np.testing.assert_array_equal(kwargs["prev_chunk_left_over"][:2], first[2:])
+        np.testing.assert_array_equal(
+            kwargs["prev_chunk_left_over"][2:],
+            np.zeros((2, 2), dtype=np.float32),
+        )
+        self.assertEqual(kwargs["previous_left_over_steps"], 2)
         self.assertEqual(kwargs["inference_delay"], 3)
         self.assertEqual(kwargs["execution_horizon"], 3)
         self.assertTrue(result["rtc"]["enabled"])
