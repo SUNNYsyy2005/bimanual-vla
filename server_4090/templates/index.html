@@ -833,6 +833,10 @@ function renderEvalVideoRow(video) {
   const statusClass = video.success === 'success' ? 'ok' : video.success === 'failed' ? 'bad' : 'warn';
   const statusLabel = video.success === 'success' ? '成功' : video.success === 'failed' ? '失败' : '未知';
   const meta = `${esc(video.source || (video.remote ? 'remote' : '4×4090'))} · task=${esc(video.task || '-')} · exp=${esc(video.experiment || '-')} · ${esc(video.updated_at)} · ${esc(video.size_mib)} MiB`;
+  const modelInfo = video.model_name ? `model=${esc(video.model_name)}${video.checkpoint_id ? ` · ckpt=${esc(video.checkpoint_id)}` : ''}` : (video.checkpoint_id ? `ckpt=${esc(video.checkpoint_id)}` : '');
+  const layoutInfo = video.video_layout ? `layout=${esc(video.video_layout)}${Array.isArray(video.video_views) && video.video_views.length ? ` · views=${esc(video.video_views.join(' + '))}` : ''}` : '';
+  const instructionInfo = video.instruction ? `instruction=${esc(video.instruction)}` : '';
+  const diagnosticInfo = [modelInfo, layoutInfo, instructionInfo].filter(Boolean).map(item => `<br><span class="muted eval-video-diagnostic">${item}</span>`).join('');
   const holderId = evalPlayerId(esc(video.id));
   const label = video.display_name || video.name || video.relative_path;
   const checkbox = video.deletable
@@ -843,7 +847,7 @@ function renderEvalVideoRow(video) {
     : `<button class="inline" type="button" data-video-id="${esc(video.id)}" onclick="playEvalVideo(this.dataset.videoId)">${expandedEvalVideoIds.has(video.id) ? '收起播放器' : '加载 / 播放'}</button><button class="inline danger" type="button" data-video-id="${esc(video.id)}" data-video-label="${esc(label)}" onclick="deleteEvalVideo(this.dataset.videoId, this.dataset.videoLabel)">删除</button>`;
   const eventSummary = renderEvalEventSummary(video);
   return `<div class="eval-video-card${video.remote ? ' remote' : ''}" data-video-id="${esc(video.id)}">
-    <header><div class="eval-video-header"><div class="eval-video-select-cell">${checkbox}</div><div class="eval-video-title"><strong>${esc(video.display_name || video.name || video.relative_path)}</strong> <span class="${statusClass}">${statusLabel}</span><br><code class="path">${esc(video.relative_path)}</code><br><span class="muted">${meta}${video.score == null ? '' : ` · score=${esc(video.score)}`}</span>${eventSummary}</div></div><div class="eval-video-actions">${action}</div></header>
+    <header><div class="eval-video-header"><div class="eval-video-select-cell">${checkbox}</div><div class="eval-video-title"><strong>${esc(video.display_name || video.name || video.relative_path)}</strong> <span class="${statusClass}">${statusLabel}</span><br><code class="path">${esc(video.relative_path)}</code><br><span class="muted">${meta}${video.score == null ? '' : ` · score=${esc(video.score)}`}</span>${diagnosticInfo}${eventSummary}</div></div><div class="eval-video-actions">${action}</div></header>
     <div id="${holderId}"></div>
   </div>`;
 }

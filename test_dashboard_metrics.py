@@ -16,6 +16,7 @@ from server_4090.app import (
     dataset_origin_info,
     gpu_memory_shortfalls,
     gpu_inventory,
+    blocking_gpu_processes,
     infer_model_variant,
     parse_training_metrics,
     complete_checkpoint_steps,
@@ -323,6 +324,71 @@ class GpuInventoryTest(unittest.TestCase):
             {2: {"free_mib": 22_364, "required_mib": 23_000}},
         )
 
+    def test_gpu_memory_shortfall_treats_replaced_process_as_reclaimable(self):
+        inventory = {
+            1: {
+                "memory_total_mib": 24_564,
+                "memory_used_mib": 14_000,
+                "processes": [
+                    {"pid": 101, "memory_mib": 9_000},
+                    {"pid": 202, "memory_mib": 5_000},
+                ],
+            },
+        }
+        self.assertEqual(
+            gpu_memory_shortfalls(inventory, [1], 12_000),
+            {1: {"free_mib": 10_564, "required_mib": 12_000}},
+        )
+        self.assertEqual(
+            gpu_memory_shortfalls(inventory, [1], 12_000, ignored_pids={101}),
+            {},
+        )
+
+    def test_small_gpu_processes_do_not_block_until_limits_are_exceeded(self):
+        processes = [
+            {"pid": 101, "memory_mib": 300},
+            {"pid": 202, "memory_mib": 500},
+        ]
+        self.assertEqual(
+            blocking_gpu_processes(
+                processes,
+                small_process_memory_mib=512,
+                small_process_total_mib=1024,
+            ),
+            [],
+        )
+        self.assertEqual(
+            blocking_gpu_processes(
+                processes,
+                small_process_memory_mib=400,
+                small_process_total_mib=1024,
+            ),
+            processes,
+        )
+        self.assertEqual(
+            blocking_gpu_processes(
+                [{"pid": 303, "memory_mib": None}],
+                small_process_memory_mib=512,
+                small_process_total_mib=1024,
+            ),
+            [{"pid": 303, "memory_mib": None}],
+        )
+
+    @mock.patch("server_4090.app.cuda_visible_devices", return_value="GPU-one")
+    def test_policy_environment_disables_xla_preallocation(self, _visible):
+        env = build_environment(
+            {
+                "openpi_python": "/opt/conda/envs/openpi/bin/python",
+                "dataset_root": "/datasets",
+                "xla_memory_fraction": 0.90,
+            },
+            [1],
+            xla_memory_fraction=0.60,
+            xla_preallocate=False,
+        )
+        self.assertEqual(env["XLA_PYTHON_CLIENT_MEM_FRACTION"], "0.6")
+        self.assertEqual(env["XLA_PYTHON_CLIENT_PREALLOCATE"], "false")
+
 
 class ModelVariantTest(unittest.TestCase):
     def test_infers_nearest_checkpoint_variant(self):
@@ -418,6 +484,29 @@ class DatasetSchemaDescriptionTest(unittest.TestCase):
                 self.assertEqual(result["model_action_dim"], 7)
                 self.assertEqual(result["model_gripper_semantics"], model_gripper)
                 self.assertEqual(result["wire_gripper_semantics"], model_gripper)
+
+    def test_franka_bimanual_16d_joint_is_trainable(self):
+        info = self.info(
+            "observation.state", 16, "action", 16,
+            [
+                ("observation.images.cam_high", "image"),
+                ("observation.images.cam_left_wrist", "image"),
+                ("observation.images.cam_right_wrist", "image"),
+            ],
+            contract_version=3,
+            gripper_semantics="absolute_opening_fraction_0_closed_1_open",
+        )
+        info["dataset_origin"] = "simulation"
+        result = describe_dataset_schema(info)
+        self.assertTrue(result["training_supported"])
+        self.assertEqual(result["schema"], "joint")
+        self.assertEqual(result["arm_mode"], "bimanual")
+        self.assertEqual(result["raw_action_dim"], 16)
+        self.assertEqual(result["model_action_dim"], 16)
+        self.assertEqual(
+            result["model_action_semantics"],
+            "joint_delta_chunk_origin_first_7_absolute_gripper_target",
+        )
 
     def test_legacy_delivery_10d7d_is_step_delta_and_new_10d10d_is_absolute_raw(self):
         legacy = describe_dataset_schema(

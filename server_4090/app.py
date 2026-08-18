@@ -829,6 +829,8 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
     layouts = {
         (7, 7): ("joint", "single", False),
         (14, 14): ("joint", "bimanual", False),
+        # Franka Panda: 7 joints + 1 gripper per arm.
+        (16, 16): ("joint", "bimanual", False),
         (10, 7): ("delivery", "single", True),
         (20, 14): ("delivery", "bimanual", True),
         (10, 10): ("delivery", "single", False),
@@ -842,7 +844,11 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
     arm_mode = str(metadata.get("arm_mode") or inferred_arm_mode).lower()
     arm_side = "both" if arm_mode == "bimanual" else str(metadata.get("arm_side") or "right").lower()
     arm_count = 2 if arm_mode == "bimanual" else 1
-    model_action_dim = 7 * arm_count if arm_mode in {"single", "bimanual"} else None
+    model_action_dim = (
+        raw_action_dim
+        if schema == "joint" and arm_mode in {"single", "bimanual"}
+        else 7 * arm_count if arm_mode in {"single", "bimanual"} else None
+    )
 
     media = sorted(
         (
@@ -1006,7 +1012,7 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
                 )
             elif is_simulation_dataset:
                 # RoboTwin / sim LeRobot exports commonly contain canonical joint
-                # 7D/14D rows without the real-robot action-contract metadata.
+                # 7D/14D Piper or 16D Franka rows without real-robot contract metadata.
                 # Keep real datasets fail-closed, but allow simulation datasets to
                 # default to the current v3 opening-fraction joint convention.
                 contract_version = CURRENT_CONTRACT_VERSION
@@ -1018,11 +1024,16 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
                 )
             else:
                 errors.append(
-                    "joint 7D/14D requires contract_version or gripper semantics to distinguish v2 metres from v3 fraction"
+                    "joint 7D/14D/16D requires contract_version or gripper semantics to distinguish v2 metres from v3 fraction"
                 )
             raw_action_convention = JOINT_RAW_ACTION_CONVENTION
             model_action_convention = DELIVERY_CHUNK_ORIGIN_ACTION_CONVENTION
-            model_action_semantics = JOINT_MODEL_ACTION_SEMANTICS
+            joint_dims_per_arm = int(raw_action_dim // arm_count) - 1
+            model_action_semantics = (
+                JOINT_MODEL_ACTION_SEMANTICS
+                if joint_dims_per_arm == 6
+                else f"joint_delta_chunk_origin_first_{joint_dims_per_arm}_absolute_gripper_target"
+            )
             # New training converts legacy joint metres to fractions before norm.
             model_gripper_semantics = NEW_GRIPPER_SEMANTICS
 
@@ -1377,10 +1388,18 @@ def load_config(path: Path) -> dict[str, Any]:
         "port": 8090,
         "allowed_gpu_ids": [0, 1, 2, 3],
         "allow_busy_gpus": False,
+        "small_gpu_process_memory_mib": 512,
+        "small_gpu_process_total_mib": 1024,
         "xla_memory_fraction": 0.90,
         "training_min_free_gpu_mib": 23_000,
         "evaluation_min_free_gpu_mib": 23_000,
         "evaluation_xla_memory_fraction": 0.85,
+        # Policy inference is much lighter than training. Keep training/eval
+        # exclusive, but allow Policy to share with small stable workloads.
+        "policy_allow_busy_gpus": True,
+        "policy_min_free_gpu_mib": 12_000,
+        "policy_xla_memory_fraction": 0.60,
+        "policy_xla_preallocate": False,
         "max_upload_gib": 500,
         "max_chunk_mib": 64,
         "policy_port_min": 8000,
@@ -1662,6 +1681,7 @@ class TaskManager:
             f"--property=StandardError=append:{log_path}",
             "--property=KillMode=control-group",
             "--property=ManagedOOMPreference=omit",
+            "--property=OOMScoreAdjust=-500",
         ]
         for key, value in sorted(env.items()):
             if "=" in key or "\x00" in key or "\x00" in str(value):
@@ -3516,15 +3536,24 @@ def gpu_memory_shortfalls(
     inventory: dict[int, dict[str, Any]],
     gpu_ids: list[int],
     minimum_free_mib: int,
+    *,
+    ignored_pids: set[int] | None = None,
 ) -> dict[int, dict[str, int]]:
     if minimum_free_mib <= 0:
         return {}
+    ignored_pids = ignored_pids or set()
     shortfalls: dict[int, dict[str, int]] = {}
     for gpu_id in gpu_ids:
         gpu = inventory.get(gpu_id, {})
+        reclaimable_mib = sum(
+            max(0, int(process.get("memory_mib") or 0))
+            for process in gpu.get("processes", [])
+            if int(process.get("pid", -1)) in ignored_pids
+        )
         free_mib = max(
             0,
-            int(gpu.get("memory_total_mib", 0)) - int(gpu.get("memory_used_mib", 0)),
+            int(gpu.get("memory_total_mib", 0))
+            - max(0, int(gpu.get("memory_used_mib", 0)) - reclaimable_mib),
         )
         if free_mib < minimum_free_mib:
             shortfalls[gpu_id] = {
@@ -3532,6 +3561,33 @@ def gpu_memory_shortfalls(
                 "required_mib": minimum_free_mib,
             }
     return shortfalls
+
+
+def blocking_gpu_processes(
+    processes: list[dict[str, Any]],
+    *,
+    small_process_memory_mib: int,
+    small_process_total_mib: int,
+) -> list[dict[str, Any]]:
+    """Return GPU occupants that should prevent a new task from starting.
+
+    Low-memory simulation or visualization processes can share a GPU when
+    their individual and aggregate memory footprints stay below the limits.
+    Unknown memory usage remains blocking.
+    """
+    if not processes:
+        return []
+    if small_process_memory_mib <= 0 or small_process_total_mib <= 0:
+        return list(processes)
+    total = 0
+    for process in processes:
+        memory_mib = process.get('memory_mib')
+        if not isinstance(memory_mib, int) or memory_mib < 0:
+            return list(processes)
+        if memory_mib > small_process_memory_mib:
+            return list(processes)
+        total += memory_mib
+    return [] if total <= small_process_total_mib else list(processes)
 
 
 def process_owner_map(pids: Iterable[int]) -> dict[int, str]:
@@ -3863,6 +3919,7 @@ def build_environment(
     gpu_ids: list[int] | None,
     *,
     xla_memory_fraction: float | None = None,
+    xla_preallocate: bool | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     for sensitive_key in ("BIMANUAL_VLA_SERVER_TOKEN", "BIMANUAL_VLA_LOGIN_PASSWORD"):
@@ -3899,6 +3956,8 @@ def build_environment(
     if nccl_preload and gpu_ids is not None:
         inherited_preload = env.get("LD_PRELOAD", "")
         env["LD_PRELOAD"] = str(nccl_preload) + ((":" + inherited_preload) if inherited_preload else "")
+    if xla_preallocate is not None:
+        env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true" if xla_preallocate else "false"
     if gpu_ids is None:
         env["JAX_PLATFORMS"] = "cpu"
         env["CUDA_VISIBLE_DEVICES"] = ""
@@ -4506,6 +4565,10 @@ def create_app(config_path: Path) -> Flask:
                     "allow_busy_gpus": config["allow_busy_gpus"],
                     "xla_memory_fraction": config.get("xla_memory_fraction", 0.90),
                     "training_min_free_gpu_mib": config.get("training_min_free_gpu_mib", 23_000),
+                    "policy_allow_busy_gpus": config.get("policy_allow_busy_gpus", True),
+                    "policy_min_free_gpu_mib": config.get("policy_min_free_gpu_mib", 12_000),
+                    "policy_xla_memory_fraction": config.get("policy_xla_memory_fraction", 0.60),
+                    "policy_xla_preallocate": config.get("policy_xla_preallocate", False),
                     "transfer_parallelism": config.get("transfer_parallelism", 4),
                     "nas_dataset_staging_root": config.get("nas_dataset_staging_root"),
                     "policy_port_range": [config["policy_port_min"], config["policy_port_max"]],
@@ -4720,11 +4783,19 @@ def create_app(config_path: Path) -> Flask:
         if unavailable:
             raise ValueError(f"GPU(s) are unavailable for CUDA compute: {unavailable}")
         busy = {
-            gpu_id: [
-                process
-                for process in inventory.get(gpu_id, {}).get("processes", [])
-                if int(process.get("pid", -1)) not in ignored_pids
-            ]
+            gpu_id: blocking_gpu_processes(
+                [
+                    process
+                    for process in inventory.get(gpu_id, {}).get("processes", [])
+                    if int(process.get("pid", -1)) not in ignored_pids
+                ],
+                small_process_memory_mib=int(
+                    config.get("small_gpu_process_memory_mib", 512)
+                ),
+                small_process_total_mib=int(
+                    config.get("small_gpu_process_total_mib", 1024)
+                ),
+            )
             for gpu_id in gpu_ids
         }
         busy = {gpu_id: procs for gpu_id, procs in busy.items() if procs}
@@ -4736,7 +4807,12 @@ def create_app(config_path: Path) -> Flask:
         if busy and not effective_allow_busy:
             raise ValueError(f"refusing busy GPU(s): {busy}")
         if minimum_free_mib > 0:
-            low_memory = gpu_memory_shortfalls(inventory, gpu_ids, minimum_free_mib)
+            low_memory = gpu_memory_shortfalls(
+                inventory,
+                gpu_ids,
+                minimum_free_mib,
+                ignored_pids=ignored_pids,
+            )
             if low_memory:
                 raise ValueError(f"GPU(s) do not have enough free memory: {low_memory}")
         return gpu_ids
@@ -5453,6 +5529,11 @@ print(json.dumps(rows, ensure_ascii=False))
         score: float | None = None
         episode_status: str | None = None
         episode_seed: Any | None = None
+        instruction: str | None = None
+        model_name: str | None = None
+        checkpoint_id: str | None = None
+        video_layout: str | None = None
+        video_views: list[Any] | None = None
         event_track: dict[str, Any] | None = None
         root_path = Path(root)
         path = root_path / relative_path
@@ -5473,6 +5554,19 @@ print(json.dumps(rows, ensure_ascii=False))
                         score = float(score_value)
                     episode_status = str(item.get("status", "")) or None
                     episode_seed = item.get("seed")
+                    instruction_value = item.get("instruction")
+                    instruction = str(instruction_value).strip() if instruction_value is not None else None
+                    model_value = item.get("model_name")
+                    model_name = str(model_value).strip() if model_value is not None else None
+                    checkpoint_value = item.get("checkpoint_id")
+                    checkpoint_id = str(checkpoint_value).strip() if checkpoint_value is not None else None
+                    layout_value = item.get("video_layout")
+                    video_layout = str(layout_value).strip() if layout_value is not None else None
+                    views_value = item.get("video_views")
+                    video_views = list(views_value) if isinstance(views_value, list) else None
+                    item_task = item.get("task_name", item.get("task"))
+                    if item_task:
+                        task_name = str(item_task)
                     if bool(item.get("success")):
                         success = "success"
                     else:
@@ -5526,6 +5620,11 @@ print(json.dumps(rows, ensure_ascii=False))
             "score": score,
             "episode_status": episode_status,
             "episode_seed": episode_seed,
+            "instruction": instruction,
+            "model_name": model_name,
+            "checkpoint_id": checkpoint_id,
+            "video_layout": video_layout,
+            "video_views": video_views,
             "event_track": event_track,
             "source": source,
             "display_name": name,
@@ -7191,6 +7290,40 @@ print(json.dumps(rows, ensure_ascii=False))
     @app.post("/api/tasks/policy")
     def start_policy():
         payload = request.get_json(force=True)
+        raw_rtc_enabled = payload.get("rtc_enabled", True)
+        if isinstance(raw_rtc_enabled, bool):
+            rtc_enabled = raw_rtc_enabled
+        elif isinstance(raw_rtc_enabled, (int, float)) and raw_rtc_enabled in (0, 1):
+            rtc_enabled = bool(raw_rtc_enabled)
+        elif isinstance(raw_rtc_enabled, str) and raw_rtc_enabled.strip().lower() in {
+            "true", "1", "yes", "on",
+        }:
+            rtc_enabled = True
+        elif isinstance(raw_rtc_enabled, str) and raw_rtc_enabled.strip().lower() in {
+            "false", "0", "no", "off",
+        }:
+            rtc_enabled = False
+        else:
+            raise ValueError("rtc_enabled must be a boolean")
+        rtc_execution_horizon = safe_int(
+            payload.get("rtc_execution_horizon", 8),
+            "rtc_execution_horizon",
+            1,
+            50,
+        )
+        rtc_max_guidance_weight = safe_float(
+            payload.get("rtc_max_guidance_weight", 5.0),
+            "rtc_max_guidance_weight",
+            0.001,
+            100.0,
+        )
+        rtc_prefix_attention_schedule = str(
+            payload.get("rtc_prefix_attention_schedule", "linear") or "linear"
+        ).strip().lower()
+        if rtc_prefix_attention_schedule not in {"zeros", "ones", "linear", "exp"}:
+            raise ValueError(
+                "rtc_prefix_attention_schedule must be one of zeros, ones, linear, exp"
+            )
         policy_target = str(payload.get("execution_target", "local_4090") or "local_4090")
         if policy_target not in {"", "local", "local_4090", "4x4090"}:
             raise ValueError("Policy serving is only supported on the 4×4090 host; train/sync checkpoints back before serving")
@@ -7296,11 +7429,37 @@ print(json.dumps(rows, ensure_ascii=False))
                 raise ValueError("replace_task_id must refer to a policy task")
             old_active = old_task.get("state") in {"starting", "running", "stopping"}
             if old_active and old_task.get("pid"):
-                ignored_pids.add(int(old_task["pid"]))
+                old_root_pid = int(old_task["pid"])
+                ignored_pids.add(old_root_pid)
+                ignored_pids.update(
+                    process_descendant_pids(old_root_pid, process_children_by_parent())
+                )
+
+        policy_allow_busy_gpus = bool(config.get("policy_allow_busy_gpus", True))
+        policy_min_free_gpu_mib = safe_int(
+            config.get("policy_min_free_gpu_mib", 12_000),
+            "policy_min_free_gpu_mib",
+            0,
+            1_000_000,
+        )
+        policy_xla_memory_fraction = safe_float(
+            config.get("policy_xla_memory_fraction", 0.60),
+            "policy_xla_memory_fraction",
+            0.25,
+            0.90,
+        )
+        policy_xla_preallocate = bool(config.get("policy_xla_preallocate", False))
 
         # Validate the target resources before disrupting a working Policy. The
-        # process being replaced may legitimately own the requested GPU/port.
-        gpu_ids = parse_gpus(payload, one_only=True, ignored_pids=ignored_pids)
+        # process being replaced may legitimately own the requested GPU/port;
+        # its memory is treated as reclaimable during this first check.
+        gpu_ids = parse_gpus(
+            payload,
+            one_only=True,
+            ignored_pids=ignored_pids,
+            minimum_free_mib=policy_min_free_gpu_mib,
+            allow_busy=policy_allow_busy_gpus,
+        )
         old_port = old_task.get("metadata", {}).get("port") if old_task else None
         with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
             port_busy = sock.connect_ex(("127.0.0.1", port)) == 0
@@ -7337,6 +7496,15 @@ print(json.dumps(rows, ensure_ascii=False))
                 raise ValueError(f"port {port} is still in use after stopping the previous policy")
             time.sleep(0.1)
 
+        # Recheck after replacement shutdown so a process that raced onto the
+        # selected GPU cannot bypass the free-memory guard.
+        gpu_ids = parse_gpus(
+            payload,
+            one_only=True,
+            minimum_free_mib=policy_min_free_gpu_mib,
+            allow_busy=policy_allow_busy_gpus,
+        )
+
         telemetry_session, telemetry_dir = observations.create_session()
         command = [
             config["openpi_python"], openpi_helper, "serve",
@@ -7351,7 +7519,10 @@ print(json.dumps(rows, ensure_ascii=False))
             "--checkpoint", str(checkpoint),
             "--port", str(port),
             "--telemetry-dir", str(telemetry_dir),
-            "--rtc-enabled",
+            "--rtc-enabled" if rtc_enabled else "--no-rtc-enabled",
+            "--rtc-execution-horizon", str(rtc_execution_horizon),
+            "--rtc-max-guidance-weight", str(rtc_max_guidance_weight),
+            "--rtc-prefix-attention-schedule", rtc_prefix_attention_schedule,
         ] + action_contract_command_args(model_contract)
         default_prompt = str(payload.get("default_prompt", "")).strip()
         if default_prompt:
@@ -7360,7 +7531,12 @@ print(json.dumps(rows, ensure_ascii=False))
             command += ["--default-prompt", default_prompt]
         task = tasks.start(
             "policy", command,
-            env=build_environment(config, gpu_ids),
+            env=build_environment(
+                config,
+                gpu_ids,
+                xla_memory_fraction=policy_xla_memory_fraction,
+                xla_preallocate=policy_xla_preallocate,
+            ),
             metadata={
                 "dataset_id": dataset_id,
                 "arm_mode": arm_mode,
@@ -7375,12 +7551,18 @@ print(json.dumps(rows, ensure_ascii=False))
                 "model_variant": model_variant,
                 "checkpoint": str(checkpoint),
                 "gpu_ids": gpu_ids,
+                "allow_busy_gpus": policy_allow_busy_gpus,
+                "minimum_free_gpu_mib": policy_min_free_gpu_mib,
+                "xla_memory_fraction": policy_xla_memory_fraction,
+                "xla_preallocate": policy_xla_preallocate,
                 "port": port,
                 "ws_url": f"ws://{request.host.split(':')[0]}:{port}",
                 "telemetry_session": telemetry_session,
                 "telemetry_dir": str(telemetry_dir),
-                "rtc_enabled": True,
-                "rtc_algorithm": "real_time_chunking_prefix_guidance",
+                "rtc_enabled": rtc_enabled,
+                "rtc_execution_horizon": rtc_execution_horizon,
+                "rtc_max_guidance_weight": rtc_max_guidance_weight,
+                "rtc_prefix_attention_schedule": rtc_prefix_attention_schedule,
                 "replaced_task_id": replace_task_id or None,
             },
         )
