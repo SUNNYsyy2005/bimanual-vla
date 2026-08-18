@@ -13,6 +13,7 @@ Verify device IDs before connecting:
 """
 
 from pathlib import Path
+from collections import deque
 from dataclasses import dataclass
 import re
 import subprocess
@@ -44,6 +45,24 @@ DEFAULT_CAM_IDS = {
 }
 
 STALE_THRESHOLD_S = 0.5   # flag image as stale if older than this
+
+
+@dataclass(frozen=True)
+class CameraFrameSet:
+    """One complete multi-camera acquisition with wall and monotonic clocks."""
+
+    images: dict[str, np.ndarray]
+    timestamps: dict[str, float]
+    monotonic_timestamps: dict[str, float]
+    captured_monotonic: float
+
+    def copied(self) -> "CameraFrameSet":
+        return CameraFrameSet(
+            images={key: frame.copy() for key, frame in self.images.items()},
+            timestamps=dict(self.timestamps),
+            monotonic_timestamps=dict(self.monotonic_timestamps),
+            captured_monotonic=float(self.captured_monotonic),
+        )
 
 # Camera roles used by the current collection rig.  Device numbers and USB
 # paths can change after reconnecting a hub, but these model names and serial
@@ -341,6 +360,12 @@ class CameraCapture:
         # observations remain square/padded in ``_latest_images``.
         self._latest_preview_images: dict[str, np.ndarray] = {}
         self._latest_timestamps: dict[str, float] = {}
+        self._latest_monotonic_timestamps: dict[str, float] = {}
+        self._latest_captured_monotonic: float | None = None
+        self._frame_history: deque[CameraFrameSet] = deque(
+            maxlen=max(8, int(round(float(fps) * 2.0)))
+        )
+        self._last_direct_monotonic_timestamps: dict[str, float] = {}
         self._source_aspects: dict[str, float] = {}
         self._background_error: BaseException | None = None
 
@@ -384,6 +409,10 @@ class CameraCapture:
             self._latest_images.clear()
             self._latest_preview_images.clear()
             self._latest_timestamps.clear()
+            self._latest_monotonic_timestamps.clear()
+            self._latest_captured_monotonic = None
+            self._frame_history.clear()
+            self._last_direct_monotonic_timestamps.clear()
             self._source_aspects.clear()
             self._background_error = None
 
@@ -402,13 +431,15 @@ class CameraCapture:
             }
 
     @staticmethod
-    def _read_frame(cap: cv2.VideoCapture) -> tuple[bool, np.ndarray | None, float]:
+    def _read_frame(
+        cap: cv2.VideoCapture,
+    ) -> tuple[bool, np.ndarray | None, float, float]:
         ret, frame = cap.read()
-        return ret, frame, time.time()
+        return ret, frame, time.time(), time.monotonic()
 
     def _read_direct(self) -> tuple[dict[str, np.ndarray], dict[str, float]]:
         """Read and preprocess one frame from each camera without background mode."""
-        images, timestamps = {}, {}
+        images, timestamps, monotonic_timestamps = {}, {}, {}
         if self._executor is None:
             results = {
                 key: self._read_frame(cap)
@@ -421,8 +452,9 @@ class CameraCapture:
             }
             results = {key: future.result() for key, future in futures.items()}
 
-        for key, (ret, frame, timestamp) in results.items():
+        for key, (ret, frame, timestamp, monotonic_timestamp) in results.items():
             timestamps[key] = timestamp
+            monotonic_timestamps[key] = monotonic_timestamp
             if not ret:
                 raise RuntimeError(f"Camera {key} read failed")
             # OpenCV returns BGR HWC -> RGB HWC. Preserve aspect ratio and pad
@@ -442,6 +474,7 @@ class CameraCapture:
             x0 = (target_w - new_w) // 2
             padded[y0:y0 + new_h, x0:x0 + new_w] = resized
             images[key] = padded.transpose(2, 0, 1)  # (H,W,C) -> (C,H,W)
+        self._last_direct_monotonic_timestamps = monotonic_timestamps
         return images, timestamps
 
     def read(self) -> tuple[dict, dict]:
@@ -470,6 +503,28 @@ class CameraCapture:
         with self._read_lock:
             return self._read_direct()
 
+    def read_nearest(self, target_monotonic: float) -> CameraFrameSet:
+        """Return the buffered complete frame set closest to a robot-state time."""
+        target = float(target_monotonic)
+        if not np.isfinite(target):
+            raise ValueError("target_monotonic must be finite")
+        if self._background_thread is None:
+            raise RuntimeError("nearest-frame lookup requires background camera capture")
+        with self._latest_condition:
+            if self._background_error is not None:
+                raise RuntimeError("background camera capture failed") from self._background_error
+            if not self._frame_history:
+                self._latest_condition.wait(timeout=1.0)
+            if self._background_error is not None:
+                raise RuntimeError("background camera capture failed") from self._background_error
+            if not self._frame_history:
+                raise RuntimeError("background camera capture has not produced a frame")
+            selected = min(
+                self._frame_history,
+                key=lambda frame_set: abs(frame_set.captured_monotonic - target),
+            )
+            return selected.copied()
+
     def start_background_capture(
         self,
         callback: Callable[[dict[str, np.ndarray], dict[str, float], float], None] | None = None,
@@ -491,6 +546,8 @@ class CameraCapture:
             raise ValueError("background capture fps must be positive and finite")
         self._background_error = None
         self._background_stop.clear()
+        with self._latest_condition:
+            self._frame_history.clear()
 
         def loop() -> None:
             period = 1.0 / capture_fps
@@ -501,9 +558,31 @@ class CameraCapture:
                     with self._read_lock:
                         images, timestamps = self._read_direct()
                     completed = time.monotonic()
+                    monotonic_timestamps = dict(self._last_direct_monotonic_timestamps)
+                    if set(monotonic_timestamps) != set(images):
+                        monotonic_timestamps = {key: completed for key in images}
+                    captured_monotonic = float(
+                        np.median(list(monotonic_timestamps.values()))
+                    )
+                    frame_set = CameraFrameSet(
+                        images={key: frame.copy() for key, frame in images.items()},
+                        timestamps={key: float(value) for key, value in timestamps.items()},
+                        monotonic_timestamps={
+                            key: float(value)
+                            for key, value in monotonic_timestamps.items()
+                        },
+                        captured_monotonic=captured_monotonic,
+                    )
                     with self._latest_condition:
-                        self._latest_images = {key: frame.copy() for key, frame in images.items()}
-                        self._latest_timestamps = dict(timestamps)
+                        self._latest_images = {
+                            key: frame.copy() for key, frame in frame_set.images.items()
+                        }
+                        self._latest_timestamps = dict(frame_set.timestamps)
+                        self._latest_monotonic_timestamps = dict(
+                            frame_set.monotonic_timestamps
+                        )
+                        self._latest_captured_monotonic = frame_set.captured_monotonic
+                        self._frame_history.append(frame_set)
                         self._latest_condition.notify_all()
                     if callback is not None:
                         callback(images, timestamps, completed)

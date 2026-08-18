@@ -40,14 +40,15 @@ import socket
 import sys
 import threading
 import time
-from typing import Any, Callable
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 import uuid
 
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
-from camera import CameraCapture, CameraPreview
+from camera import CameraCapture, CameraFrameSet, CameraPreview
 from deployment_recording import DeploymentRunRecorder
 from collect_output_arm import require_can_interface_up
 from piper_action_conventions import (
@@ -104,6 +105,9 @@ DEFAULT_GRIPPER_LOWPASS_ALPHA = 0.5
 DEFAULT_GRIPPER_HYSTERESIS = 0.05
 DEFAULT_GRIPPER_CONFIRM_STEPS = 2
 DEFAULT_FEEDBACK_MAX_AGE_S = 0.5
+DEFAULT_MAX_IMAGE_STATE_SKEW_S = 0.075
+DEFAULT_TRACKING_LAG_THRESHOLD_RAD = 0.10
+DEFAULT_TRACKING_LAG_CONFIRM_CYCLES = 3
 DEFAULT_ARM_HOLD_TOLERANCE_RAD = 0.05
 DEFAULT_JOINT_LIMIT_TOLERANCE_RAD = 0.05
 GRIPPER_OPENING_FRACTION = NEW_GRIPPER_SEMANTICS
@@ -1465,6 +1469,113 @@ def decode_action_queue(
     return anchor, decoded
 
 
+def _freeze_snapshot_value(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        frozen = np.array(value, copy=True)
+        frozen.setflags(write=False)
+        return frozen
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_snapshot_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_snapshot_value(item) for item in value)
+    return value
+
+
+def _thaw_snapshot_value(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return np.array(value, copy=True)
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_snapshot_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_snapshot_value(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True)
+class ObservationSnapshot:
+    """Immutable robot/image/RTC state consumed by one inference request."""
+
+    generation: int
+    state: np.ndarray
+    raw_delivery_state: np.ndarray
+    qpos_m: np.ndarray
+    captured_at: float
+    captured_monotonic: float
+    images: Mapping[str, np.ndarray]
+    image_timestamps: Mapping[str, float]
+    image_monotonic_timestamps: Mapping[str, float]
+    image_captured_monotonic: float
+    rtc_metadata: Mapping[str, Any]
+    execution_metadata: Mapping[str, Any]
+    executed_plan_command_count: int
+
+    @property
+    def image_state_skew_s(self) -> float:
+        return abs(float(self.image_captured_monotonic) - float(self.captured_monotonic))
+
+
+def make_observation_snapshot(
+    *,
+    generation: int,
+    raw_delivery_state: np.ndarray,
+    qpos_m: np.ndarray,
+    protocol: PolicyProtocol,
+    captured_at: float,
+    captured_monotonic: float,
+    frame_set: CameraFrameSet,
+    rtc_metadata: Mapping[str, Any],
+    execution_metadata: Mapping[str, Any],
+    executed_plan_command_count: int,
+    max_image_state_skew_s: float = DEFAULT_MAX_IMAGE_STATE_SKEW_S,
+) -> ObservationSnapshot:
+    """Validate and freeze one time-consistent inference observation."""
+    state = policy_observation_state(raw_delivery_state, qpos_m, protocol)
+    if state.shape != (protocol.state_dim,) or not np.all(np.isfinite(state)):
+        raise RuntimeError(
+            f"{protocol.arm_mode} {protocol.schema} observation state must be finite "
+            f"{protocol.state_dim}D, got {state.shape}"
+        )
+    expected_camera_keys = (
+        {"cam_high", "cam_wrist"}
+        if protocol.arm_mode == "single"
+        else set(protocol.camera_keys)
+    )
+    if set(frame_set.images) != expected_camera_keys:
+        raise RuntimeError(
+            f"camera snapshot keys must be {sorted(expected_camera_keys)}, "
+            f"got {sorted(frame_set.images)}"
+        )
+    skew_s = abs(float(frame_set.captured_monotonic) - float(captured_monotonic))
+    if not math.isfinite(skew_s) or skew_s > float(max_image_state_skew_s):
+        raise RuntimeError(
+            f"nearest camera/state skew {skew_s * 1000.0:.1f}ms exceeds "
+            f"{float(max_image_state_skew_s) * 1000.0:.1f}ms"
+        )
+    metadata = dict(execution_metadata)
+    metadata["inference_generation"] = int(generation)
+    return ObservationSnapshot(
+        generation=int(generation),
+        state=_freeze_snapshot_value(np.asarray(state, dtype=np.float32)),
+        raw_delivery_state=_freeze_snapshot_value(
+            np.asarray(raw_delivery_state, dtype=np.float32)
+        ),
+        qpos_m=_freeze_snapshot_value(np.asarray(qpos_m, dtype=np.float32)),
+        captured_at=float(captured_at),
+        captured_monotonic=float(captured_monotonic),
+        images=_freeze_snapshot_value(frame_set.images),
+        image_timestamps=_freeze_snapshot_value(frame_set.timestamps),
+        image_monotonic_timestamps=_freeze_snapshot_value(
+            frame_set.monotonic_timestamps
+        ),
+        image_captured_monotonic=float(frame_set.captured_monotonic),
+        rtc_metadata=_freeze_snapshot_value(dict(rtc_metadata)),
+        execution_metadata=_freeze_snapshot_value(metadata),
+        executed_plan_command_count=int(executed_plan_command_count),
+    )
+
+
 @dataclass(frozen=True)
 class InferenceLaunch:
     generation: int
@@ -1479,6 +1590,7 @@ class InferenceLaunch:
     # observation capture.  The completed inference may only skip a delayed
     # prefix when the old plan really progressed while inference was running.
     executed_plan_command_count: int = 0
+    observation_snapshot: ObservationSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -4132,34 +4244,26 @@ class ExecutionController:
 
 def build_observation(
     *,
-    delivery_state: np.ndarray,
-    qpos: np.ndarray,
+    snapshot: ObservationSnapshot,
     protocol: PolicyProtocol,
-    images: dict[str, np.ndarray],
-    image_timestamps: dict[str, float],
     instruction: str,
     source_name: str,
     args: argparse.Namespace,
-    execution: ExecutionController,
-    captured_at: float | None = None,
-    captured_monotonic: float | None = None,
-    execution_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    captured_at = time.time() if captured_at is None else float(captured_at)
-    captured_monotonic = (
-        time.monotonic()
-        if captured_monotonic is None
-        else float(captured_monotonic)
-    )
-    state = policy_observation_state(delivery_state, qpos, protocol)
+    """Build a policy payload using only a frozen control-thread snapshot."""
+    state = np.array(snapshot.state, dtype=np.float32, copy=True)
     if state.shape != (protocol.state_dim,) or not np.all(np.isfinite(state)):
         raise RuntimeError(
             f"{protocol.arm_mode} {protocol.schema} observation state must be finite "
             f"{protocol.state_dim}D, got {state.shape}"
         )
+    images = snapshot.images
+    image_timestamps = snapshot.image_timestamps
+    image_monotonic_timestamps = snapshot.image_monotonic_timestamps
     if protocol.arm_mode == "bimanual":
         observation_images = {
-            key: np.asarray(images[key], dtype=np.uint8) for key in protocol.camera_keys
+            key: np.array(images[key], dtype=np.uint8, copy=True)
+            for key in protocol.camera_keys
         }
         can_names = {"left": args.left_can, "right": args.right_can}
         camera_devices = {
@@ -4170,8 +4274,8 @@ def build_observation(
     else:
         wrist_key = next(key for key in protocol.camera_keys if "wrist" in key)
         observation_images = {
-            "cam_high": np.asarray(images["cam_high"], dtype=np.uint8),
-            wrist_key: np.asarray(images["cam_wrist"], dtype=np.uint8),
+            "cam_high": np.array(images["cam_high"], dtype=np.uint8, copy=True),
+            wrist_key: np.array(images["cam_wrist"], dtype=np.uint8, copy=True),
         }
         can_names = {protocol.arm_side: args.can}
         camera_devices = {
@@ -4183,15 +4287,31 @@ def build_observation(
         "images": observation_images,
         "prompt": instruction,
         "client_metadata": {
-            "captured_at": captured_at,
-            "captured_monotonic": captured_monotonic,
+            "captured_at": float(snapshot.captured_at),
+            "captured_monotonic": float(snapshot.captured_monotonic),
+            "state_captured_at": float(snapshot.captured_at),
+            "state_captured_monotonic": float(snapshot.captured_monotonic),
+            "image_set_captured_monotonic": float(snapshot.image_captured_monotonic),
+            "image_state_skew_ms": snapshot.image_state_skew_s * 1000.0,
             "source_name": source_name,
             "arm_mode": protocol.arm_mode,
             "arm_side": protocol.arm_side,
             "can_names": can_names,
             "camera_devices": camera_devices,
             "image_captured_at": {
-                key: float(image_timestamps["cam_wrist"] if protocol.arm_mode == "single" and "wrist" in key else image_timestamps[key])
+                key: float(
+                    image_timestamps["cam_wrist"]
+                    if protocol.arm_mode == "single" and "wrist" in key
+                    else image_timestamps[key]
+                )
+                for key in protocol.camera_keys
+            },
+            "image_captured_monotonic": {
+                key: float(
+                    image_monotonic_timestamps["cam_wrist"]
+                    if protocol.arm_mode == "single" and "wrist" in key
+                    else image_monotonic_timestamps[key]
+                )
                 for key in protocol.camera_keys
             },
             # Preserve old single-arm telemetry fields.
@@ -4204,22 +4324,11 @@ def build_observation(
             "policy_state_gripper_semantics": protocol.state_gripper_semantics,
             "policy_contract_version": protocol.contract_version,
             "policy_gripper_semantics_explicit": protocol.metadata_gripper_semantics_explicit,
-            **(
-                execution.metadata()
-                if execution_metadata is None
-                else execution_metadata
-            ),
+            **_thaw_snapshot_value(snapshot.execution_metadata),
             "rtc": {
-                **(
-                    execution.rtc_request_metadata(protocol)
-                    if callable(getattr(execution, "rtc_request_metadata", None))
-                    else {"enabled": False, "inference_delay_steps": 0, "previous_chunk_offset_steps": 0}
-                ),
-                "enabled": bool(getattr(execution, "rtc_enabled", False)),
+                **_thaw_snapshot_value(snapshot.rtc_metadata),
                 "session_id": str(getattr(args, "rtc_session_id", "")),
-                "inference_generation": execution_metadata.get("inference_generation")
-                if isinstance(execution_metadata, dict)
-                else getattr(execution, "inference_generation", None),
+                "inference_generation": int(snapshot.generation),
             },
         },
     }
@@ -4461,6 +4570,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                 "camera_capture_fps": float(args.camera_fps),
             }
         )
+        record_camera_stream = None
         if recorder.is_active:
             def record_camera_stream(
                 images: dict[str, np.ndarray],
@@ -4476,15 +4586,15 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                 except Exception:
                     logging.exception("Failed to record background camera frames")
 
-            try:
-                cameras.start_background_capture(
-                    record_camera_stream, fps=args.camera_fps
-                )
-            except Exception:
-                logging.exception(
-                    "Could not start background camera recording; "
-                    "continuing with direct inference capture"
-                )
+        try:
+            cameras.start_background_capture(
+                record_camera_stream, fps=args.camera_fps
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "RTC deployment requires the background camera stream for "
+                "time-aligned observation snapshots"
+            ) from exc
         logging.info(
             "Deployment recording: %s",
             recorder.run_dir if recorder.is_active else "disabled",
@@ -4568,16 +4678,34 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                     sides = (
                         ("left", "right") if args.arm_mode == "bimanual" else (args.arm_side,)
                     )
-                    states = {
-                        side: read_output_state(
-                            pipers[side], max_feedback_age_s=args.max_feedback_age_s
-                        )
-                        for side in sides
-                    }
-                    delivery_state = np.concatenate([states[side][0] for side in sides]).astype(
-                        np.float32
-                    )
-                    qpos = np.concatenate([states[side][1] for side in sides]).astype(np.float32)
+                    if protocol.schema == "joint":
+                        qpos = np.concatenate(
+                            [
+                                read_output_qpos(
+                                    pipers[side],
+                                    max_feedback_age_s=args.max_feedback_age_s,
+                                )
+                                for side in sides
+                            ]
+                        ).astype(np.float32)
+                        # Joint policies and their command-feedback guard do not
+                        # depend on EEF feedback.  Keep the absent modality
+                        # explicit instead of blocking on GetArmEndPoseMsgs().
+                        delivery_state = np.empty(0, dtype=np.float32)
+                    else:
+                        states = {
+                            side: read_output_state(
+                                pipers[side],
+                                max_feedback_age_s=args.max_feedback_age_s,
+                            )
+                            for side in sides
+                        }
+                        delivery_state = np.concatenate(
+                            [states[side][0] for side in sides]
+                        ).astype(np.float32)
+                        qpos = np.concatenate(
+                            [states[side][1] for side in sides]
+                        ).astype(np.float32)
                     observation_captured_at = time.time()
                     observation_captured_monotonic = time.monotonic()
 
