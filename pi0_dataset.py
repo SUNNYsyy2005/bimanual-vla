@@ -141,7 +141,7 @@ def classify_contract_dimensions(
     if not inferred_schema:
         if (state_dim, raw_action_dim) in {(10, 7), (20, 14), (10, 10), (20, 20)}:
             inferred_schema = "delivery"
-        elif (state_dim, raw_action_dim) in {(7, 7), (14, 14)}:
+        elif (state_dim, raw_action_dim) in {(7, 7), (14, 14), (16, 16)}:
             inferred_schema = "joint"
         else:
             raise ValueError(
@@ -149,19 +149,21 @@ def classify_contract_dimensions(
             )
 
     if inferred_schema == "joint":
-        if (state_dim, raw_action_dim) not in {(7, 7), (14, 14)}:
+        if (state_dim, raw_action_dim) not in {(7, 7), (14, 14), (16, 16)}:
             raise ValueError(
-                f"joint schema requires 7D/7D or 14D/14D, got {state_dim}/{raw_action_dim}"
+                f"joint schema requires 7D/7D, 14D/14D, or Franka 16D/16D, got {state_dim}/{raw_action_dim}"
             )
         if legacy_requested:
             raise ValueError("legacy_v2 is reserved for delivery step-delta datasets")
-        arm_count = state_dim // 7
+        arm_count = 1 if state_dim == 7 else 2
+        model_action_dim = raw_action_dim
         legacy = False
         action_format = "absolute_joint_target"
     else:
         if state_dim not in {10, 20}:
             raise ValueError(f"delivery schema requires 10D or 20D state, got {state_dim}")
         arm_count = state_dim // 10
+        model_action_dim = arm_count * 7
         if raw_action_dim == state_dim:
             if legacy_requested:
                 raise ValueError(
@@ -185,7 +187,7 @@ def classify_contract_dimensions(
         "arm_mode": "single" if arm_count == 1 else "bimanual",
         "state_dim": state_dim,
         "raw_action_dim": raw_action_dim,
-        "model_action_dim": arm_count * 7,
+        "model_action_dim": model_action_dim,
         "legacy": legacy,
         "legacy_format": LEGACY_V2 if legacy else None,
         "contract_format": LEGACY_V2 if legacy else CANONICAL_CONTRACT_FORMAT,

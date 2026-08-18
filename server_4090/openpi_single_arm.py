@@ -1027,6 +1027,8 @@ def resolve_dataset_contract(args: argparse.Namespace) -> DatasetContract:
     by_dims = {
         (7, 7): ("joint", "single", False),
         (14, 14): ("joint", "bimanual", False),
+        # Franka Panda: 7 joints + 1 gripper per arm.
+        (16, 16): ("joint", "bimanual", False),
         (10, 7): ("delivery", "single", True),
         (20, 14): ("delivery", "bimanual", True),
         (10, 10): ("delivery", "single", False),
@@ -1036,7 +1038,7 @@ def resolve_dataset_contract(args: argparse.Namespace) -> DatasetContract:
     if inferred is None:
         raise ValueError(
             f"unsupported Piper state/raw-action dimensions {(state_dim, raw_action_dim)}; "
-            "expected joint (7,7)/(14,14), legacy delivery (10,7)/(20,14), "
+            "expected joint (7,7)/(14,14)/Franka (16,16), legacy delivery (10,7)/(20,14), "
             "or absolute-EEF delivery (10,10)/(20,20)"
         )
     inferred_schema, inferred_arm_mode, legacy_delivery = inferred
@@ -1078,7 +1080,7 @@ def resolve_dataset_contract(args: argparse.Namespace) -> DatasetContract:
         )
 
     arm_count = 2 if arm_mode == "bimanual" else 1
-    model_action_dim = 7 * arm_count
+    model_action_dim = raw_action_dim if schema == "joint" else 7 * arm_count
     if schema == "joint":
         declared_gripper = metadata.get("raw_gripper_semantics") or metadata.get(
             "gripper_semantics"
@@ -1126,7 +1128,12 @@ def resolve_dataset_contract(args: argparse.Namespace) -> DatasetContract:
             or JOINT_RAW_ACTION_SEMANTICS
         )
         model_action_convention = JOINT_MODEL_ACTION_CONVENTION
-        model_action_semantics = JOINT_MODEL_ACTION_SEMANTICS
+        joint_dims_per_arm = int(model_action_dim // arm_count) - 1
+        model_action_semantics = (
+            JOINT_MODEL_ACTION_SEMANTICS
+            if joint_dims_per_arm == 6
+            else f"joint_delta_chunk_origin_first_{joint_dims_per_arm}_absolute_gripper_target"
+        )
         wire_action_semantics = raw_action_semantics
         model_gripper_semantics = GRIPPER_OPENING_FRACTION
         wire_gripper_semantics = model_gripper_semantics
@@ -1536,11 +1543,11 @@ class PiperDataConfig(training_config.DataConfigFactory):
                 robot_transforms = robot_transforms.push(
                     inputs=[JointGripperMetersToFraction(arm_count=arm_count)]
                 )
-            mask = (
-                transforms.make_bool_mask(6, -1, 6, -1)
-                if self.contract.arm_mode == "bimanual"
-                else transforms.make_bool_mask(6, -1)
-            )
+            joint_dims_per_arm = self.contract.model_action_dim // arm_count - 1
+            mask_parts: list[int] = []
+            for _ in range(arm_count):
+                mask_parts.extend((joint_dims_per_arm, -1))
+            mask = transforms.make_bool_mask(*mask_parts)
             robot_transforms = robot_transforms.push(
                 inputs=[transforms.DeltaActions(mask)],
                 outputs=[transforms.AbsoluteActions(mask)],
@@ -1839,10 +1846,17 @@ class _ExternalResumeCheckpointManager:
     the target manager.
     """
 
-    def __init__(self, source_manager: Any, target_manager: Any, source_step: int):
+    def __init__(
+        self,
+        source_manager: Any,
+        target_manager: Any,
+        source_step: int,
+        target_shardings: dict[str, Any],
+    ):
         self._source = source_manager
         self._target = target_manager
         self._source_step = int(source_step)
+        self._target_shardings = target_shardings
 
     def latest_step(self) -> int:
         return self._source_step
@@ -1850,6 +1864,37 @@ class _ExternalResumeCheckpointManager:
     def restore(self, step=None, *args, **kwargs):
         selected = self._source_step if step is None else int(step)
         logging.info("Restoring external full-state checkpoint from %s (step %s)", self._source.directory, selected)
+
+        # ``items`` contains the freshly initialized train state for the
+        # *current* device mesh. Orbax 0.11 otherwise trusts the sharding
+        # metadata embedded in the source checkpoint. That fails when, for
+        # example, a checkpoint saved with 2-way FSDP is resumed on one H100:
+        # the saved devices no longer exist and no target sharding is supplied.
+        # Construct explicit restore args from the current target arrays so
+        # Orbax reads the global arrays and reshares them onto the new mesh.
+        target_items = kwargs.get("items")
+        if target_items is not None and kwargs.get("restore_kwargs") is None:
+            from orbax.checkpoint import checkpoint_utils
+
+            item_shardings = self._target_shardings.get("items")
+            if item_shardings is None:
+                raise RuntimeError(
+                    "external checkpoint target shardings were not captured before restore"
+                )
+            kwargs["restore_kwargs"] = {
+                item_name: {
+                    "restore_args": checkpoint_utils.construct_restore_args(
+                        item,
+                        sharding_tree=item_shardings[item_name],
+                    ),
+                }
+                for item_name, item in target_items.items()
+            }
+            logging.info(
+                "Restoring external checkpoint with explicit target shardings for items: %s",
+                sorted(target_items),
+            )
+
         return self._source.restore(selected, *args, **kwargs)
 
     def save(self, *args, **kwargs):
@@ -1880,6 +1925,32 @@ def _install_external_full_state_resume(train_module: Any, config: Any, source_c
     source_dir = source_checkpoint.parent
     source_step = int(source_checkpoint.name)
     installed = False
+    target_shardings: dict[str, Any] = {}
+
+    # In resume mode upstream ``init_train_state`` returns ShapeDtypeStruct
+    # leaves, whose own ``.sharding`` is None, plus a separate sharding tree.
+    # Capture that tree and split it exactly like ``restore_state`` splits the
+    # target state into ``train_state`` and inference ``params`` items.
+    original_init_train_state = train_module.init_train_state
+
+    @functools.wraps(original_init_train_state)
+    def init_train_state(*args, **kwargs):
+        state, state_sharding = original_init_train_state(*args, **kwargs)
+        # The sharding tree has ``NamedSharding`` objects where TrainState's
+        # runtime type hints normally require arrays. Match upstream
+        # checkpoint save/restore code and suspend jaxtyping while applying
+        # the same structural split.
+        with train_module._checkpoints.at.disable_typechecking():
+            train_state_sharding, params_sharding = train_module._checkpoints._split_params(
+                state_sharding
+            )
+        target_shardings["items"] = {
+            "train_state": train_state_sharding,
+            "params": {"params": params_sharding},
+        }
+        return state, state_sharding
+
+    train_module.init_train_state = init_train_state
 
     def initialize(checkpoint_dir, *, keep_period, overwrite, resume):
         nonlocal installed
@@ -1907,7 +1978,12 @@ def _install_external_full_state_resume(train_module: Any, config: Any, source_c
             source_step,
             target_dir,
         )
-        return _ExternalResumeCheckpointManager(source_manager, target_manager, source_step), True
+        return _ExternalResumeCheckpointManager(
+            source_manager,
+            target_manager,
+            source_step,
+            target_shardings,
+        ), True
 
     train_module._checkpoints.initialize_checkpoint_dir = initialize
 
@@ -3014,11 +3090,25 @@ def run_serve(args: argparse.Namespace) -> None:
     policy_metadata = dict(config.policy_metadata)
     if args.rtc_enabled:
         rtc_backend = "pytorch" if bool(getattr(policy, "_is_pytorch_model", False)) else "jax"
+        contract = getattr(getattr(config, "data", None), "contract", None)
+        if contract is None:
+            raise RuntimeError("RTC requires the resolved Piper dataset contract")
+        reanchor_action_mask = None
+        if contract.schema == "joint":
+            arm_count = 2 if contract.arm_mode == "bimanual" else 1
+            joint_dims_per_arm = contract.model_action_dim // arm_count - 1
+            mask_values: list[bool] = []
+            for _ in range(arm_count):
+                mask_values.extend([True] * joint_dims_per_arm)
+                mask_values.append(False)  # Gripper remains an absolute action.
+            reanchor_action_mask = tuple(mask_values)
         rtc_config = RTCConfig(
             enabled=True,
             execution_horizon=args.rtc_execution_horizon,
             max_guidance_weight=args.rtc_max_guidance_weight,
             prefix_attention_schedule=args.rtc_prefix_attention_schedule,
+            physical_action_dim=int(contract.model_action_dim),
+            reanchor_action_mask=reanchor_action_mask,
         )
         policy = build_rtc_policy(policy, rtc_config)
         policy_metadata.update(
@@ -3029,6 +3119,8 @@ def run_serve(args: argparse.Namespace) -> None:
                 "rtc_execution_horizon": rtc_config.execution_horizon,
                 "rtc_max_guidance_weight": rtc_config.max_guidance_weight,
                 "rtc_prefix_attention_schedule": rtc_config.prefix_attention_schedule,
+                "rtc_physical_action_dim": rtc_config.physical_action_dim,
+                "rtc_chunk_origin_reanchoring": bool(reanchor_action_mask),
             }
         )
     else:
