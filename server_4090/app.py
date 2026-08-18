@@ -1391,7 +1391,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "small_gpu_process_memory_mib": 512,
         "small_gpu_process_total_mib": 1024,
         "xla_memory_fraction": 0.90,
-        "training_min_free_gpu_mib": 23_000,
+        "training_min_free_gpu_mib": 22_500,
         "evaluation_min_free_gpu_mib": 23_000,
         "evaluation_xla_memory_fraction": 0.85,
         # Policy inference is much lighter than training. Keep training/eval
@@ -1819,7 +1819,7 @@ class TaskManager:
         minimum_free_mib = int(
             metadata.get(
                 "minimum_free_gpu_mib",
-                self.config.get("training_min_free_gpu_mib", 23_000),
+                self.config.get("training_min_free_gpu_mib", 22_500),
             )
         )
         low_memory = gpu_memory_shortfalls(inventory, gpu_ids, minimum_free_mib)
@@ -4564,7 +4564,7 @@ def create_app(config_path: Path) -> Flask:
                     "allowed_gpu_ids": sorted(allowed_gpus),
                     "allow_busy_gpus": config["allow_busy_gpus"],
                     "xla_memory_fraction": config.get("xla_memory_fraction", 0.90),
-                    "training_min_free_gpu_mib": config.get("training_min_free_gpu_mib", 23_000),
+                    "training_min_free_gpu_mib": config.get("training_min_free_gpu_mib", 22_500),
                     "policy_allow_busy_gpus": config.get("policy_allow_busy_gpus", True),
                     "policy_min_free_gpu_mib": config.get("policy_min_free_gpu_mib", 12_000),
                     "policy_xla_memory_fraction": config.get("policy_xla_memory_fraction", 0.60),
@@ -6774,7 +6774,7 @@ print(json.dumps(rows, ensure_ascii=False))
         execution_target = str(payload.get("execution_target", "local_4090") or "local_4090")
         cluster_target_config = runtime_config_for_target(execution_target)
         is_cluster_target = cluster_target_config is not None
-        minimum_free_gpu_mib = int(config.get("training_min_free_gpu_mib", 23_000))
+        minimum_free_gpu_mib = int(config.get("training_min_free_gpu_mib", 22_500))
         allow_busy_raw = payload.get("allow_busy_gpus", config.get("allow_busy_gpus", False))
         allow_busy_gpus = (
             allow_busy_raw
