@@ -9,7 +9,7 @@ import unittest
 import cv2
 import numpy as np
 
-from camera import CameraCapture
+from camera import CameraCapture, CameraFrameSet
 from deployment_recording import DeploymentRunRecorder
 
 
@@ -135,6 +135,33 @@ class DeploymentRunRecorderTest(unittest.TestCase):
         self.assertEqual(images["cam_high"].shape, (3, 16, 16))
         self.assertEqual(timestamps["cam_high"], 123.0)
         self.assertGreaterEqual(len(callback_count), 1)
+
+    def test_camera_nearest_frame_uses_monotonic_ring_buffer_and_returns_copy(self):
+        camera = CameraCapture(cam_ids={"cam_high": 0}, fps=20, image_hw=(4, 4))
+        camera._background_thread = object()
+        older = CameraFrameSet(
+            images={"cam_high": np.zeros((3, 4, 4), dtype=np.uint8)},
+            timestamps={"cam_high": 100.0},
+            monotonic_timestamps={"cam_high": 10.0},
+            captured_monotonic=10.0,
+        )
+        nearer_image = np.ones((3, 4, 4), dtype=np.uint8)
+        nearer = CameraFrameSet(
+            images={"cam_high": nearer_image},
+            timestamps={"cam_high": 100.05},
+            monotonic_timestamps={"cam_high": 10.05},
+            captured_monotonic=10.05,
+        )
+        camera._frame_history.extend((older, nearer))
+        try:
+            selected = camera.read_nearest(10.04)
+        finally:
+            camera._background_thread = None
+
+        self.assertEqual(selected.captured_monotonic, 10.05)
+        np.testing.assert_array_equal(selected.images["cam_high"], nearer_image)
+        selected.images["cam_high"][0, 0, 0] = 9
+        self.assertEqual(nearer.images["cam_high"][0, 0, 0], 1)
 
     def test_disabled_recorder_is_noop(self):
         with TemporaryDirectory() as tmp:

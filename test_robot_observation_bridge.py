@@ -2155,6 +2155,113 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         np.testing.assert_allclose(due_at, [0.0, 0.25, 0.50, 0.75], atol=1e-12)
         self.assertAlmostEqual(schedule.period_s, 0.25)
 
+    def test_control_rate_must_match_policy_action_rate(self):
+        execution = ExecutionController(
+            FakePiper(), execution_args(control_hz=10.0, action_hz=None)
+        )
+        with self.assertRaisesRegex(ValueError, "must match policy_action_hz"):
+            execution.configure_protocol(self.joint_protocol)
+
+    def test_tracking_lag_guard_freezes_suffix_and_requires_fresh_observation(self):
+        execution, _ = self.configured_execution(
+            tracking_lag_threshold_rad=0.05,
+            tracking_lag_confirm_cycles=3,
+        )
+        _, decoded = decode_action_queue(
+            self.joint_chunk(3, 0.10),
+            self.joint_protocol,
+            np.empty(0, dtype=np.float32),
+            self.qpos,
+            generation=11,
+            observation_capture_monotonic=time.monotonic(),
+            action_hz=20.0,
+        )
+        execution.last_safe_target = decoded[0]
+        execution.pending_actions = decoded[1:]
+        lagging_qpos = self.qpos.copy()
+        lagging_qpos[0] = 0.20
+
+        for cycle in range(3):
+            execution._pending_feedback_command = {
+                "hold": False,
+                "generation": 11,
+                "command_at": time.time() - 0.05,
+                "sides": {
+                    "right": {
+                        "commanded_joints_rad": np.zeros(6).tolist(),
+                        "commanded_gripper_m": float(self.qpos[6]),
+                        "pre_ik_eef_target": None,
+                    }
+                },
+            }
+            execution._complete_pending_command_feedback(
+                np.empty(0, dtype=np.float32),
+                lagging_qpos,
+                self.joint_protocol,
+                feedback_at=time.time(),
+            )
+            if cycle < 2:
+                self.assertFalse(execution.tracking_lag_active)
+                self.assertEqual(len(execution.pending_actions), 2)
+
+        self.assertTrue(execution.tracking_lag_active)
+        self.assertEqual(execution.tracking_lag_consecutive_cycles, 3)
+        self.assertEqual(execution.pending_action_count, 0)
+        self.assertTrue(execution.hold_active)
+        self.assertIsNone(
+            execution.last_command_feedback["sides"]["right"]
+            ["next_cycle_feedback"]["eef_state"]
+        )
+        guard = execution.metadata()["tracking_lag_guard"]
+        self.assertTrue(guard["active"])
+        self.assertEqual(guard["trigger_generation"], 11)
+
+        barrier = execution.tracking_lag_required_after_monotonic
+        assert barrier is not None
+        result = execution_result(self.joint_chunk(2, 0.10))
+        stale_launch, stale_arrived_at = inference_launch(
+            np.empty(0, dtype=np.float32),
+            self.qpos,
+            generation=12,
+            captured_monotonic=barrier - 0.01,
+        )
+        self.assertFalse(
+            execution.accept_inference_result(
+                result,
+                stale_launch,
+                self.joint_protocol,
+                arrived_at=stale_arrived_at,
+                arrived_monotonic=barrier,
+                min_steps_override=1,
+                skip_steps_override=0,
+                blend_steps_override=0,
+            )
+        )
+        self.assertTrue(execution.tracking_lag_active)
+        self.assertIn("post-trigger observation", execution.rejected_result["reason"])
+
+        fresh_launch, fresh_arrived_at = inference_launch(
+            np.empty(0, dtype=np.float32),
+            self.qpos,
+            generation=13,
+            captured_monotonic=barrier + 0.01,
+        )
+        self.assertTrue(
+            execution.accept_inference_result(
+                result,
+                fresh_launch,
+                self.joint_protocol,
+                arrived_at=fresh_arrived_at,
+                arrived_monotonic=barrier + 0.02,
+                min_steps_override=1,
+                skip_steps_override=0,
+                blend_steps_override=0,
+            )
+        )
+        self.assertFalse(execution.tracking_lag_active)
+        self.assertEqual(execution.tracking_lag_recovered_generation, 13)
+        self.assertEqual(execution.pending_action_count, 2)
+
     def test_blended_target_cannot_bypass_per_tick_delivery_safety(self):
         execution, piper = self.configured_execution(self.delivery_protocol, blend_steps=4)
         old = np.zeros((8, 7), dtype=np.float64)
@@ -2526,7 +2633,11 @@ class ExecutionQueueTest(unittest.TestCase):
 
     def test_bimanual_joint_action_maps_left_and_right_to_piper_units(self):
         protocol = validate_policy_metadata(BIMANUAL_JOINT_METADATA, "both", "bimanual")
-        pipers = {"left": FakePiper(), "right": FakePiper()}
+        event_log = []
+        pipers = {
+            "left": FakePiper(side="left", event_log=event_log),
+            "right": FakePiper(side="right", event_log=event_log),
+        }
         execution = ExecutionController(
             pipers,
             execution_args(
@@ -2576,6 +2687,24 @@ class ExecutionQueueTest(unittest.TestCase):
         self.assertEqual(
             set(execution.last_actuator_command["sides"]), {"left", "right"}
         )
+        self.assertEqual(
+            event_log,
+            [
+                ("left", "ModeCtrl"),
+                ("right", "ModeCtrl"),
+                ("left", "JointCtrl"),
+                ("right", "JointCtrl"),
+                ("left", "GripperCtrl"),
+                ("right", "GripperCtrl"),
+            ],
+        )
+        trace = execution.last_actuator_command
+        for key in ("modectrl_skew_ms", "jointctrl_skew_ms", "gripperctrl_skew_ms"):
+            self.assertIsNotNone(trace[key])
+            self.assertGreaterEqual(trace[key], 0.0)
+        for side in ("left", "right"):
+            self.assertIn("joint_ctrl_at", trace["sides"][side])
+            self.assertIn("joint_ctrl_monotonic", trace["sides"][side])
 
 
 if __name__ == "__main__":
