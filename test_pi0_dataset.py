@@ -11,12 +11,20 @@ import numpy as np
 from pi0_dataset import (
     DELIVERY_LEGACY_ACTION_SEMANTICS,
     Pi0LeRobotDatasetWriter,
+    classify_contract_dimensions,
     default_eef_names,
 )
 from piper_data_contract import EpisodeContract
 
 
 class Pi0LeRobotDatasetWriterContractTest(unittest.TestCase):
+    def test_franka_bimanual_joint_dimensions_remain_16d(self):
+        contract = classify_contract_dimensions(16, 16, schema="joint")
+        self.assertEqual(contract["arm_mode"], "bimanual")
+        self.assertEqual(contract["arm_count"], 2)
+        self.assertEqual(contract["raw_action_dim"], 16)
+        self.assertEqual(contract["model_action_dim"], 16)
+
     def make_writer(
         self,
         root: Path,

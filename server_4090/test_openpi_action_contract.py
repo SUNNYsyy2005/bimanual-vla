@@ -21,6 +21,7 @@ def _load_openpi_helper():
     transforms = types.ModuleType("openpi.transforms")
     transforms.DataTransformFn = object
     models = types.ModuleType("openpi.models")
+    model = types.ModuleType("openpi.models.model")
     pi0_config = types.ModuleType("openpi.models.pi0_config")
     policies = types.ModuleType("openpi.policies")
     policy_config = types.ModuleType("openpi.policies.policy_config")
@@ -30,9 +31,14 @@ def _load_openpi_helper():
     shared = types.ModuleType("openpi.shared")
     normalize = types.ModuleType("openpi.shared.normalize")
     training = types.ModuleType("openpi.training")
+    checkpoints = types.ModuleType("openpi.training.checkpoints")
     training_config = types.ModuleType("openpi.training.config")
     training_config.DataConfigFactory = object
     data_loader = types.ModuleType("openpi.training.data_loader")
+    lerobot_dataset = types.ModuleType("openpi.training.data_loader.lerobot_dataset")
+    lerobot_dataset.decode_video_frames = lambda *args, **kwargs: None
+    lerobot_dataset.get_safe_default_codec = lambda *args, **kwargs: None
+    optimizer = types.ModuleType("openpi.training.optimizer")
     weight_loaders = types.ModuleType("openpi.training.weight_loaders")
 
     openpi.transforms = transforms
@@ -42,17 +48,22 @@ def _load_openpi_helper():
     openpi.shared = shared
     openpi.training = training
     models.pi0_config = pi0_config
+    models.model = model
     policies.policy_config = policy_config
     serving.websocket_policy_server = websocket_policy_server
     shared.normalize = normalize
     training.config = training_config
+    training.checkpoints = checkpoints
     training.data_loader = data_loader
+    data_loader.lerobot_dataset = lerobot_dataset
+    training.optimizer = optimizer
     training.weight_loaders = weight_loaders
 
     stubs = {
         "openpi": openpi,
         "openpi.transforms": transforms,
         "openpi.models": models,
+        "openpi.models.model": model,
         "openpi.models.pi0_config": pi0_config,
         "openpi.policies": policies,
         "openpi.policies.policy_config": policy_config,
@@ -61,8 +72,11 @@ def _load_openpi_helper():
         "openpi.shared": shared,
         "openpi.shared.normalize": normalize,
         "openpi.training": training,
+        "openpi.training.checkpoints": checkpoints,
         "openpi.training.config": training_config,
         "openpi.training.data_loader": data_loader,
+        "openpi.training.data_loader.lerobot_dataset": lerobot_dataset,
+        "openpi.training.optimizer": optimizer,
         "openpi.training.weight_loaders": weight_loaders,
     }
     module_name = "server_4090._openpi_single_arm_contract_test_target"
@@ -626,6 +640,38 @@ class OpenPiDatasetContractTest(unittest.TestCase):
             self.assertEqual(absolute.raw_action_convention, "absolute_eef_target")
             self.assertEqual(absolute.action_offset, 0)
             self.assertEqual(absolute.model_action_start_offset, 1)
+
+    def test_franka_bimanual_16d_joint_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_info(
+                root,
+                "franka16",
+                {
+                    "contract_version": 3,
+                    "gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+                    "features": {
+                        "observation.state": {"shape": [16]},
+                        "action": {"shape": [16]},
+                        "observation.images.cam_high": {"dtype": "image"},
+                        "observation.images.cam_left_wrist": {"dtype": "image"},
+                        "observation.images.cam_right_wrist": {"dtype": "image"},
+                    },
+                },
+            )
+            marker = root / "franka16" / "meta" / "dashboard_dataset_origin.json"
+            marker.write_text(json.dumps({"origin": "simulation"}), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"HF_LEROBOT_HOME": str(root)}):
+                contract = HELPER.resolve_dataset_contract(self.args("franka16"))
+
+            self.assertEqual(contract.schema, "joint")
+            self.assertEqual(contract.arm_mode, "bimanual")
+            self.assertEqual(contract.state_dim, 16)
+            self.assertEqual((contract.raw_action_dim, contract.model_action_dim), (16, 16))
+            self.assertEqual(
+                contract.model_action_semantics,
+                "joint_delta_chunk_origin_first_7_absolute_gripper_target",
+            )
 
     def test_extended_norm_contract_accepts_current_version(self):
         contract = {
