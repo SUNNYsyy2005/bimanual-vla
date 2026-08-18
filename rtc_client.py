@@ -2531,6 +2531,20 @@ class ExecutionController:
             "last_actuator_command": self.last_actuator_command,
             "last_command_feedback": self.last_command_feedback,
             "estimated_actuator_delay_s": self.estimated_actuator_delay_s,
+            "tracking_lag_guard": {
+                "active": self.tracking_lag_active,
+                "threshold_rad": self.tracking_lag_threshold_rad,
+                "confirm_cycles": self.tracking_lag_confirm_cycles,
+                "consecutive_cycles": self.tracking_lag_consecutive_cycles,
+                "started_at": self.tracking_lag_started_at,
+                "required_after_monotonic": (
+                    self.tracking_lag_required_after_monotonic
+                ),
+                "peak_error_rad": self.tracking_lag_peak_error_rad,
+                "trigger_count": self.tracking_lag_trigger_count,
+                "trigger_generation": self.tracking_lag_trigger_generation,
+                "recovered_generation": self.tracking_lag_recovered_generation,
+            },
             "gripper_filter": {
                 "lowpass_alpha": self.gripper_lowpass_alpha,
                 "hysteresis": self.gripper_hysteresis,
@@ -3278,19 +3292,22 @@ class ExecutionController:
         delivery = np.asarray(raw_delivery_state, dtype=np.float64)
         expected_qpos_dim = 7 * len(current_sides)
         expected_delivery_dim = 10 * len(current_sides)
-        if (
-            qpos.shape != (expected_qpos_dim,)
-            or delivery.shape != (expected_delivery_dim,)
-            or not np.all(np.isfinite(qpos))
-            or not np.all(np.isfinite(delivery))
-        ):
+        qpos_valid = qpos.shape == (expected_qpos_dim,) and np.all(np.isfinite(qpos))
+        delivery_valid = (
+            protocol.schema == "joint"
+            or (
+                delivery.shape == (expected_delivery_dim,)
+                and np.all(np.isfinite(delivery))
+            )
+        )
+        if not qpos_valid or not delivery_valid:
+            requirement = f"finite {expected_qpos_dim}D qpos"
+            if protocol.schema != "joint":
+                requirement += f" and {expected_delivery_dim}D delivery state"
             self.last_command_feedback = {
                 **pending,
                 "feedback_status": "unavailable",
-                "feedback_error": (
-                    f"next-cycle feedback must be finite {expected_qpos_dim}D qpos and "
-                    f"{expected_delivery_dim}D delivery state"
-                ),
+                "feedback_error": f"next-cycle feedback must be {requirement}",
                 "feedback_at": float(feedback_at),
             }
             return
@@ -3304,7 +3321,11 @@ class ExecutionController:
             issued = pending_sides[side]
             issued = issued if isinstance(issued, dict) else {}
             measured_qpos = qpos[index * 7 : (index + 1) * 7]
-            measured_delivery = delivery[index * 10 : (index + 1) * 10]
+            measured_delivery = (
+                delivery[index * 10 : (index + 1) * 10]
+                if protocol.schema != "joint"
+                else None
+            )
             commanded_joints = np.asarray(
                 issued.get("commanded_joints_rad"), dtype=np.float64
             )
@@ -3334,35 +3355,37 @@ class ExecutionController:
             eef_translation_error_m = None
             eef_rotation_error_rad = None
             measured_eef_rpy_deg = None
-            try:
-                measured_rotation = rotation_from_state(measured_delivery)
-                measured_eef_rpy_deg = Rotation.from_matrix(measured_rotation).as_euler(
-                    "xyz", degrees=True
-                ).tolist()
-            except (ExecutionBlocked, ValueError, FloatingPointError):
-                measured_rotation = None
-            pre_ik = issued.get("pre_ik_eef_target")
-            if isinstance(pre_ik, dict):
-                absolute_target = np.asarray(
-                    pre_ik.get("absolute_target"), dtype=np.float64
-                )
-                if absolute_target.shape == (10,) and np.all(np.isfinite(absolute_target)):
-                    eef_translation_error_m = float(
-                        np.linalg.norm(measured_delivery[:3] - absolute_target[:3])
+            measured_rotation = None
+            if measured_delivery is not None:
+                try:
+                    measured_rotation = rotation_from_state(measured_delivery)
+                    measured_eef_rpy_deg = Rotation.from_matrix(measured_rotation).as_euler(
+                        "xyz", degrees=True
+                    ).tolist()
+                except (ExecutionBlocked, ValueError, FloatingPointError):
+                    measured_rotation = None
+                pre_ik = issued.get("pre_ik_eef_target")
+                if isinstance(pre_ik, dict):
+                    absolute_target = np.asarray(
+                        pre_ik.get("absolute_target"), dtype=np.float64
                     )
-                    try:
-                        if measured_rotation is not None:
-                            eef_rotation_error_rad = float(
-                                Rotation.from_matrix(
-                                    rotation_from_state(absolute_target)
-                                    @ measured_rotation.T
-                                ).magnitude()
-                            )
-                    except (ExecutionBlocked, ValueError, FloatingPointError):
-                        eef_rotation_error_rad = None
-                    eef_translation_errors.append(eef_translation_error_m)
-                    if eef_rotation_error_rad is not None:
-                        eef_rotation_errors.append(eef_rotation_error_rad)
+                    if absolute_target.shape == (10,) and np.all(np.isfinite(absolute_target)):
+                        eef_translation_error_m = float(
+                            np.linalg.norm(measured_delivery[:3] - absolute_target[:3])
+                        )
+                        try:
+                            if measured_rotation is not None:
+                                eef_rotation_error_rad = float(
+                                    Rotation.from_matrix(
+                                        rotation_from_state(absolute_target)
+                                        @ measured_rotation.T
+                                    ).magnitude()
+                                )
+                        except (ExecutionBlocked, ValueError, FloatingPointError):
+                            eef_rotation_error_rad = None
+                        eef_translation_errors.append(eef_translation_error_m)
+                        if eef_rotation_error_rad is not None:
+                            eef_rotation_errors.append(eef_rotation_error_rad)
 
             completed_sides[side] = {
                 **issued,
@@ -3370,9 +3393,19 @@ class ExecutionController:
                     "feedback_at": float(feedback_at),
                     "joints_rad": measured_qpos[:6].tolist(),
                     "gripper_opening_m": float(measured_qpos[6]),
-                    "eef_state": measured_delivery.tolist(),
-                    "eef_xyz_m": measured_delivery[:3].tolist(),
-                    "eef_rotation6d": measured_delivery[3:9].tolist(),
+                    "eef_state": (
+                        measured_delivery.tolist() if measured_delivery is not None else None
+                    ),
+                    "eef_xyz_m": (
+                        measured_delivery[:3].tolist()
+                        if measured_delivery is not None
+                        else None
+                    ),
+                    "eef_rotation6d": (
+                        measured_delivery[3:9].tolist()
+                        if measured_delivery is not None
+                        else None
+                    ),
                     "eef_rpy_deg": measured_eef_rpy_deg,
                     "gripper_opening_fraction": float(
                         np.clip(measured_qpos[6] / GRIPPER_MAX_M, 0.0, 1.0)
@@ -3392,6 +3425,7 @@ class ExecutionController:
             }
 
         command_at = self._finite_timing_value(pending.get("command_at"))
+        max_joint_error = max(max_joint_errors) if max_joint_errors else None
         self.last_command_feedback = {
             **pending,
             "feedback_status": "complete",
@@ -3402,7 +3436,7 @@ class ExecutionController:
                 if command_at is not None
                 else None
             ),
-            "max_joint_abs_error_rad": max(max_joint_errors) if max_joint_errors else None,
+            "max_joint_abs_error_rad": max_joint_error,
             "max_gripper_abs_error_m": max(gripper_errors) if gripper_errors else None,
             "max_eef_translation_error_m": (
                 max(eef_translation_errors) if eef_translation_errors else None
@@ -3412,6 +3446,58 @@ class ExecutionController:
             ),
             "sides": completed_sides,
         }
+
+        # Wall-clock trajectory selection must not outrun physical tracking.
+        # A transient one-frame error is tolerated, but sustained joint lag
+        # freezes the active suffix and requires inference from a post-trigger
+        # robot/image snapshot before motion can resume.
+        if not bool(pending.get("hold")) and max_joint_error is not None:
+            if max_joint_error > self.tracking_lag_threshold_rad:
+                self.tracking_lag_consecutive_cycles += 1
+                self.tracking_lag_peak_error_rad = max(
+                    self.tracking_lag_peak_error_rad, max_joint_error
+                )
+            elif not self.tracking_lag_active:
+                self.tracking_lag_consecutive_cycles = 0
+                self.tracking_lag_peak_error_rad = 0.0
+
+            if (
+                not self.tracking_lag_active
+                and self.tracking_lag_consecutive_cycles
+                >= self.tracking_lag_confirm_cycles
+            ):
+                self.tracking_lag_active = True
+                self.tracking_lag_started_at = float(feedback_at)
+                self.tracking_lag_required_after_monotonic = time.monotonic()
+                self.tracking_lag_trigger_count += 1
+                generation = pending.get("generation")
+                self.tracking_lag_trigger_generation = (
+                    int(generation) if generation is not None else self.active_generation
+                )
+                suffix_count = len(self.pending_actions)
+                reason = (
+                    "tracking lag guard froze timed trajectory after "
+                    f"{self.tracking_lag_consecutive_cycles} consecutive cycles above "
+                    f"{self.tracking_lag_threshold_rad:.6f} rad"
+                )
+                if suffix_count:
+                    self._record_queue_drop(suffix_count, reason, kind="other")
+                    self.pending_actions.clear()
+                else:
+                    self.last_queue_drop_reason = reason
+                    self.last_queue_drop_kind = "other"
+                self.queued_action_index = None
+                self.timeline_resync_active = False
+                self.hold_active = self.last_safe_target is not None
+                if self.hold_active and self.hold_started_at is None:
+                    self.hold_started_at = float(feedback_at)
+                self.state = "holding" if self.hold_active else "blocked"
+                self.blocked_reason = reason
+                logging.warning(
+                    "%s; peak error %.6f rad",
+                    reason,
+                    self.tracking_lag_peak_error_rad,
+                )
 
     def accept_inference_result(
         self,
@@ -3481,6 +3567,16 @@ class ExecutionController:
                 return self._reject_result(
                     launch.generation,
                     "discarded pre-settle inference; waiting for a post-enable observation",
+                    arrived_at,
+                )
+
+        if self.tracking_lag_active:
+            barrier = self.tracking_lag_required_after_monotonic
+            if barrier is None or float(launch.captured_monotonic) < barrier:
+                return self._reject_result(
+                    launch.generation,
+                    "discarded inference captured before tracking-lag guard triggered; "
+                    "waiting for a post-trigger observation",
                     arrived_at,
                 )
 
@@ -3627,6 +3723,12 @@ class ExecutionController:
             # first row later fails safety, authorization, IK, or queue timing.
             self.enable_staged_generation = launch.generation
         self.waiting_fresh_after_enable = False
+        if self.tracking_lag_active:
+            self.tracking_lag_active = False
+            self.tracking_lag_consecutive_cycles = 0
+            self.tracking_lag_required_after_monotonic = None
+            self.tracking_lag_recovered_generation = int(launch.generation)
+            self.tracking_lag_peak_error_rad = 0.0
         self.rejected_result = None
         if bool(getattr(self.args, "allow_execution", False)):
             self.state = "ready"
@@ -4104,11 +4206,12 @@ class ExecutionController:
             # against the same fresh feedback before either arm receives a command.
             command_started_at = time.time()
             command_started_monotonic = time.monotonic()
+            wire_commands: dict[str, tuple[np.ndarray, int]] = {}
             for side in sides:
-                piper = self.pipers[side]
                 target_joints, target_gripper_m = prepared[side]
                 raw_joints = np.rint(target_joints * RAD_FACTOR).astype(np.int64)
                 raw_gripper = round(target_gripper_m * GRIPPER_FACTOR)
+                wire_commands[side] = (raw_joints, int(raw_gripper))
                 command_pipeline[side]["piper_jointctrl_units"] = raw_joints.tolist()
                 command_pipeline[side]["piper_gripperctrl_units"] = int(raw_gripper)
                 command_pipeline[side]["piper_speed_pct"] = int(
@@ -4117,13 +4220,51 @@ class ExecutionController:
                 command_pipeline[side]["piper_gripper_effort"] = int(
                     getattr(self.args, "gripper_effort", 1000)
                 )
+
+            # Publish bimanual commands in phases.  This avoids completing the
+            # full Mode/Joint/Gripper sequence for one arm before the other arm
+            # receives its JointCtrl target, and exposes the remaining skew.
+            for side in sides:
+                piper = self.pipers[side]
+                started_at = time.time()
+                started_monotonic = time.monotonic()
                 piper.ModeCtrl(
                     0x01, 0x01, int(getattr(self.args, "speed_pct", 10)), 0x00
                 )
+                command_pipeline[side]["mode_ctrl_started_at"] = started_at
+                command_pipeline[side][
+                    "mode_ctrl_started_monotonic"
+                ] = started_monotonic
+                command_pipeline[side]["mode_ctrl_at"] = time.time()
+                command_pipeline[side]["mode_ctrl_monotonic"] = time.monotonic()
+
+            for side in sides:
+                piper = self.pipers[side]
+                raw_joints, _ = wire_commands[side]
+                started_at = time.time()
+                started_monotonic = time.monotonic()
                 piper.JointCtrl(*map(int, raw_joints))
+                command_pipeline[side]["joint_ctrl_started_at"] = started_at
+                command_pipeline[side][
+                    "joint_ctrl_started_monotonic"
+                ] = started_monotonic
+                command_pipeline[side]["joint_ctrl_at"] = time.time()
+                command_pipeline[side]["joint_ctrl_monotonic"] = time.monotonic()
+
+            for side in sides:
+                piper = self.pipers[side]
+                _, raw_gripper = wire_commands[side]
+                started_at = time.time()
+                started_monotonic = time.monotonic()
                 piper.GripperCtrl(
                     int(raw_gripper), int(getattr(self.args, "gripper_effort", 1000)), 0x01, 0
                 )
+                command_pipeline[side]["gripper_ctrl_started_at"] = started_at
+                command_pipeline[side][
+                    "gripper_ctrl_started_monotonic"
+                ] = started_monotonic
+                command_pipeline[side]["gripper_ctrl_at"] = time.time()
+                command_pipeline[side]["gripper_ctrl_monotonic"] = time.monotonic()
         except ExecutionBlocked as exc:
             staged_enable_failure = bool(
                 self.enable_staged_generation == queued.generation
@@ -4214,6 +4355,17 @@ class ExecutionController:
             now_wall=command_at,
         )
         self.command_sequence += 1
+
+        def command_skew_ms(field: str) -> float | None:
+            timestamps = [
+                float(command_pipeline[side][field])
+                for side in sides
+                if field in command_pipeline[side]
+            ]
+            if len(timestamps) < 2:
+                return None
+            return (max(timestamps) - min(timestamps)) * 1000.0
+
         command_trace = {
             "trace_version": 1,
             "command_sequence": self.command_sequence,
@@ -4246,6 +4398,9 @@ class ExecutionController:
             "command_publish_duration_ms": max(
                 0.0, (command_monotonic - command_started_monotonic) * 1000.0
             ),
+            "modectrl_skew_ms": command_skew_ms("mode_ctrl_monotonic"),
+            "jointctrl_skew_ms": command_skew_ms("joint_ctrl_monotonic"),
+            "gripperctrl_skew_ms": command_skew_ms("gripper_ctrl_monotonic"),
             "queue_anchor_at": self.queue_anchor_at,
             "queue_loaded_at": self.queue_loaded_at,
             "sides": command_pipeline,
@@ -4844,7 +4999,16 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                             if args.once and accepted:
                                 once_result_accepted = True
 
-                    launch_candidate: tuple[InferenceLaunch, Callable[[], InferenceWorkerResult]] | None = None
+                    if execution.tracking_lag_active and not worker.in_flight:
+                        # The lag guard cleared the old suffix.  Retry immediately
+                        # rather than waiting for the normal 4 Hz launch cadence.
+                        launch_schedule.next_at = min(
+                            launch_schedule.next_at, tick_started
+                        )
+
+                    launch_candidate: tuple[
+                        InferenceLaunch, Callable[[], InferenceWorkerResult]
+                    ] | None = None
                     if launch_schedule.due(tick_started):
                         if worker.in_flight:
                             execution.record_launch_deferred()
@@ -5159,6 +5323,15 @@ def main() -> None:
         help="camera acquisition rate (default 20 Hz; independent of 4 Hz inference launches)",
     )
     parser.add_argument(
+        "--max-image-state-skew-ms",
+        type=float,
+        default=DEFAULT_MAX_IMAGE_STATE_SKEW_S * 1000.0,
+        help=(
+            "maximum allowed monotonic skew between Piper feedback and the "
+            "nearest buffered multi-camera frame set"
+        ),
+    )
+    parser.add_argument(
         "--hz",
         type=float,
         default=DEFAULT_INFERENCE_HZ,
@@ -5226,6 +5399,21 @@ def main() -> None:
             "estimated command-to-actuation delay used for monotonic future-target "
             "selection (default 0)"
         ),
+    )
+    parser.add_argument(
+        "--tracking-lag-threshold-rad",
+        type=float,
+        default=DEFAULT_TRACKING_LAG_THRESHOLD_RAD,
+        help=(
+            "freeze the timed suffix after sustained commanded-vs-measured joint "
+            "error exceeds this infinity-norm threshold"
+        ),
+    )
+    parser.add_argument(
+        "--tracking-lag-confirm-cycles",
+        type=int,
+        default=DEFAULT_TRACKING_LAG_CONFIRM_CYCLES,
+        help="consecutive high-error feedback cycles required to trigger the lag guard",
     )
     parser.add_argument(
         "--latency-skip-compensation-steps",
@@ -5405,6 +5593,7 @@ def main() -> None:
             if args.max_joint_gripper_step_m is not None
             else 0.25
         )
+    args.max_image_state_skew_s = args.max_image_state_skew_ms / 1000.0
     if not 1 <= args.port <= 65535:
         parser.error("port must be in [1, 65535]")
     if args.action_chunk_steps is not None:
@@ -5414,6 +5603,7 @@ def main() -> None:
         args.control_hz,
         args.camera_fps,
         args.camera_preview_fps,
+        args.max_image_state_skew_ms,
         args.action_hz if args.action_hz is not None else 1.0,
         args.rtc_execution_horizon,
         args.rtc_max_guidance_weight,
@@ -5424,6 +5614,7 @@ def main() -> None:
         args.max_gripper_step,
         args.gripper_range_tolerance,
         args.max_joint_step_rad,
+        args.tracking_lag_threshold_rad,
         args.max_joint_gripper_step,
         args.ik_max_joint_step_rad,
         args.ik_search_joint_radius_rad,
@@ -5462,6 +5653,8 @@ def main() -> None:
         parser.error("gripper-hysteresis must be in (0,0.5)")
     if args.gripper_confirm_steps < 1:
         parser.error("gripper-confirm-steps must be positive")
+    if args.tracking_lag_confirm_cycles < 1:
+        parser.error("tracking-lag-confirm-cycles must be positive")
     if not 1 <= args.speed_pct <= 100:
         parser.error("speed-pct must be in [1,100]")
     if not 0 <= args.gripper_effort <= 5000:
