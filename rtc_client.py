@@ -2219,6 +2219,13 @@ class ExecutionController:
                 DEFAULT_TRACKING_LAG_CONFIRM_CYCLES,
             )
         )
+        if (
+            not math.isfinite(self.tracking_lag_threshold_rad)
+            or self.tracking_lag_threshold_rad <= 0
+        ):
+            raise ValueError("tracking_lag_threshold_rad must be positive")
+        if self.tracking_lag_confirm_cycles < 1:
+            raise ValueError("tracking_lag_confirm_cycles must be positive")
         self.expected_action_horizon = int(protocol.action_horizon)
         self.pending_actions.clear()
         self.tracking_lag_consecutive_cycles = 0
