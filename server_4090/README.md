@@ -234,7 +234,7 @@ cd /home/sunny/bimanual-vla
    - norm batch size 只影响统计阶段的吞吐与资源占用，不需要和训练 batch size 一致；
    - 2×24 GiB RTX 4090 的 π0.5 LoRA 已验证安全起点为全局 batch `2`、`fsdp_devices=2`、`xla_memory_fraction=0.90`；batch `4` 可能在首个训练步的 NCCL 通信阶段 OOM；
    - Dashboard 按 GPU UUID 设置 `CUDA_VISIBLE_DEVICES`，避免某张故障卡从 CUDA 枚举中消失后数字序号错位；`nvidia-smi` 出现 `[N/A]` compute context 的卡会标记为不可训练；
-   - 正式训练启动前要求每张 4090 至少有 23000 MiB 空闲显存，避免数据采集、仿真或其他进程与 JAX 预分配/NCCL 抢占显存；
+   - 正式训练启动前默认要求每张 4090 至少有 22500 MiB 空闲显存；单个不超过 512 MiB 且合计不超过 1024 MiB 的稳定小型可视化/仿真进程不会单独触发 busy 拒绝，但仍必须满足空闲显存阈值，避免与 JAX 预分配/NCCL 抢占显存；
    - `norm_stats.json` 已存在且 episode 划分一致时直接启动训练；
    - 缺失时自动启动完整 norm 任务，训练进入持久化 `waiting_norm`；
    - norm 成功后自动启动训练；GPU 暂忙时进入 `waiting_gpu` 并自动重试；
@@ -247,6 +247,7 @@ cd /home/sunny/bimanual-vla
 7. 在“新建 / 切换 Policy 进程”中选择 GPU、端口和 checkpoint：
    - 留空“操作对象”：新建独立 Policy；
    - 选择运行中的 Policy：先停止旧进程，再从新 checkpoint 启动替代进程。
+   - Policy 使用独立的显存策略：默认允许卡上已有小型计算进程，但启动时仍要求至少 `12000 MiB` 空闲显存；同时设置 `XLA_PYTHON_CLIENT_PREALLOCATE=false` 和 `policy_xla_memory_fraction=0.60`，避免沿用训练配置预留接近整张 24 GiB 卡。训练和 heldout eval 仍保持原有独占/高空闲显存限制。
 8. 在“Policy 进程管理”中查看：
    - PID 和进程状态；
    - WebSocket `/healthz`；
@@ -276,8 +277,11 @@ POST   /api/tasks/batch-delete
 flow-matching denoising 阶段，用上一 action chunk 尚未执行的 normalized prefix
 对新 chunk 做 guidance，以补偿推理/传输延迟；它不是单纯的客户端 action 插值。
 Dashboard 启动 Policy 时默认传递 `--rtc-enabled`，JAX/Orbax 与 PyTorch
-checkpoint 都走模型侧 RTC。客户端只传 session、generation、offset 和 latency
-估计，默认关闭额外的客户端 old/new blend。
+checkpoint 都走模型侧 RTC。API 还可设置 `rtc_execution_horizon`、
+`rtc_max_guidance_weight` 和 `rtc_prefix_attention_schedule`（`zeros` / `ones` /
+`linear` / `exp`）。客户端只传 session、generation、offset 和 latency 估计，
+默认关闭额外的客户端 old/new blend；服务端按真实剩余步数填充固定 shape，避免
+JAX 因不同 offset 反复重新编译。
 
 脚本必须运行在物理连接 Piper CAN 和相机的电脑，而不是 4×4090；单臂使用一个 CAN 和两路相机：
 
@@ -349,6 +353,7 @@ Policy metadata 会继续发布：`action_hz` 等于数据集 `meta/info.json` �
 
 异步执行采用长 chunk 流水切换：控制循环持续以 20 Hz 消费旧 chunk，
 而推理默认以 4 Hz **尝试启动**，不是吞吐保证；客户端故意只允许一个请求在途。
+在当前链路正常时，模型推理加传输常见约 `200 ms`，但调度仍以实测端到端延迟为准。
 因此实际启动/完成频率受完整 capture→result 延迟限制，近似满足
 `actual_hz <= 1 / latency_s`。例如一次延迟 550 ms 时，单在途上限只有约 1.82 Hz，
 即使配置仍是 4 Hz。Dashboard 分开显示配置频率、实际 launch/result 频率和该上限；
@@ -411,4 +416,4 @@ WebSocket 和独立 20 Hz 控制循环。旧的 `robot_observation_bridge.py` �
 - Dashboard telemetry 是 Policy 收到数据后的只读镜像。
 - 服务端 EXECUTE 授权最长 1 小时，网页默认 5 分钟；Dashboard 重启、Policy 停止或模型切换都会回到 SHADOW。
 - 客户端没有 `--allow-execution` 时永远不会发布动作；即使双重门打开，动作新鲜度、每条 20 Hz command 的位移/旋转/夹爪变化、workspace、`action_horizon` 和 Piper 状态仍会在本地逐次检查。
-- 默认拒绝在已有计算进程的 GPU 上启动任务；如修改 `allow_busy_gpus`，应明确确认不会干扰其他任务。
+- 训练和 heldout eval 默认拒绝已有计算进程，并继续使用 `allow_busy_gpus` 与各自的空闲显存阈值。Policy 单独使用 `policy_allow_busy_gpus`（默认 `true`）和 `policy_min_free_gpu_mib`（默认 `12000`）；只应与显存占用稳定的小型任务共享，不能与后续还会持续增长显存的训练任务抢卡。

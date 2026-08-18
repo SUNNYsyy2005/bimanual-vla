@@ -127,7 +127,7 @@ Dashboard 均使用同一份 `EpisodeContract` 元数据。输出臂反馈采集
 
 - 轨迹保存 / 回放：`trajectory.py`
 - 导出可直接用于 pi0.5 / openpi 训练的 LeRobot 风格数据集：`pi0_dataset.py`
-- openpi / pi0.5 实机推理桥接：Dashboard 的 `server_4090/openpi_single_arm.py` 与 `rtc_client.py`；`serve_piper.py`、`run.py` 为 legacy 入口
+- openpi / pi0.5 实机推理桥接：Dashboard 的 `server_4090/openpi_single_arm.py` 与 `rtc_client.py`；`robot_observation_bridge.py` 是兼容别名，`serve_piper.py`、`run.py` 为 legacy 入口
 
 ---
 
@@ -617,6 +617,7 @@ Dashboard Token 只保护管理 API，机械臂客户端不需要 Dashboard URL 
 
 - `serve_piper.py`：旧版独立 Policy server；不包含模型侧 RTC。需要实机 RTC 时使用 Dashboard 启动的 `server_4090/openpi_single_arm.py serve --rtc-enabled`
 - `rtc_client.py`：正式实机客户端，记录机械臂轨迹、模型 action chunk 和同步视频
+- `robot_observation_bridge.py`：兼容旧启动命令的别名，直接转发到 `rtc_client.py`，不维护第二套控制实现
 - `run.py`：旧版简化实机循环，读取观测并请求 policy 动作
 - `robot_smoke_test.py`：机械臂 / 相机 smoke 测试
 - `policy_server_smoke_test.py`：与远程 policy server 联合推理 smoke 测试
