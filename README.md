@@ -1,101 +1,190 @@
+<div align="center">
+
 # bimanual-vla
 
-Piper 单臂/双臂数据采集、数据整理、OpenPI 训练管理和实机部署工具。
+**End-to-end Piper robot data collection, OpenPI training, and real-time policy deployment**
 
-项目围绕四条主流程组织：
+[![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](docs/INSTALLATION.md) [![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04-E95420?logo=ubuntu&logoColor=white)](docs/INSTALLATION.md) [![LeRobot](https://img.shields.io/badge/LeRobot-v2.1-FFD21E)](https://github.com/huggingface/lerobot) [![OpenPI](https://img.shields.io/badge/OpenPI-pi0%20%7C%20pi0.5-6C5CE7)](https://github.com/Physical-Intelligence/openpi) [![Control](https://img.shields.io/badge/Robot_Control-20_Hz-2E8B57)](#real-robot-deployment)
 
-1. **采集**：Piper 主从遥操作或输出臂反馈，配合 2/3 路 RGB 相机记录 episode。
-2. **GUI**：连接设备、采集、回放、检查、转换和上传数据。
-3. **训练平台**：4×4090 Dashboard 管理数据集、norm、训练、checkpoint 和评测。
-4. **模型部署**：Dashboard 启动 OpenPI Policy，机器人端 RTC 客户端负责观测、推理和安全执行。
+[**Code**](https://github.com/SUNNYsyy2005/bimanual-vla) &nbsp;&middot;&nbsp; [**Documentation**](docs/README.md) &nbsp;&middot;&nbsp; [**Demo**](#demo) &nbsp;&middot;&nbsp; [**Installation**](docs/INSTALLATION.md)
 
-统一命令入口会优先使用本机 `dual_arm` Conda 环境，也可以通过
-`BIMANUAL_VLA_PYTHON=/path/to/python` 显式指定解释器。
+</div>
 
-## 快速开始
+<p align="center">
+  <img src="assets/hero.jpg" width="100%" alt="Bimanual Piper robot platform">
+</p>
 
-### 启动采集 GUI
+## Overview
+
+`bimanual-vla` connects the complete real-robot learning loop in one repository:
+collect synchronized Piper demonstrations, validate and export LeRobot datasets,
+fine-tune OpenPI `pi0` / `pi0.5` policies, and deploy action chunks through a
+latency-aware and safety-gated execution stack.
+
+```text
+Piper + RGB Cameras  ->  Robot Demonstrations  ->  LeRobot Dataset
+        ->  OpenPI LoRA Fine-tuning  ->  Policy Server
+        ->  Real-Time Chunking  ->  Safety Layer  ->  Piper Execution
+```
+
+The same workflow supports a single 6-DoF arm or a bimanual system, joint-space
+and end-effector-space policies, and both GUI-driven and command-line operation.
+
+## Highlights
+
+- **End-to-end real-robot pipeline** from demonstrations to closed-loop policy execution.
+- **Multi-camera Piper collection** with GUI operation, teleoperation, replay, and episode management.
+- **LeRobot-compatible data** with versioned contracts, validation, conversion, and upload tools.
+- **OpenPI training stack** for `pi0` / `pi0.5` LoRA fine-tuning and optional multi-GPU FSDP.
+- **Real-time, safety-aware deployment** with model-side RTC, 20 Hz control, and fail-closed execution.
+
+## System Overview
+
+<p align="center">
+  <img src="assets/architecture_overview.png" width="100%" alt="bimanual-vla system architecture">
+</p>
+
+The public workflow is organized into three stages. Detailed data contracts,
+validation rules, transport fields, and server operations live in
+[the documentation](docs/README.md) instead of the project homepage.
+
+| Stage | Input | Core components | Output |
+|---|---|---|---|
+| Data collection | Piper feedback, RGB views, language instruction | GUI or teleoperation, synchronized recording, episode validation | Raw robot episodes and LeRobot v2.1 datasets |
+| VLA training | Images, robot state, actions, task text | OpenPI `pi0` / `pi0.5`, LoRA, optional FSDP | Versioned Policy checkpoints |
+| Real-time deployment | Live observation and Policy checkpoint | WebSocket inference, RTC, action queue, safety gates | 20 Hz Piper commands |
+
+## Hardware Setup
+
+### Robot and Sensors
+
+| Component | Configuration |
+|---|---|
+| Robot | Piper robotic arm, single-arm or bimanual |
+| Kinematics | 6 revolute joints per arm plus gripper |
+| End effector | Piper gripper, approximately `0.00-0.07 m` opening range |
+| Control | Piper SDK over SocketCAN at `1 Mbit/s` |
+| Overhead camera | Intel RealSense D435i, third-person RGB view |
+| Wrist cameras | Intel RealSense D405, one RGB view per active wrist |
+| Collection / control rate | `20 Hz` |
+| Camera source rate | Typically `30 FPS` |
+
+Depth is available on the camera hardware but is not part of the current
+training contract. Stable `/dev/v4l/by-path` camera selectors are recommended
+because `/dev/videoN` indices can change after USB reconnection.
+
+### Compute
+
+| Role | Typical platform | Responsibility |
+|---|---|---|
+| Robot workstation | Ubuntu 22.04, x86_64 | CAN control, camera capture, GUI, RTC client |
+| Policy and Dashboard server | NVIDIA RTX 4090 workstation | Dataset management, Policy inference, telemetry |
+| Training cluster | NVIDIA H100 / H200 with Slurm | Multi-GPU fine-tuning and evaluation |
+
+ROS, ROS2, gRPC, and EtherCAT are not required by the current stack.
+
+## Data Collection
+
+<p align="center">
+  <img src="assets/collection_gui.jpg" width="100%" alt="Piper data collection GUI">
+</p>
+
+The collection application provides device discovery, live multi-camera
+preview, task metadata, robot feedback, episode controls, replay, and direct
+conversion/upload. It supports:
+
+- single-arm and bimanual collection;
+- master/slave teleoperation or output-arm feedback recording;
+- overhead plus left/right wrist RGB streams;
+- `joint` and `delivery` data schemas;
+- success/failure labeling and guarded episode publication.
+
+Start the GUI from the robot workstation:
 
 ```bash
+conda activate dual_arm
 bash start_gui.sh
 ```
 
-GUI 是日常采集的推荐入口，支持单臂/双臂、`joint`/`delivery` schema、相机预览、
-episode 回放、数据检查、LeRobot 转换和 Dashboard 上传。
-
-详细操作见 [GUI 操作手册](docs/collection/GUI_OPERATION_GUIDE.md)。
-
-### 命令行采集
-
-双臂主从遥操作：
+For command-line bimanual teleoperation and recording:
 
 ```bash
 bin/bimanual-vla teleop-bimanual --record --schema joint
 ```
 
-单臂主从遥操作：
+See the [GUI operation guide](docs/collection/GUI_OPERATION_GUIDE.md) and
+[data collection guide](docs/collection/DATA_COLLECTION_GUIDE.md) before
+connecting hardware.
 
-```bash
-bin/bimanual-vla teleop-single --arm-side right --record --schema joint
+## Dataset Pipeline
+
+```text
+Raw NPZ Episodes  ->  Contract Validation  ->  LeRobot v2.1
+       ->  Dataset Inspection / Merge  ->  OpenPI Training Dataset
 ```
 
-只读取输出臂反馈：
+Each episode combines the signals needed by a vision-language-action policy:
+
+| Signal | Content |
+|---|---|
+| RGB observations | Overhead view and one or two wrist views |
+| Robot state | Joint state or absolute end-effector state |
+| Actions | Joint targets or end-effector targets / model deltas |
+| Language | Natural-language task instruction |
+| Metadata | Timestamps, schema, arm mode, contract version, success label |
+
+Supported v3 action contracts are explicit and versioned:
+
+| Mode | Schema | Observation | Raw action | Model action |
+|---|---|---:|---:|---:|
+| Single arm | Joint | 7D | 7D | 7D |
+| Bimanual | Joint | 14D | 14D | 14D |
+| Single arm | Delivery | 10D | 10D | 7D |
+| Bimanual | Delivery | 20D | 20D | 14D |
+
+Bimanual vectors always use `left + right` ordering, and the normalized gripper
+convention is `0 = closed`, `1 = open`.
 
 ```bash
-bin/bimanual-vla collect-output \
-  --arm-mode single \
-  --arm-side right \
-  --schema joint \
-  --can can0 \
-  --task-name pick_cube \
-  --instruction "pick up the cube"
-```
+# Validate raw episodes
+bin/bimanual-vla data-validate \
+  --input-dir episodes_piper_v21 \
+  --target-fps 20
 
-硬件映射、按键和采集参数见
-[数据采集指南](docs/collection/DATA_COLLECTION_GUIDE.md)。
-
-### 检查和导出数据
-
-```bash
-bin/bimanual-vla data-validate --input-dir episodes_piper_v21 --target-fps 20
-
+# Export successful episodes to LeRobot v2.1
 bin/bimanual-vla data-export \
   --input-dir episodes_piper_v21 \
   --repo-id piper/piper_v1 \
-  --root piper/piper_v1 \
+  --root lerobot_datasets/piper_v1 \
   --fps 20
+
+# Validate the exported dataset
+bin/bimanual-vla data-check lerobot_datasets/piper_v1
 ```
 
-上传到训练服务器：
+The authoritative field definitions are documented in the
+[Piper data contract](docs/collection/PIPER_DATA_CONTRACT.md).
 
-```bash
-bin/bimanual-vla data-upload piper/piper_v1 \
-  --dataset-origin real
+## VLA Training
+
+The training backend integrates OpenPI `pi0` and `pi0.5` with LoRA fine-tuning.
+The Dashboard manages dataset selection, persistent train/test splits,
+normalization statistics, training jobs, checkpoints, and held-out evaluation.
+FSDP can distribute supported runs across multiple GPUs; H100/H200 jobs are
+submitted through Slurm.
+
+```yaml
+Input:
+  Images: overhead RGB + wrist RGB views
+  State: joint 7D/14D or end-effector 10D/20D
+  Language: natural-language task instruction
+
+Output:
+  Action chunk: 50 x 7D or 50 x 14D
+  Execution target: decoded joint/gripper command after safety checks
 ```
 
-数据字段和动作语义以
-[Piper 数据合同](docs/collection/PIPER_DATA_CONTRACT.md) 为准。
-
-### 启动训练和部署平台
-
-将 Dashboard 部署到 4×4090：
-
-```bash
-bash deploy_4090_server.sh
-```
-
-默认地址为 `http://192.168.101.9:8090`。Dashboard 提供：
-
-- 数据集浏览、编辑、合并和校验；
-- norm、训练和 held-out loss 任务；
-- checkpoint 与 Policy 生命周期管理；
-- 实时遥测和评测视频；
-- H100/H200 Slurm 资源与任务接入。
-
-服务端说明见 [Dashboard README](server_4090/README.md)，API 见
-[API 使用文档](server_4090/API_USAGE.md)。
-
-下载 OpenPI 基座权重：
+Download an OpenPI base checkpoint with the repository helper:
 
 ```bash
 python -m scripts.models.download_openpi_checkpoint \
@@ -105,96 +194,137 @@ python -m scripts.models.download_openpi_checkpoint \
   --chunks-per-file 16
 ```
 
-### 运行实机 Policy 客户端
+Training and Policy serving use a separate OpenPI Python 3.11 environment. Do
+not install the robot workstation requirements over a working JAX/OpenPI
+environment. Follow the [installation guide](docs/INSTALLATION.md#9-openpi-policy-and-training-server)
+for the pinned upstream revision and server configuration.
 
-先使用 shadow 模式检查观测和模型输出：
+## Real-Robot Deployment
 
-```bash
-bin/bimanual-vla rtc-client \
-  --arm-mode single \
-  --arm-side right \
-  --instruction "pick up the cube"
+```text
+Robot Workstation                         Policy Server
+-----------------                        -----------------
+RGB cameras + Piper state  --WebSocket-> OpenPI pi0 / pi0.5
+RTC session and timing      --WebSocket-> Model-side RTC
+Action queue + safety       <-WebSocket-- Timestamped action chunk
+        |
+        +--> 20 Hz validated Piper commands
 ```
 
-机器人运动采用双重授权：本地必须显式加入 `--allow-execution`，Dashboard 也必须对
-同一 Policy 发出未过期的 EXECUTE 授权。RTC、时间戳、录制和安全约束见
-[RTC 客户端指南](docs/deployment/RTC_CLIENT_GUIDE.md)。
+Start the Dashboard/Policy stack on a configured inference server, then run the
+robot client in **shadow mode** first:
 
-`bin/bimanual-vla legacy-bridge` 仅保留为旧命令兼容入口，实际控制实现只有
-`bimanual_vla/deployment/client.py` 一份。
+```bash
+export BIMANUAL_VLA_POLICY_HOST="<policy-server-host>"
 
-## 项目结构
+bin/bimanual-vla rtc-client \
+  --host "$BIMANUAL_VLA_POLICY_HOST" \
+  --port 8000 \
+  --arm-mode bimanual \
+  --arm-side both \
+  --left-can can0 \
+  --right-can can1 \
+  --cam-high-device auto \
+  --cam-left-wrist-device auto \
+  --cam-right-wrist-device auto \
+  --instruction "pick up the cube" \
+  --hz 4 \
+  --control-hz 20 \
+  --rtc-enabled
+```
+
+> [!CAUTION]
+> Real motion requires both the local `--allow-execution` flag and a non-expired
+> Dashboard `EXECUTE` authorization for the same Policy. A stale camera, CAN or
+> Policy stream, a contract mismatch, or any failed safety check blocks commands.
+
+The execution layer validates action age and shape, workspace bounds, joint and
+gripper changes, IK feasibility, Piper state, and authorization on every control
+cycle. RTC is applied inside model denoising; it is not client-side interpolation.
+See the [RTC deployment guide](docs/deployment/RTC_CLIENT_GUIDE.md).
+
+## Demo
+
+<p align="center">
+  <img src="assets/demo.gif" width="720" alt="Bimanual Piper real-robot demonstration">
+</p>
+
+The demo presents the bimanual Piper platform during a real manipulation run.
+
+## Dashboard
+
+<p align="center">
+  <img src="assets/dashboard.png" width="100%" alt="Training and deployment Dashboard">
+</p>
+
+The web and desktop interfaces cover dataset/episode management, normalization,
+LoRA/FSDP training, checkpoint and Policy lifecycle, live telemetry, action
+accounting, trajectory inspection, and evaluation video management.
+
+## Installation
+
+The robot workstation is tested with Ubuntu 22.04 and Python 3.10:
+
+```bash
+git clone https://github.com/SUNNYsyy2005/bimanual-vla.git
+cd bimanual-vla
+
+conda create -n dual_arm python=3.10.20 -y
+conda activate dual_arm
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+
+bin/bimanual-vla --help
+```
+
+System packages, SocketCAN activation, RealSense selection, OpenPI setup,
+Dashboard configuration, Slurm, verification, and troubleshooting are covered
+in the [complete installation guide](docs/INSTALLATION.md).
+
+## Project Layout
 
 ```text
 .
-├── bin/
-│   └── bimanual-vla        # 统一命令入口
-├── bimanual_vla/
-│   ├── collection/         # GUI、相机、遥操作、机械臂和采集会话
-│   ├── data/               # 数据合同、校验、导出、上传和回放
-│   └── deployment/         # RTC 客户端、RTC Policy 和部署录制
-├── server_4090/            # Dashboard 后端、前端和 Policy 服务
-├── docs/                   # 采集与部署专题文档
-├── scripts/                # smoke test、维护、分析和模型工具
-├── jobs/                   # 集群分析任务
-└── tests/                  # 自动化测试
+|-- assets/                    # README images and demos
+|-- bin/bimanual-vla          # Unified command entry point
+|-- bimanual_vla/
+|   |-- collection/           # GUI, cameras, teleoperation, robot sessions
+|   |-- data/                 # Contracts, validation, export, upload, replay
+|   `-- deployment/           # RTC client, Policy adapter, safety execution
+|-- server_4090/              # Dashboard backend, frontend, Policy services
+|-- docs/                     # Installation, collection, and deployment guides
+|-- scripts/                  # Model, maintenance, analysis, and smoke tools
+|-- jobs/                     # Slurm and analysis jobs
+|-- tests/                    # Automated test suite
+`-- requirements.txt          # Robot workstation dependencies
 ```
 
-根目录不再放置 Python 源文件，只保留 README 和兼容的 Shell 入口。一次性迁移
-工具位于 `scripts/maintenance/`，硬件/模型 smoke test 位于 `scripts/smoke/`。
+Runtime datasets, checkpoints, telemetry, and deployment recordings are not
+source code and are excluded from Git.
 
-## 数据约定
+## Documentation
 
-- 双臂向量固定按 `left + right` 拼接。
-- 单臂/双臂 `joint` state/action 分别为 7D/14D。
-- 单臂/双臂 `delivery` 原始 state/action 分别为 10D/20D。
-- `joint` 每臂为 6 个关节角和夹爪开度；`delivery` 每臂为 xyz、rotation-6D 和夹爪开度。
-- 夹爪统一使用 `0=闭合、1=张开`。
-- 默认采集与控制频率为 20 Hz，异步模型请求约为 4 Hz。
+| Topic | Guide |
+|---|---|
+| Installation and hardware | [Installation](docs/INSTALLATION.md) |
+| Collection GUI | [GUI operation guide](docs/collection/GUI_OPERATION_GUIDE.md) |
+| Data collection | [Data collection guide](docs/collection/DATA_COLLECTION_GUIDE.md) |
+| Dataset fields and semantics | [Piper data contract](docs/collection/PIPER_DATA_CONTRACT.md) |
+| 7D/10D action design | [OpenPI action design](docs/collection/PI05_PIPER_7D_10D_DATA_ACTION_DESIGN.md) |
+| Real-robot inference | [RTC client guide](docs/deployment/RTC_CLIENT_GUIDE.md) |
+| Dashboard backend | [Dashboard operations](server_4090/README.md) |
+| Dashboard API | [API reference](server_4090/API_USAGE.md) |
 
-完整动作设计见
-[π0.5 Piper 动作设计](docs/collection/PI05_PIPER_7D_10D_DATA_ACTION_DESIGN.md)。
-
-## 测试
-
-在包含项目依赖的 Conda 环境中运行：
+## Testing
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-仅检查 Python 语法和模块布局：
+Hardware and Policy smoke tests are available under `scripts/smoke/`. Run them
+only in the matching robot or inference-server environment.
 
-```bash
-python -m compileall -q -x 'deployment_runs|episodes_piper_v21|lerobot_datasets|monitoring_data' .
-```
+## Acknowledgements
 
-硬件和 Policy smoke test：
-
-```bash
-python -m scripts.smoke.robot_smoke_test
-python -m scripts.smoke.policy_server_smoke_test --shadow --steps 10
-python -m scripts.smoke.inference_smoke_test
-```
-
-## 运行数据
-
-以下目录是本地运行数据，不属于源码，已由 `.gitignore` 排除：
-
-- `episodes_piper_v21/`
-- `lerobot_datasets/`
-- `deployment_runs/`
-- `monitoring_data/*`
-
-结构整理不会删除这些目录。需要释放磁盘空间时，应先确认数据已上传或备份，再单独清理。
-
-## 更多文档
-
-- [GUI 操作手册](docs/collection/GUI_OPERATION_GUIDE.md)
-- [数据采集指南](docs/collection/DATA_COLLECTION_GUIDE.md)
-- [Piper 数据合同](docs/collection/PIPER_DATA_CONTRACT.md)
-- [RTC 客户端指南](docs/deployment/RTC_CLIENT_GUIDE.md)
-- [服务器路径与训练评测](docs/deployment/SERVER_PATHS_ENV_TRAIN_EVAL.md)
-- [NAS 部署与使用](docs/deployment/NAS_DEPLOYMENT_AND_USAGE.md)
-- [Dashboard 架构与运维](server_4090/README.md)
-- [仿真 Dashboard](server_4090/SIMULATION_DASHBOARD.md)
+This project builds on [OpenPI](https://github.com/Physical-Intelligence/openpi),
+[LeRobot](https://github.com/huggingface/lerobot), and the Piper robot SDK.

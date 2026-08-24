@@ -1,5 +1,9 @@
 # 文档索引
 
+## 安装
+
+- [环境安装与硬件配置](INSTALLATION.md)
+
 ## 数据采集
 
 - [GUI 操作手册](collection/GUI_OPERATION_GUIDE.md)
