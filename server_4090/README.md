@@ -111,7 +111,7 @@ ssh 4x4090 'tail -n 100 ~/.local/share/bimanual-vla-server/dashboard.log'
 直接上传 GUI 原始采集目录并增量追加：
 
 ```bash
-python upload_dataset_4090.py /path/to/gui_episodes \
+bin/bimanual-vla data-upload /path/to/gui_episodes \
   --name pick_cube_piper_r1 \
   --dataset-origin real \
   --server http://192.168.101.9:8090 \
@@ -124,7 +124,7 @@ python upload_dataset_4090.py /path/to/gui_episodes \
 上传已导出的 LeRobot 目录：
 
 ```bash
-python upload_dataset_4090.py /path/to/pi0_dataset_single \
+bin/bimanual-vla data-upload /path/to/pi0_dataset_single \
   --name pick_cube_piper_r1 \
   --dataset-origin real \
   --server http://192.168.101.9:8090 \
@@ -209,7 +209,7 @@ Dashboard 训练表单支持动态选择 `π0.5` 或 `π0` 模型系列，并会
 
 ```bash
 cd /home/sunny/bimanual-vla
-/home/sunny/miniconda3/envs/openpi/bin/python download_openpi_checkpoint.py \
+/home/sunny/miniconda3/envs/openpi/bin/python -m scripts.models.download_openpi_checkpoint \
   --checkpoint gs://openpi-assets/checkpoints/pi05_base \
   --source auto \
   --workers 16 \
@@ -273,7 +273,7 @@ POST   /api/tasks/batch-delete
 
 ## 机械臂电脑：RTC 实时控制客户端
 
-本项目中的 RTC 指 **Real-Time Chunking**。`rtc_openpi.py` 在服务端的
+本项目中的 RTC 指 **Real-Time Chunking**。`bimanual_vla/deployment/rtc_policy.py` 在服务端的
 flow-matching denoising 阶段，用上一 action chunk 尚未执行的 normalized prefix
 对新 chunk 做 guidance，以补偿推理/传输延迟；它不是单纯的客户端 action 插值。
 Dashboard 启动 Policy 时默认传递 `--rtc-enabled`，JAX/Orbax 与 PyTorch
@@ -286,7 +286,7 @@ JAX 因不同 offset 反复重新编译。
 脚本必须运行在物理连接 Piper CAN 和相机的电脑，而不是 4×4090；单臂使用一个 CAN 和两路相机：
 
 ```bash
-python rtc_client.py \
+bin/bimanual-vla rtc-client \
   --host 192.168.101.9 \
   --port 8000 \
   --can can0 \
@@ -297,11 +297,11 @@ python rtc_client.py \
   --hz 4
 ```
 
-`rtc_client.py` 默认使用 `--output-mode auto`，按 Policy 握手
+`bimanual_vla/deployment/client.py` 默认使用 `--output-mode auto`，按 Policy 握手
 metadata 自动选择 `delivery` 或 `joint`。部署 joint 模型时可以显式锁定合同：
 
 ```bash
-python rtc_client.py \
+bin/bimanual-vla rtc-client \
   --host 192.168.101.9 \
   --port 8099 \
   --can can0 \
@@ -320,7 +320,7 @@ python rtc_client.py \
 双臂 shadow-only 示例使用两个 CAN 和三路相机：
 
 ```bash
-python rtc_client.py \
+bin/bimanual-vla rtc-client \
   --host 192.168.101.9 \
   --port 8000 \
   --arm-mode bimanual \
@@ -371,9 +371,9 @@ anchor，不能与 canonical absolute-EEF 静默混用。`joint` wire action 已
 
 该脚本不需要 Dashboard URL 或 Token。上述默认命令不会调用动作控制 API。
 
-`rtc_client.py` 是唯一的实时控制入口；它直接拥有 Piper CAN、相机、Policy
-WebSocket 和独立 20 Hz 控制循环。旧的 `robot_observation_bridge.py` 仍保留为
-兼容入口，但不再是 GUI 的推理模式，也不应由 `collect_gui.py` 隐式启动。
+`bimanual_vla/deployment/client.py` 是唯一的实时控制入口；它直接拥有 Piper CAN、相机、Policy
+WebSocket 和独立 20 Hz 控制循环。旧的 `bin/bimanual-vla legacy-bridge` 仍保留为
+兼容入口，但不再是 GUI 的推理模式，也不应由 `bimanual_vla/collection/gui.py` 隐式启动。
 
 需要让客户端具备执行能力时，必须在机械臂电脑本地显式追加：
 

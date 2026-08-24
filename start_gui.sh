@@ -31,4 +31,5 @@ for can_name in can0 can1; do
 done
 
 cd "$SCRIPT_DIR"
-exec "$PYTHON_BIN" collect_gui.py "$@"
+export BIMANUAL_VLA_PYTHON="$PYTHON_BIN"
+exec "$SCRIPT_DIR/bin/bimanual-vla" collect-gui "$@"

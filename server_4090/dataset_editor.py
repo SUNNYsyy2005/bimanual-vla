@@ -29,7 +29,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from pi0_dataset import (
+from bimanual_vla.data.lerobot import (
     DEFAULT_ACTION_HORIZON,
     DELIVERY_ABSOLUTE_ACTION_FORMAT,
     DELIVERY_LEGACY_ACTION_FORMAT,

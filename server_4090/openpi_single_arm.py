@@ -196,11 +196,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
-    import piper_action_conventions as _piper_action_conventions
+    from bimanual_vla.data import action_conventions as _piper_action_conventions
 except ImportError:  # Keep the OpenPI helper usable while collection code is staged separately.
     _piper_action_conventions = None
 
-from rtc_openpi import RTCConfig, build_rtc_policy
+from bimanual_vla.deployment.rtc_policy import RTCConfig, build_rtc_policy
 
 
 def _convention_value(name: str, default: str) -> str:

@@ -100,7 +100,7 @@ AI agent 处理仿真训练 / 评测任务时，按下面顺序执行：
 在能访问 `4x4090:8091` 的机器执行：
 
 ```bash
-python upload_dataset_4090.py /path/to/LEROBOT_OR_GUI_NPZ_DIR \
+bin/bimanual-vla data-upload /path/to/LEROBOT_OR_GUI_NPZ_DIR \
   --name DATASET_ID \
   --dataset-origin simulation \
   --server http://192.168.101.9:8091 \
@@ -1045,7 +1045,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 上传客户端无需指定服务器，默认安装到 4×4090：
 
 ```bash
-python upload_dataset_4090.py LEROBOT_OR_GUI_NPZ_DIR \
+bin/bimanual-vla data-upload LEROBOT_OR_GUI_NPZ_DIR \
   --name my_sim_dataset --dataset-origin simulation \
   --server "$SIM_DASHBOARD" --token "$TOKEN" --workers 4 --merge
 ```

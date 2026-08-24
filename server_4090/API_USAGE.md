@@ -212,7 +212,7 @@ curl -H "Authorization: Bearer $TOKEN" "$DASH/api/tasks" | jq .
 上传采用分片协议。更推荐直接使用仓库脚本：
 
 ```bash
-python upload_dataset_4090.py LEROBOT_OR_GUI_NPZ_DIR \
+bin/bimanual-vla data-upload LEROBOT_OR_GUI_NPZ_DIR \
   --name my_dataset \
   --dataset-origin simulation \
   --server "$DASH" \
@@ -1153,7 +1153,7 @@ Content-Type: application/json
 
 ```bash
 # 1. 上传到 4×4090
-python upload_dataset_4090.py ./my_lerobot_dataset \
+bin/bimanual-vla data-upload ./my_lerobot_dataset \
   --name my_sim_dataset --dataset-origin simulation \
   --server "$DASH" --token "$TOKEN" --workers 4 --merge
 

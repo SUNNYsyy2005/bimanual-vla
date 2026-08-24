@@ -23,15 +23,10 @@ rsync -av --relative \
   "$LOCAL_ROOT/./server_4090/templates/index.html" \
   "$LOCAL_ROOT/./server_4090/README.md" \
   "$LOCAL_ROOT/./server_4090/SIMULATION_DASHBOARD.md" \
-  "$LOCAL_ROOT/./SERVER_PATHS_ENV_TRAIN_EVAL.md" \
-  "$LOCAL_ROOT/./check_pi05_dataset.py" \
-  "$LOCAL_ROOT/./download_openpi_checkpoint.py" \
-  "$LOCAL_ROOT/./upload_dataset_4090.py" \
-  "$LOCAL_ROOT/./rtc_openpi.py" \
-  "$LOCAL_ROOT/./piper_action_conventions.py" \
-  "$LOCAL_ROOT/./piper_data_contract.py" \
-  "$LOCAL_ROOT/./camera.py" \
-  "$LOCAL_ROOT/./pi0_dataset.py" \
+  "$LOCAL_ROOT/./docs/deployment/SERVER_PATHS_ENV_TRAIN_EVAL.md" \
+  "$LOCAL_ROOT/./bimanual_vla" \
+  "$LOCAL_ROOT/./bin/bimanual-vla" \
+  "$LOCAL_ROOT/./scripts/models/download_openpi_checkpoint.py" \
   "$LOCAL_ROOT/./scripts/query_h100_h200_resources.sh" \
   "$REMOTE_HOST:$REMOTE_ROOT/"
 
@@ -66,13 +61,13 @@ mkdir -p \
 install -m 0644 \
   server_4090/bimanual-vla-sim-dashboard.service \
   "$HOME/.config/systemd/user/bimanual-vla-sim-dashboard.service"
-chmod +x server_4090/slurm_job_runner.py server_4090/dataset_transfer_runner.py server_4090/slurm_dataset_sync_runner.py server_4090/video_transfer_runner.py server_4090/run_server_foreground.sh scripts/query_h100_h200_resources.sh
+chmod +x bin/bimanual-vla server_4090/slurm_job_runner.py server_4090/dataset_transfer_runner.py server_4090/slurm_dataset_sync_runner.py server_4090/video_transfer_runner.py server_4090/run_server_foreground.sh scripts/query_h100_h200_resources.sh
 # Best-effort staging for H100/login-server Slurm helpers. H200 remains
 # independent and should be prepared via its dedicated setup Slurm jobs.
 if command -v rsync >/dev/null 2>&1; then
   timeout 20 ssh -n -o BatchMode=yes -o ConnectTimeout=8 login-server 'mkdir -p /DATA/disk0/sunny/bimanual-vla /DATA/NAS/GPUServer/sunny/dashboard_dataset_sync' 2>/dev/null && \
   timeout 60 rsync -az --delete \
-    server_4090 piper_action_conventions.py piper_data_contract.py pi0_dataset.py check_pi05_dataset.py download_openpi_checkpoint.py \
+    server_4090 bimanual_vla bin scripts/models/download_openpi_checkpoint.py \
     login-server:/DATA/disk0/sunny/bimanual-vla/ 2>/dev/null || true
 fi
 # Best-effort mirror of H200 Slurm inventory caches onto 4x4090 so the UI does

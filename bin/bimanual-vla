@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+LOCAL_PYTHON="/home/user/miniconda3/envs/dual_arm/bin/python"
+if [[ -n "${BIMANUAL_VLA_PYTHON:-}" ]]; then
+  PYTHON_BIN="$BIMANUAL_VLA_PYTHON"
+elif [[ -x "$LOCAL_PYTHON" ]]; then
+  PYTHON_BIN="$LOCAL_PYTHON"
+else
+  PYTHON_BIN="python3"
+fi
+
+usage() {
+  cat <<'EOF'
+Usage: bin/bimanual-vla COMMAND [ARGS...]
+
+Collection:
+  collect-gui        Start the collection GUI
+  collect-output     Record output-arm feedback
+  teleop-bimanual    Run bimanual master/slave teleoperation
+  teleop-single      Run single-arm master/slave teleoperation
+  home-single        Run the guarded single-arm home workflow
+
+Data:
+  data-check         Validate a LeRobot/pi0.5 dataset
+  data-export        Export NPZ episodes to LeRobot
+  data-upload        Upload a dataset to the Dashboard
+  data-validate      Validate raw Piper episodes
+  data-view          View a recorded episode
+
+Deployment:
+  rtc-client         Run the canonical robot-side RTC client
+  legacy-bridge      Compatibility alias for rtc-client
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+command_name="$1"
+shift
+
+case "$command_name" in
+  collect-gui) module="bimanual_vla.collection.gui" ;;
+  collect-output) module="bimanual_vla.collection.output" ;;
+  teleop-bimanual) module="bimanual_vla.collection.teleop_bimanual" ;;
+  teleop-single) module="bimanual_vla.collection.teleop_single" ;;
+  home-single) module="bimanual_vla.collection.home" ;;
+  data-check) module="bimanual_vla.data.check" ;;
+  data-export) module="bimanual_vla.data.export" ;;
+  data-upload) module="bimanual_vla.data.upload" ;;
+  data-validate) module="bimanual_vla.data.validate" ;;
+  data-view) module="bimanual_vla.data.viewer" ;;
+  rtc-client) module="bimanual_vla.deployment.client" ;;
+  legacy-bridge) module="bimanual_vla.deployment.legacy_bridge" ;;
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  *)
+    printf 'Unknown command: %s\n\n' "$command_name" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+cd "$REPO_ROOT"
+exec "$PYTHON_BIN" -m "$module" "$@"

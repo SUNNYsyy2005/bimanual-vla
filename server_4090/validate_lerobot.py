@@ -86,7 +86,7 @@ def _install_torchvision_stub_if_broken() -> None:
 
 _install_torchvision_stub_if_broken()
 
-from check_pi05_dataset import _dataset_contract, check_dataset
+from bimanual_vla.data.check import _dataset_contract, check_dataset
 
 try:
     # Older LeRobot revisions used by some OpenPI checkouts.

@@ -1,0 +1,751 @@
+"""RGB camera capture for π0.5 inference and output-arm data collection.
+
+Camera keys match AlohaInputs convention (what the policy server expects):
+  cam_high        – head / front camera     (device ID UNKNOWN)
+  cam_left_wrist  – left wrist camera       (device path/index)
+  cam_right_wrist – right wrist camera      (device path/index)
+
+Images returned as (C, H, W) uint8 RGB  ← AlohaInputs expected format.
+
+Verify device IDs before connecting:
+  ls -la /dev/video*
+  v4l2-ctl --list-devices
+"""
+
+from pathlib import Path
+from collections import deque
+from dataclasses import dataclass
+import re
+import subprocess
+import time
+import logging
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from typing import Callable
+
+import cv2
+import numpy as np
+
+try:
+    import tkinter as tk
+    from PIL import Image, ImageTk
+except Exception:  # pragma: no cover - headless/minimal installations
+    tk = None
+    Image = None
+    ImageTk = None
+
+# Default inference size. The delivery collector overrides this to 256x256.
+IMG_H, IMG_W = 224, 224
+
+# UNKNOWN: set correct device IDs after running `v4l2-ctl --list-devices`
+DEFAULT_CAM_IDS = {
+    "cam_high":        0,   # head / front camera
+    "cam_left_wrist":  2,   # left wrist camera
+    "cam_right_wrist": 4,   # right wrist camera
+}
+
+STALE_THRESHOLD_S = 0.5   # flag image as stale if older than this
+
+
+@dataclass(frozen=True)
+class CameraFrameSet:
+    """One complete multi-camera acquisition with wall and monotonic clocks."""
+
+    images: dict[str, np.ndarray]
+    timestamps: dict[str, float]
+    monotonic_timestamps: dict[str, float]
+    captured_monotonic: float
+
+    def copied(self) -> "CameraFrameSet":
+        return CameraFrameSet(
+            images={key: frame.copy() for key, frame in self.images.items()},
+            timestamps=dict(self.timestamps),
+            monotonic_timestamps=dict(self.monotonic_timestamps),
+            captured_monotonic=float(self.captured_monotonic),
+        )
+
+# Camera roles used by the current collection rig.  Device numbers and USB
+# paths can change after reconnecting a hub, but these model names and serial
+# backed udev properties remain stable.
+CAMERA_MODEL_HINTS = {
+    # Current physical installation: D435i is the overhead view. Both wrist
+    # roles are D405 units. Their default USB topology bindings are required
+    # because model-only discovery cannot distinguish identical devices.
+    "cam_high": ("realsense_tm__depth_camera_435i", "depth_camera_435i"),
+    "cam_wrist": ("realsense_tm__depth_camera_405", "depth_camera_405"),
+    "cam_right_wrist": ("realsense_tm__depth_camera_405", "depth_camera_405"),
+    "cam_left_wrist": ("realsense_tm__depth_camera_405", "depth_camera_405"),
+}
+# Physical wrist placement for the current rig. The two D405 units are
+# identical, so model matching alone cannot tell left from right. These USB
+# topology fragments are stable across normal video-node renumbering.
+CAMERA_ROLE_PATH_HINTS = {
+    "cam_left_wrist": ("usb-0:6.2:",),
+    "cam_right_wrist": ("usb-0:5.2:",),
+}
+COLOR_FORMAT_SCORES = {
+    "MJPG": 40,
+    "YUYV": 35,
+    "RGB3": 35,
+    "BGR3": 35,
+    "UYVY": 10,
+}
+
+
+def _command_output(args: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def _stable_video_selector(
+    device: Path,
+    stable_directories: tuple[Path, ...] | None = None,
+) -> str:
+    """Prefer a stable USB-topology symlink for a concrete video node.
+
+    ``by-path`` is intentionally preferred over ``by-id``. Some identical
+    RealSense cameras do not expose unique serial numbers, so their generic
+    ``by-id`` names can move between physical devices after reconnecting.
+    """
+    resolved = device.resolve(strict=False)
+    directories = stable_directories or (
+        Path("/dev/v4l/by-path"),
+        Path("/dev/v4l/by-id"),
+    )
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        for candidate in sorted(directory.iterdir()):
+            try:
+                if candidate.resolve(strict=True) == resolved:
+                    return str(candidate)
+            except OSError:
+                continue
+    return str(device)
+
+
+@dataclass(frozen=True)
+class VideoDeviceCandidate:
+    """One colour-capable V4L2 node and its udev identity."""
+
+    device: Path
+    index: int
+    properties: str
+    format_score: int
+
+
+def _enumerate_video_candidates(
+    *, device_root: Path = Path("/dev")
+) -> list[VideoDeviceCandidate]:
+    """Inspect V4L2 nodes once so multiple roles can be allocated jointly."""
+    candidates: list[VideoDeviceCandidate] = []
+    for device in device_root.glob("video[0-9]*"):
+        match = re.fullmatch(r"video(\d+)", device.name)
+        if match is None:
+            continue
+        properties = _command_output(
+            ["udevadm", "info", "--query=property", f"--name={device}"]
+        ).lower()
+        formats = _command_output(["v4l2-ctl", "-d", str(device), "--list-formats"])
+        format_score = max(
+            (score for pixel_format, score in COLOR_FORMAT_SCORES.items() if pixel_format in formats),
+            default=0,
+        )
+        if format_score <= 0:
+            continue
+        candidates.append(
+            VideoDeviceCandidate(
+                device=device,
+                index=int(match.group(1)),
+                properties=properties,
+                format_score=format_score,
+            )
+        )
+    return candidates
+
+
+def _matching_video_candidates(
+    camera_key: str,
+    candidates: list[VideoDeviceCandidate],
+) -> list[VideoDeviceCandidate]:
+    hints = CAMERA_MODEL_HINTS.get(camera_key)
+    if not hints:
+        raise RuntimeError(
+            f"Cannot auto-discover unknown camera role {camera_key!r}; enter an explicit /dev/videoN path."
+        )
+    role_path_hints = CAMERA_ROLE_PATH_HINTS.get(camera_key, ())
+
+    def sort_key(candidate: VideoDeviceCandidate) -> tuple[int, int, int]:
+        selector = _stable_video_selector(candidate.device)
+        preferred = bool(role_path_hints) and any(
+            hint in selector for hint in role_path_hints
+        )
+        return (0 if preferred else 1, -candidate.format_score, candidate.index)
+
+    return sorted(
+        (
+            candidate
+            for candidate in candidates
+            if any(hint in candidate.properties for hint in hints)
+        ),
+        key=sort_key,
+    )
+
+
+def discover_video_device(camera_key: str, *, device_root: Path = Path("/dev")) -> str:
+    """Discover the RGB V4L2 node for a known camera role.
+
+    RealSense devices expose depth, infrared, metadata and RGB nodes under one
+    USB device.  Model matching alone is therefore insufficient: candidates
+    are also ranked by their advertised colour pixel formats.
+    """
+    candidates = _matching_video_candidates(
+        camera_key,
+        _enumerate_video_candidates(device_root=device_root),
+    )
+    if not candidates:
+        raise RuntimeError(
+            f"Cannot auto-discover an RGB device for {camera_key}. "
+            "Check that the expected camera is connected and visible in 'v4l2-ctl --list-devices'."
+        )
+    return _stable_video_selector(candidates[0].device)
+
+
+def _existing_configured_device(
+    configured_device: object,
+    *,
+    device_root: Path,
+) -> object | None:
+    """Return a valid explicit selector, or ``None`` for auto/stale values."""
+    if isinstance(configured_device, int):
+        numeric_device = device_root / f"video{int(configured_device)}"
+        return configured_device if numeric_device.exists() else None
+    if isinstance(configured_device, str) and configured_device.isdigit():
+        numeric_device = device_root / f"video{int(configured_device)}"
+        return int(configured_device) if numeric_device.exists() else None
+    configured_text = str(configured_device).strip()
+    if configured_text.lower() == "auto":
+        return None
+    candidate = Path(configured_text).expanduser()
+    return str(candidate) if candidate.exists() else None
+
+
+def _concrete_video_device(device: object, *, device_root: Path) -> Path:
+    if isinstance(device, int) or (isinstance(device, str) and device.isdigit()):
+        candidate = device_root / f"video{int(device)}"
+    else:
+        candidate = Path(str(device)).expanduser()
+    return candidate.resolve(strict=False)
+
+
+def select_video_devices(
+    configured_devices: dict[str, object],
+    *,
+    device_root: Path = Path("/dev"),
+) -> dict[str, object]:
+    """Resolve all camera roles together without assigning one node twice.
+
+    Valid explicit selectors take priority. Missing, stale, or ``auto`` values
+    are filled from colour-capable nodes matching the expected camera model.
+    This joint allocation is required for the two identical D405 wrist units.
+    """
+    selected: dict[str, object] = {}
+    used_devices: dict[Path, str] = {}
+    pending: list[str] = []
+
+    for camera_key, configured_device in configured_devices.items():
+        explicit = _existing_configured_device(
+            configured_device,
+            device_root=device_root,
+        )
+        if explicit is None:
+            pending.append(camera_key)
+            continue
+        concrete = _concrete_video_device(explicit, device_root=device_root)
+        previous_role = used_devices.get(concrete)
+        if previous_role is not None:
+            raise RuntimeError(
+                f"Camera roles {previous_role} and {camera_key} both select {concrete}. "
+                "Choose distinct devices or set both selectors to 'auto'."
+            )
+        selected[camera_key] = explicit
+        used_devices[concrete] = camera_key
+
+    candidates = _enumerate_video_candidates(device_root=device_root) if pending else []
+    for camera_key in pending:
+        available = [
+            candidate
+            for candidate in _matching_video_candidates(camera_key, candidates)
+            if candidate.device.resolve(strict=False) not in used_devices
+        ]
+        if not available:
+            expected = " / ".join(CAMERA_MODEL_HINTS.get(camera_key, (camera_key,)))
+            raise RuntimeError(
+                f"Cannot auto-discover a distinct RGB device for {camera_key} "
+                f"(expected {expected}). Check camera connections or choose devices "
+                "in Device settings."
+            )
+        candidate = available[0]
+        selected[camera_key] = _stable_video_selector(candidate.device)
+        used_devices[candidate.device.resolve(strict=False)] = camera_key
+
+    return selected
+
+
+def select_video_device(camera_key: str, configured_device: object) -> object:
+    """Keep a valid configured selector, otherwise auto-discover by role."""
+    return select_video_devices({camera_key: configured_device})[camera_key]
+
+
+def resolve_video_device(device: object) -> str:
+    """Return the concrete ``/dev/videoN`` path behind a camera selector.
+
+    Collection uses stable ``/dev/v4l/by-path`` symlinks so USB enumeration
+    changes do not swap camera roles.  Operators still need to see which
+    numeric video node was selected for the current connection.
+    """
+    if isinstance(device, int) or (isinstance(device, str) and device.isdigit()):
+        candidate = Path(f"/dev/video{int(device)}")
+    else:
+        candidate = Path(str(device)).expanduser()
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        resolved = candidate.resolve(strict=False)
+    if re.fullmatch(r"video\d+", resolved.name):
+        return str(resolved)
+    if re.fullmatch(r"video\d+", candidate.name):
+        return str(candidate)
+    return str(resolved)
+
+
+class CameraCapture:
+    """Open and read from 3 cameras.
+
+    cam_ids: dict mapping π0.5 camera key → /dev/videoN index.
+    """
+
+    def __init__(
+        self,
+        cam_ids: dict = None,
+        fps: int = 30,
+        image_hw: tuple[int, int] = (IMG_H, IMG_W),
+        capture_hw: tuple[int, int] | None = None,
+        parallel_reads: bool = False,
+    ):
+        self._ids = cam_ids or dict(DEFAULT_CAM_IDS)
+        self._configured_ids = dict(self._ids)
+        self._fps = fps
+        self._image_hw = tuple(image_hw)
+        self._capture_hw = tuple(capture_hw or image_hw)
+        self._parallel_reads = parallel_reads
+        self._caps: dict[str, cv2.VideoCapture] = {}
+        self._executor: ThreadPoolExecutor | None = None
+        self._read_lock = threading.Lock()
+        self._background_stop = threading.Event()
+        self._background_thread: threading.Thread | None = None
+        self._latest_condition = threading.Condition()
+        self._latest_images: dict[str, np.ndarray] = {}
+        # Native-aspect RGB frames for the optional operator preview.  Model
+        # observations remain square/padded in ``_latest_images``.
+        self._latest_preview_images: dict[str, np.ndarray] = {}
+        self._latest_timestamps: dict[str, float] = {}
+        self._latest_monotonic_timestamps: dict[str, float] = {}
+        self._latest_captured_monotonic: float | None = None
+        self._frame_history: deque[CameraFrameSet] = deque(
+            maxlen=max(8, int(round(float(fps) * 2.0)))
+        )
+        self._last_direct_monotonic_timestamps: dict[str, float] = {}
+        self._source_aspects: dict[str, float] = {}
+        self._background_error: BaseException | None = None
+
+    def open(self):
+        try:
+            selected_ids = select_video_devices(self._configured_ids)
+            for key, configured_id in self._configured_ids.items():
+                dev_id = selected_ids[key]
+                self._ids[key] = dev_id
+                cap = cv2.VideoCapture(dev_id)
+                if not cap.isOpened():
+                    raise RuntimeError(
+                        f"Cannot open camera {key} at {dev_id} "
+                        f"(configured selector: {configured_id})"
+                    )
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._capture_hw[1])
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._capture_hw[0])
+                cap.set(cv2.CAP_PROP_FPS, self._fps)
+                # disable internal buffering to reduce latency
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self._caps[key] = cap
+        except Exception:
+            self.close()
+            raise
+        if self._parallel_reads and len(self._caps) > 1:
+            self._executor = ThreadPoolExecutor(
+                max_workers=len(self._caps),
+                thread_name_prefix="camera-read",
+            )
+
+    def close(self):
+        self.stop_background_capture()
+        with self._read_lock:
+            if self._executor is not None:
+                self._executor.shutdown(wait=True)
+                self._executor = None
+            for cap in self._caps.values():
+                cap.release()
+            self._caps.clear()
+        with self._latest_condition:
+            self._latest_images.clear()
+            self._latest_preview_images.clear()
+            self._latest_timestamps.clear()
+            self._latest_monotonic_timestamps.clear()
+            self._latest_captured_monotonic = None
+            self._frame_history.clear()
+            self._last_direct_monotonic_timestamps.clear()
+            self._source_aspects.clear()
+            self._background_error = None
+
+    @property
+    def source_aspects(self) -> dict[str, float]:
+        """Return the latest native width/height ratio for each camera."""
+        with self._latest_condition:
+            return dict(self._source_aspects)
+
+    @property
+    def latest_preview_images(self) -> dict[str, np.ndarray]:
+        """Return newest native-aspect RGB frames for a local preview window."""
+        with self._latest_condition:
+            return {
+                key: frame.copy() for key, frame in self._latest_preview_images.items()
+            }
+
+    @staticmethod
+    def _read_frame(
+        cap: cv2.VideoCapture,
+    ) -> tuple[bool, np.ndarray | None, float, float]:
+        ret, frame = cap.read()
+        return ret, frame, time.time(), time.monotonic()
+
+    def _read_direct(self) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+        """Read and preprocess one frame from each camera without background mode."""
+        images, timestamps, monotonic_timestamps = {}, {}, {}
+        if self._executor is None:
+            results = {
+                key: self._read_frame(cap)
+                for key, cap in self._caps.items()
+            }
+        else:
+            futures = {
+                key: self._executor.submit(self._read_frame, cap)
+                for key, cap in self._caps.items()
+            }
+            results = {key: future.result() for key, future in futures.items()}
+
+        for key, (ret, frame, timestamp, monotonic_timestamp) in results.items():
+            timestamps[key] = timestamp
+            monotonic_timestamps[key] = monotonic_timestamp
+            if not ret:
+                raise RuntimeError(f"Camera {key} read failed")
+            # OpenCV returns BGR HWC -> RGB HWC. Preserve aspect ratio and pad
+            # with black before returning RGB CHW for the existing callers.
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            target_h, target_w = self._image_hw
+            src_h, src_w = rgb.shape[:2]
+            with self._latest_condition:
+                self._source_aspects[key] = src_w / src_h
+                self._latest_preview_images[key] = rgb.copy()
+            scale = min(target_w / src_w, target_h / src_h)
+            new_w = max(1, round(src_w * scale))
+            new_h = max(1, round(src_h * scale))
+            resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            padded = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+            y0 = (target_h - new_h) // 2
+            x0 = (target_w - new_w) // 2
+            padded[y0:y0 + new_h, x0:x0 + new_w] = resized
+            images[key] = padded.transpose(2, 0, 1)  # (H,W,C) -> (C,H,W)
+        self._last_direct_monotonic_timestamps = monotonic_timestamps
+        return images, timestamps
+
+    def read(self) -> tuple[dict, dict]:
+        """Return (images, timestamps).
+
+        When ``start_background_capture`` is active, this returns the newest
+        complete camera set.  That makes model observations and recorded video
+        share one acquisition stream instead of competing for V4L2 frames.
+        Images are keyed by camera role and have shape ``(C,H,W)`` RGB uint8.
+        Timestamps are Unix seconds from the source read.
+        """
+        if self._background_thread is not None:
+            with self._latest_condition:
+                if self._background_error is not None:
+                    raise RuntimeError("background camera capture failed") from self._background_error
+                if not self._latest_images:
+                    self._latest_condition.wait(timeout=1.0)
+                if self._background_error is not None:
+                    raise RuntimeError("background camera capture failed") from self._background_error
+                if not self._latest_images:
+                    raise RuntimeError("background camera capture has not produced a frame")
+                return (
+                    {key: frame.copy() for key, frame in self._latest_images.items()},
+                    dict(self._latest_timestamps),
+                )
+        with self._read_lock:
+            return self._read_direct()
+
+    def read_nearest(self, target_monotonic: float) -> CameraFrameSet:
+        """Return the buffered complete frame set closest to a robot-state time."""
+        target = float(target_monotonic)
+        if not np.isfinite(target):
+            raise ValueError("target_monotonic must be finite")
+        if self._background_thread is None:
+            raise RuntimeError("nearest-frame lookup requires background camera capture")
+        with self._latest_condition:
+            if self._background_error is not None:
+                raise RuntimeError("background camera capture failed") from self._background_error
+            if not self._frame_history:
+                self._latest_condition.wait(timeout=1.0)
+            if self._background_error is not None:
+                raise RuntimeError("background camera capture failed") from self._background_error
+            if not self._frame_history:
+                raise RuntimeError("background camera capture has not produced a frame")
+            selected = min(
+                self._frame_history,
+                key=lambda frame_set: abs(frame_set.captured_monotonic - target),
+            )
+            return selected.copied()
+
+    def start_background_capture(
+        self,
+        callback: Callable[[dict[str, np.ndarray], dict[str, float], float], None] | None = None,
+        *,
+        fps: float | None = None,
+    ) -> None:
+        """Continuously capture complete camera sets for video and inference.
+
+        ``callback`` is invoked as ``callback(images, timestamps, monotonic_now)``
+        after each successful capture.  The callback must be non-blocking; the
+        deployment recorder only queues a copy and returns immediately.
+        """
+        if not self._caps:
+            raise RuntimeError("cannot start background capture before cameras are open")
+        if self._background_thread is not None:
+            return
+        capture_fps = self._fps if fps is None else float(fps)
+        if not np.isfinite(capture_fps) or capture_fps <= 0:
+            raise ValueError("background capture fps must be positive and finite")
+        self._background_error = None
+        self._background_stop.clear()
+        with self._latest_condition:
+            self._frame_history.clear()
+
+        def loop() -> None:
+            period = 1.0 / capture_fps
+            next_at = time.monotonic()
+            while not self._background_stop.is_set():
+                started = time.monotonic()
+                try:
+                    with self._read_lock:
+                        images, timestamps = self._read_direct()
+                    completed = time.monotonic()
+                    monotonic_timestamps = dict(self._last_direct_monotonic_timestamps)
+                    if set(monotonic_timestamps) != set(images):
+                        monotonic_timestamps = {key: completed for key in images}
+                    captured_monotonic = float(
+                        np.median(list(monotonic_timestamps.values()))
+                    )
+                    frame_set = CameraFrameSet(
+                        images={key: frame.copy() for key, frame in images.items()},
+                        timestamps={key: float(value) for key, value in timestamps.items()},
+                        monotonic_timestamps={
+                            key: float(value)
+                            for key, value in monotonic_timestamps.items()
+                        },
+                        captured_monotonic=captured_monotonic,
+                    )
+                    with self._latest_condition:
+                        self._latest_images = {
+                            key: frame.copy() for key, frame in frame_set.images.items()
+                        }
+                        self._latest_timestamps = dict(frame_set.timestamps)
+                        self._latest_monotonic_timestamps = dict(
+                            frame_set.monotonic_timestamps
+                        )
+                        self._latest_captured_monotonic = frame_set.captured_monotonic
+                        self._frame_history.append(frame_set)
+                        self._latest_condition.notify_all()
+                    if callback is not None:
+                        callback(images, timestamps, completed)
+                except BaseException as exc:
+                    with self._latest_condition:
+                        self._background_error = exc
+                        self._latest_condition.notify_all()
+                    return
+                next_at += period
+                sleep_s = next_at - time.monotonic()
+                if sleep_s > 0:
+                    self._background_stop.wait(sleep_s)
+                else:
+                    next_at = started + period
+
+        self._background_thread = threading.Thread(
+            target=loop, name="camera-capture", daemon=True
+        )
+        self._background_thread.start()
+
+    def stop_background_capture(self) -> None:
+        thread = self._background_thread
+        if thread is None:
+            return
+        self._background_stop.set()
+        with self._latest_condition:
+            self._latest_condition.notify_all()
+        thread.join(timeout=5.0)
+        if thread.is_alive():
+            raise RuntimeError("timed out stopping background camera capture")
+        self._background_thread = None
+
+    def check_stale(self, timestamps: dict) -> list[str]:
+        """Return list of camera keys whose frames are too old."""
+        now = time.time()
+        return [k for k, t in timestamps.items() if now - t > STALE_THRESHOLD_S]
+
+    def verify(self) -> dict:
+        """Read one frame from each camera and return latency info (for setup check)."""
+        results = {}
+        with self._read_lock:
+            for key, cap in self._caps.items():
+                t0 = time.time()
+                ret, frame = cap.read()
+                latency_ms = (time.time() - t0) * 1000
+                results[key] = {
+                    "ok": ret,
+                    "shape": frame.shape if ret else None,
+                    "latency_ms": round(latency_ms, 1),
+                    "fps": float(cap.get(cv2.CAP_PROP_FPS)),
+                    "configured_device": str(self._configured_ids[key]),
+                    "selected_device": str(self._ids[key]),
+                    "video_device": resolve_video_device(self._ids[key]),
+                }
+        return results
+
+
+class CameraPreview:
+    """Large, low-refresh, non-blocking preview for the operator.
+
+    The preview is deliberately outside the inference/control path. If the
+    machine has no graphical display or OpenCV's GUI backend is unavailable,
+    it disables itself and the bridge continues in headless mode.
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        window_name: str = "Piper cameras",
+        fps: float = 8.0,
+    ):
+        self.enabled = bool(enabled)
+        self.window_name = str(window_name)
+        self.fps = float(fps)
+        if not np.isfinite(self.fps) or self.fps <= 0:
+            raise ValueError("camera preview fps must be positive and finite")
+        self._next_update = 0.0
+        self._disabled_logged = False
+        self._root = None
+        self._label = None
+        self._photo = None
+        if self.enabled:
+            self._open_window()
+
+    def _open_window(self) -> None:
+        if tk is None or Image is None or ImageTk is None:
+            self._disable("Tkinter/Pillow is unavailable")
+            return
+        try:
+            self._root = tk.Tk()
+            self._root.title(self.window_name)
+            self._root.protocol("WM_DELETE_WINDOW", self.close)
+            self._root.bind("<Escape>", lambda _event: self.close())
+            self._root.bind("q", lambda _event: self.close())
+            self._label = tk.Label(self._root, bg="black")
+            self._label.pack(fill="both", expand=True)
+            self._root.update_idletasks()
+        except Exception as exc:  # TclError when DISPLAY is unavailable
+            self._disable(f"GUI window unavailable: {exc}")
+
+    def _disable(self, reason: str) -> None:
+        if not self._disabled_logged:
+            logging.warning("Camera preview disabled: %s", reason)
+            self._disabled_logged = True
+        self.enabled = False
+        self._root = None
+        self._label = None
+        self._photo = None
+
+    def update(self, images: dict[str, np.ndarray]) -> None:
+        if not self.enabled or not images:
+            return
+        now = time.monotonic()
+        if now < self._next_update:
+            return
+        self._next_update = now + 1.0 / self.fps
+        try:
+            if self._root is None or self._label is None:
+                self._disable("preview window is not initialized")
+                return
+            frames: list[np.ndarray] = []
+            for key, image in images.items():
+                frame = np.asarray(image)
+                if frame.ndim != 3 or frame.shape[-1] != 3:
+                    continue
+                h, w = frame.shape[:2]
+                # Upscale the low-cost 424x240 camera frame for readability.
+                # Refresh throttling keeps the display overhead below the
+                # original 360px/20Hz preview.
+                tile_w = 600
+                tile_h = max(1, round(h * tile_w / w))
+                frame = cv2.resize(frame, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+                cv2.rectangle(frame, (0, 0), (tile_w - 1, 25), (0, 0, 0), -1)
+                cv2.putText(frame, str(key), (8, 18), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (255, 255, 255), 1, cv2.LINE_AA)
+                frames.append(frame)
+            if not frames:
+                return
+            max_h = max(frame.shape[0] for frame in frames)
+            padded = []
+            for frame in frames:
+                if frame.shape[0] < max_h:
+                    canvas = np.zeros((max_h, frame.shape[1], 3), dtype=np.uint8)
+                    canvas[: frame.shape[0]] = frame
+                    frame = canvas
+                padded.append(frame)
+            rgb = np.concatenate(padded, axis=1)
+            self._photo = ImageTk.PhotoImage(Image.fromarray(rgb, mode="RGB"))
+            self._label.configure(image=self._photo)
+            self._root.update_idletasks()
+            self._root.update()
+        except Exception as exc:
+            self._disable(f"preview update failed: {exc}")
+
+    def close(self) -> None:
+        if not self.enabled:
+            return
+        if self._root is not None:
+            try:
+                self._root.destroy()
+            except Exception:
+                pass
+        self.enabled = False
+        self._root = None
+        self._label = None
+        self._photo = None

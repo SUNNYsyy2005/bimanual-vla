@@ -36,7 +36,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
-    import piper_action_conventions as _piper_action_conventions
+    from bimanual_vla.data import action_conventions as _piper_action_conventions
 except ImportError:
     _piper_action_conventions = None
 
@@ -3997,7 +3997,12 @@ def create_app(config_path: Path) -> Flask:
             raise ValueError(f"dataset is in use by active task(s): {summary}")
 
     def validate_staging_dataset(path: Path) -> str:
-        checker = [config["openpi_python"], str(REPO_DIR / "check_pi05_dataset.py"), str(path)]
+        checker = [
+            config["openpi_python"],
+            "-m",
+            "bimanual_vla.data.check",
+            str(path),
+        ]
         result = subprocess.run(
             checker,
             cwd=str(REPO_DIR),
@@ -6500,7 +6505,7 @@ print(json.dumps(rows, ensure_ascii=False))
         session_id = f"collect-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
         server_url = payload.get("server") or f"http://192.168.101.9:{config['port']}"
         upload_command = (
-            f"python upload_dataset_4090.py LEROBOT_OR_GUI_NPZ_DIR --name {dataset_id} "
+            f"bin/bimanual-vla data-upload LEROBOT_OR_GUI_NPZ_DIR --name {dataset_id} "
             f"--dataset-origin {origin} --server {server_url} --token TOKEN --workers 4 --merge"
         )
         session = {
