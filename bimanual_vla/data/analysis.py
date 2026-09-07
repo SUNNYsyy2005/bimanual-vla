@@ -15,6 +15,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from bimanual_vla.data.episode_analysis import compute_eef_trajectory
+
 
 DEFAULT_NAMES = tuple(
     f"{side}_{joint}"
@@ -366,34 +368,25 @@ def compute_end_effector_positions(
 ) -> dict[str, np.ndarray]:
     """Compute Piper XYZ trajectories from joint-space state/action data.
 
-    Piper's SDK exposes the same forward-kinematics implementation used by the
-    runtime.  Joint data is expected in left/right blocks of 7 values; delivery
-    (10D pose) data is intentionally skipped because it is already a pose
-    representation and does not need a second FK conversion.
+    Uses the same Piper SDK FK as the runtime when available, with a deterministic
+    approximate fallback for machines that only need offline visualization.
+    Joint data is expected in left/right blocks of 7 values; delivery (10D pose)
+    data is intentionally skipped because it is already a pose representation.
     """
     if data.measured.ndim != 2 or data.measured.shape[1] not in (7, 14):
         return {}
-    try:
-        from piper_sdk import C_PiperForwardKinematics
-
-        fk = C_PiperForwardKinematics()
-    except Exception:
-        return {}
     end = data.sample_count - 1 if end_index is None else min(end_index, data.sample_count - 1)
     start = max(0, min(start_index, end))
+    arm_side = str(data.metadata.get("arm_side") or "right")
+    measured, _method = compute_eef_trajectory(
+        data.measured[start : end + 1], arm_side=arm_side
+    )
+    desired, _method = compute_eef_trajectory(
+        data.desired[start : end + 1], arm_side=arm_side
+    )
     result: dict[str, np.ndarray] = {}
-    sides = ("left", "right") if data.measured.shape[1] == 14 else (str(data.metadata.get("arm_side") or "right"),)
-    for source_name, source in (("measured", data.measured), ("target", data.desired)):
-        for side_index, side in enumerate(sides):
-            block = source[start : end + 1, side_index * 7 : side_index * 7 + 6]
-            positions = np.full((len(block), 3), np.nan, dtype=np.float64)
-            for index, joints in enumerate(block):
-                if not np.all(np.isfinite(joints)):
-                    continue
-                try:
-                    pose = np.asarray(fk.CalFK(joints.tolist())[-1], dtype=np.float64)
-                    positions[index] = pose[:3] / 1000.0
-                except Exception:
-                    continue
-            result[f"{side}_{source_name}"] = positions
+    for side, values in measured.items():
+        result[f"{side}_measured"] = np.asarray(values.get("position", []), dtype=np.float64)
+    for side, values in desired.items():
+        result[f"{side}_target"] = np.asarray(values.get("position", []), dtype=np.float64)
     return result

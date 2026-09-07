@@ -385,6 +385,31 @@ class DatasetEditorTest(unittest.TestCase):
                 b"synthetic-jpeg" if frame_index == 1 else b"synthetic-png",
             )
 
+    def test_crop_episode_reindexes_parquet_and_raw_payloads(self):
+        target = make_dataset(self.datasets, "target", [6])
+        result = self.editor().crop_episode("target", 0, 2, 4)
+        self.assertEqual(result["removed_frames"], 3)
+        self.assertEqual(result["frames"], 3)
+        parquet = target / DATA_PATH.format(episode_chunk=0, episode_index=0)
+        table = pq.read_table(parquet)
+        np.testing.assert_array_equal(table["frame_index"].to_numpy(), [0, 1, 2])
+        np.testing.assert_array_equal(table["index"].to_numpy(), [0, 1, 2])
+        np.testing.assert_array_equal(table["observation.state"].to_pylist(), [[0.0] * 7] * 3)
+        with np.load(target / "raw" / "episode_000000.npz", allow_pickle=False) as raw:
+            np.testing.assert_array_equal(raw["frame_index"], [0, 1, 2])
+            self.assertEqual(raw["state"].shape, (3, 7))
+
+    def test_episode_analysis_and_frame_payload_are_available_for_dashboard(self):
+        make_dataset(self.datasets, "target", [4])
+        analysis = self.editor().episode_analysis("target", 0)
+        self.assertEqual(analysis["frame_count"], 4)
+        self.assertEqual(analysis["joint_names"][-1], "right_gripper")
+        self.assertIn("right", analysis["eef"])
+        frame = self.editor().episode_frame("target", 0, 2)
+        self.assertEqual(frame["frame_index"], 2)
+        self.assertEqual(len(frame["joints"]), 7)
+        self.assertIn("speed_norm", frame)
+
     def test_embedded_image_bytes_are_served_without_external_image_directory(self):
         target = make_dataset(self.datasets, "target", [1])
         info_path = target / "meta" / "info.json"

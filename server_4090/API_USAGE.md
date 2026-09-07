@@ -1226,6 +1226,9 @@ curl -H "Authorization: Bearer $TOKEN" \
 | DELETE | `/api/datasets/<dataset_id>` | 删除数据集 |
 | GET | `/api/datasets/<dataset_id>/episodes/<episode_index>/video/<video_key>` | episode 视频 |
 | GET | `/api/datasets/<dataset_id>/episodes/<episode_index>/image/<image_key>/<frame_index>` | episode 图像帧 |
+| GET | `/api/datasets/<dataset_id>/episodes/<episode_index>/analysis` | episode 逐帧分析、空闲帧区间、末端轨迹，以及 jitter/速度反向/剧烈变化异常标记（`max_points` 可调） |
+| GET | `/api/datasets/<dataset_id>/episodes/<episode_index>/frames/<frame_index>` | 当前帧关节角、速度、加速度、目标值、异常类型和末端位姿 |
+| POST | `/api/datasets/<dataset_id>/episodes/<episode_index>/crop` | 按 `start_frame` / `end_frame` 原子裁剪 episode（`/trim` 为别名） |
 | PATCH | `/api/datasets/<dataset_id>/episodes/<episode_index>` | 修改 episode 参数 |
 | POST | `/api/datasets/<dataset_id>/episodes/delete` | 批量删除 episodes |
 | POST | `/api/datasets/<dataset_id>/merge` | 合并数据集 |

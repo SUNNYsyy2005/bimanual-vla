@@ -41,6 +41,11 @@ from bimanual_vla.data.lerobot import (
     classify_contract_dimensions,
     default_eef_names,
 )
+from bimanual_vla.data.episode_analysis import (
+    analysis_payload,
+    analyze_episode,
+    frame_payload,
+)
 
 
 EPISODE_FILE = re.compile(r"episode_(\d+)\.parquet$")
@@ -277,6 +282,24 @@ def _image_keys(info: dict[str, Any]) -> list[str]:
     )
 
 
+def _first_feature_key(info: dict[str, Any], candidates: tuple[str, ...]) -> str | None:
+    features = info.get("features", {})
+    if not isinstance(features, dict):
+        return None
+    for key in candidates:
+        if key in features:
+            return key
+    return None
+
+
+def _feature_names(info: dict[str, Any], key: str | None) -> list[str] | None:
+    if not key:
+        return None
+    feature = (info.get("features") or {}).get(key)
+    names = feature.get("names") if isinstance(feature, dict) else None
+    return [str(item) for item in names] if isinstance(names, list) else None
+
+
 def _image_cell(table: pa.Table, image_key: str, frame_index: int) -> dict[str, Any]:
     column_index = table.schema.get_field_index(image_key)
     if column_index < 0:
@@ -417,6 +440,94 @@ def _transcode_video_to_h264(source: Path, target: Path) -> None:
             temp.unlink()
         except FileNotFoundError:
             pass
+
+
+def _crop_video(source: Path, target: Path, start_frame: int, end_frame: int, *, fps: Any = 20) -> None:
+    """Write an exact inclusive frame slice without touching the source video."""
+
+    try:
+        import cv2
+    except Exception as exc:  # pragma: no cover - OpenCV is a project dependency
+        raise RuntimeError("OpenCV is required to crop episode videos") from exc
+    capture = cv2.VideoCapture(str(source))
+    if not capture.isOpened():
+        raise RuntimeError(f"unable to open episode video: {source}")
+    source_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    output_fps = source_fps if source_fps > 0 else max(1.0, float(fps or 20))
+    writer = None
+    temp = target.with_name(f".{target.name}.tmp-{uuid.uuid4().hex}.mp4")
+    written = 0
+    try:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        for source_index in range(0, int(end_frame) + 1):
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if source_index < int(start_frame):
+                continue
+            if writer is None:
+                height, width = frame.shape[:2]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                writer = cv2.VideoWriter(
+                    str(temp),
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    output_fps,
+                    (int(width), int(height)),
+                )
+                if not writer.isOpened():
+                    raise RuntimeError(f"unable to create cropped video: {target}")
+            writer.write(frame)
+            written += 1
+    finally:
+        capture.release()
+        if writer is not None:
+            writer.release()
+    if written != int(end_frame) - int(start_frame) + 1:
+        temp.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"video ended before crop range [{start_frame}, {end_frame}] (written {written})"
+        )
+    os.replace(temp, target)
+
+
+def _crop_episode_metadata(row: dict[str, Any], start_frame: int, end_frame: int) -> None:
+    """Shift frame-based metadata when an episode is cropped."""
+
+    timeline = row.get("event_timeline")
+    if isinstance(timeline, list):
+        updated = []
+        carry: dict[str, Any] | None = None
+        for marker in timeline:
+            if not isinstance(marker, dict):
+                continue
+            frame = _safe_int_or_none(marker.get("frame", marker.get("step")))
+            if frame is None or frame > end_frame:
+                continue
+            if frame < start_frame:
+                carry = dict(marker)
+                continue
+            item = dict(marker)
+            item["frame"] = frame - start_frame
+            if "step" in item:
+                step = _safe_int_or_none(item.get("step"))
+                item["step"] = max(0, int(step if step is not None else frame) - start_frame)
+            updated.append(item)
+        if carry is not None:
+            carry["frame"] = 0
+            if "step" in carry:
+                carry["step"] = 0
+            updated.insert(0, carry)
+        row["event_timeline"] = updated
+        if updated:
+            final = updated[-1]
+            if "current_event" in final:
+                row["current_event"] = final["current_event"]
+            if "max_event_reached" in final:
+                row["max_event_reached"] = final["max_event_reached"]
+        else:
+            row.pop("current_event", None)
+            row.pop("max_event_reached", None)
+            row.pop("max_event", None)
 
 
 def _format_episode_path(root: Path, info: dict[str, Any], key: str, episode_index: int, **extra: Any) -> Path:
@@ -1002,6 +1113,7 @@ class DatasetEditor:
         self.video_cache_root = self.dataset_root / ".dashboard_video_cache"
         self._locks: dict[str, threading.Lock] = {}
         self._global_lock = threading.Lock()
+        self._analysis_cache: dict[tuple[str, int, int, int], Any] = {}
 
     def _dataset_path(self, dataset_id: str) -> Path:
         return self.dataset_root / dataset_id
@@ -1130,6 +1242,90 @@ class DatasetEditor:
             "limit": limit,
             "total": len(indexes),
         }
+
+    def _load_episode_analysis(self, dataset_id: str, episode_index: int):
+        """Load one parquet episode into the reusable analysis layer."""
+
+        dataset_id = _safe_dataset_id(dataset_id)
+        root = self._dataset_path(dataset_id)
+        info = _read_json(root / "meta" / "info.json")
+        if not isinstance(info, dict):
+            raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
+        parquet_path = _parquet_paths(root).get(int(episode_index))
+        if parquet_path is None:
+            raise FileNotFoundError(f"episode {episode_index} does not exist in {dataset_id}")
+        stat = parquet_path.stat()
+        cache_key = (dataset_id, int(episode_index), int(stat.st_mtime_ns), int(stat.st_size))
+        cached = self._analysis_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        state_key = _first_feature_key(info, ("observation.state", "state", "joint_qpos", "qpos"))
+        action_key = _first_feature_key(info, ("action", "actions", "command_action"))
+        schema_names = set(pq.read_schema(parquet_path).names)
+        if state_key not in schema_names:
+            state_key = next((key for key in ("observation.state", "state", "joint_qpos", "qpos") if key in schema_names), None)
+        if action_key not in schema_names:
+            action_key = next((key for key in ("action", "actions", "command_action") if key in schema_names), None)
+        if state_key is None:
+            raise ValueError(f"episode parquet has no state column: {parquet_path}")
+        columns = [state_key]
+        if action_key and action_key != state_key:
+            columns.append(action_key)
+        timestamp_key = next((key for key in ("timestamp", "timestamps", "state_timestamp") if key in schema_names), None)
+        if timestamp_key:
+            columns.append(timestamp_key)
+        table = pq.read_table(parquet_path, columns=columns)
+
+        def matrix(name: str | None, fallback: Any = None) -> np.ndarray:
+            if not name:
+                return np.asarray(fallback, dtype=np.float64)
+            values = table[name].to_pylist()
+            return np.asarray(values, dtype=np.float64)
+
+        state = matrix(state_key)
+        action = matrix(action_key, state)
+        timestamps = np.asarray(table[timestamp_key].to_numpy(zero_copy_only=False), dtype=np.float64) if timestamp_key else None
+        contract = _contract_metadata(info)
+        state_names = _feature_names(info, state_key) or contract.get("state_names")
+        action_names = _feature_names(info, action_key) or contract.get("action_names")
+        analysis = analyze_episode(
+            state,
+            action,
+            timestamps,
+            state_names=state_names,
+            action_names=action_names,
+            fps=info.get("fps", 20),
+            arm_side=str(contract.get("arm_side") or info.get("arm_side") or "right"),
+        )
+        self._analysis_cache[cache_key] = analysis
+        if len(self._analysis_cache) > 12:
+            self._analysis_cache.pop(next(iter(self._analysis_cache)))
+        return analysis
+
+    def episode_analysis(self, dataset_id: str, episode_index: int, *, max_points: int = 1200) -> dict[str, Any]:
+        analysis = self._load_episode_analysis(dataset_id, episode_index)
+        payload = analysis_payload(analysis, max_points=max_points)
+        payload.update(
+            {
+                "dataset_id": _safe_dataset_id(dataset_id),
+                "episode_index": int(episode_index),
+                "analysis_version": "episode_analysis.v2",
+            }
+        )
+        return payload
+
+    def episode_frame(self, dataset_id: str, episode_index: int, frame_index: int) -> dict[str, Any]:
+        analysis = self._load_episode_analysis(dataset_id, episode_index)
+        payload = frame_payload(analysis, frame_index)
+        payload.update(
+            {
+                "dataset_id": _safe_dataset_id(dataset_id),
+                "episode_index": int(episode_index),
+                "analysis_version": "episode_analysis.v2",
+                "eef_method": analysis.eef_method,
+            }
+        )
+        return payload
 
     def video_path(self, dataset_id: str, episode_index: int, video_key: str) -> Path:
         root = self._dataset_path(dataset_id)
@@ -1546,6 +1742,52 @@ class DatasetEditor:
             result.update({"operation": "update_episode", "episode_index": episode_index, "structural_validation": structural})
             return result
 
+    def crop_episode(
+        self,
+        dataset_id: str,
+        episode_index: int,
+        start_frame: int,
+        end_frame: int,
+    ) -> dict[str, Any]:
+        """Atomically keep an inclusive frame range from one episode."""
+
+        dataset_id = _safe_dataset_id(dataset_id)
+        target = self._dataset_path(dataset_id)
+        if not target.is_dir():
+            raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
+        parquet_path = _parquet_paths(target).get(int(episode_index))
+        if parquet_path is None:
+            raise FileNotFoundError(f"episode {episode_index} does not exist in {dataset_id}")
+        length = pq.read_metadata(parquet_path).num_rows
+        start = int(start_frame)
+        end = int(end_frame)
+        if start < 0 or end < start or end >= length:
+            raise ValueError(f"crop range must be within [0, {max(0, length - 1)}]")
+        if start == 0 and end == length - 1:
+            raise ValueError("crop range keeps the complete episode")
+        with self._lock(dataset_id):
+            self.assert_idle(dataset_id)
+            candidate = self._rebuild_candidate(
+                dataset_id,
+                [(target, {int(episode_index): {}})],
+                frame_ranges={int(episode_index): (start, end)},
+            )
+            structural, result = self._validated_commit(dataset_id, candidate)
+            for key in list(self._analysis_cache):
+                if key[0] == dataset_id and key[1] == int(episode_index):
+                    self._analysis_cache.pop(key, None)
+            result.update(
+                {
+                    "operation": "crop_episode",
+                    "episode_index": int(episode_index),
+                    "start_frame": start,
+                    "end_frame": end,
+                    "removed_frames": int(length - (end - start + 1)),
+                    "structural_validation": structural,
+                }
+            )
+            return result
+
     def delete_episodes(self, dataset_id: str, episode_indexes: list[int]) -> dict[str, Any]:
         target = self._dataset_path(dataset_id)
         if not target.is_dir():
@@ -1623,8 +1865,10 @@ class DatasetEditor:
         sources: list[tuple[Path, dict[int, dict[str, Any]] | None]],
         *,
         excluded: set[int] | None = None,
+        frame_ranges: dict[int, tuple[int, int]] | None = None,
     ) -> Path:
         excluded = excluded or set()
+        frame_ranges = frame_ranges or {}
         base = sources[0][0]
         base_info = _read_json(base / "meta" / "info.json")
         if not isinstance(base_info, dict):
@@ -1668,6 +1912,15 @@ class DatasetEditor:
                         continue
                     update = (updates or {}).get(old_episode_index, {})
                     table = pq.read_table(parquet_path)
+                    original_frame_count = table.num_rows
+                    crop_start, crop_end = frame_ranges.get(old_episode_index, (0, original_frame_count - 1))
+                    if crop_start < 0 or crop_end < crop_start or crop_end >= original_frame_count:
+                        raise ValueError(
+                            f"invalid crop range [{crop_start}, {crop_end}] for episode {old_episode_index} "
+                            f"with {original_frame_count} frames"
+                        )
+                    if crop_start != 0 or crop_end != original_frame_count - 1:
+                        table = table.slice(crop_start, crop_end - crop_start + 1)
                     frame_count = table.num_rows
                     if frame_count <= 0:
                         raise ValueError(f"episode is empty: {parquet_path}")
@@ -1723,7 +1976,10 @@ class DatasetEditor:
                         destination_video = _format_episode_path(
                             candidate, base_info, "video_path", new_episode_index, video_key=video_key
                         )
-                        _link_or_copy(source_video, destination_video)
+                        if crop_start == 0 and crop_end == original_frame_count - 1:
+                            _link_or_copy(source_video, destination_video)
+                        else:
+                            _crop_video(source_video, destination_video, crop_start, crop_end, fps=info.get("fps", 20))
                         total_videos += 1
 
                     self._copy_episode_images(
@@ -1733,11 +1989,14 @@ class DatasetEditor:
                         old_episode_index=old_episode_index,
                         candidate=candidate,
                         new_episode_index=new_episode_index,
+                        source_frame_start=crop_start,
                     )
 
                     source_row["episode_index"] = new_episode_index
                     source_row["length"] = frame_count
                     source_row["tasks"] = _unique_strings(task_texts)
+                    if crop_start != 0 or crop_end != original_frame_count - 1:
+                        _crop_episode_metadata(source_row, crop_start, crop_end)
                     if base_contract.get("legacy"):
                         source_row.update(
                             {
@@ -1796,7 +2055,29 @@ class DatasetEditor:
                             task_indexes=np.asarray(mapped_task_ids, dtype=np.int64),
                             episode_row=source_row,
                             update=update,
+                            frame_start=crop_start,
+                            frame_end=crop_end,
                         )
+
+                    if crop_start != 0 or crop_end != original_frame_count - 1:
+                        override = _read_event_overrides(
+                            _episode_override_path(source, old_episode_index),
+                            episode_length=original_frame_count,
+                        )
+                        if override is not None:
+                            edits = []
+                            for marker in override.get("edits", []):
+                                marker = dict(marker)
+                                marker["start_frame"] = int(marker.get("start_frame", 0)) - crop_start
+                                if marker["start_frame"] < 0:
+                                    marker["start_frame"] = 0
+                                if marker["start_frame"] > crop_end - crop_start:
+                                    continue
+                                edits.append(marker)
+                            override["length"] = frame_count
+                            override["episode_index"] = new_episode_index
+                            override["edits"] = _normalize_event_edits(edits, episode_length=frame_count)
+                            _atomic_json(_episode_override_path(candidate, new_episode_index), override)
 
                     total_frames += frame_count
                     new_episode_index += 1
@@ -1881,18 +2162,20 @@ class DatasetEditor:
         old_episode_index: int,
         candidate: Path,
         new_episode_index: int,
+        source_frame_start: int = 0,
     ) -> None:
         for image_key in _image_keys(info):
             if table.schema.get_field_index(image_key) < 0:
                 raise ValueError(f"episode parquet is missing image column {image_key}")
             for frame_index in range(table.num_rows):
+                source_frame_index = int(source_frame_start) + frame_index
                 cell = _image_cell(table, image_key, frame_index)
                 external = _external_image_path(
                     source,
                     info,
                     image_key,
                     old_episode_index,
-                    frame_index,
+                    source_frame_index,
                     cell.get("path"),
                 )
                 if external is None:
@@ -1925,10 +2208,24 @@ class DatasetEditor:
         task_indexes: np.ndarray,
         episode_row: dict[str, Any],
         update: dict[str, Any],
+        frame_start: int = 0,
+        frame_end: int | None = None,
     ) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         with np.load(source, allow_pickle=False) as data:
             payload = {key: data[key] for key in data.files}
+        if frame_end is not None:
+            source_count = None
+            for key in ("frame_index", "state", "observation.state", "joint_qpos", "qpos"):
+                value = payload.get(key)
+                if isinstance(value, np.ndarray) and value.ndim >= 1:
+                    source_count = len(value)
+                    break
+            if source_count is not None and (frame_start != 0 or int(frame_end) + 1 != int(source_count)):
+                stop = min(int(frame_end) + 1, int(source_count))
+                for key, value in list(payload.items()):
+                    if isinstance(value, np.ndarray) and value.ndim >= 1 and len(value) == source_count:
+                        payload[key] = value[int(frame_start) : stop]
         payload["episode_index"] = np.full(frame_count, episode_index, dtype=np.int64)
         payload["frame_index"] = np.arange(frame_count, dtype=np.int64)
         payload["index"] = np.arange(global_offset, global_offset + frame_count, dtype=np.int64)
@@ -1982,6 +2279,9 @@ class DatasetEditor:
                 os.replace(backup, target)
             raise
         invalidated = self._invalidate_norm_stats(dataset_id)
+        for key in list(self._analysis_cache):
+            if key[0] == dataset_id:
+                self._analysis_cache.pop(key, None)
         info = _read_json(target / "meta" / "info.json", {})
         return {
             "dataset_id": dataset_id,
