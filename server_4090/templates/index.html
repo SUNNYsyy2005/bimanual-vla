@@ -80,8 +80,10 @@
     .architecture > span { padding:9px; border:1px solid #34506f; border-radius:10px; background:#0a1728; }
     .path { max-width:460px; overflow-wrap:anywhere; }
     #message { position:sticky; top:calc(var(--nav-height) + 8px); z-index:40; display:none; margin-bottom:12px; padding:10px 14px; border:1px solid #3b82f6; border-radius:9px; background:#172554; box-shadow:0 8px 30px rgba(0,0,0,.3); }
-    .episode-editor-grid { display:grid; grid-template-columns:minmax(520px,1.35fr) minmax(360px,.85fr); gap:14px; margin-top:14px; }
+    .episode-editor-grid { display:grid; grid-template-columns:minmax(0,1fr); gap:14px; margin-top:14px; }
     .episode-panel { padding:12px; border:1px solid #334c69; border-radius:11px; background:#091727; }
+    .episode-panel.table-wrap { max-height:430px; overflow:auto; }
+    .episode-panel.table-wrap thead th { position:sticky; top:0; z-index:2; background:#0b1d31; }
     .episode-videos,.preview-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:12px 0; }
     .media-card { min-width:0; padding:10px; border:1px solid #304b68; border-radius:11px; background:#07121f; }
     .media-card header { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:8px; }
@@ -164,7 +166,7 @@
     .analysis-timeline-wrap { position:relative; margin:8px 0 12px; padding:7px; border:1px solid #29445f; border-radius:9px; background:#07121f; }
     #episodeIdleTimeline,#episodeTrajectoryChart { display:block; width:100%; height:78px; touch-action:none; }
     #episodeTrajectoryChart { height:280px; margin-top:8px; }
-    .analysis-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(340px,1.2fr); gap:12px; }
+    .analysis-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
     .analysis-card { min-width:0; padding:10px; border:1px solid #304b68; border-radius:10px; background:#07121f; }
     .analysis-card h3 { margin-top:0; }
     .joint-table { max-height:340px; overflow:auto; }
@@ -176,7 +178,9 @@
     .anomaly-reversal { color:#ff9f68; }
     .anomaly-abrupt { color:#ff5f6d; }
     .analysis-anomaly-legend { display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 2px; color:#b8cbe0; font-size:11px; }
-    @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid,.telemetry-latency-grid{grid-template-columns:repeat(2,1fr)}.episode-editor-grid{grid-template-columns:1fr}}
+    @media(min-width:1480px){.episode-editor-grid{grid-template-columns:minmax(520px,1.05fr) minmax(620px,1.25fr)}}
+    @media(max-width:1280px){.analysis-grid{grid-template-columns:1fr}.episode-videos{grid-template-columns:1fr}}
+    @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid,.telemetry-latency-grid{grid-template-columns:repeat(2,1fr)}}
     @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid,.telemetry-vector-grid,.analysis-grid{grid-template-columns:1fr}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
   </style>
 </head>
