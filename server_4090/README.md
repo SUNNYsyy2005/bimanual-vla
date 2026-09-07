@@ -241,6 +241,7 @@ cd /home/sunny/bimanual-vla
    - norm 失败、丢失或未生成统计文件时，训练任务标记失败并显示依赖原因；
    - 同一数据集、模型系列、基础权重和划分参数已有运行中的 norm 时复用该任务，Dashboard 重启后依赖仍可恢复；
    - 启动方式默认使用 `auto`：实验目录存在时等价于 `--resume`，不存在时创建新训练；只有明确选择 `overwrite` 才会删除原 checkpoint。
+   - 长时间训练默认通过 `nohup` + 独立会话启动，Dashboard 重启或终端断开不会向训练 runner 发送挂断信号；任务仍通过 `task_runner.py` 写入 `exit.json`，因此状态、日志和停止按钮保持可用。`nohup` 只隔离会话生命周期，不能绕过内核/显存 OOM 或磁盘空间限制。
 4. “计算归一化统计”表单用于首次确定或主动修改 episode 划分，也可手动重算或限制帧数调试；训练提交时会复用已保存划分，缺少 norm 时自动补算。
 5. 训练模块集中展示 Norm / Train 进程管理、任务日志和指标曲线；从日志提取 `Step N: key=value`，绘制 `loss`、`loss_physical_14d`、`loss_padding_18d` 等曲线，并显示 step 进度、latest/min/max；图例按钮可切换 `grad_norm`、`param_norm` 等其他指标。
 6. 页面按模型系列和数据集臂模式扫描 `pi05_piper_*_lora/<experiment>/<step>` 与 `pi0_piper_*_lora/<experiment>/<step>`，过滤完整 checkpoint，并在训练模块列出 checkpoint 表；可以按实验筛选，并批量删除选中的完整 checkpoint 目录（不会删除任务记录、日志或数据集）。

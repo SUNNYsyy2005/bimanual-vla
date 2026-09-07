@@ -777,6 +777,7 @@ H100/H200 Slurm 示例：
 - `eval_interval_steps` 必须能被 `save_interval` 整除，且当前要求是 5000 的倍数；
 - 若 norm 不存在，本地训练会自动先创建 norm task，并在 norm 完成后训练；Slurm 训练会在一个 Slurm job 内先 norm 后 train。
 - `execution_target` 为 H100/H200 时，Dashboard 会先根据远端 inventory 判断数据集是否存在；不存在或 inventory 不可用时，默认先执行一次幂等数据集同步（`auto_sync_dataset=true`，目标已存在则跳过），然后再提交 Slurm norm/train。
+- 本地 Dashboard 训练默认使用 `training_task_launch_backend=nohup`：训练 runner 通过 `nohup` 和独立会话脱离 Dashboard/终端生命周期；任务状态仍由 `task_runner.py` 的 `exit.json` 和日志维护。该设置不等价于绕过内核/显存 OOM 或磁盘配额限制。
 - Policy 推理只能在 4×4090 启动；H100/H200 训练出的 checkpoint 需要通过 `POST /api/checkpoints/sync` 同步回 4×4090 的本地 checkpoint root 后才能在实机 Policy 中选择。
 
 返回 `train` task。若自动 norm，返回的 train task 可能处于 `waiting_norm`。

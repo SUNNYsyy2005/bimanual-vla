@@ -1412,6 +1412,9 @@ def load_config(path: Path) -> dict[str, Any]:
         "policy_port_max": 8099,
         "robot_observation_max_age_s": 3.0,
         "task_monitor_interval_s": 2.0,
+        # Keep long-running training outside the Dashboard's terminal/session
+        # lifecycle. Norm/eval/policy retain the existing auto backend.
+        "training_task_launch_backend": "nohup",
         "dashboard_profile": "real",
         "dashboard_title": "Bimanual-VLA · 4×4090 控制台",
         "upload_default_origin": None,
@@ -1606,9 +1609,22 @@ class TaskManager:
             *[str(item) for item in task["command"]],
         ]
 
-    def _systemd_task_backend_enabled(self) -> bool:
-        backend = str(self.config.get("task_launch_backend", "auto") or "auto").lower()
+    def _task_launch_backend(self, task: dict[str, Any]) -> str:
+        """Return the configured launcher for a task.
+
+        Training can be launched with ``nohup`` so it is detached from the
+        Dashboard's terminal/session.  Other task types keep the existing
+        systemd/direct selection unless a global backend is explicitly set.
+        """
+        key = "training_task_launch_backend" if task.get("type") == "train" else "task_launch_backend"
+        backend = self.config.get(key, self.config.get("task_launch_backend", "auto"))
+        return str(backend or "auto").strip().lower()
+
+    def _systemd_task_backend_enabled(self, task: dict[str, Any]) -> bool:
+        backend = self._task_launch_backend(task)
         if backend in {"direct", "popen", "subprocess"}:
+            return False
+        if backend in {"nohup", "detached"}:
             return False
         if backend in {"systemd", "systemd_user", "systemd-user"}:
             return True
@@ -1662,6 +1678,36 @@ class TaskManager:
                 task["launch_command"],
                 cwd=self.config["openpi_repo"],
                 env=env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            log_handle.close()
+
+    def _launch_nohup_runner(
+        self,
+        task: dict[str, Any],
+        *,
+        env: dict[str, str],
+    ) -> subprocess.Popen:
+        """Launch a task with nohup and a detached process session.
+
+        ``task_runner.py`` still owns the child process and writes the durable
+        exit.json file.  Keeping the runner command (rather than the nohup
+        executable) in ``launch_command`` also lets Dashboard recovery match
+        the post-exec Python process after a Dashboard restart.
+        """
+        nohup = shutil.which("nohup")
+        if not nohup:
+            raise RuntimeError("nohup executable is required for the configured task backend")
+        log_handle = self._log_path(task["id"]).open("ab", buffering=0)
+        try:
+            return subprocess.Popen(
+                [nohup, *task["launch_command"]],
+                cwd=self.config["openpi_repo"],
+                env=env,
+                stdin=subprocess.DEVNULL,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -1737,7 +1783,8 @@ class TaskManager:
         atomic_json(self._path(task_id), task)
 
         try:
-            if self._systemd_task_backend_enabled():
+            backend = self._task_launch_backend(task)
+            if self._systemd_task_backend_enabled(task):
                 try:
                     pid = self._launch_systemd_runner(task, env=env)
                     task.update({
@@ -1752,8 +1799,12 @@ class TaskManager:
                 except Exception as exc:
                     self._append_log(task, f"systemd task launch failed; falling back to direct runner: {exc}")
 
-            task["launch_backend"] = "direct_runner"
-            process = self._launch_direct_runner(task, env=env)
+            if backend in {"nohup", "detached"}:
+                task["launch_backend"] = "nohup"
+                process = self._launch_nohup_runner(task, env=env)
+            else:
+                task["launch_backend"] = "direct_runner"
+                process = self._launch_direct_runner(task, env=env)
         except Exception as exc:
             task.update(
                 {

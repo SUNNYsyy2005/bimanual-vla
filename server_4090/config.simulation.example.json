@@ -33,6 +33,7 @@
   "policy_min_free_gpu_mib": 12000,
   "policy_xla_memory_fraction": 0.60,
   "policy_xla_preallocate": false,
+  "training_task_launch_backend": "nohup",
   "task_monitor_interval_s": 2.0,
   "max_upload_gib": 500,
   "max_chunk_mib": 64,
