@@ -29,6 +29,7 @@
   "max_chunk_mib": 64,
   "policy_port_min": 8000,
   "policy_port_max": 8099,
+  "training_task_launch_backend": "nohup",
   "checkpoint_allowed_roots": [
     "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints",
     "/home/sunny/.cache/openpi/openpi-assets/checkpoints"

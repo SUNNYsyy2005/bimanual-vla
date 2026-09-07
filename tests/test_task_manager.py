@@ -318,6 +318,28 @@ class TaskManagerDeleteTest(unittest.TestCase):
         self.assertEqual(probe["status"], "unknown")
         self.assertIsNone(probe["has_points"])
 
+    def test_training_tasks_use_configured_nohup_backend_without_changing_other_tasks(self):
+        manager = TaskManager({
+            "workspace_root": self.tempdir.name,
+            "task_monitor_interval_s": 0,
+            "openpi_python": "/opt/openpi/bin/python",
+            "openpi_repo": "/opt/openpi",
+            "dataset_root": "/datasets",
+            "assets_base_dir": "/assets",
+            "checkpoint_base_dir": "/checkpoints",
+            "base_checkpoint": "/base/pi05",
+            "allowed_gpu_ids": [0, 1, 2, 3],
+            "task_launch_backend": "systemd",
+            "training_task_launch_backend": "nohup",
+        })
+        try:
+            self.assertEqual(manager._task_launch_backend({"type": "train"}), "nohup")
+            self.assertEqual(manager._task_launch_backend({"type": "norm"}), "systemd")
+            self.assertFalse(manager._systemd_task_backend_enabled({"type": "train"}))
+            self.assertTrue(manager._systemd_task_backend_enabled({"type": "norm"}))
+        finally:
+            manager.close()
+
 
 if __name__ == "__main__":
     unittest.main()
