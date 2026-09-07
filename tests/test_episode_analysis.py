@@ -45,6 +45,28 @@ class EpisodeAnalysisTest(unittest.TestCase):
         self.assertIn("right", result["eef"])
         self.assertEqual(len(result["sampled_frames"]), 4)
 
+    def test_franka_bimanual_16d_state_includes_panda_eef_trajectory(self):
+        state = np.zeros((5, 16), dtype=np.float64)
+        state[:, 1] = np.linspace(-0.2, 0.2, 5)
+        state[:, 8] = np.linspace(0.1, -0.1, 5)
+        result = analysis_payload(
+            analyze_episode(
+                state,
+                state,
+                np.arange(5, dtype=np.float64) / 20.0,
+                state_names=[
+                    f"{side}_{name}"
+                    for side in ("left", "right")
+                    for name in [*(f"joint_{index}" for index in range(1, 8)), "gripper"]
+                ],
+            )
+        )
+        json.dumps(result, allow_nan=False)
+        self.assertEqual(result["eef_method"], "franka_panda_fk")
+        self.assertEqual(set(result["eef"]), {"left", "right"})
+        self.assertEqual(len(result["eef"]["left"]["position"]), 5)
+        self.assertEqual(len(result["eef"]["right"]["position"]), 5)
+
     def test_motion_anomaly_detector_marks_reversal_jitter_and_spike(self):
         timestamps = np.arange(9, dtype=np.float64) / 20.0
         state = np.zeros((9, 7), dtype=np.float64)

@@ -23,6 +23,12 @@ DEFAULT_JOINT_NAMES = tuple(
     for value in ([f"{side}_joint_{index}" for index in range(1, 7)] + [f"{side}_gripper"])
 )
 
+FRANKA_JOINT_NAMES = tuple(
+    value
+    for side in ("left", "right")
+    for value in ([f"{side}_joint_{index}" for index in range(1, 8)] + [f"{side}_gripper"])
+)
+
 
 @dataclass(frozen=True)
 class EpisodeAnalysis:
@@ -70,9 +76,14 @@ def infer_joint_names(names: Sequence[Any] | None, width: int, *, arm_side: str 
             return values
     if width == 14:
         return DEFAULT_JOINT_NAMES
+    if width == 16:
+        return FRANKA_JOINT_NAMES
     if width == 7:
         side = arm_side if arm_side in {"left", "right"} else "right"
         return tuple(f"{side}_joint_{index}" for index in range(1, 7)) + (f"{side}_gripper",)
+    if width == 8:
+        side = arm_side if arm_side in {"left", "right"} else "right"
+        return tuple(f"{side}_joint_{index}" for index in range(1, 8)) + (f"{side}_gripper",)
     return tuple(f"dim_{index + 1}" for index in range(width))
 
 
@@ -332,6 +343,61 @@ def _fallback_fk(joints: np.ndarray) -> np.ndarray:
     return np.asarray([x, y, z], dtype=np.float64)
 
 
+def _rotation_x(angle: float) -> np.ndarray:
+    cosine, sine = np.cos(angle), np.sin(angle)
+    return np.asarray(
+        [[1.0, 0.0, 0.0], [0.0, cosine, -sine], [0.0, sine, cosine]],
+        dtype=np.float64,
+    )
+
+
+def _rotation_z(angle: float) -> np.ndarray:
+    cosine, sine = np.cos(angle), np.sin(angle)
+    return np.asarray(
+        [[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+
+def _rigid_transform(translation: Sequence[float], rotation: np.ndarray) -> np.ndarray:
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = np.asarray(translation, dtype=np.float64)
+    return transform
+
+
+def _franka_fk(joints: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute Panda hand pose from seven joint positions using the Panda URDF chain."""
+
+    origins = (
+        ((0.0, 0.0, 0.333), (0.0, 0.0, 0.0)),
+        ((0.0, 0.0, 0.0), (-np.pi / 2.0, 0.0, 0.0)),
+        ((0.0, -0.316, 0.0), (np.pi / 2.0, 0.0, 0.0)),
+        ((0.0825, 0.0, 0.0), (np.pi / 2.0, 0.0, 0.0)),
+        ((-0.0825, 0.384, 0.0), (-np.pi / 2.0, 0.0, 0.0)),
+        ((0.0, 0.0, 0.0), (np.pi / 2.0, 0.0, 0.0)),
+        ((0.088, 0.0, 0.0), (np.pi / 2.0, 0.0, 0.0)),
+    )
+    transform = np.eye(4, dtype=np.float64)
+    for angle, (translation, rpy) in zip(np.asarray(joints[:7], dtype=np.float64), origins):
+        transform = transform @ _rigid_transform(translation, _rotation_x(rpy[0]))
+        transform = transform @ _rigid_transform((0.0, 0.0, 0.0), _rotation_z(float(angle)))
+    transform = transform @ _rigid_transform((0.0, 0.0, 0.107), np.eye(3, dtype=np.float64))
+    return transform[:3, 3], transform[:3, :3]
+
+
+def _rotation_to_rpy(rotation: np.ndarray) -> np.ndarray:
+    pitch = np.arcsin(np.clip(-float(rotation[2, 0]), -1.0, 1.0))
+    cosine = np.cos(pitch)
+    if abs(cosine) > 1e-8:
+        roll = np.arctan2(float(rotation[2, 1]), float(rotation[2, 2]))
+        yaw = np.arctan2(float(rotation[1, 0]), float(rotation[0, 0]))
+    else:
+        roll = 0.0
+        yaw = np.arctan2(-float(rotation[0, 1]), float(rotation[1, 1]))
+    return np.asarray([roll, pitch, yaw], dtype=np.float64)
+
+
 def compute_eef_trajectory(
     state: Any,
     *,
@@ -340,8 +406,9 @@ def compute_eef_trajectory(
 ) -> tuple[dict[str, dict[str, np.ndarray]], str]:
     """Return per-arm XYZ trajectories and the method used.
 
-    Cartesian 10D/20D states are read directly.  Joint 7D/14D states use the
-    Piper SDK when present and otherwise a deterministic approximate FK.
+    Cartesian 10D/20D states are read directly.  Franka Panda 8D/16D joint
+    states use the Panda URDF chain, while Piper 7D/14D states use the Piper
+    SDK when present and otherwise a deterministic approximate FK.
     """
 
     matrix = _as_matrix(state)
@@ -358,6 +425,20 @@ def compute_eef_trajectory(
                 "orientation": block[:, 3:9],
             }
         return result, "recorded_eef"
+    if width in {8, 16}:
+        arms = 1 if width == 8 else 2
+        sides = (arm_side if arm_side in {"left", "right"} else "right",) if arms == 1 else ("left", "right")
+        for arm_index, side in enumerate(sides):
+            block = matrix[:, arm_index * 8 : arm_index * 8 + 7]
+            positions = np.full((len(block), 3), np.nan, dtype=np.float64)
+            orientations = np.full((len(block), 3), np.nan, dtype=np.float64)
+            for index, joints in enumerate(block):
+                if not np.all(np.isfinite(joints)):
+                    continue
+                positions[index], rotation = _franka_fk(joints)
+                orientations[index] = _rotation_to_rpy(rotation)
+            result[side] = {"position": positions, "orientation": orientations}
+        return result, "franka_panda_fk"
     if width not in {7, 14}:
         return {}, "unavailable"
     arms = 1 if width == 7 else 2
