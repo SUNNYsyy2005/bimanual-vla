@@ -1400,6 +1400,12 @@ def load_config(path: Path) -> dict[str, Any]:
         "policy_min_free_gpu_mib": 12_000,
         "policy_xla_memory_fraction": 0.60,
         "policy_xla_preallocate": False,
+        # Server-owned RTC capability ceiling. The actual runtime values are
+        # selected by each robot client and can change without restarting the
+        # Policy process.
+        "policy_rtc_enabled": True,
+        "policy_rtc_max_execution_horizon": 8,
+        "policy_rtc_max_guidance_weight": 5.0,
         "max_upload_gib": 500,
         "max_chunk_mib": 64,
         "policy_port_min": 8000,
@@ -4574,6 +4580,13 @@ def create_app(config_path: Path) -> Flask:
                     "policy_min_free_gpu_mib": config.get("policy_min_free_gpu_mib", 12_000),
                     "policy_xla_memory_fraction": config.get("policy_xla_memory_fraction", 0.60),
                     "policy_xla_preallocate": config.get("policy_xla_preallocate", False),
+                    "policy_rtc_enabled": config.get("policy_rtc_enabled", True),
+                    "policy_rtc_max_execution_horizon": config.get(
+                        "policy_rtc_max_execution_horizon", 8
+                    ),
+                    "policy_rtc_max_guidance_weight": config.get(
+                        "policy_rtc_max_guidance_weight", 5.0
+                    ),
                     "transfer_parallelism": config.get("transfer_parallelism", 4),
                     "nas_dataset_staging_root": config.get("nas_dataset_staging_root"),
                     "policy_port_range": [config["policy_port_min"], config["policy_port_max"]],
@@ -4663,6 +4676,30 @@ def create_app(config_path: Path) -> Flask:
         dataset_id = safe_name(dataset_id, "dataset id")
         source, mimetype = dataset_editor.image_source(dataset_id, episode_index, image_key, frame_index)
         return send_file(source, mimetype=mimetype, conditional=True, max_age=3600)
+
+    @app.get("/api/datasets/<dataset_id>/episodes/<int:episode_index>/analysis")
+    def dataset_episode_analysis(dataset_id: str, episode_index: int):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        max_points = safe_int(request.args.get("max_points", 1200), "max_points", 50, 5000)
+        return jsonify(dataset_editor.episode_analysis(dataset_id, episode_index, max_points=max_points))
+
+    @app.get("/api/datasets/<dataset_id>/episodes/<int:episode_index>/frames/<int:frame_index>")
+    @app.get("/api/datasets/<dataset_id>/episodes/<int:episode_index>/frame/<int:frame_index>")
+    @app.get("/api/datasets/<dataset_id>/episodes/<int:episode_index>/frame-data/<int:frame_index>")
+    def dataset_episode_frame(dataset_id: str, episode_index: int, frame_index: int):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        return jsonify(dataset_editor.episode_frame(dataset_id, episode_index, frame_index))
+
+    @app.post("/api/datasets/<dataset_id>/episodes/<int:episode_index>/crop")
+    @app.post("/api/datasets/<dataset_id>/episodes/<int:episode_index>/trim")
+    def crop_dataset_episode(dataset_id: str, episode_index: int):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict):
+            raise ValueError("crop request must be a JSON object")
+        start = safe_int(payload.get("start_frame"), "start_frame", 0, 10**9)
+        end = safe_int(payload.get("end_frame"), "end_frame", 0, 10**9)
+        return jsonify(dataset_editor.crop_episode(dataset_id, episode_index, start, end))
 
     @app.patch("/api/datasets/<dataset_id>/episodes/<int:episode_index>")
     def update_dataset_episode(dataset_id: str, episode_index: int):
@@ -7295,40 +7332,23 @@ print(json.dumps(rows, ensure_ascii=False))
     @app.post("/api/tasks/policy")
     def start_policy():
         payload = request.get_json(force=True)
-        raw_rtc_enabled = payload.get("rtc_enabled", True)
-        if isinstance(raw_rtc_enabled, bool):
-            rtc_enabled = raw_rtc_enabled
-        elif isinstance(raw_rtc_enabled, (int, float)) and raw_rtc_enabled in (0, 1):
-            rtc_enabled = bool(raw_rtc_enabled)
-        elif isinstance(raw_rtc_enabled, str) and raw_rtc_enabled.strip().lower() in {
-            "true", "1", "yes", "on",
-        }:
-            rtc_enabled = True
-        elif isinstance(raw_rtc_enabled, str) and raw_rtc_enabled.strip().lower() in {
-            "false", "0", "no", "off",
-        }:
-            rtc_enabled = False
-        else:
-            raise ValueError("rtc_enabled must be a boolean")
+        # RTC runtime values and prompt are client-owned. The Dashboard only
+        # starts a Policy with the server's capability ceiling; clients send
+        # their selected values at runtime and can change them without
+        # restarting this process.
+        rtc_enabled = bool(config.get("policy_rtc_enabled", True))
         rtc_execution_horizon = safe_int(
-            payload.get("rtc_execution_horizon", 8),
-            "rtc_execution_horizon",
+            config.get("policy_rtc_max_execution_horizon", 8),
+            "policy_rtc_max_execution_horizon",
             1,
             50,
         )
         rtc_max_guidance_weight = safe_float(
-            payload.get("rtc_max_guidance_weight", 5.0),
-            "rtc_max_guidance_weight",
+            config.get("policy_rtc_max_guidance_weight", 5.0),
+            "policy_rtc_max_guidance_weight",
             0.001,
             100.0,
         )
-        rtc_prefix_attention_schedule = str(
-            payload.get("rtc_prefix_attention_schedule", "linear") or "linear"
-        ).strip().lower()
-        if rtc_prefix_attention_schedule not in {"zeros", "ones", "linear", "exp"}:
-            raise ValueError(
-                "rtc_prefix_attention_schedule must be one of zeros, ones, linear, exp"
-            )
         policy_target = str(payload.get("execution_target", "local_4090") or "local_4090")
         if policy_target not in {"", "local", "local_4090", "4x4090"}:
             raise ValueError("Policy serving is only supported on the 4×4090 host; train/sync checkpoints back before serving")
@@ -7527,13 +7547,7 @@ print(json.dumps(rows, ensure_ascii=False))
             "--rtc-enabled" if rtc_enabled else "--no-rtc-enabled",
             "--rtc-execution-horizon", str(rtc_execution_horizon),
             "--rtc-max-guidance-weight", str(rtc_max_guidance_weight),
-            "--rtc-prefix-attention-schedule", rtc_prefix_attention_schedule,
         ] + action_contract_command_args(model_contract)
-        default_prompt = str(payload.get("default_prompt", "")).strip()
-        if default_prompt:
-            if len(default_prompt) > 500:
-                raise ValueError("default_prompt is too long")
-            command += ["--default-prompt", default_prompt]
         task = tasks.start(
             "policy", command,
             env=build_environment(
@@ -7564,10 +7578,9 @@ print(json.dumps(rows, ensure_ascii=False))
                 "ws_url": f"ws://{request.host.split(':')[0]}:{port}",
                 "telemetry_session": telemetry_session,
                 "telemetry_dir": str(telemetry_dir),
-                "rtc_enabled": rtc_enabled,
-                "rtc_execution_horizon": rtc_execution_horizon,
-                "rtc_max_guidance_weight": rtc_max_guidance_weight,
-                "rtc_prefix_attention_schedule": rtc_prefix_attention_schedule,
+                "rtc_server_enabled": rtc_enabled,
+                "rtc_server_max_execution_horizon": rtc_execution_horizon,
+                "rtc_server_max_guidance_weight": rtc_max_guidance_weight,
                 "replaced_task_id": replace_task_id or None,
             },
         )

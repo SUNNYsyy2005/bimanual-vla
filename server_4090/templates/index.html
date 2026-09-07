@@ -156,8 +156,28 @@
     .event-editor select,.event-editor input { width:auto; min-width:82px; padding:5px 7px; }
     .event-editor button { width:auto; padding:5px 8px; }
     .event-pill { display:inline-block; margin:2px 4px 2px 0; padding:1px 6px; border:1px solid #35597b; border-radius:999px; background:#0d2136; color:#bfeaff; }
+    .episode-analysis { margin-top:14px; padding-top:12px; border-top:1px solid #29445f; }
+    .episode-analysis-toolbar { display:flex; flex-wrap:wrap; align-items:end; gap:8px; margin:8px 0; }
+    .episode-analysis-toolbar label { margin:0; }
+    .episode-analysis-toolbar input { width:100px; }
+    .analysis-summary { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
+    .analysis-timeline-wrap { position:relative; margin:8px 0 12px; padding:7px; border:1px solid #29445f; border-radius:9px; background:#07121f; }
+    #episodeIdleTimeline,#episodeTrajectoryChart { display:block; width:100%; height:78px; touch-action:none; }
+    #episodeTrajectoryChart { height:280px; margin-top:8px; }
+    .analysis-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(340px,1.2fr); gap:12px; }
+    .analysis-card { min-width:0; padding:10px; border:1px solid #304b68; border-radius:10px; background:#07121f; }
+    .analysis-card h3 { margin-top:0; }
+    .joint-table { max-height:340px; overflow:auto; }
+    .joint-table table { min-width:520px; }
+    .joint-table td,.joint-table th { padding:5px 7px; font-size:12px; }
+    .idle-frame { color:#ffd166; }
+    .anomaly-frame { color:#ff7b8f; }
+    .anomaly-jitter { color:#d7a6ff; }
+    .anomaly-reversal { color:#ff9f68; }
+    .anomaly-abrupt { color:#ff5f6d; }
+    .analysis-anomaly-legend { display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 2px; color:#b8cbe0; font-size:11px; }
     @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid,.telemetry-latency-grid{grid-template-columns:repeat(2,1fr)}.episode-editor-grid{grid-template-columns:1fr}}
-    @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid,.telemetry-vector-grid{grid-template-columns:1fr}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
+    @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid,.telemetry-vector-grid,.analysis-grid{grid-template-columns:1fr}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
   </style>
 </head>
 <body>
@@ -230,6 +250,24 @@
               <form id="episodeForm"><input id="episodeIndex" type="hidden"><label>Episode</label><input id="episodeIndexDisplay" disabled><label>Instruction</label><textarea id="episodeInstruction" rows="3" required></textarea><label>Task name（可选）</label><input id="episodeTaskName" placeholder="未设置"><label>Success（可选）</label><select id="episodeSuccess"><option value="">未设置</option><option value="true">true</option><option value="false">false</option></select><label>附加 metadata（JSON object）</label><textarea id="episodeMetadata" rows="7">{}</textarea><label>删除 metadata 字段（逗号分隔）</label><input id="episodeRemoveMetadata" placeholder="operator_note, bad_reason"><p><button type="submit">保存 Episode 参数</button></p></form>
               <h3>Event track（可选）</h3><div id="episodeEventTrack" class="event-status no-track">选择 episode 后加载。</div>
               <h3>相机媒体 <span class="event-pill">三路强制同步</span></h3><div class="muted">任意一路播放、暂停或拖动，其他相机同步到同一帧。</div><div id="episodeVideos" class="episode-videos"><span class="muted">选择 episode 后加载。</span></div>
+              <section class="episode-analysis" aria-label="Episode 逐帧分析">
+                <h3>逐帧数据分析</h3>
+                <div class="muted">当前帧会同步显示关节角、关节速度和末端位置（保持数据集原始单位）；黄色区域为自动识别的空闲帧。</div>
+                <div class="episode-analysis-toolbar">
+                  <div><label>手动裁剪起始帧</label><input id="episodeCropStart" type="number" min="0" value="0"></div>
+                  <div><label>手动裁剪结束帧</label><input id="episodeCropEnd" type="number" min="0" value="0"></div>
+                  <button class="inline secondary" type="button" onclick="cropEpisodeFromInputs()">按范围裁剪</button>
+                  <button class="inline secondary" type="button" onclick="cropEpisodeIdlePadding()">一键去除首尾空闲帧</button>
+                  <button class="inline secondary" type="button" onclick="refreshEpisodeAnalysis()">刷新分析</button>
+                </div>
+                <div id="episodeAnalysisSummary" class="analysis-summary"><span class="muted">选择 episode 后加载分析。</span></div>
+                <div class="analysis-anomaly-legend"><span class="idle-frame">■ idle</span><span class="anomaly-jitter">■ jitter</span><span class="anomaly-reversal">■ velocity reversal</span><span class="anomaly-abrupt">■ abrupt change</span></div>
+                <div class="analysis-timeline-wrap"><canvas id="episodeIdleTimeline" width="1000" height="78"></canvas></div>
+                <div class="analysis-grid">
+                  <div class="analysis-card"><h3>末端位姿轨迹（XYZ）</h3><canvas id="episodeTrajectoryChart" width="1000" height="280"></canvas><div id="episodeTrajectoryLegend" class="metric-legend"></div></div>
+                  <div class="analysis-card"><h3>当前帧关节状态</h3><div id="episodeFrameSummary" class="muted">尚未加载当前帧。</div><div class="joint-table"><table><thead><tr><th>关节</th><th>角度 / 值</th><th>速度 / s</th><th>加速度 / s²</th><th>目标</th><th>异常</th></tr></thead><tbody id="episodeJointRows"><tr><td colspan="6" class="muted">选择 episode 后加载。</td></tr></tbody></table></div><div id="episodeEefFrame" class="muted" style="margin-top:8px"></div></div>
+                </div>
+              </section>
             </div>
           </div>
         </div>
@@ -362,10 +400,10 @@
     <section id="module-policy" class="dashboard-module" data-module="policy" hidden>
       <div class="module-heading"><div><h2>Policy 管理</h2><p>从 checkpoint 启动、切换、健康检测和实机执行授权。</p></div></div>
       <div class="grid">
-        <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><input type="hidden" name="model_variant" id="policyModelVariant" value="pi05"><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div><div><label>默认 prompt</label><input name="default_prompt"></div></div><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
+        <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><input type="hidden" name="model_variant" id="policyModelVariant" value="pi05"><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div></div><p class="muted">Prompt 与 RTC 运行参数由机械臂客户端配置；Policy 仅提供服务器能力上限。客户端改动后无需重启 Policy。</p><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
         <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code>、<code>action_horizon &gt;= 16</code> 和本地逐 20 Hz command 安全检查。异步客户端默认 4 Hz 启动推理（推理+传输通常约 200 ms），旧 chunk 在推理期间持续执行；新 chunk 到达后按实时 arrival 延迟动态过期 prefix，融合 2~4 步后切换 generation。已结束的历史进程可删除记录和日志。</p><div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('policy')" disabled data-bulk-delete-scope="policy">批量删除已选日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束 Policy；不会删除模型或其他输出。</span></div><div class="table-wrap"><table><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="policy" onchange="toggleTaskSelection('policy', this.checked)" aria-label="全选 Policy 历史任务"></th><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端状态 / 延迟摘要</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div></div>
         <div class="card" id="policyTaskLogCard"><h2>Policy 进程日志</h2><p class="muted">从 Policy 进程表点击“日志”查看最近输出。</p><pre id="policyTaskLog">尚未选择 Policy 进程。</pre></div>
-        <div class="card"><h2>机械臂客户端命令</h2><pre id="policyClientCommand">bin/bimanual-vla rtc-client --host 192.168.101.9 --port 8000 --hz 4 --arm-mode single --arm-side right --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16 --instruction "pick up the cube"</pre></div>
+        <div class="card"><h2>机械臂客户端命令</h2><p class="muted">以下只生成连接/设备示例；prompt 和 RTC 运行参数属于客户端。连接后以 telemetry 中的 client prompt/RTC 为准。</p><pre id="policyClientCommand">bin/bimanual-vla rtc-client --host 192.168.101.9 --port 8000 --arm-mode single --arm-side right --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16</pre></div>
       </div>
     </section>
 
@@ -415,6 +453,13 @@ let episodeVideoSyncState = {leader: null, currentTime: 0, playing: false, playb
 let episodeImageSyncState = {timer: null, position: 0, playing: false, fps: 20};
 let episodeDatasetData = null;
 let episodeOffset = 0;
+let episodeAnalysisData = null;
+let episodeAnalysisEpisode = null;
+let episodeFrameRequestSerial = 0;
+let episodeFrameCache = new Map();
+let episodeFrameLastRequestAt = 0;
+let episodeFramePending = null;
+let episodeFrameThrottleTimer = null;
 let trainingMetricsData = null;
 let enabledMetrics = new Set();
 let metricsRequestSerial = 0;
@@ -1451,6 +1496,223 @@ function clearEpisodeMedia() {
   }
 }
 
+function currentAnalysisEpisode() {
+  const index = Number(document.getElementById('episodeIndex')?.value);
+  if (!Number.isInteger(index) || !episodeDatasetData) return null;
+  return (episodeDatasetData.episodes || []).find(item => Number(item.episode_index) === index) || null;
+}
+
+function analysisNumber(value, digits = 4) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(digits) : '-';
+}
+
+function renderEpisodeAnalysisSummary(data) {
+  const summary = document.getElementById('episodeAnalysisSummary');
+  if (!summary) return;
+  if (!data || !data.frame_count) {
+    summary.innerHTML = '<span class="muted">当前 episode 没有可分析的数值帧。</span>';
+    return;
+  }
+  const crop = data.suggested_crop || {};
+  summary.innerHTML = [
+    `<span class="pill">${esc(data.frame_count)} frames</span>`,
+    `<span class="pill">fps=${esc(analysisNumber(data.fps, 2))}</span>`,
+    `<span class="pill ${Number(data.idle_frames) ? 'idle-frame' : ''}">空闲 ${esc(data.idle_frames)} (${esc(analysisNumber(Number(data.idle_fraction || 0) * 100, 1))}%)</span>`,
+    `<span class="pill ${Number(data.anomaly_frames) ? 'anomaly-frame' : ''}">异常 ${esc(data.anomaly_frames || 0)} · jitter ${esc(data.jitter_frames || 0)} · reversal ${esc(data.velocity_reversal_frames || 0)} · abrupt ${esc(data.abrupt_change_frames || 0)}</span>`,
+    `<span class="pill">建议保留 ${esc(crop.start_frame ?? 0)}-${esc(crop.end_frame ?? data.frame_count - 1)}</span>`,
+    `<span class="pill">EEF=${esc(data.eef_method || 'unavailable')}</span>`,
+    `<span class="muted">sample stride=${esc(data.sample_stride || 1)}</span>`,
+  ].join('');
+  const start = document.getElementById('episodeCropStart');
+  const end = document.getElementById('episodeCropEnd');
+  if (start && document.activeElement !== start) start.value = String(crop.start_frame ?? 0);
+  if (end && document.activeElement !== end) end.value = String(crop.end_frame ?? Math.max(0, data.frame_count - 1));
+}
+
+function drawEpisodeIdleTimeline(data, frame = 0) {
+  const canvas = document.getElementById('episodeIdleTimeline');
+  if (!canvas) return;
+  const width = Math.max(320, canvas.clientWidth || 1000);
+  const height = 78;
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#0b1a2d'; ctx.fillRect(0, 0, width, height);
+  const count = Math.max(1, Number(data?.frame_count || 1));
+  const x = value => 8 + (Math.max(0, Math.min(count - 1, value)) / Math.max(1, count - 1)) * (width - 16);
+  ctx.fillStyle = '#1c3651'; ctx.fillRect(8, 25, width - 16, 22);
+  ctx.fillStyle = '#d7a62b';
+  for (const run of (data?.idle_runs || [])) {
+    const left = x(run.start_frame), right = Math.max(left + 1, x(run.end_frame));
+    ctx.fillRect(left, 25, right - left, 22);
+  }
+  const timeline = data?.timeline || {};
+  const sampled = data?.sampled_frames || [];
+  const markerWidth = Math.max(2, (width - 16) / Math.max(1, count - 1));
+  sampled.forEach((sampleFrame, index) => {
+    const px = x(sampleFrame);
+    if (timeline.jitter?.[index]) { ctx.fillStyle = '#d7a6ff'; ctx.fillRect(px, 50, markerWidth, 5); }
+    if (timeline.velocity_reversal?.[index]) { ctx.fillStyle = '#ff9f68'; ctx.fillRect(px, 56, markerWidth, 5); }
+    if (timeline.abrupt_change?.[index]) { ctx.fillStyle = '#ff5f6d'; ctx.fillRect(px, 62, markerWidth, 5); }
+  });
+  const cursor = x(frame);
+  ctx.strokeStyle = '#42c7ff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(cursor, 12); ctx.lineTo(cursor, 62); ctx.stroke();
+  ctx.fillStyle = '#cfe2f7'; ctx.font = '12px ui-monospace, monospace';
+  ctx.fillText(`frame ${Math.max(0, Math.min(count - 1, Number(frame) || 0))}`, 8, 16);
+  ctx.fillStyle = '#8fa9c3'; ctx.font = '11px ui-sans-serif, sans-serif';
+  ctx.fillText('idle / jitter / reversal / abrupt', 8, 73);
+  canvas.onclick = event => {
+    const rect = canvas.getBoundingClientRect();
+    const position = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+    const selected = Math.round(position * Math.max(0, count - 1));
+    seekEpisodeMediaToFrame(selected);
+  };
+}
+
+function drawEpisodeTrajectory(data) {
+  const canvas = document.getElementById('episodeTrajectoryChart');
+  const legend = document.getElementById('episodeTrajectoryLegend');
+  if (!canvas) return;
+  const width = Math.max(320, canvas.clientWidth || 1000), height = 280;
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.round(width * ratio); canvas.height = Math.round(height * ratio);
+  const ctx = canvas.getContext('2d'); ctx.setTransform(ratio, 0, 0, ratio, 0, 0); ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#07121f'; ctx.fillRect(0, 0, width, height);
+  const points = [];
+  for (const [side, value] of Object.entries(data?.eef || {})) {
+    for (let axis = 0; axis < 3; axis++) {
+      const values = (value.position || []).map(item => Number(item?.[axis])).filter(Number.isFinite);
+      if (values.length) points.push({side, axis, values});
+    }
+  }
+  if (!points.length) {
+    ctx.fillStyle = '#8fa9c3'; ctx.font = '13px ui-sans-serif, sans-serif'; ctx.fillText('当前数据格式没有可用的末端位姿', 16, height / 2);
+    if (legend) legend.innerHTML = '';
+    return;
+  }
+  const all = points.flatMap(item => item.values); let min = Math.min(...all), max = Math.max(...all);
+  if (Math.abs(max - min) < 1e-8) { min -= 0.05; max += 0.05; }
+  const left = 48, right = 14, top = 18, bottom = 28;
+  const x = index => left + index * (width - left - right) / Math.max(1, (data.sampled_frames || []).length - 1);
+  const y = value => top + (max - value) * (height - top - bottom) / (max - min);
+  ctx.strokeStyle = '#24415d'; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) { const yy = top + i * (height - top - bottom) / 4; ctx.beginPath(); ctx.moveTo(left, yy); ctx.lineTo(width - right, yy); ctx.stroke(); }
+  ctx.fillStyle = '#8fa9c3'; ctx.font = '10px ui-monospace, monospace'; ctx.fillText(`${max.toFixed(3)}m`, 4, top + 4); ctx.fillText(`${min.toFixed(3)}m`, 4, height - bottom);
+  const colors = {left: ['#42c7ff', '#3ee6a8', '#a78bfa'], right: ['#ff9f68', '#ffd166', '#ff6f91']};
+  for (const item of points) {
+    const series = data.eef[item.side]?.position || [];
+    ctx.strokeStyle = (colors[item.side] || ['#d9ebff', '#b9dcff', '#86b7df'])[item.axis]; ctx.lineWidth = 1.7; ctx.beginPath();
+    let moved = false;
+    series.forEach((row, index) => { const value = Number(row?.[item.axis]); if (!Number.isFinite(value)) { moved = false; return; } const px = x(index), py = y(value); if (!moved) { ctx.moveTo(px, py); moved = true; } else ctx.lineTo(px, py); });
+    ctx.stroke();
+  }
+  if (legend) legend.innerHTML = points.map(item => `<span class="pill">${esc(item.side)} ${['X','Y','Z'][item.axis]}</span>`).join('');
+}
+
+function renderEpisodeFrame(frame) {
+  const summary = document.getElementById('episodeFrameSummary');
+  const rows = document.getElementById('episodeJointRows');
+  const eef = document.getElementById('episodeEefFrame');
+  if (!episodeFrameCache.current) return;
+  const data = episodeFrameCache.current;
+  if (summary) {
+    const anomalyTypes = (data.anomaly_types || []).join(' / ');
+    summary.innerHTML = `<span class="pill">frame ${esc(data.frame_index)}</span><span class="pill">t=${esc(analysisNumber(data.relative_time_s, 3))}s</span><span class="pill ${data.idle ? 'idle-frame' : ''}">${data.idle ? '空闲帧' : '运动帧'}</span><span class="pill">速度范数 ${esc(analysisNumber(data.speed_norm, 4))}</span><span class="pill">加速度范数 ${esc(analysisNumber(data.acceleration_norm, 3))}</span><span class="pill ${data.anomaly ? 'anomaly-frame' : ''}">${data.anomaly ? `异常: ${esc(anomalyTypes || 'detected')}` : '无异常'}</span>`;
+  }
+  if (rows) rows.innerHTML = (data.joints || []).map(item => {
+    const flags = [];
+    if (item.jitter) flags.push('<span class="anomaly-jitter">jitter</span>');
+    if (item.velocity_reversal) flags.push('<span class="anomaly-reversal">reverse</span>');
+    return `<tr><td><code>${esc(item.name)}</code></td><td>${esc(analysisNumber(item.angle, 5))}</td><td>${esc(analysisNumber(item.velocity, 5))}</td><td>${esc(analysisNumber(item.acceleration, 4))}</td><td>${esc(analysisNumber(item.target, 5))}</td><td>${flags.join(' ') || '<span class="muted">-</span>'}</td></tr>`;
+  }).join('') || '<tr><td colspan="6" class="muted">无关节列。</td></tr>';
+  if (eef) {
+    eef.innerHTML = Object.entries(data.eef || {}).map(([side, value]) => `<span class="pill">${esc(side)} XYZ: ${esc((value.position || []).map(item => analysisNumber(item, 4)).join(', ') || '-')} · RPY/方向: ${esc((value.orientation || []).map(item => analysisNumber(item, 4)).join(', ') || '-')}</span>`).join('') || '没有末端位姿列。';
+  }
+  drawEpisodeIdleTimeline(episodeAnalysisData, Number(data.frame_index || frame || 0));
+}
+
+async function loadEpisodeFrame(frame, episode = null) {
+  const current = episode || episodeAnalysisEpisode || currentAnalysisEpisode();
+  if (!current) return;
+  const datasetId = document.getElementById('editorDataset').value;
+  const index = Math.max(0, Math.min(Number(episodeAnalysisData?.frame_count || current.length || 1) - 1, Math.round(Number(frame) || 0)));
+  const key = `${datasetId}:${current.episode_index}:${index}`;
+  try {
+    episodeFrameRequestSerial += 1;
+    const serial = episodeFrameRequestSerial;
+    const cached = episodeFrameCache.get(key);
+    if (cached) episodeFrameCache.current = cached;
+    else {
+      const value = await api(`/api/datasets/${encodeURIComponent(datasetId)}/episodes/${current.episode_index}/frames/${index}`);
+      if (serial !== episodeFrameRequestSerial) return;
+      episodeFrameCache.set(key, value); episodeFrameCache.current = value;
+    }
+    renderEpisodeFrame(index);
+  } catch (error) { show(`当前帧分析加载失败：${error.message}`); }
+}
+
+function updateEpisodeFrameAnalysis(frame = 0) {
+  if (!episodeAnalysisData || !episodeAnalysisEpisode) return;
+  const target = Math.max(0, Math.min(Number(episodeAnalysisData.frame_count || 1) - 1, Math.round(Number(frame) || 0)));
+  drawEpisodeIdleTimeline(episodeAnalysisData, target);
+  episodeFramePending = target;
+  const now = performance.now();
+  const elapsed = now - episodeFrameLastRequestAt;
+  if (elapsed < 80) {
+    if (!episodeFrameThrottleTimer) episodeFrameThrottleTimer = window.setTimeout(() => { episodeFrameThrottleTimer = null; updateEpisodeFrameAnalysis(episodeFramePending); }, 80 - elapsed);
+    return;
+  }
+  episodeFrameLastRequestAt = now;
+  const pending = episodeFramePending;
+  episodeFramePending = null;
+  loadEpisodeFrame(pending, episodeAnalysisEpisode);
+}
+
+async function refreshEpisodeAnalysis() {
+  const episode = currentAnalysisEpisode();
+  if (!episode) return;
+  const datasetId = document.getElementById('editorDataset').value;
+  try {
+    episodeAnalysisData = await api(`/api/datasets/${encodeURIComponent(datasetId)}/episodes/${episode.episode_index}/analysis?max_points=1200`);
+    episodeAnalysisEpisode = episode; episodeFrameCache = new Map(); episodeFrameCache.current = null; episodeFrameLastRequestAt = 0; episodeFramePending = null;
+    renderEpisodeAnalysisSummary(episodeAnalysisData); drawEpisodeTrajectory(episodeAnalysisData); updateEpisodeFrameAnalysis(0);
+  } catch (error) { episodeAnalysisData = null; show(`Episode 分析加载失败：${error.message}`); }
+}
+
+function seekEpisodeMediaToFrame(frame) {
+  const target = Math.max(0, Number(frame) || 0);
+  const videos = activeEpisodeVideoPlayers();
+  const images = activeEpisodeImagePlayers();
+  if (videos.length) {
+    const fps = Number(videos[0].media?.fps || episodeDatasetData?.info?.fps || 20);
+    setEpisodeVideoTime(videos[0], target / Math.max(1, fps), true);
+    syncEpisodeVideoTime(videos[0], true);
+  } else if (images.length) seekEpisodeImagePlayers(images[0], target);
+  updateEpisodeFrameAnalysis(target);
+}
+
+async function cropEpisode(start, end, sourceLabel = '手动范围') {
+  const episode = currentAnalysisEpisode(); const datasetId = document.getElementById('editorDataset').value;
+  if (!episode || !datasetId) return;
+  start = Number(start); end = Number(end);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end >= Number(episode.length)) { show(`裁剪范围无效，应在 0-${Math.max(0, Number(episode.length) - 1)} 内。`); return; }
+  if (start === 0 && end === Number(episode.length) - 1) { show('裁剪范围等于完整 episode，无需操作。'); return; }
+  if (!confirm(`${sourceLabel}：保留 frame ${start}-${end}，删除其余 ${Number(episode.length) - (end - start + 1)} 帧？\n此操作会重建 episode、媒体和 raw 文件，并使 norm stats 失效。`)) return;
+  try {
+    const result = await api(`/api/datasets/${encodeURIComponent(datasetId)}/episodes/${episode.episode_index}/crop`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({start_frame: start, end_frame: end})});
+    show(`裁剪完成：episode ${episode.episode_index} 保留 ${result.frames} 帧。`, false);
+    episodeAnalysisData = null; episodeAnalysisEpisode = null; episodeFrameCache = new Map();
+    await refreshAll(); await loadDatasetEpisodes(episodeOffset); await editEpisode(Number(episode.episode_index));
+  } catch (error) { show(`裁剪失败：${error.message}`); }
+}
+
+function cropEpisodeFromInputs() { cropEpisode(Number(document.getElementById('episodeCropStart').value), Number(document.getElementById('episodeCropEnd').value), '手动范围'); }
+function cropEpisodeIdlePadding() { const crop = episodeAnalysisData?.suggested_crop; if (!crop) { show('尚未加载空闲帧分析。'); return; } cropEpisode(crop.start_frame, crop.end_frame, '自动去除首尾空闲帧'); }
+
 function updateEpisodeEventDisplay(episode, frame = 0) {
   const box = document.getElementById('episodeEventTrack');
   if (!box) return;
@@ -1519,7 +1781,10 @@ async function loadImageFrame(player, frameIndex) {
     player.frame = index;
     player.slider.value = String(index);
     player.counter.textContent = `${index + 1} / ${player.frames}`;
-    if (player.episode) updateEpisodeEventDisplay(player.episode, index);
+    if (player.episode) {
+      updateEpisodeEventDisplay(player.episode, index);
+      updateEpisodeFrameAnalysis(index);
+    }
   } catch (error) {
     player.status.textContent = `加载失败：${error.message}`;
     player.status.className = 'bad';
@@ -1659,6 +1924,7 @@ async function createVideoPlayer(container, datasetId, episode, media) {
     eventBox.className = 'event-status';
     eventBox.innerHTML = renderEventStatusHTML(episode.event_track, eventStepForFrame(frame, episode.event_track), `${episode.instruction || ''} ${episode.task_name || ''}`);
     updateEpisodeEventDisplay(episode, frame);
+    updateEpisodeFrameAnalysis(frame);
   };
 
   video.addEventListener('loadedmetadata', () => {
@@ -1736,7 +2002,11 @@ async function editEpisode(index) {
   document.getElementById('episodeSuccess').value = episode.success == null ? '' : episode.success === false ? 'false' : 'true';
   document.getElementById('episodeMetadata').value = JSON.stringify(episode.parameters || {}, null, 2);
   document.getElementById('episodeRemoveMetadata').value = '';
+  episodeAnalysisEpisode = episode;
+  episodeAnalysisData = null;
+  episodeFrameCache = new Map();
   updateEpisodeEventDisplay(episode, 0);
+  await refreshEpisodeAnalysis();
 
   clearEpisodeMedia();
   const container = document.getElementById('episodeVideos');
@@ -2836,6 +3106,10 @@ function telemetrySummary(t) {
     ? '<span class="bad">双重门 OPEN</span>'
     : '<span class="ok">双重门 CLOSED</span>';
   const drop = queueDropInfo(t);
+  const clientRtc = t.client_rtc && typeof t.client_rtc === 'object' ? t.client_rtc : {};
+  const clientRtcText = Object.keys(clientRtc).length
+    ? `enabled=${clientRtc.enabled ?? '-'} · horizon=${clientRtc.execution_horizon ?? '-'} · weight=${clientRtc.max_guidance_weight ?? '-'} · schedule=${clientRtc.prefix_attention_schedule || '-'} · revision=${t.client_rtc_config_revision ?? '-'}`
+    : 'not reported';
   const reason = drop.currentReason || t.horizon_error || t.time_contract_error || '';
   const safetyBadge = drop.unsafeActive === true
     ? '<span class="bad">当前安全阻断</span>'
@@ -2843,6 +3117,8 @@ function telemetrySummary(t) {
       ? '<span class="ok">当前无安全阻断</span>'
       : '<span class="muted">安全状态未上报</span>';
   const details = `
+    <div>client prompt=${esc(t.client_prompt || t.prompt || '-')} · prompt revision=${esc(t.prompt_revision ?? '-')}</div>
+    <div>client RTC=${esc(clientRtcText)} · server limits=${esc(JSON.stringify(t.server_rtc_limits || {}))}</div>
     <div>推理频率：配置=${esc(configuredHz)} Hz · 实际启动=${esc(launchHz ?? '-')} Hz · 实际完成=${esc(resultHz ?? '-')} Hz · 单在途延迟上限=${esc(t.client_inference_single_inflight_ceiling_hz ?? '-')} Hz</div>
     <div>推理时序：launch/capture/arrival=${esc(fmtTime(t.client_launch_at))}/${esc(fmtTime(t.client_capture_at ?? t.captured_at))}/${esc(fmtTime(t.client_arrival_at))}</div>
     <div>异步延迟：capture→result=${esc(metricMs(t.client_latency_ms))} · 上传=${esc(uploadTiming)} · 模型=${esc(metricMs(t.server_model_inference_ms ?? t.client_model_inference_ms))} · 下行=${esc(downloadTiming)} · RTT=${esc(metricMs(t.client_round_trip_ms))}</div>
@@ -3158,9 +3434,10 @@ function updatePolicyOperation(applyTask = true) {
 function updateClientCommand() {
   let port = document.getElementById('policyPort').value || 8000;
   const selected = document.getElementById('replacePolicy').value;
+  let selectedTask = null;
   if (selected && latestStatus) {
-    const task = latestStatus.tasks.find(t => t.id === selected);
-    if (task && task.metadata && task.metadata.port) port = task.metadata.port;
+    selectedTask = latestStatus.tasks.find(t => t.id === selected) || null;
+    if (selectedTask && selectedTask.metadata && selectedTask.metadata.port) port = selectedTask.metadata.port;
   }
   const dataset = datasetById(document.getElementById('policyDataset').value);
   const armMode = dataset && dataset.arm_mode === 'bimanual' ? 'bimanual' : 'single';
@@ -3178,12 +3455,16 @@ function updateClientCommand() {
   --can can0 \\
   --cam-high-device /dev/video8 \\
   --cam-wrist-device /dev/video16`;
+  const telemetry = selectedTask && selectedTask.telemetry ? selectedTask.telemetry : {};
+  const prompt = telemetry.client_prompt ? JSON.stringify(telemetry.client_prompt) : '"<client prompt>"';
   document.getElementById('policyClientCommand').textContent = `bin/bimanual-vla rtc-client \\
   --host 192.168.101.9 \\
   --port ${port} \\
-  --hz 4 \\
 ${robotArgs} \\
-  --instruction "pick up the cube"`;
+  --instruction ${prompt}
+
+# RTC flags and inference rate are owned by this client; Dashboard only displays
+# the last effective client_rtc reported by telemetry.`;
 }
 
 const TELEMETRY_CAMERA_LABELS = {
@@ -3421,7 +3702,10 @@ function fillObservation(obs) {
   const horizonStatus = obs.horizon_execution_ready
     ? `ready (>= ${obs.minimum_horizon ?? 16})`
     : `BLOCKED: ${obs.horizon_error || 'action_horizon must be >= 16'}`;
-  document.getElementById('policyAction').textContent = `prompt: ${obs.prompt || '-'}
+  const clientRtc = obs.client_rtc && typeof obs.client_rtc === 'object' ? obs.client_rtc : {};
+  document.getElementById('policyAction').textContent = `prompt: ${obs.client_prompt || obs.prompt || '-'} (revision=${obs.prompt_revision ?? '-'})
+client RTC: enabled=${clientRtc.enabled ?? '-'} · horizon=${clientRtc.execution_horizon ?? '-'} · weight=${clientRtc.max_guidance_weight ?? '-'} · schedule=${clientRtc.prefix_attention_schedule || '-'} · revision=${obs.client_rtc_config_revision ?? '-'}
+server RTC limits: ${JSON.stringify(obs.server_rtc_limits || {})}
 contract: v${obs.contract_version || '?'} · raw/model=${obs.raw_action_dim || '?'}D/${obs.model_action_dim || '?'}D
 raw semantics: ${obs.raw_action_semantics || '-'} · ${obs.raw_action_convention || '-'}
 model semantics: ${obs.model_action_semantics || '-'} · ${obs.model_action_convention || '-'}
@@ -3741,6 +4025,9 @@ document.getElementById('trainingMetricFilter').addEventListener('change', () =>
 document.getElementById('policyPort').addEventListener('input', updateClientCommand);
 document.getElementById('editorDataset').addEventListener('change', () => {
   episodeDatasetData = null;
+  episodeAnalysisData = null;
+  episodeAnalysisEpisode = null;
+  episodeFrameCache = new Map();
   clearEpisodeMedia();
   updateMergeSourceOptions();
   document.getElementById('datasetEventSemanticsStatus').textContent = '正在加载数据集 Event 语义…';
