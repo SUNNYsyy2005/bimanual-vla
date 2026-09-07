@@ -165,7 +165,11 @@
     .analysis-summary { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
     .analysis-timeline-wrap { position:relative; margin:8px 0 12px; padding:7px; border:1px solid #29445f; border-radius:9px; background:#07121f; }
     #episodeIdleTimeline,#episodeTrajectoryChart { display:block; width:100%; height:78px; touch-action:none; }
-    #episodeTrajectoryChart { height:280px; margin-top:8px; }
+    #episodeTrajectoryChart { height:360px; margin-top:8px; cursor:grab; }
+    #episodeTrajectoryChart:active { cursor:grabbing; }
+    .trajectory-header { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    .trajectory-header h3 { margin-bottom:0; }
+    .trajectory-hint { margin-top:4px; }
     .analysis-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
     .analysis-card { min-width:0; padding:10px; border:1px solid #304b68; border-radius:10px; background:#07121f; }
     .analysis-card h3 { margin-top:0; }
@@ -268,7 +272,7 @@
                 <div class="analysis-anomaly-legend"><span class="idle-frame">■ idle</span><span class="anomaly-jitter">■ jitter</span><span class="anomaly-reversal">■ velocity reversal</span><span class="anomaly-abrupt">■ abrupt change</span></div>
                 <div class="analysis-timeline-wrap"><canvas id="episodeIdleTimeline" width="1000" height="78"></canvas></div>
                 <div class="analysis-grid">
-                  <div class="analysis-card"><h3>末端位姿轨迹（XYZ）</h3><canvas id="episodeTrajectoryChart" width="1000" height="280"></canvas><div id="episodeTrajectoryLegend" class="metric-legend"></div></div>
+                  <div class="analysis-card"><div class="trajectory-header"><h3>末端位姿 3D 轨迹</h3><button class="inline secondary" type="button" onclick="resetEpisodeTrajectoryView()">重置视角</button></div><div class="muted trajectory-hint">显示第 0 帧到当前帧的历史轨迹；当前末端位置以高亮点标出。拖拽旋转，滚轮缩放。</div><canvas id="episodeTrajectoryChart" width="1000" height="360" aria-label="末端位姿三维历史轨迹"></canvas><div id="episodeTrajectoryLegend" class="metric-legend"></div></div>
                   <div class="analysis-card"><h3>当前帧关节状态</h3><div id="episodeFrameSummary" class="muted">尚未加载当前帧。</div><div class="joint-table"><table><thead><tr><th>关节</th><th>角度 / 值</th><th>速度 / s</th><th>加速度 / s²</th><th>目标</th><th>异常</th></tr></thead><tbody id="episodeJointRows"><tr><td colspan="6" class="muted">选择 episode 后加载。</td></tr></tbody></table></div><div id="episodeEefFrame" class="muted" style="margin-top:8px"></div></div>
                 </div>
               </section>
@@ -464,6 +468,7 @@ let episodeFrameCache = new Map();
 let episodeFrameLastRequestAt = 0;
 let episodeFramePending = null;
 let episodeFrameThrottleTimer = null;
+let episodeTrajectoryView = {yaw: -0.7, pitch: 0.45, zoom: 1, dragging: false, lastX: 0, lastY: 0};
 let trainingMetricsData = null;
 let enabledMetrics = new Set();
 let metricsRequestSerial = 0;
@@ -1577,7 +1582,7 @@ function drawEpisodeIdleTimeline(data, frame = 0) {
   };
 }
 
-function drawEpisodeTrajectory(data) {
+function drawEpisodeTrajectoryLegacy(data) {
   const canvas = document.getElementById('episodeTrajectoryChart');
   const legend = document.getElementById('episodeTrajectoryLegend');
   if (!canvas) return;
@@ -1617,6 +1622,201 @@ function drawEpisodeTrajectory(data) {
   if (legend) legend.innerHTML = points.map(item => `<span class="pill">${esc(item.side)} ${['X','Y','Z'][item.axis]}</span>`).join('');
 }
 
+function trajectoryPoint(value) {
+  const point = Array.isArray(value) ? value.slice(0, 3).map(Number) : [];
+  return point.length === 3 && point.every(Number.isFinite) ? point : null;
+}
+
+function ensureEpisodeTrajectoryInteractions() {
+  const canvas = document.getElementById('episodeTrajectoryChart');
+  if (!canvas || canvas.dataset.interactive === '1') return;
+  canvas.dataset.interactive = '1';
+  canvas.addEventListener('pointerdown', event => {
+    episodeTrajectoryView.dragging = true;
+    episodeTrajectoryView.lastX = event.clientX;
+    episodeTrajectoryView.lastY = event.clientY;
+    canvas.setPointerCapture(event.pointerId);
+  });
+  canvas.addEventListener('pointermove', event => {
+    if (!episodeTrajectoryView.dragging) return;
+    const dx = event.clientX - episodeTrajectoryView.lastX;
+    const dy = event.clientY - episodeTrajectoryView.lastY;
+    episodeTrajectoryView.lastX = event.clientX;
+    episodeTrajectoryView.lastY = event.clientY;
+    episodeTrajectoryView.yaw += dx * 0.012;
+    episodeTrajectoryView.pitch = Math.max(-1.35, Math.min(1.35, episodeTrajectoryView.pitch + dy * 0.012));
+    drawEpisodeTrajectory(episodeAnalysisData, episodeFrameCache.current?.frame_index || 0, episodeFrameCache.current);
+  });
+  const stopDragging = event => {
+    episodeTrajectoryView.dragging = false;
+    if (event.pointerId != null && canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+  };
+  canvas.addEventListener('pointerup', stopDragging);
+  canvas.addEventListener('pointercancel', stopDragging);
+  canvas.addEventListener('wheel', event => {
+    event.preventDefault();
+    episodeTrajectoryView.zoom = Math.max(0.55, Math.min(3.5, episodeTrajectoryView.zoom * (event.deltaY < 0 ? 1.1 : 0.9)));
+    drawEpisodeTrajectory(episodeAnalysisData, episodeFrameCache.current?.frame_index || 0, episodeFrameCache.current);
+  }, {passive: false});
+}
+
+function resetEpisodeTrajectoryView() {
+  episodeTrajectoryView = {yaw: -0.7, pitch: 0.45, zoom: 1, dragging: false, lastX: 0, lastY: 0};
+  drawEpisodeTrajectory(episodeAnalysisData, episodeFrameCache.current?.frame_index || 0, episodeFrameCache.current);
+}
+
+function drawEpisodeTrajectory(data, frame = 0, frameData = null) {
+  const canvas = document.getElementById('episodeTrajectoryChart');
+  const legend = document.getElementById('episodeTrajectoryLegend');
+  if (!canvas) return;
+  ensureEpisodeTrajectoryInteractions();
+  const width = Math.max(320, canvas.clientWidth || 1000), height = 360;
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#07121f';
+  ctx.fillRect(0, 0, width, height);
+
+  const frameCount = Math.max(1, Number(data?.frame_count || 1));
+  const currentFrame = Math.max(0, Math.min(frameCount - 1, Math.round(Number(frame) || 0)));
+  const sampledFrames = Array.isArray(data?.sampled_frames) ? data.sampled_frames : [];
+  const tracks = [];
+  const allPoints = [];
+  for (const [side, value] of Object.entries(data?.eef || {})) {
+    const positions = Array.isArray(value?.position) ? value.position : [];
+    const samples = [];
+    const history = [];
+    positions.forEach((row, index) => {
+      const point = trajectoryPoint(row);
+      if (!point) return;
+      const sample = {frame: Number(sampledFrames[index] ?? index), point};
+      samples.push(sample);
+      allPoints.push(point);
+      if (sample.frame <= currentFrame) history.push(sample);
+    });
+    const exact = trajectoryPoint(frameData?.eef?.[side]?.position);
+    if (exact) {
+      allPoints.push(exact);
+      const existing = history.findIndex(item => item.frame === currentFrame);
+      if (existing >= 0) history[existing] = {frame: currentFrame, point: exact};
+      else history.push({frame: currentFrame, point: exact});
+    }
+    history.sort((left, right) => left.frame - right.frame);
+    tracks.push({side, samples, history, current: history.length ? history[history.length - 1].point : null});
+  }
+  if (!allPoints.length) {
+    ctx.fillStyle = '#8fa9c3';
+    ctx.font = '13px ui-sans-serif, sans-serif';
+    ctx.fillText('当前数据格式没有可用的末端位姿', 16, height / 2);
+    if (legend) legend.innerHTML = '';
+    return;
+  }
+
+  const minimum = [0, 1, 2].map(axis => Math.min(...allPoints.map(point => point[axis])));
+  const maximum = [0, 1, 2].map(axis => Math.max(...allPoints.map(point => point[axis])));
+  const extent = Math.max(...[0, 1, 2].map(axis => maximum[axis] - minimum[axis]), 0.08);
+  const center = [0, 1, 2].map(axis => (minimum[axis] + maximum[axis]) / 2);
+  const scale = Math.min(width - 72, height - 72) * 0.82 * episodeTrajectoryView.zoom;
+  const cosYaw = Math.cos(episodeTrajectoryView.yaw);
+  const sinYaw = Math.sin(episodeTrajectoryView.yaw);
+  const cosPitch = Math.cos(episodeTrajectoryView.pitch);
+  const sinPitch = Math.sin(episodeTrajectoryView.pitch);
+  const project = point => {
+    const x = (point[0] - center[0]) / extent;
+    const y = (point[1] - center[1]) / extent;
+    const z = (point[2] - center[2]) / extent;
+    const yawX = cosYaw * x - sinYaw * y;
+    const yawY = sinYaw * x + cosYaw * y;
+    const screenY = cosPitch * yawY - sinPitch * z;
+    const depth = sinPitch * yawY + cosPitch * z;
+    const perspective = 1 / (1 + depth * 0.35);
+    return {
+      x: width / 2 + yawX * scale * perspective,
+      y: height / 2 - screenY * scale * perspective,
+      depth,
+    };
+  };
+  const drawSegment = (from, to, color, lineWidth = 1, alpha = 1) => {
+    const start = project(from), end = project(to);
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.beginPath();
+    ctx.moveTo(start.x, start.y);
+    ctx.lineTo(end.x, end.y);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  };
+
+  const gridZ = minimum[2];
+  const gridSize = extent * 0.62;
+  ctx.lineWidth = 1;
+  for (let step = -3; step <= 3; step++) {
+    const offset = gridSize * step / 3;
+    drawSegment([center[0] - gridSize, center[1] + offset, gridZ], [center[0] + gridSize, center[1] + offset, gridZ], '#18324b', 1, 0.9);
+    drawSegment([center[0] + offset, center[1] - gridSize, gridZ], [center[0] + offset, center[1] + gridSize, gridZ], '#18324b', 1, 0.9);
+  }
+  const origin = center;
+  const axisLength = extent * 0.32;
+  const axes = [
+    {label: 'X', point: [origin[0] + axisLength, origin[1], origin[2]], color: '#ff6f91'},
+    {label: 'Y', point: [origin[0], origin[1] + axisLength, origin[2]], color: '#3ee6a8'},
+    {label: 'Z', point: [origin[0], origin[1], origin[2] + axisLength], color: '#42c7ff'},
+  ];
+  for (const axis of axes) {
+    drawSegment(origin, axis.point, axis.color, 1.5, 0.9);
+    const labelPoint = project(axis.point);
+    ctx.fillStyle = axis.color;
+    ctx.font = 'bold 11px ui-sans-serif, sans-serif';
+    ctx.fillText(axis.label, labelPoint.x + 4, labelPoint.y - 4);
+  }
+
+  const colors = {left: '#42c7ff', right: '#ff9f68'};
+  for (const track of tracks) {
+    const color = colors[track.side] || '#d9ebff';
+    const history = track.history;
+    if (history.length > 1) {
+      ctx.globalAlpha = 0.9;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      history.forEach((item, index) => {
+        const projected = project(item.point);
+        if (index === 0) ctx.moveTo(projected.x, projected.y);
+        else ctx.lineTo(projected.x, projected.y);
+      });
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    if (track.current) {
+      const projected = project(track.current);
+      ctx.fillStyle = color;
+      ctx.strokeStyle = '#f7fbff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(projected.x, projected.y, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#f7fbff';
+      ctx.font = '11px ui-sans-serif, sans-serif';
+      ctx.fillText(track.side + ' latest', projected.x + 9, projected.y - 8);
+    }
+  }
+  ctx.fillStyle = '#cfe2f7';
+  ctx.font = '12px ui-monospace, monospace';
+  ctx.fillText('frame ' + currentFrame + ' / ' + Math.max(0, frameCount - 1), 10, 18);
+  ctx.fillStyle = '#8fa9c3';
+  ctx.font = '11px ui-sans-serif, sans-serif';
+  ctx.fillText('history: 0 → current · unit: m · view: ' + episodeTrajectoryView.zoom.toFixed(2) + 'x', 10, height - 10);
+  if (legend) {
+    legend.innerHTML = tracks.map(track => '<span class="pill" style="border-color:' + (colors[track.side] || '#d9ebff') + '">' + esc(track.side) + ' history + latest</span>').join('')
+      + '<span class="pill">frame ' + esc(currentFrame) + ' / ' + esc(Math.max(0, frameCount - 1)) + '</span>';
+  }
+}
+
 function renderEpisodeFrame(frame) {
   const summary = document.getElementById('episodeFrameSummary');
   const rows = document.getElementById('episodeJointRows');
@@ -1636,6 +1836,7 @@ function renderEpisodeFrame(frame) {
   if (eef) {
     eef.innerHTML = Object.entries(data.eef || {}).map(([side, value]) => `<span class="pill">${esc(side)} XYZ: ${esc((value.position || []).map(item => analysisNumber(item, 4)).join(', ') || '-')} · RPY/方向: ${esc((value.orientation || []).map(item => analysisNumber(item, 4)).join(', ') || '-')}</span>`).join('') || '没有末端位姿列。';
   }
+  drawEpisodeTrajectory(episodeAnalysisData, Number(data.frame_index || frame || 0), data);
   drawEpisodeIdleTimeline(episodeAnalysisData, Number(data.frame_index || frame || 0));
 }
 
@@ -3995,7 +4196,10 @@ document.querySelectorAll('.nav-button').forEach(button => {
   button.addEventListener('click', () => showModule(button.dataset.module));
 });
 window.addEventListener('hashchange', () => showModule(location.hash.slice(1), false));
-window.addEventListener('resize', () => requestAnimationFrame(drawTrainingMetrics));
+window.addEventListener('resize', () => {
+  requestAnimationFrame(drawTrainingMetrics);
+  if (episodeAnalysisData) requestAnimationFrame(() => drawEpisodeTrajectory(episodeAnalysisData, episodeFrameCache.current?.frame_index || 0, episodeFrameCache.current));
+});
 window.addEventListener('beforeunload', () => {
   clearEpisodeMedia();
   previewUrls.forEach(URL.revokeObjectURL);
