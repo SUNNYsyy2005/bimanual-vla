@@ -17,6 +17,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import queue
 import sys
 import threading
 import time
@@ -1695,12 +1696,14 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
             "action_source": contract.action_source,
             "action_alignment": contract.action_alignment,
             "transport": "openpi_websocket_v1",
-            "rtc_enabled": bool(getattr(args, "rtc_enabled", False)),
-            "rtc_execution_horizon": int(getattr(args, "rtc_execution_horizon", 8)),
-            "rtc_max_guidance_weight": float(getattr(args, "rtc_max_guidance_weight", 5.0)),
-            "rtc_prefix_attention_schedule": str(
-                getattr(args, "rtc_prefix_attention_schedule", "linear")
-            ),
+            "rtc_supported": bool(getattr(args, "rtc_enabled", False)),
+            "rtc_capabilities": {
+                "max_execution_horizon": int(getattr(args, "rtc_execution_horizon", 8)),
+                "max_guidance_weight": float(
+                    getattr(args, "rtc_max_guidance_weight", 5.0)
+                ),
+                "prefix_attention_schedules": ["zeros", "ones", "linear", "exp"],
+            },
         },
     )
 
@@ -2664,6 +2667,16 @@ class PolicyTelemetry:
         self.active_inferences = 0
         self.last_inference_started_at: float | None = None
         self.last_inference_finished_at: float | None = None
+        # Dashboard image encoding is observational side work. Keep it off
+        # the inference/websocket critical path; metadata remains synchronous
+        # and is the source of truth for the latest observation.
+        self._image_queue: queue.Queue[dict[str, np.ndarray] | None] = queue.Queue(maxsize=4)
+        self._image_writer = threading.Thread(
+            target=self._image_writer_loop,
+            name="policy-telemetry-images",
+            daemon=True,
+        )
+        self._image_writer.start()
 
     @staticmethod
     def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -2680,6 +2693,28 @@ class PolicyTelemetry:
         Image.fromarray(image).save(temp, format="JPEG", quality=90)
         os.replace(temp, path)
         return list(image.shape)
+
+    def _image_writer_loop(self) -> None:
+        while True:
+            images = self._image_queue.get()
+            try:
+                if images is None:
+                    return
+                for key, image in images.items():
+                    try:
+                        self._atomic_image(self.root / f"{key}.jpg", image)
+                    except Exception:
+                        logging.exception("failed to publish Policy telemetry image %s", key)
+            finally:
+                self._image_queue.task_done()
+
+    def _enqueue_images(self, images: dict[str, np.ndarray]) -> None:
+        try:
+            self._image_queue.put_nowait(images)
+        except queue.Full:
+            # Telemetry is not part of the robot control contract. Dropping a
+            # frame is preferable to adding latency to policy inference.
+            logging.warning("Policy telemetry image queue full; dropping one frame")
 
     @staticmethod
     def _client_address(remote_address: Any) -> str:
@@ -2821,14 +2856,15 @@ class PolicyTelemetry:
                 client = {}
             images = observation.get("images", {})
             camera_shapes: dict[str, list[int]] = {}
+            image_payload: dict[str, np.ndarray] = {}
             for camera_key in self.metadata["camera_keys"]:
-                camera_shapes[camera_key] = self._atomic_image(
-                    self.root / f"{camera_key}.jpg", images[camera_key]
-                )
+                image = np.asarray(images[camera_key], dtype=np.uint8).copy()
+                camera_shapes[camera_key] = list(image.shape)
+                image_payload[camera_key] = image
             if self.metadata["arm_mode"] == "single":
                 wrist_key = next(key for key in self.metadata["camera_keys"] if "wrist" in key)
                 if wrist_key != "cam_wrist":
-                    self._atomic_image(self.root / "cam_wrist.jpg", images[wrist_key])
+                    image_payload["cam_wrist"] = image_payload[wrist_key].copy()
             actions = np.asarray(result.get("actions"), dtype=np.float32)
             state = np.asarray(observation.get("state"), dtype=np.float32)
             action_horizon = self._positive_int(self.metadata.get("action_horizon"))
@@ -2873,6 +2909,11 @@ class PolicyTelemetry:
             captured_at = _telemetry_nonnegative_float(client.get("captured_at"))
             transport_timing = result.get("transport_timing")
             transport_timing = transport_timing if isinstance(transport_timing, dict) else {}
+            result_rtc = result.get("rtc")
+            result_rtc = result_rtc if isinstance(result_rtc, dict) else {}
+            client_rtc_config = result_rtc.get("client_config")
+            if not isinstance(client_rtc_config, dict):
+                client_rtc_config = None
             server_model_inference_ms = _telemetry_nonnegative_float(
                 transport_timing.get("model_inference_ms")
             )
@@ -2887,6 +2928,15 @@ class PolicyTelemetry:
                 "received_at": now,
                 "captured_at": captured_at if captured_at is not None else now,
                 "source_name": str(client.get("source_name", "official-openpi-client"))[:256],
+                "prompt_revision": self._nonnegative_int(client.get("prompt_revision")),
+                "client_prompt": str(
+                    observation.get("prompt", result.get("prompt", "")) or ""
+                )[:500],
+                "client_rtc": client_rtc_config,
+                "client_rtc_config_revision": self._nonnegative_int(
+                    result_rtc.get("client_config_revision")
+                ),
+                "server_rtc_limits": self._json_object(result_rtc.get("server_limits")),
                 "can_name": str(client.get("can_name", ""))[:256],
                 "cam_high_device": str(client.get("cam_high_device", ""))[:256],
                 "cam_wrist_device": str(client.get("cam_wrist_device", ""))[:256],
@@ -2960,7 +3010,9 @@ class PolicyTelemetry:
                 "transport": "openpi_websocket_v1",
                 "state": state.tolist(),
                 "state_dim": int(state.shape[-1]),
-                "prompt": str(observation.get("prompt", ""))[:500],
+                "prompt": str(
+                    observation.get("prompt", result.get("prompt", "")) or ""
+                )[:500],
                 "camera_shapes": camera_shapes,
                 "cam_high_shape": camera_shapes.get("cam_high"),
                 "cam_wrist_shape": next(
@@ -2991,6 +3043,7 @@ class PolicyTelemetry:
                 "execution_control": result.get("execution_control"),
             }
             self._atomic_json(self.root / "latest.json", payload)
+            self._enqueue_images(image_payload)
             return self.sequence
 
     def mark_response_ready(self, sequence: int, response_ready_at: float) -> None:
@@ -3113,18 +3166,25 @@ def run_serve(args: argparse.Namespace) -> None:
         policy = build_rtc_policy(policy, rtc_config)
         policy_metadata.update(
             {
-                "rtc_enabled": True,
+                "rtc_supported": True,
+                "rtc_capabilities": {
+                    "max_execution_horizon": rtc_config.execution_horizon,
+                    "max_guidance_weight": rtc_config.max_guidance_weight,
+                    "prefix_attention_schedules": ["zeros", "ones", "linear", "exp"],
+                },
                 "rtc_algorithm": "real_time_chunking_prefix_guidance",
                 "rtc_backend": rtc_backend,
-                "rtc_execution_horizon": rtc_config.execution_horizon,
-                "rtc_max_guidance_weight": rtc_config.max_guidance_weight,
-                "rtc_prefix_attention_schedule": rtc_config.prefix_attention_schedule,
                 "rtc_physical_action_dim": rtc_config.physical_action_dim,
                 "rtc_chunk_origin_reanchoring": bool(reanchor_action_mask),
             }
         )
     else:
-        policy_metadata["rtc_enabled"] = False
+        policy_metadata["rtc_supported"] = False
+        policy_metadata["rtc_capabilities"] = {
+            "max_execution_horizon": 0,
+            "max_guidance_weight": 0.0,
+            "prefix_attention_schedules": [],
+        }
     if args.telemetry_dir:
         telemetry = PolicyTelemetry(Path(args.telemetry_dir).expanduser().resolve(), policy_metadata)
         policy = TelemetryPolicy(policy, telemetry)

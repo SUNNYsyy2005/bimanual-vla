@@ -498,6 +498,10 @@ def build_inference_bridge_command(
     allow_execution: bool,
     camera_preview: bool = False,
     rtc_enabled: bool = True,
+    rtc_execution_horizon: int = 8,
+    rtc_max_guidance_weight: float = 5.0,
+    rtc_prefix_attention_schedule: str = "linear",
+    rtc_client_blend_steps: int = 0,
 ) -> list[str]:
     """Build the local robot-observation bridge command without shell quoting."""
     if not host.strip():
@@ -506,6 +510,14 @@ def build_inference_bridge_command(
         raise ValueError("policy port must be in [1, 65535]")
     if float(hz) <= 0:
         raise ValueError("inference rate must be positive")
+    if not 1 <= int(rtc_execution_horizon) <= 50:
+        raise ValueError("RTC execution horizon must be in [1, 50]")
+    if float(rtc_max_guidance_weight) <= 0:
+        raise ValueError("RTC guidance weight must be positive")
+    if rtc_prefix_attention_schedule not in {"zeros", "ones", "linear", "exp"}:
+        raise ValueError("unsupported RTC prefix attention schedule")
+    if int(rtc_client_blend_steps) not in {0, 2, 3, 4}:
+        raise ValueError("RTC client blend steps must be one of 0, 2, 3, 4")
     if arm_mode not in {SINGLE_ARM, BIMANUAL}:
         raise ValueError(f"unsupported arm mode: {arm_mode}")
     if arm_mode == BIMANUAL:
@@ -560,6 +572,18 @@ def build_inference_bridge_command(
     if allow_execution:
         command.append("--allow-execution")
     command.append("--rtc-enabled" if rtc_enabled else "--no-rtc-enabled")
+    command.extend(
+        (
+            "--rtc-execution-horizon",
+            str(int(rtc_execution_horizon)),
+            "--rtc-max-guidance-weight",
+            str(float(rtc_max_guidance_weight)),
+            "--rtc-prefix-attention-schedule",
+            rtc_prefix_attention_schedule,
+            "--rtc-client-blend-steps",
+            str(int(rtc_client_blend_steps)),
+        )
+    )
     return command
 
 
@@ -820,6 +844,18 @@ class CollectorGUI:
         )
         self.inference_rtc_enabled_var = tk.BooleanVar(
             value=bool(self.gui_preferences.get("inference_rtc_enabled", True))
+        )
+        self.inference_rtc_horizon_var = tk.StringVar(
+            value=str(self.gui_preferences.get("inference_rtc_horizon") or "8")
+        )
+        self.inference_rtc_weight_var = tk.StringVar(
+            value=str(self.gui_preferences.get("inference_rtc_weight") or "5.0")
+        )
+        self.inference_rtc_schedule_var = tk.StringVar(
+            value=str(self.gui_preferences.get("inference_rtc_schedule") or "linear")
+        )
+        self.inference_rtc_blend_steps_var = tk.StringVar(
+            value=str(self.gui_preferences.get("inference_rtc_blend_steps") or "0")
         )
         self.inference_status_var = tk.StringVar(value="Inference idle")
         self.inference_pid_var = tk.StringVar(value="No inference process")
@@ -1437,6 +1473,41 @@ class CollectorGUI:
             takefocus=False,
         ).pack(side="left", padx=(18, 0))
 
+        rtc_settings = ttk.LabelFrame(config, text="Client RTC settings", padding=8)
+        rtc_settings.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        rtc_settings.columnconfigure(1, weight=1)
+        rtc_settings.columnconfigure(3, weight=1)
+        ttk.Label(rtc_settings, text="Execution horizon").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Entry(rtc_settings, textvariable=self.inference_rtc_horizon_var, width=10).grid(
+            row=0, column=1, sticky="ew", padx=(8, 14), pady=3
+        )
+        ttk.Label(rtc_settings, text="Max guidance weight").grid(row=0, column=2, sticky="w", pady=3)
+        ttk.Entry(rtc_settings, textvariable=self.inference_rtc_weight_var, width=10).grid(
+            row=0, column=3, sticky="ew", padx=(8, 0), pady=3
+        )
+        ttk.Label(rtc_settings, text="Prefix schedule").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Combobox(
+            rtc_settings,
+            textvariable=self.inference_rtc_schedule_var,
+            values=("zeros", "ones", "linear", "exp"),
+            state="readonly",
+            width=10,
+        ).grid(row=1, column=1, sticky="ew", padx=(8, 14), pady=3)
+        ttk.Label(rtc_settings, text="Client blend steps").grid(row=1, column=2, sticky="w", pady=3)
+        ttk.Combobox(
+            rtc_settings,
+            textvariable=self.inference_rtc_blend_steps_var,
+            values=("0", "2", "3", "4"),
+            state="readonly",
+            width=10,
+        ).grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Label(
+            rtc_settings,
+            text="这些值属于客户端；Policy 只提供服务器能力上限，修改后无需重启 Policy。",
+            foreground="#68707d",
+            justify="left",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(5, 0))
+
         devices = ttk.LabelFrame(frame, text="Devices", padding=14)
         devices.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 14))
         devices.columnconfigure(0, weight=1)
@@ -1837,6 +1908,10 @@ class CollectorGUI:
             "inference_allow_execution": bool(self.inference_allow_execution_var.get()),
             "inference_camera_preview": bool(self.inference_camera_preview_var.get()),
             "inference_rtc_enabled": bool(self.inference_rtc_enabled_var.get()),
+            "inference_rtc_horizon": self.inference_rtc_horizon_var.get().strip(),
+            "inference_rtc_weight": self.inference_rtc_weight_var.get().strip(),
+            "inference_rtc_schedule": self.inference_rtc_schedule_var.get().strip(),
+            "inference_rtc_blend_steps": self.inference_rtc_blend_steps_var.get().strip(),
             "left_wrist_device": self.left_wrist_var.get().strip(),
             "right_wrist_device": self.right_wrist_var.get().strip(),
             "swap_wrist_cameras": bool(self.swap_wrist_cameras_var.get()),
@@ -2345,8 +2420,11 @@ class CollectorGUI:
         try:
             port = int(self.inference_port_var.get())
             hz = float(self.inference_hz_var.get())
+            rtc_horizon = int(self.inference_rtc_horizon_var.get())
+            rtc_weight = float(self.inference_rtc_weight_var.get())
+            rtc_blend_steps = int(self.inference_rtc_blend_steps_var.get())
         except ValueError as exc:
-            raise ValueError("Policy port and inference rate must be numeric") from exc
+            raise ValueError("Policy port, inference rate, and RTC values must be numeric") from exc
         command = build_inference_bridge_command(
             python_executable=sys.executable,
             module_name=RTC_CLIENT_MODULE,
@@ -2366,6 +2444,10 @@ class CollectorGUI:
             allow_execution=bool(self.inference_allow_execution_var.get()),
             camera_preview=bool(self.inference_camera_preview_var.get()),
             rtc_enabled=bool(self.inference_rtc_enabled_var.get()),
+            rtc_execution_horizon=rtc_horizon,
+            rtc_max_guidance_weight=rtc_weight,
+            rtc_prefix_attention_schedule=self.inference_rtc_schedule_var.get().strip().lower(),
+            rtc_client_blend_steps=rtc_blend_steps,
         )
         return command, f"{self.inference_host_var.get().strip()}:{port} @ {hz:g} Hz"
 

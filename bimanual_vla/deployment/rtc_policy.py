@@ -11,12 +11,16 @@ before the action chunk is unnormalized and sent back to the robot.
 The repository's OpenPI checkout is kept external by deployment policy.  The
 runtime adapter below patches its PyTorch ``PI0Pytorch`` or JAX/NNX ``Pi0``
 instance without modifying that checkout, and wraps the upstream ``Policy`` to
-pass per-request RTC state over the existing WebSocket observation payload.
+pass a lightweight per-request RTC progress envelope over the existing
+WebSocket observation payload. Prompt and RTC configuration are session state;
+the full values are sent only on the first request or a client revision change.
+The observation transform still consumes only image/state/prompt, so transport
+timing and queue progress never become VLA input features.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import threading
 import types
@@ -411,12 +415,35 @@ def patch_pytorch_model(model: Any, config: RTCConfig) -> None:
     model.sample_actions = types.MethodType(_rtc_sample_actions_pytorch, model)
 
 
-def _jax_prefix_weights(start: Any, end: Any, total: int, schedule: str):
+def _jax_prefix_weights(start: Any, end: Any, total: int, schedule: Any):
     """Build RTC prefix weights with tracer-safe scalar operations."""
     import jax.numpy as jnp
 
     start = jnp.asarray(start, dtype=jnp.int32)
     end = jnp.asarray(end, dtype=jnp.int32)
+    if not isinstance(schedule, str):
+        # Keep the schedule selectable per request without passing a Python
+        # string through a jitted JAX call.  0/1/2/3 map to zeros/ones/linear/exp.
+        schedule_id = jnp.asarray(schedule, dtype=jnp.int32)
+        positions = jnp.arange(total)
+        zeros = (positions < start).astype(jnp.float32)
+        ones = (positions < end).astype(jnp.float32)
+        span = jnp.maximum(jnp.asarray(1, dtype=jnp.int32), end - start)
+        middle = (end.astype(jnp.float32) - positions.astype(jnp.float32)) / (
+            span.astype(jnp.float32) + 1.0
+        )
+        middle = jnp.clip(middle, 0.0, 1.0)
+        exp_middle = middle * jnp.expm1(middle) / (np.e - 1.0)
+        linear = jnp.where(positions < start, 1.0, jnp.where(positions < end, middle, 0.0))
+        exponential = jnp.where(
+            positions < start, 1.0, jnp.where(positions < end, exp_middle, 0.0)
+        )
+        return jnp.where(
+            schedule_id == 0,
+            zeros,
+            jnp.where(schedule_id == 1, ones, jnp.where(schedule_id == 2, linear, exponential)),
+        )
+
     total_value = jnp.asarray(total, dtype=jnp.int32)
     end = jnp.clip(end, 0, total_value)
     start = jnp.clip(start, 0, end)
@@ -447,6 +474,8 @@ def _rtc_sample_actions_jax(
     inference_delay=None,
     execution_horizon=None,
     previous_left_over_steps=None,
+    rtc_max_guidance_weight=None,
+    rtc_prefix_attention_schedule_id=None,
 ):
     """JAX counterpart of the RTC flow-matching denoiser hook.
 
@@ -527,7 +556,9 @@ def _rtc_sample_actions_jax(
             delay,
             horizon,
             self.action_horizon,
-            getattr(self, "_rtc_prefix_attention_schedule", "linear"),
+            rtc_prefix_attention_schedule_id
+            if rtc_prefix_attention_schedule_id is not None
+            else 2,
         ).reshape(1, self.action_horizon, 1).astype(noise.dtype)
         physical_action_dim = getattr(self, "_rtc_physical_action_dim", None)
         if physical_action_dim is None:
@@ -586,13 +617,18 @@ def _rtc_sample_actions_jax(
             guidance_weight = ((1.0 - tau) / tau_safe) * (
                 ((1.0 - tau) ** 2 + tau**2) / denominator
             )
+            max_guidance_weight = (
+                self._rtc_max_guidance_weight
+                if rtc_max_guidance_weight is None
+                else rtc_max_guidance_weight
+            )
             guidance_weight = jnp.nan_to_num(
                 guidance_weight,
-                nan=self._rtc_max_guidance_weight,
-                posinf=self._rtc_max_guidance_weight,
+                nan=max_guidance_weight,
+                posinf=max_guidance_weight,
                 neginf=0.0,
             )
-            guidance_weight = jnp.clip(guidance_weight, 0.0, self._rtc_max_guidance_weight)
+            guidance_weight = jnp.clip(guidance_weight, 0.0, max_guidance_weight)
             v_t = v_t - guidance_weight * correction
         else:
             v_t = denoise(x_t, time)
@@ -624,6 +660,12 @@ class _RTCSession:
     absolute_actions: np.ndarray | None = None
     origin_state: np.ndarray | None = None
     generation: int | None = None
+    # Prompt and runtime RTC settings are session state. The client sends the
+    # full values only on the first request or when their revision changes.
+    prompt: str | None = None
+    prompt_revision: int | None = None
+    rtc_config: dict[str, Any] | None = None
+    rtc_config_revision: int | None = None
 
 
 class RTCAwarePolicy:
@@ -670,21 +712,59 @@ class RTCAwarePolicy:
     def metadata(self) -> dict[str, Any]:
         return getattr(self.policy, "metadata", {})
 
+    def _normalize_rtc_config(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """Validate a client RTC update against the server capability ceiling."""
+        enabled = bool(raw.get("enabled", False)) and bool(self.config.enabled)
+        try:
+            requested_horizon = int(raw.get("execution_horizon", self.config.execution_horizon))
+        except (TypeError, ValueError):
+            requested_horizon = self.config.execution_horizon
+        try:
+            requested_weight = float(
+                raw.get("max_guidance_weight", self.config.max_guidance_weight)
+            )
+        except (TypeError, ValueError):
+            requested_weight = self.config.max_guidance_weight
+        schedule = str(
+            raw.get("prefix_attention_schedule", self.config.prefix_attention_schedule)
+            or self.config.prefix_attention_schedule
+        ).strip().lower()
+        if schedule not in {"zeros", "ones", "linear", "exp"}:
+            schedule = self.config.prefix_attention_schedule
+        return {
+            "enabled": enabled,
+            "execution_horizon": max(1, min(requested_horizon, self.config.execution_horizon)),
+            "max_guidance_weight": max(
+                0.001, min(requested_weight, self.config.max_guidance_weight)
+            ),
+            "prefix_attention_schedule": schedule,
+        }
+
+    def _apply_model_runtime_config(self, config: dict[str, Any]) -> None:
+        """Apply client-owned guidance knobs while the inference lock is held."""
+        model = getattr(self.policy, "_model", None)
+        if model is None:
+            return
+        if bool(getattr(self.policy, "_is_pytorch_model", False)):
+            processor = getattr(model, "_rtc_processor", None)
+            if processor is not None:
+                processor.config = replace(
+                    processor.config,
+                    max_guidance_weight=float(config["max_guidance_weight"]),
+                    prefix_attention_schedule=str(config["prefix_attention_schedule"]),
+                )
+        else:
+            model._rtc_max_guidance_weight = float(config["max_guidance_weight"])
+            model._rtc_prefix_attention_schedule = str(config["prefix_attention_schedule"])
+
     def infer(self, observation: dict[str, Any]) -> dict[str, Any]:
         client = observation.get("client_metadata")
         client = client if isinstance(client, dict) else {}
         rtc = client.get("rtc")
         rtc = rtc if isinstance(rtc, dict) else {}
         session_id = str(rtc.get("session_id") or client.get("source_name") or "default")
-        enabled = bool(rtc.get("enabled", False))
         delay = max(0, int(rtc.get("inference_delay_steps", 0) or 0))
         offset = max(0, int(rtc.get("previous_chunk_offset_steps", 0) or 0))
-        requested_horizon = rtc.get("execution_horizon")
-        execution_horizon = (
-            self.config.execution_horizon
-            if requested_horizon is None
-            else max(1, min(int(requested_horizon), self.config.execution_horizon))
-        )
         client_previous_generation = rtc.get("previous_chunk_generation")
         try:
             client_previous_generation = (
@@ -713,6 +793,40 @@ class RTCAwarePolicy:
 
         with self._lock:
             session = self._sessions.setdefault(session_id, _RTCSession())
+            raw_rtc_config = rtc.get("config")
+            if isinstance(raw_rtc_config, dict):
+                raw_revision = rtc.get("config_revision", raw_rtc_config.get("revision"))
+                try:
+                    config_revision = None if raw_revision is None else int(raw_revision)
+                except (TypeError, ValueError):
+                    config_revision = None
+                if session.rtc_config is None or config_revision != session.rtc_config_revision:
+                    session.rtc_config = self._normalize_rtc_config(raw_rtc_config)
+                    session.rtc_config_revision = config_revision
+            elif session.rtc_config is None:
+                # Backward-compatible path for clients that predate the
+                # session-level config envelope.
+                session.rtc_config = self._normalize_rtc_config(rtc)
+                session.rtc_config_revision = None
+            rtc_config = session.rtc_config or self._normalize_rtc_config({})
+            enabled = bool(rtc_config["enabled"])
+            execution_horizon = int(rtc_config["execution_horizon"])
+            self._apply_model_runtime_config(rtc_config)
+
+            prompt = observation.get("prompt")
+            if prompt is not None and str(prompt).strip():
+                session.prompt = str(prompt).strip()[:500]
+                raw_prompt_revision = client.get("prompt_revision")
+                try:
+                    session.prompt_revision = (
+                        None if raw_prompt_revision is None else int(raw_prompt_revision)
+                    )
+                except (TypeError, ValueError):
+                    session.prompt_revision = None
+            elif session.prompt:
+                observation = dict(observation)
+                observation["prompt"] = session.prompt
+
             previous = session.normalized_actions
             previous_absolute = session.absolute_actions
             old_generation = session.generation
@@ -778,6 +892,13 @@ class RTCAwarePolicy:
                         "previous_left_over_steps": previous_steps,
                         "inference_delay": delay,
                         "execution_horizon": execution_horizon,
+                        "rtc_max_guidance_weight": float(rtc_config["max_guidance_weight"]),
+                        "rtc_prefix_attention_schedule_id": {
+                            "zeros": 0,
+                            "ones": 1,
+                            "linear": 2,
+                            "exp": 3,
+                        }[str(rtc_config["prefix_attention_schedule"])],
                     }
                 )
             else:
@@ -785,6 +906,8 @@ class RTCAwarePolicy:
                 sample_kwargs.pop("previous_left_over_steps", None)
                 sample_kwargs.pop("inference_delay", None)
                 sample_kwargs.pop("execution_horizon", None)
+                sample_kwargs.pop("rtc_max_guidance_weight", None)
+                sample_kwargs.pop("rtc_prefix_attention_schedule_id", None)
             old_kwargs = getattr(self.policy, "_sample_kwargs", {})
             self.policy._sample_kwargs = sample_kwargs
             try:
@@ -879,8 +1002,14 @@ class RTCAwarePolicy:
             "previous_chunk_offset_steps": offset,
             "previous_chunk_left_over_steps": previous_steps,
             "execution_horizon": execution_horizon,
-            "prefix_attention_schedule": self.config.prefix_attention_schedule,
-            "max_guidance_weight": self.config.max_guidance_weight,
+            "prefix_attention_schedule": rtc_config["prefix_attention_schedule"],
+            "max_guidance_weight": rtc_config["max_guidance_weight"],
+            "client_config": dict(rtc_config),
+            "client_config_revision": session.rtc_config_revision,
+            "server_limits": {
+                "execution_horizon": self.config.execution_horizon,
+                "max_guidance_weight": self.config.max_guidance_weight,
+            },
             "old_origin_state": (
                 old_origin_state.tolist() if old_origin_state is not None else None
             ),
@@ -901,6 +1030,8 @@ class RTCAwarePolicy:
             ),
             "position_boundary_jump_l2": position_boundary_jump_l2,
         }
+        result["prompt"] = session.prompt
+        result["prompt_revision"] = session.prompt_revision
         return result
 
     def reset(self) -> None:
