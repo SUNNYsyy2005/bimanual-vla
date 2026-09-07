@@ -306,10 +306,17 @@ class PolicyProtocol:
     metadata_gripper_semantics_explicit: bool = False
     contract_version: int | None = None
     action_horizon: int = DEFAULT_OPENPI_CHUNK_STEPS
-    rtc_enabled: bool = False
-    rtc_execution_horizon: int = DEFAULT_RTC_EXECUTION_HORIZON
+    # RTC capability advertised by the server. Runtime values remain
+    # client-owned and are not copied from server defaults.
+    rtc_supported: bool = False
+    rtc_max_execution_horizon: int = DEFAULT_RTC_EXECUTION_HORIZON
     rtc_max_guidance_weight: float = DEFAULT_RTC_MAX_GUIDANCE_WEIGHT
-    rtc_prefix_attention_schedule: str = "linear"
+    rtc_supported_schedules: tuple[str, ...] = ("zeros", "ones", "linear", "exp")
+
+    @property
+    def rtc_enabled(self) -> bool:
+        """Backward-compatible alias for the server RTC capability flag."""
+        return self.rtc_supported
 
 
 def connect_piper(can_name: str) -> Any:
@@ -1130,43 +1137,47 @@ def validate_policy_metadata(
     ):
         expected_camera_keys = [sorted(keys) for keys in expected_camera_key_sets]
         errors.append(f"camera_keys={camera_keys!r}, expected one of {expected_camera_keys!r}")
-    rtc_enabled = bool(metadata.get("rtc_enabled", False))
-    raw_rtc_execution_horizon = metadata.get(
-        "rtc_execution_horizon", DEFAULT_RTC_EXECUTION_HORIZON
+    capabilities = metadata.get("rtc_capabilities")
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    rtc_supported = bool(metadata.get("rtc_supported", metadata.get("rtc_enabled", False)))
+    raw_rtc_execution_horizon = capabilities.get(
+        "max_execution_horizon",
+        metadata.get("rtc_execution_horizon", DEFAULT_RTC_EXECUTION_HORIZON),
     )
     try:
-        rtc_execution_horizon = int(raw_rtc_execution_horizon)
+        rtc_max_execution_horizon = int(raw_rtc_execution_horizon)
     except (TypeError, ValueError):
-        rtc_execution_horizon = DEFAULT_RTC_EXECUTION_HORIZON
-        if rtc_enabled:
+        rtc_max_execution_horizon = DEFAULT_RTC_EXECUTION_HORIZON
+        if rtc_supported:
             errors.append(
-                "rtc_execution_horizon must be a positive integer, got "
+                "rtc max_execution_horizon must be a positive integer, got "
                 f"{raw_rtc_execution_horizon!r}"
             )
-    raw_rtc_max_guidance_weight = metadata.get(
-        "rtc_max_guidance_weight", DEFAULT_RTC_MAX_GUIDANCE_WEIGHT
+    raw_rtc_max_guidance_weight = capabilities.get(
+        "max_guidance_weight",
+        metadata.get("rtc_max_guidance_weight", DEFAULT_RTC_MAX_GUIDANCE_WEIGHT),
     )
     try:
         rtc_max_guidance_weight = float(raw_rtc_max_guidance_weight)
     except (TypeError, ValueError):
         rtc_max_guidance_weight = DEFAULT_RTC_MAX_GUIDANCE_WEIGHT
-        if rtc_enabled:
+        if rtc_supported:
             errors.append(
-                "rtc_max_guidance_weight must be a positive number, got "
+                "rtc max_guidance_weight must be a positive number, got "
                 f"{raw_rtc_max_guidance_weight!r}"
             )
-    rtc_prefix_attention_schedule = str(
-        metadata.get("rtc_prefix_attention_schedule", "linear")
-    )
-    if rtc_enabled:
-        if rtc_execution_horizon <= 0:
-            errors.append("rtc_execution_horizon must be positive")
+    raw_schedules = capabilities.get("prefix_attention_schedules", ("zeros", "ones", "linear", "exp"))
+    rtc_supported_schedules = tuple(
+        schedule for schedule in (str(item).strip().lower() for item in raw_schedules)
+        if schedule in {"zeros", "ones", "linear", "exp"}
+    ) if isinstance(raw_schedules, (list, tuple)) else ("zeros", "ones", "linear", "exp")
+    if rtc_supported:
+        if rtc_max_execution_horizon <= 0:
+            errors.append("rtc max_execution_horizon must be positive")
         if not math.isfinite(rtc_max_guidance_weight) or rtc_max_guidance_weight <= 0:
-            errors.append("rtc_max_guidance_weight must be positive")
-        if rtc_prefix_attention_schedule not in {"zeros", "ones", "linear", "exp"}:
-            errors.append(
-                "rtc_prefix_attention_schedule must be one of zeros, ones, linear, exp"
-            )
+            errors.append("rtc max_guidance_weight must be positive")
+        if not rtc_supported_schedules:
+            errors.append("rtc capabilities must advertise at least one prefix schedule")
     if errors:
         raise RuntimeError("incompatible policy metadata: " + "; ".join(errors))
 
@@ -1184,10 +1195,10 @@ def validate_policy_metadata(
         metadata_gripper_semantics_explicit=raw_gripper_semantics is not None,
         contract_version=contract_version,
         action_horizon=action_horizon,
-        rtc_enabled=rtc_enabled,
-        rtc_execution_horizon=rtc_execution_horizon,
+        rtc_supported=rtc_supported,
+        rtc_max_execution_horizon=rtc_max_execution_horizon,
         rtc_max_guidance_weight=rtc_max_guidance_weight,
-        rtc_prefix_attention_schedule=rtc_prefix_attention_schedule,
+        rtc_supported_schedules=rtc_supported_schedules,
     )
 
 
@@ -2143,6 +2154,8 @@ class ExecutionController:
         self.rtc_execution_horizon = DEFAULT_RTC_EXECUTION_HORIZON
         self.rtc_max_guidance_weight = DEFAULT_RTC_MAX_GUIDANCE_WEIGHT
         self.rtc_prefix_attention_schedule = "linear"
+        self.rtc_config_revision = 0
+        self._rtc_config_sent_revision: int | None = None
 
     def configure_protocol(self, protocol: PolicyProtocol) -> None:
         action_hz = getattr(self.args, "action_hz", None) or protocol.action_hz or DEFAULT_ACTION_HZ
@@ -2164,20 +2177,29 @@ class ExecutionController:
         )
         self.rtc_execution_horizon = max(
             1, min(
-                int(getattr(self.args, "rtc_execution_horizon", protocol.rtc_execution_horizon)),
+                int(getattr(self.args, "rtc_execution_horizon", DEFAULT_RTC_EXECUTION_HORIZON)),
+                int(protocol.rtc_max_execution_horizon),
                 int(protocol.action_horizon),
             )
         )
         self.rtc_max_guidance_weight = float(
-            getattr(self.args, "rtc_max_guidance_weight", protocol.rtc_max_guidance_weight)
-        )
-        self.rtc_prefix_attention_schedule = str(
-            getattr(
-                self.args,
-                "rtc_prefix_attention_schedule",
-                protocol.rtc_prefix_attention_schedule,
+            min(
+                float(getattr(self.args, "rtc_max_guidance_weight", DEFAULT_RTC_MAX_GUIDANCE_WEIGHT)),
+                float(protocol.rtc_max_guidance_weight),
             )
         )
+        self.rtc_prefix_attention_schedule = str(
+            getattr(self.args, "rtc_prefix_attention_schedule", "linear")
+        )
+        if self.rtc_enabled and self.rtc_prefix_attention_schedule not in protocol.rtc_supported_schedules:
+            raise RuntimeError(
+                "client RTC prefix schedule is not supported by the Policy: "
+                f"{self.rtc_prefix_attention_schedule!r} not in {protocol.rtc_supported_schedules!r}"
+            )
+        # A new Policy/WebSocket session must receive the full client-owned
+        # RTC configuration once. Subsequent requests carry only progress.
+        self.rtc_config_revision += 1
+        self._rtc_config_sent_revision = None
         # Model-side RTC already aligns the new chunk during denoising.  A
         # second default client trajectory blend would reintroduce avoidable
         # latency; keep it opt-in through --rtc-client-blend-steps.
@@ -2590,16 +2612,10 @@ class ExecutionController:
         """Describe the previous model chunk at the next inference launch.
 
         The server keeps the previous normalized chunk per WebSocket session.
-        The client only sends the source offset and a latency-based delay
-        estimate, so normalized model actions never cross the robot wire.
+        The client sends the source offset and latency-based delay on every
+        request, but sends the larger runtime RTC configuration only on the
+        first request after a connection/configuration revision.
         """
-        if not self.rtc_enabled:
-            return {
-                "enabled": False,
-                "inference_delay_steps": 0,
-                "previous_chunk_offset_steps": 0,
-                "previous_chunk_generation": None,
-            }
         offset = 0
         previous_generation = self.active_generation or None
         if self.pending_actions:
@@ -2625,13 +2641,23 @@ class ExecutionController:
         delay = max(0, int(math.ceil(float(latency_s) * self.policy_action_hz)))
         if protocol is not None:
             delay = min(delay, max(0, int(protocol.action_horizon) - 1))
-        return {
-            "enabled": True,
+        payload = {
+            "enabled": bool(self.rtc_enabled),
             "inference_delay_steps": delay,
             "previous_chunk_offset_steps": offset,
             "previous_chunk_generation": previous_generation,
             "predicted_capture_to_result_s": float(latency_s),
         }
+        if self._rtc_config_sent_revision != self.rtc_config_revision:
+            payload["config_revision"] = int(self.rtc_config_revision)
+            payload["config"] = {
+                "enabled": bool(self.rtc_enabled),
+                "execution_horizon": int(self.rtc_execution_horizon),
+                "max_guidance_weight": float(self.rtc_max_guidance_weight),
+                "prefix_attention_schedule": str(self.rtc_prefix_attention_schedule),
+            }
+            self._rtc_config_sent_revision = self.rtc_config_revision
+        return payload
 
     def _block(self, state: str, reason: str) -> bool:
         self.state = state
@@ -4461,7 +4487,7 @@ def build_observation(
     *,
     snapshot: ObservationSnapshot,
     protocol: PolicyProtocol,
-    instruction: str,
+    instruction: str | None,
     source_name: str,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
@@ -4497,10 +4523,9 @@ def build_observation(
             "cam_high": str(args.cam_high_device),
             wrist_key: str(args.cam_wrist_device),
         }
-    return {
+    observation = {
         "state": state,
         "images": observation_images,
-        "prompt": instruction,
         "client_metadata": {
             "captured_at": float(snapshot.captured_at),
             "captured_monotonic": float(snapshot.captured_monotonic),
@@ -4547,6 +4572,11 @@ def build_observation(
             },
         },
     }
+    # Prompt text is session state on the Policy side. The client sends it on
+    # the first request and only when the local prompt revision changes.
+    if instruction is not None:
+        observation["prompt"] = str(instruction)
+    return observation
 
 
 def print_result(
@@ -4736,6 +4766,8 @@ def run_rtc_client(args: argparse.Namespace) -> None:
     command_count = 0
     once_result_accepted = False
     last_reconnect_attempt = 0.0
+    prompt_revision = 0
+    prompt_sent_revision: int | None = None
     control_period = 1.0 / float(getattr(args, "control_hz", DEFAULT_ACTION_HZ))
     try:
         cameras.open()
@@ -4853,6 +4885,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                 output_mode,
                             )
                             execution.configure_protocol(protocol)
+                            prompt_sent_revision = None
                             recorder.update_metadata({
                                 "policy_protocol": {
                                     "requested_output_mode": output_mode,
@@ -5089,12 +5122,17 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                         camera_selection_finished_monotonic
                                     ),
                                 ) -> InferenceWorkerResult:
+                                    nonlocal prompt_sent_revision
+                                    send_prompt = prompt_sent_revision != prompt_revision
                                     observation = build_observation(
                                         snapshot=snapshot_ref,
                                         protocol=protocol_ref,
-                                        instruction=args.instruction,
+                                        instruction=args.instruction if send_prompt else None,
                                         source_name=source_name,
                                         args=args,
+                                    )
+                                    observation["client_metadata"]["prompt_revision"] = int(
+                                        prompt_revision
                                     )
                                     request_sent_at = time.time()
                                     request_sent_monotonic = time.monotonic()
@@ -5113,6 +5151,8 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                         }
                                     )
                                     result = dict(policy_ref.infer(observation))
+                                    if send_prompt:
+                                        prompt_sent_revision = prompt_revision
                                     response_received_at = time.time()
                                     response_received_monotonic = time.monotonic()
                                     server_timing = result.get("transport_timing")
