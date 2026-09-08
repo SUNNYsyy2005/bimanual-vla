@@ -398,6 +398,9 @@ def _rotation_z(angle: float) -> np.ndarray:
     )
 
 
+_ROBOTWIN_ROOT_ROTATION = _rotation_z(np.pi / 2.0)
+
+
 def _rotation_y(angle: float) -> np.ndarray:
     cosine, sine = np.cos(angle), np.sin(angle)
     return np.asarray(
@@ -510,16 +513,24 @@ def _rotation_to_rpy(rotation: np.ndarray) -> np.ndarray:
     return np.asarray([roll, pitch, yaw], dtype=np.float64)
 
 
-def _default_arm_geometry(robot_type: str | None) -> tuple[tuple[float, float, float], dict[str, np.ndarray]] | None:
-    if normalize_robot_type(robot_type) != "aloha-agilex":
+def _default_arm_geometry(
+    robot_type: str | None,
+) -> tuple[tuple[float, float, float] | None, dict[str, np.ndarray]] | None:
+    family = normalize_robot_type(robot_type)
+    if family in {"piper", "arx-x5", "franka-panda"}:
+        return None, {
+            "left": _ROBOTWIN_ROOT_ROTATION.copy(),
+            "right": _ROBOTWIN_ROOT_ROTATION.copy(),
+        }
+    if family != "aloha-agilex":
         return None
     left_origin = np.asarray((0.2305, 0.297, 0.782), dtype=np.float64)
     right_origin = np.asarray((0.2315, -0.3063, 0.781), dtype=np.float64)
-    left_rotation = _rotation_from_rpy((0.0, 0.0, 0.02))
-    right_rotation = _rotation_from_rpy((0.0, 0.0, 0.01))
+    left_rotation = _ROBOTWIN_ROOT_ROTATION @ _rotation_from_rpy((0.0, 0.0, 0.02))
+    right_rotation = _ROBOTWIN_ROOT_ROTATION @ _rotation_from_rpy((0.0, 0.0, 0.01))
     return (
-        tuple(float(value) for value in left_rotation.T @ (right_origin - left_origin)),
-        {"left": np.eye(3, dtype=np.float64), "right": left_rotation.T @ right_rotation},
+        tuple(float(value) for value in _ROBOTWIN_ROOT_ROTATION @ (right_origin - left_origin)),
+        {"left": left_rotation, "right": right_rotation},
     )
 
 
@@ -529,15 +540,24 @@ def _resolve_arm_geometry(
     arm_base_rotations: Any,
     *,
     bimanual: bool,
+    dataset_origin: Any = None,
 ) -> tuple[tuple[float, float, float] | None, dict[str, np.ndarray] | None]:
     offset = normalize_arm_base_offset(arm_base_offset)
     rotations = normalize_arm_base_rotations(arm_base_rotations)
-    if bimanual and normalize_robot_type(robot_type) == "aloha-agilex":
+    is_simulation = str(dataset_origin or "").strip().lower() in {
+        "simulation",
+        "sim",
+        "synthetic",
+    }
+    if is_simulation or normalize_robot_type(robot_type) == "aloha-agilex":
         default_geometry = _default_arm_geometry(robot_type)
         if default_geometry is not None:
             default_offset, default_rotations = default_geometry
-            offset = default_offset if offset is None else offset
-            rotations = default_rotations if rotations is None else rotations
+            if bimanual and offset is None:
+                offset = default_offset
+            merged_rotations = dict(default_rotations)
+            merged_rotations.update(rotations or {})
+            rotations = merged_rotations
     return offset, rotations
 
 
@@ -566,12 +586,14 @@ def _apply_arm_base_offset(
     arm_base_rotations: Any = None,
     *,
     robot_type: str | None = None,
+    dataset_origin: Any = None,
 ) -> tuple[dict[str, dict[str, np.ndarray]], tuple[float, float, float] | None, dict[str, np.ndarray] | None]:
     offset, rotations = _resolve_arm_geometry(
         robot_type,
         arm_base_offset,
         arm_base_rotations,
         bimanual={"left", "right"}.issubset(eef),
+        dataset_origin=dataset_origin,
     )
     bimanual = {"left", "right"}.issubset(eef)
     origins = (
@@ -600,6 +622,7 @@ def compute_eef_trajectory(
     arm_base_offset: Any = None,
     arm_base_rotations: Any = None,
     robot_type: str | None = None,
+    dataset_origin: Any = None,
 ) -> tuple[dict[str, dict[str, np.ndarray]], str]:
     """Return per-arm XYZ trajectories and the method used.
 
@@ -628,6 +651,7 @@ def compute_eef_trajectory(
             arm_base_offset,
             arm_base_rotations,
             robot_type=robot_type,
+            dataset_origin=dataset_origin,
         )
         return transformed, "recorded_eef"
 
@@ -653,6 +677,7 @@ def compute_eef_trajectory(
             arm_base_offset,
             arm_base_rotations,
             robot_type=robot_type,
+            dataset_origin=dataset_origin,
         )
         return transformed, "franka_panda_fk"
 
@@ -697,6 +722,7 @@ def compute_eef_trajectory(
         arm_base_offset,
         arm_base_rotations,
         robot_type=robot_type,
+        dataset_origin=dataset_origin,
     )
     if family == "piper" and sdk_fk is not None:
         return transformed, "piper_sdk_fk"
@@ -715,6 +741,7 @@ def analyze_episode(
     arm_base_offset: Any = None,
     arm_base_rotations: Any = None,
     robot_type: str | None = None,
+    dataset_origin: Any = None,
     velocity_threshold: float = 0.035,
     action_delta_threshold: float = 0.012,
     min_idle_run: int = 2,
@@ -742,6 +769,7 @@ def analyze_episode(
         arm_base_offset,
         arm_base_rotations,
         bimanual=measured.shape[1] in {14, 16, 20},
+        dataset_origin=dataset_origin,
     )
     eef, eef_method = compute_eef_trajectory(
         measured,
@@ -750,6 +778,7 @@ def analyze_episode(
         arm_base_offset=effective_offset,
         arm_base_rotations=effective_rotations,
         robot_type=robot_type,
+        dataset_origin=dataset_origin,
     )
     inferred_fps = float(fps or (1.0 / np.median(np.diff(time_axis)) if count > 1 else 20.0))
     return EpisodeAnalysis(

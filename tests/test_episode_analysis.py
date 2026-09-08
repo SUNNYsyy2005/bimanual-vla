@@ -109,9 +109,53 @@ class EpisodeAnalysisTest(unittest.TestCase):
     def test_aloha_uses_robotwin_embedded_base_geometry(self):
         analysis = analyze_episode(np.zeros((1, 14)), robot_type="aloha-agilex")
         payload = analysis_payload(analysis)
-        self.assertAlmostEqual(payload["arm_base_offset"][1], -0.6033, places=3)
-        self.assertEqual(payload["arm_base_rotations"]["left"], np.eye(3).tolist())
+        self.assertAlmostEqual(payload["arm_base_offset"][0], 0.6033, places=3)
+        self.assertAlmostEqual(payload["arm_base_offset"][1], 0.001, places=3)
+        self.assertNotEqual(payload["arm_base_rotations"]["left"], np.eye(3).tolist())
         self.assertNotEqual(payload["arm_base_rotations"]["right"], np.eye(3).tolist())
+
+    def test_robotwin_root_rotation_maps_local_x_to_common_y_for_simulation(self):
+        state = np.zeros((1, 14), dtype=np.float64)
+        local = analyze_episode(
+            state,
+            robot_type="piper",
+        )
+        simulation = analyze_episode(
+            state,
+            robot_type="piper",
+            dataset_origin="simulation",
+            arm_base_offset=[0.9, 0.0, 0.0],
+        )
+        for side in ("left", "right"):
+            expected = np.column_stack((
+                -local.eef[side]["position"][:, 1],
+                local.eef[side]["position"][:, 0],
+                local.eef[side]["position"][:, 2],
+            ))
+            if side == "right":
+                expected[:, 0] += 0.9
+            np.testing.assert_allclose(simulation.eef[side]["position"], expected)
+        np.testing.assert_allclose(
+            simulation.arm_base_rotations["left"],
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            atol=1e-12,
+        )
+
+    def test_real_piper_keeps_explicit_common_frame_without_robotwin_rotation(self):
+        state = np.zeros((1, 14), dtype=np.float64)
+        local = analyze_episode(
+            state,
+            robot_type="piper",
+            arm_base_offset=[0.8, 0.0, 0.0],
+        )
+        real = analyze_episode(
+            state,
+            robot_type="piper",
+            dataset_origin="real",
+            arm_base_offset=[0.8, 0.0, 0.0],
+        )
+        for side in ("left", "right"):
+            np.testing.assert_allclose(real.eef[side]["position"], local.eef[side]["position"])
 
     def test_explicit_arm_base_rotation_transforms_position_and_orientation(self):
         state = np.zeros((1, 16), dtype=np.float64)
