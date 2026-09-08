@@ -1648,6 +1648,7 @@ function renderEpisodeAnalysisSummary(data) {
     `<span class="pill ${Number(data.idle_frames) ? 'idle-frame' : ''}">空闲 ${esc(data.idle_frames)} (${esc(analysisNumber(Number(data.idle_fraction || 0) * 100, 1))}%)</span>`,
     `<span class="pill ${Number(data.anomaly_frames) ? 'anomaly-frame' : ''}">异常 ${esc(data.anomaly_frames || 0)} · jitter ${esc(data.jitter_frames || 0)} · reversal ${esc(data.velocity_reversal_frames || 0)} · abrupt ${esc(data.abrupt_change_frames || 0)}</span>`,
     `<span class="pill">建议保留 ${esc(crop.start_frame ?? 0)}-${esc(crop.end_frame ?? data.frame_count - 1)}</span>`,
+    data.robot_type ? `<span class="pill">robot=${esc(data.robot_type)}</span>` : '',
     `<span class="pill">EEF=${esc(data.eef_method || 'unavailable')}</span>`,
     data.arm_base_offset ? `<span class="pill">base ΔR-L=${esc(data.arm_base_offset.map(value => analysisNumber(value, 3)).join(', '))}m</span>` : '<span class="pill warn">base offset unavailable</span>',
     `<span class="muted">sample stride=${esc(data.sample_stride || 1)}</span>`,
@@ -1765,11 +1766,33 @@ function trajectoryOrigins(data) {
 
 function trajectoryAxisSigns(data) {
   const raw = data?.arm_axis_signs && typeof data.arm_axis_signs === 'object' ? data.arm_axis_signs : {};
-  const bimanual = Boolean(data?.eef && data.eef.left && data.eef.right);
   return {
     left: trajectoryPoint(raw.left) || [1, 1, 1],
-    right: trajectoryPoint(raw.right) || (bimanual ? [-1, 1, 1] : [1, 1, 1]),
+    right: trajectoryPoint(raw.right) || [1, 1, 1],
   };
+}
+
+function trajectoryAxisRotations(data) {
+  const identity = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  const raw = data?.arm_base_rotations && typeof data.arm_base_rotations === 'object' ? data.arm_base_rotations : {};
+  const rotations = {};
+  for (const side of ['left', 'right']) {
+    const value = raw[side];
+    if (Array.isArray(value) && value.length === 3 && value.every(row => Array.isArray(row) && row.length === 3 && row.every(Number.isFinite))) {
+      rotations[side] = value.map(row => row.map(Number));
+    } else {
+      rotations[side] = identity;
+    }
+  }
+  return rotations;
+}
+
+function trajectoryAxisPoints(origin, rotation, length) {
+  return [
+    [origin[0] + length * rotation[0][0], origin[1] + length * rotation[1][0], origin[2] + length * rotation[2][0]],
+    [origin[0] + length * rotation[0][1], origin[1] + length * rotation[1][1], origin[2] + length * rotation[2][1]],
+    [origin[0] + length * rotation[0][2], origin[1] + length * rotation[1][2], origin[2] + length * rotation[2][2]],
+  ];
 }
 
 function ensureEpisodeTrajectoryInteractions() {
@@ -1908,14 +1931,14 @@ function drawEpisodeTrajectoryFull(data, frame = 0, frameData = null) {
     drawSegment([center[0] + offset, center[1] - gridSize, gridZ], [center[0] + offset, center[1] + gridSize, gridZ], '#18324b', 1, 0.9);
   }
   const axisLength = extent * 0.32;
-  const axisSigns = trajectoryAxisSigns(data);
+  const axisRotations = trajectoryAxisRotations(data);
   const frameOrigins = Object.keys(origins).length ? Object.entries(origins) : [['world', center]];
   for (const [side, frameOrigin] of frameOrigins) {
-    const signs = axisSigns[side] || [1, 1, 1];
+    const points = trajectoryAxisPoints(frameOrigin, axisRotations[side] || [[1, 0, 0], [0, 1, 0], [0, 0, 1]], axisLength);
     const axes = [
-      {label: 'X', point: [frameOrigin[0] + axisLength * signs[0], frameOrigin[1], frameOrigin[2]], color: '#ff6f91'},
-      {label: 'Y', point: [frameOrigin[0], frameOrigin[1] + axisLength * signs[1], frameOrigin[2]], color: '#3ee6a8'},
-      {label: 'Z', point: [frameOrigin[0], frameOrigin[1], frameOrigin[2] + axisLength * signs[2]], color: '#42c7ff'},
+      {label: 'X', point: points[0], color: '#ff6f91'},
+      {label: 'Y', point: points[1], color: '#3ee6a8'},
+      {label: 'Z', point: points[2], color: '#42c7ff'},
     ];
     for (const axis of axes) {
       drawSegment(frameOrigin, axis.point, axis.color, 1.5, 0.9);
@@ -2083,14 +2106,14 @@ function createEpisodeTrajectoryRenderCache(data, width, height, ratio) {
     drawStaticSegment([center[0] + offset, center[1] - gridSize, gridZ], [center[0] + offset, center[1] + gridSize, gridZ], '#18324b', 1, 0.9);
   }
   const axisLength = extent * 0.32;
-  const axisSigns = trajectoryAxisSigns(data);
+  const axisRotations = trajectoryAxisRotations(data);
   const frameOrigins = Object.keys(origins).length ? Object.entries(origins) : [['world', center]];
   for (const [side, frameOrigin] of frameOrigins) {
-    const signs = axisSigns[side] || [1, 1, 1];
+    const points = trajectoryAxisPoints(frameOrigin, axisRotations[side] || [[1, 0, 0], [0, 1, 0], [0, 0, 1]], axisLength);
     const axes = [
-      {label: 'X', point: [frameOrigin[0] + axisLength * signs[0], frameOrigin[1], frameOrigin[2]], color: '#ff6f91'},
-      {label: 'Y', point: [frameOrigin[0], frameOrigin[1] + axisLength * signs[1], frameOrigin[2]], color: '#3ee6a8'},
-      {label: 'Z', point: [frameOrigin[0], frameOrigin[1], frameOrigin[2] + axisLength * signs[2]], color: '#42c7ff'},
+      {label: 'X', point: points[0], color: '#ff6f91'},
+      {label: 'Y', point: points[1], color: '#3ee6a8'},
+      {label: 'Z', point: points[2], color: '#42c7ff'},
     ];
     for (const axis of axes) {
       drawStaticSegment(frameOrigin, axis.point, axis.color, 1.5, 0.9);

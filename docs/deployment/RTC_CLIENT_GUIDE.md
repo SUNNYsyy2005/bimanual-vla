@@ -102,3 +102,38 @@ RTC 必须在模型 denoising 阶段运行；只在客户端做 action 插值不
 
 旧的 `bin/bimanual-vla legacy-bridge` 仍可运行，但新实机部署统一使用
 `bimanual_vla/deployment/client.py`；它们共用同一份安全检查和实时控制实现。
+
+
+## Smooth Piper execution options
+
+The robot-side client also carries the execution safeguards from the Piper
+reference implementation. They are independent of model training and can be
+used for joint or delivery policies:
+
+- `--trajectory-shaping` is enabled by default. It applies one shared 7D/14D
+  state to the two arms and limits joint velocity, acceleration, jerk, and
+  MOVE_J lookahead. Disable it only for an intentional A/B comparison with
+  `--no-trajectory-shaping`.
+- `--blend-profile smootherstep` removes the velocity jump at an accepted
+  chunk boundary. RTC already performs model-side overlap guidance, so the
+  default extra client blend is zero while RTC is active; opt in with
+  `--rtc-client-blend-steps 2`, `3`, or `4` when needed.
+- `--gripper-open-lookahead-steps 30` advances only opening requests. Closing
+  is never anticipated, and the resulting command still goes through the
+  independent gripper low-pass, hysteresis, and rate limits.
+- `--reject-external-control-streams` checks Piper's reported
+  `JointCtrl`/`GripperCtrl` rates before execution and refuses concurrent
+  high-rate control. Use `--no-reject-external-control-streams` only when the
+  hardware integration deliberately owns that arbitration.
+- `--auto-return` records the measured startup pose and returns all commanded
+  arms with the same bounded trajectory before disconnecting. It is enabled by
+  default; `--no-auto-return` is available for a deliberate exception.
+
+Tune the shaper with `--trajectory-max-speed-rad-s`,
+`--trajectory-max-acceleration-rad-s2`, `--trajectory-max-jerk-rad-s3`,
+`--trajectory-smoothing-cutoff-hz`, `--trajectory-tracking-time-constant-s`,
+`--trajectory-command-lookahead-rad`, and
+`--trajectory-max-tracking-error-rad`. RTC temporal consistency is enabled for
+JAX servers by default and can be controlled with the server-side
+`--rtc-temporal-consistency` and `--rtc-temporal-seed` options. All of these
+states and decisions are emitted in the per-session monitoring telemetry.

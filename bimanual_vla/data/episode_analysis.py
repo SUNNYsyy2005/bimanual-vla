@@ -16,11 +16,15 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from bimanual_vla.data.action_conventions import matrix_to_rotation6d, rotation6d_to_matrix
 from bimanual_vla.data.arm_geometry import (
     ARM_BASE_AXIS_CONVENTION,
     arm_base_axis_signs,
+    arm_base_rotation_metadata,
     arm_base_origins,
     normalize_arm_base_offset,
+    normalize_arm_base_rotations,
+    normalize_robot_type,
 )
 
 
@@ -35,6 +39,17 @@ FRANKA_JOINT_NAMES = tuple(
     for side in ("left", "right")
     for value in ([f"{side}_joint_{index}" for index in range(1, 8)] + [f"{side}_gripper"])
 )
+
+
+def _joint_names_for_robot(robot_type: str | None, side: str, width: int) -> tuple[str, ...] | None:
+    family = normalize_robot_type(robot_type)
+    arm_count = 2 if width in {14, 16} else 1
+    per_arm = width // arm_count if arm_count else 0
+    if per_arm not in {7, 8}:
+        return None
+    joint_count = per_arm - 1
+    prefix = "fl" if family == "aloha-agilex" and side == "left" else "fr" if family == "aloha-agilex" else side
+    return tuple(f"{prefix}_joint_{index}" for index in range(1, joint_count + 1)) + (f"{prefix}_gripper",)
 
 
 @dataclass(frozen=True)
@@ -58,6 +73,8 @@ class EpisodeAnalysis:
     eef_method: str
     fps: float
     arm_base_offset: tuple[float, float, float] | None
+    arm_base_rotations: dict[str, np.ndarray] | None
+    robot_type: str | None
 
     @property
     def frame_count(self) -> int:
@@ -75,13 +92,27 @@ def _as_matrix(value: Any, *, width: int | None = None) -> np.ndarray:
     return array
 
 
-def infer_joint_names(names: Sequence[Any] | None, width: int, *, arm_side: str = "right") -> tuple[str, ...]:
+def infer_joint_names(
+    names: Sequence[Any] | None,
+    width: int,
+    *,
+    arm_side: str = "right",
+    robot_type: str | None = None,
+) -> tuple[str, ...]:
     """Return stable labels for a state/action vector."""
 
     if names is not None:
         values = tuple(str(item) for item in names)
         if len(values) == width:
             return values
+    if width in {14, 16} and robot_type is not None:
+        generated = tuple(
+            name
+            for side in ("left", "right")
+            for name in (_joint_names_for_robot(robot_type, side, width // 2) or ())
+        )
+        if len(generated) == width:
+            return generated
     if width == 14:
         return DEFAULT_JOINT_NAMES
     if width == 16:
@@ -367,6 +398,37 @@ def _rotation_z(angle: float) -> np.ndarray:
     )
 
 
+def _rotation_y(angle: float) -> np.ndarray:
+    cosine, sine = np.cos(angle), np.sin(angle)
+    return np.asarray(
+        [[cosine, 0.0, sine], [0.0, 1.0, 0.0], [-sine, 0.0, cosine]],
+        dtype=np.float64,
+    )
+
+
+def _rotation_from_rpy(rpy: Sequence[float]) -> np.ndarray:
+    roll, pitch, yaw = np.asarray(rpy, dtype=np.float64)
+    return _rotation_z(float(yaw)) @ _rotation_y(float(pitch)) @ _rotation_x(float(roll))
+
+
+def _axis_angle(axis: Sequence[float], angle: float) -> np.ndarray:
+    vector = np.asarray(axis, dtype=np.float64)
+    norm = float(np.linalg.norm(vector))
+    if norm < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    axis_x, axis_y, axis_z = vector / norm
+    cosine, sine = np.cos(angle), np.sin(angle)
+    one_minus_cosine = 1.0 - cosine
+    return np.asarray(
+        [
+            [cosine + axis_x * axis_x * one_minus_cosine, axis_x * axis_y * one_minus_cosine - axis_z * sine, axis_x * axis_z * one_minus_cosine + axis_y * sine],
+            [axis_y * axis_x * one_minus_cosine + axis_z * sine, cosine + axis_y * axis_y * one_minus_cosine, axis_y * axis_z * one_minus_cosine - axis_x * sine],
+            [axis_z * axis_x * one_minus_cosine - axis_y * sine, axis_z * axis_y * one_minus_cosine + axis_x * sine, cosine + axis_z * axis_z * one_minus_cosine],
+        ],
+        dtype=np.float64,
+    )
+
+
 def _rigid_transform(translation: Sequence[float], rotation: np.ndarray) -> np.ndarray:
     transform = np.eye(4, dtype=np.float64)
     transform[:3, :3] = rotation
@@ -374,24 +436,66 @@ def _rigid_transform(translation: Sequence[float], rotation: np.ndarray) -> np.n
     return transform
 
 
+@dataclass(frozen=True)
+class _UrdfJoint:
+    origin: tuple[float, float, float]
+    rpy: tuple[float, float, float]
+    axis: tuple[float, float, float]
+
+
+_FRANKA_CHAIN = (
+    _UrdfJoint((0.0, 0.0, 0.333), (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    _UrdfJoint((0.0, 0.0, 0.0), (-np.pi / 2.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    _UrdfJoint((0.0, -0.316, 0.0), (np.pi / 2.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    _UrdfJoint((0.0825, 0.0, 0.0), (np.pi / 2.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    _UrdfJoint((-0.0825, 0.384, 0.0), (-np.pi / 2.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    _UrdfJoint((0.0, 0.0, 0.0), (np.pi / 2.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    _UrdfJoint((0.088, 0.0, 0.0), (np.pi / 2.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+)
+
+_PIPER_CHAIN = (
+    _UrdfJoint((0.0, 0.0, 0.123), (0.0, 0.0, -1.5708), (0.0, 0.0, 1.0)),
+    _UrdfJoint((0.0, 0.0, 0.0), (1.5708, 0.0, -1.5708), (0.0, 0.0, 1.0)),
+    _UrdfJoint((0.28358, 0.028726, 0.0), (0.0, 0.0, 0.10095), (0.0, 0.0, 1.0)),
+    _UrdfJoint((-0.24221, 0.068514, 0.0), (-1.5708, 0.0, 1.3826), (0.0, 0.0, 1.0)),
+    _UrdfJoint((0.0, 0.0, 0.0), (1.5708, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    _UrdfJoint((0.0, 0.091, 0.0014165), (-1.5708, -np.pi, 0.0), (0.0, 0.0, 1.0)),
+)
+
+_ARX_CHAIN = (
+    _UrdfJoint((0.0, 0.0, 0.0605), (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    _UrdfJoint((0.02, 0.0, 0.04), (0.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+    _UrdfJoint((-0.264, 0.0, 0.0), (np.pi, 0.0, 0.0), (0.0, 1.0, 0.0)),
+    _UrdfJoint((0.245, 0.0, -0.056), (0.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+    _UrdfJoint((0.06775, 0.0005, -0.0865), (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    _UrdfJoint((0.02895, 0.0, 0.0865), (-np.pi, 0.0, 0.0), (1.0, 0.0, 0.0)),
+)
+
+_ALOHA_CHAIN = (
+    _UrdfJoint((0.0, 0.0, 0.058), (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    _UrdfJoint((0.025013, 0.00060169, 0.042), (0.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+    _UrdfJoint((-0.26396, 0.0044548, 0.0), (-3.1416, 0.0, -0.015928), (0.0, 1.0, 0.0)),
+    _UrdfJoint((0.246, -0.00025, -0.06), (0.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+    _UrdfJoint((0.06775, 0.0015, -0.0855), (0.0, 0.0, -0.015928), (0.0, 0.0, 1.0)),
+    _UrdfJoint((0.03095, 0.0, 0.0855), (-3.1416, 0.0, 0.0), (1.0, 0.0, 0.0)),
+)
+
+
+def _chain_fk(joints: np.ndarray, chain: Sequence[_UrdfJoint], *, fixed_transform: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    transform = np.eye(4, dtype=np.float64)
+    for angle, joint in zip(np.asarray(joints, dtype=np.float64), chain):
+        transform = transform @ _rigid_transform(joint.origin, _rotation_from_rpy(joint.rpy))
+        transform = transform @ _rigid_transform((0.0, 0.0, 0.0), _axis_angle(joint.axis, float(angle)))
+    if fixed_transform is not None:
+        transform = transform @ fixed_transform
+    return transform[:3, 3], transform[:3, :3]
+
+
 def _franka_fk(joints: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Compute Panda hand pose from seven joint positions using the Panda URDF chain."""
 
-    origins = (
-        ((0.0, 0.0, 0.333), (0.0, 0.0, 0.0)),
-        ((0.0, 0.0, 0.0), (-np.pi / 2.0, 0.0, 0.0)),
-        ((0.0, -0.316, 0.0), (np.pi / 2.0, 0.0, 0.0)),
-        ((0.0825, 0.0, 0.0), (np.pi / 2.0, 0.0, 0.0)),
-        ((-0.0825, 0.384, 0.0), (-np.pi / 2.0, 0.0, 0.0)),
-        ((0.0, 0.0, 0.0), (np.pi / 2.0, 0.0, 0.0)),
-        ((0.088, 0.0, 0.0), (np.pi / 2.0, 0.0, 0.0)),
-    )
-    transform = np.eye(4, dtype=np.float64)
-    for angle, (translation, rpy) in zip(np.asarray(joints[:7], dtype=np.float64), origins):
-        transform = transform @ _rigid_transform(translation, _rotation_x(rpy[0]))
-        transform = transform @ _rigid_transform((0.0, 0.0, 0.0), _rotation_z(float(angle)))
-    transform = transform @ _rigid_transform((0.0, 0.0, 0.107), np.eye(3, dtype=np.float64))
-    return transform[:3, 3], transform[:3, :3]
+    fixed_hand = _rigid_transform((0.0, 0.0, 0.107), _rotation_z(-np.pi / 4.0))
+    return _chain_fk(joints[:7], _FRANKA_CHAIN, fixed_transform=fixed_hand)
 
 
 def _rotation_to_rpy(rotation: np.ndarray) -> np.ndarray:
@@ -406,22 +510,86 @@ def _rotation_to_rpy(rotation: np.ndarray) -> np.ndarray:
     return np.asarray([roll, pitch, yaw], dtype=np.float64)
 
 
+def _default_arm_geometry(robot_type: str | None) -> tuple[tuple[float, float, float], dict[str, np.ndarray]] | None:
+    if normalize_robot_type(robot_type) != "aloha-agilex":
+        return None
+    left_origin = np.asarray((0.2305, 0.297, 0.782), dtype=np.float64)
+    right_origin = np.asarray((0.2315, -0.3063, 0.781), dtype=np.float64)
+    left_rotation = _rotation_from_rpy((0.0, 0.0, 0.02))
+    right_rotation = _rotation_from_rpy((0.0, 0.0, 0.01))
+    return (
+        tuple(float(value) for value in left_rotation.T @ (right_origin - left_origin)),
+        {"left": np.eye(3, dtype=np.float64), "right": left_rotation.T @ right_rotation},
+    )
+
+
+def _resolve_arm_geometry(
+    robot_type: str | None,
+    arm_base_offset: Any,
+    arm_base_rotations: Any,
+    *,
+    bimanual: bool,
+) -> tuple[tuple[float, float, float] | None, dict[str, np.ndarray] | None]:
+    offset = normalize_arm_base_offset(arm_base_offset)
+    rotations = normalize_arm_base_rotations(arm_base_rotations)
+    if bimanual and normalize_robot_type(robot_type) == "aloha-agilex":
+        default_geometry = _default_arm_geometry(robot_type)
+        if default_geometry is not None:
+            default_offset, default_rotations = default_geometry
+            offset = default_offset if offset is None else offset
+            rotations = default_rotations if rotations is None else rotations
+    return offset, rotations
+
+
+def _transform_eef_orientation(values: np.ndarray, base_rotation: np.ndarray) -> np.ndarray:
+    if values.ndim != 2 or values.shape[1] not in {3, 6}:
+        return values
+    transformed = values.copy()
+    for index, row in enumerate(values):
+        if not np.isfinite(row).all():
+            continue
+        if values.shape[1] == 3:
+            local_rotation = _rotation_from_rpy(row)
+            transformed[index] = _rotation_to_rpy(base_rotation @ local_rotation)
+        else:
+            try:
+                local_rotation = rotation6d_to_matrix(row)
+            except ValueError:
+                continue
+            transformed[index] = matrix_to_rotation6d(base_rotation @ local_rotation)
+    return transformed
+
+
 def _apply_arm_base_offset(
     eef: dict[str, dict[str, np.ndarray]],
     arm_base_offset: Any,
-) -> tuple[dict[str, dict[str, np.ndarray]], tuple[float, float, float] | None]:
-    offset = normalize_arm_base_offset(arm_base_offset)
-    if not {"left", "right"}.issubset(eef):
-        return eef, offset
-    origins = {"left": (0.0, 0.0, 0.0), "right": offset or (0.0, 0.0, 0.0)}
-    signs = arm_base_axis_signs(offset, bimanual=True)
+    arm_base_rotations: Any = None,
+    *,
+    robot_type: str | None = None,
+) -> tuple[dict[str, dict[str, np.ndarray]], tuple[float, float, float] | None, dict[str, np.ndarray] | None]:
+    offset, rotations = _resolve_arm_geometry(
+        robot_type,
+        arm_base_offset,
+        arm_base_rotations,
+        bimanual={"left", "right"}.issubset(eef),
+    )
+    bimanual = {"left", "right"}.issubset(eef)
+    origins = (
+        {"left": (0.0, 0.0, 0.0), "right": offset or (0.0, 0.0, 0.0)}
+        if bimanual
+        else {side: (0.0, 0.0, 0.0) for side in eef}
+    )
     for side, origin in origins.items():
+        base_rotation = np.asarray(
+            (rotations or {}).get(side, np.eye(3, dtype=np.float64)),
+            dtype=np.float64,
+        )
         positions = np.asarray(eef[side].get("position", []), dtype=np.float64)
         if positions.ndim == 2 and positions.shape[1] == 3:
-            local_positions = positions.copy()
-            local_positions *= np.asarray(signs[side], dtype=np.float64)
-            eef[side]["position"] = local_positions + np.asarray(origin, dtype=np.float64)
-    return eef, offset
+            eef[side]["position"] = positions @ base_rotation.T + np.asarray(origin, dtype=np.float64)
+        orientations = np.asarray(eef[side].get("orientation", []), dtype=np.float64)
+        eef[side]["orientation"] = _transform_eef_orientation(orientations, base_rotation)
+    return eef, offset, rotations
 
 
 def compute_eef_trajectory(
@@ -430,16 +598,20 @@ def compute_eef_trajectory(
     names: Sequence[Any] | None = None,
     arm_side: str = "right",
     arm_base_offset: Any = None,
+    arm_base_rotations: Any = None,
+    robot_type: str | None = None,
 ) -> tuple[dict[str, dict[str, np.ndarray]], str]:
     """Return per-arm XYZ trajectories and the method used.
 
     Cartesian 10D/20D states are read directly.  Franka Panda 8D/16D joint
-    states use the Panda URDF chain, while Piper 7D/14D states use the Piper
-    SDK when present and otherwise a deterministic approximate FK.
+    states use the Panda URDF chain.  Piper, Aloha AgileX, and ARX-X5 7D/14D
+    joint states use their RoboTwin URDF chains; Piper keeps the SDK position
+    result when the SDK is available.
     """
 
     matrix = _as_matrix(state)
     width = matrix.shape[1]
+    family = normalize_robot_type(robot_type)
     labels = tuple(str(item) for item in names) if names is not None else ()
     result: dict[str, dict[str, np.ndarray]] = {}
     if width in {10, 20} and any("eef_x" in label for label in labels):
@@ -451,8 +623,19 @@ def compute_eef_trajectory(
                 "position": block[:, :3],
                 "orientation": block[:, 3:9],
             }
-        return _apply_arm_base_offset(result, arm_base_offset)[0], "recorded_eef"
-    if width in {8, 16}:
+        transformed, _offset, _rotations = _apply_arm_base_offset(
+            result,
+            arm_base_offset,
+            arm_base_rotations,
+            robot_type=robot_type,
+        )
+        return transformed, "recorded_eef"
+
+    if family not in {None, "franka-panda", "piper", "aloha-agilex", "arx-x5"}:
+        return {}, "unavailable"
+    if family == "franka-panda" or (family is None and width in {8, 16}):
+        if width not in {8, 16}:
+            return {}, "unavailable"
         arms = 1 if width == 8 else 2
         sides = (arm_side if arm_side in {"left", "right"} else "right",) if arms == 1 else ("left", "right")
         for arm_index, side in enumerate(sides):
@@ -465,37 +648,59 @@ def compute_eef_trajectory(
                 positions[index], rotation = _franka_fk(joints)
                 orientations[index] = _rotation_to_rpy(rotation)
             result[side] = {"position": positions, "orientation": orientations}
-        return _apply_arm_base_offset(result, arm_base_offset)[0], "franka_panda_fk"
+        transformed, _offset, _rotations = _apply_arm_base_offset(
+            result,
+            arm_base_offset,
+            arm_base_rotations,
+            robot_type=robot_type,
+        )
+        return transformed, "franka_panda_fk"
+
+    if family == "franka-panda":
+        return {}, "unavailable"
     if width not in {7, 14}:
         return {}, "unavailable"
     arms = 1 if width == 7 else 2
     sides = (arm_side if arm_side in {"left", "right"} else "right",) if arms == 1 else ("left", "right")
-    fk = None
-    try:
-        from piper_sdk import C_PiperForwardKinematics
+    chain = {
+        "piper": _PIPER_CHAIN,
+        "aloha-agilex": _ALOHA_CHAIN,
+        "arx-x5": _ARX_CHAIN,
+        None: _PIPER_CHAIN,
+    }[family]
+    sdk_fk = None
+    if family in {None, "piper"}:
+        try:
+            from piper_sdk import C_PiperForwardKinematics
 
-        fk = C_PiperForwardKinematics()
-    except Exception:
-        fk = None
+            sdk_fk = C_PiperForwardKinematics()
+        except Exception:
+            sdk_fk = None
     for arm_index, side in enumerate(sides):
         block = matrix[:, arm_index * 7 : arm_index * 7 + 6]
         positions = np.full((len(block), 3), np.nan, dtype=np.float64)
-        orientation = np.full((len(block), 3), np.nan, dtype=np.float64)
+        orientations = np.full((len(block), 3), np.nan, dtype=np.float64)
         for index, joints in enumerate(block):
             if not np.all(np.isfinite(joints)):
                 continue
+            position, rotation = _chain_fk(joints, chain)
             try:
-                positions[index] = (
-                    np.asarray(fk.CalFK(joints.tolist())[-1], dtype=np.float64)[:3] / 1000.0
-                    if fk is not None
-                    else _fallback_fk(joints)
-                )
+                if sdk_fk is not None:
+                    position = np.asarray(sdk_fk.CalFK(joints.tolist())[-1], dtype=np.float64)[:3] / 1000.0
             except Exception:
-                positions[index] = _fallback_fk(joints)
-            if fk is None:
-                orientation[index] = np.asarray([0.0, 0.0, float(np.sum(joints))], dtype=np.float64)
-        result[side] = {"position": positions, "orientation": orientation}
-    return _apply_arm_base_offset(result, arm_base_offset)[0], "piper_sdk_fk" if fk is not None else "approx_fk"
+                pass
+            positions[index] = position
+            orientations[index] = _rotation_to_rpy(rotation)
+        result[side] = {"position": positions, "orientation": orientations}
+    transformed, _offset, _rotations = _apply_arm_base_offset(
+        result,
+        arm_base_offset,
+        arm_base_rotations,
+        robot_type=robot_type,
+    )
+    if family == "piper" and sdk_fk is not None:
+        return transformed, "piper_sdk_fk"
+    return transformed, f"{family or 'piper'}_urdf_fk"
 
 
 def analyze_episode(
@@ -508,6 +713,8 @@ def analyze_episode(
     fps: float | int | None = None,
     arm_side: str = "right",
     arm_base_offset: Any = None,
+    arm_base_rotations: Any = None,
+    robot_type: str | None = None,
     velocity_threshold: float = 0.035,
     action_delta_threshold: float = 0.012,
     min_idle_run: int = 2,
@@ -530,11 +737,19 @@ def analyze_episode(
         action_delta_threshold=action_delta_threshold,
         min_run=min_idle_run,
     )
+    effective_offset, effective_rotations = _resolve_arm_geometry(
+        robot_type,
+        arm_base_offset,
+        arm_base_rotations,
+        bimanual=measured.shape[1] in {14, 16, 20},
+    )
     eef, eef_method = compute_eef_trajectory(
         measured,
         names=state_names,
         arm_side=arm_side,
-        arm_base_offset=arm_base_offset,
+        arm_base_offset=effective_offset,
+        arm_base_rotations=effective_rotations,
+        robot_type=robot_type,
     )
     inferred_fps = float(fps or (1.0 / np.median(np.diff(time_axis)) if count > 1 else 20.0))
     return EpisodeAnalysis(
@@ -550,11 +765,18 @@ def analyze_episode(
         abrupt_change=anomalies["abrupt_change"],
         anomaly_score=anomalies["anomaly_score"],
         jerk_norm=anomalies["jerk_norm"],
-        joint_names=infer_joint_names(state_names, measured.shape[1], arm_side=arm_side),
+        joint_names=infer_joint_names(
+            state_names,
+            measured.shape[1],
+            arm_side=arm_side,
+            robot_type=robot_type,
+        ),
         eef=eef,
         eef_method=eef_method,
         fps=inferred_fps,
-        arm_base_offset=normalize_arm_base_offset(arm_base_offset),
+        arm_base_offset=effective_offset,
+        arm_base_rotations=effective_rotations,
+        robot_type=normalize_robot_type(robot_type),
     )
 
 
@@ -626,6 +848,8 @@ def frame_payload(analysis: EpisodeAnalysis, frame_index: int) -> dict[str, Any]
         "joints": joints,
         "eef": eef,
         "arm_base_offset": list(analysis.arm_base_offset) if analysis.arm_base_offset is not None else None,
+        "arm_base_rotations": arm_base_rotation_metadata(analysis.arm_base_rotations),
+        "robot_type": analysis.robot_type,
         "arm_axis_convention": (
             ARM_BASE_AXIS_CONVENTION
             if analysis.arm_base_offset is not None or {"left", "right"}.issubset(analysis.eef)
@@ -650,6 +874,8 @@ def analysis_payload(analysis: EpisodeAnalysis, *, max_points: int = 1200) -> di
             "suggested_crop": suggested_crop(analysis.idle),
             "frames": [],
             "arm_base_offset": list(analysis.arm_base_offset) if analysis.arm_base_offset is not None else None,
+            "arm_base_rotations": arm_base_rotation_metadata(analysis.arm_base_rotations),
+            "robot_type": analysis.robot_type,
             "arm_axis_convention": (
                 ARM_BASE_AXIS_CONVENTION
                 if analysis.arm_base_offset is not None or {"left", "right"}.issubset(analysis.eef)
@@ -679,6 +905,8 @@ def analysis_payload(analysis: EpisodeAnalysis, *, max_points: int = 1200) -> di
         "joint_names": list(analysis.joint_names),
         "eef_method": analysis.eef_method,
         "arm_base_offset": list(analysis.arm_base_offset) if analysis.arm_base_offset is not None else None,
+        "arm_base_rotations": arm_base_rotation_metadata(analysis.arm_base_rotations),
+        "robot_type": analysis.robot_type,
         "arm_axis_convention": (
             ARM_BASE_AXIS_CONVENTION
             if analysis.arm_base_offset is not None or {"left", "right"}.issubset(analysis.eef)

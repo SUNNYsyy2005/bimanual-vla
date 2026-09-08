@@ -55,6 +55,12 @@ class DatasetOriginClassificationTest(unittest.TestCase):
                 dataset_origin_info("simulation_capture", sim, {"robot_type": "aloha"})["dataset_origin"],
                 "simulation",
             )
+            for robot_type in ("aloha-agilex", "ARX-X5", "franka-panda"):
+                with self.subTest(robot_type=robot_type):
+                    self.assertEqual(
+                        dataset_origin_info("capture", sim, {"robot_type": robot_type})["dataset_origin"],
+                        "simulation",
+                    )
             marker = sim / "meta" / "dashboard_dataset_origin.json"
             marker.write_text(json.dumps({"origin": "real", "source": "test"}), encoding="utf-8")
             marked = dataset_origin_info("simulation_capture", sim, {"robot_type": "aloha"})

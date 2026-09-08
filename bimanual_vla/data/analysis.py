@@ -15,6 +15,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from bimanual_vla.data.arm_geometry import normalize_arm_base_offset, normalize_arm_base_rotations
 from bimanual_vla.data.episode_analysis import compute_eef_trajectory
 
 
@@ -33,6 +34,18 @@ def _scalar(value: Any, default: Any = None) -> Any:
         value = value.item()
     except AttributeError:
         pass
+    return value
+
+
+def _metadata_value(value: Any) -> Any:
+    value = _scalar(value)
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    if isinstance(value, np.ndarray):
+        return value.tolist()
     return value
 
 
@@ -135,8 +148,19 @@ def _load_episode(path: Path) -> AnalysisData:
         ).reshape(-1)
         names = _names(archive["state_names"] if "state_names" in archive else None, width)
         metadata = {
-            key: _scalar(archive[key])
-            for key in ("task", "instruction", "schema", "arm_mode", "arm_side", "fps", "success")
+            key: _metadata_value(archive[key])
+            for key in (
+                "task",
+                "instruction",
+                "schema",
+                "arm_mode",
+                "arm_side",
+                "fps",
+                "success",
+                "robot_type",
+                "arm_base_offset",
+                "arm_base_rotations",
+            )
             if key in archive
         }
     count = min(len(timestamps), len(measured), len(desired))
@@ -366,23 +390,32 @@ def compute_end_effector_positions(
     start_index: int = 0,
     end_index: int | None = None,
 ) -> dict[str, np.ndarray]:
-    """Compute Piper XYZ trajectories from joint-space state/action data.
-
-    Uses the same Piper SDK FK as the runtime when available, with a deterministic
-    approximate fallback for machines that only need offline visualization.
-    Joint data is expected in left/right blocks of 7 values; delivery (10D pose)
-    data is intentionally skipped because it is already a pose representation.
-    """
-    if data.measured.ndim != 2 or data.measured.shape[1] not in (7, 14):
+    """Compute per-arm XYZ trajectories using the declared robot geometry."""
+    if data.measured.ndim != 2 or data.measured.shape[1] not in (7, 8, 14, 16):
         return {}
     end = data.sample_count - 1 if end_index is None else min(end_index, data.sample_count - 1)
     start = max(0, min(start_index, end))
     arm_side = str(data.metadata.get("arm_side") or "right")
+    robot_type = data.metadata.get("robot_type")
+    arm_base_offset = data.metadata.get("arm_base_offset")
+    arm_base_rotations = data.metadata.get("arm_base_rotations")
+    if arm_base_offset is not None:
+        arm_base_offset = normalize_arm_base_offset(arm_base_offset)
+    if arm_base_rotations is not None:
+        arm_base_rotations = normalize_arm_base_rotations(arm_base_rotations)
     measured, _method = compute_eef_trajectory(
-        data.measured[start : end + 1], arm_side=arm_side
+        data.measured[start : end + 1],
+        arm_side=arm_side,
+        robot_type=robot_type,
+        arm_base_offset=arm_base_offset,
+        arm_base_rotations=arm_base_rotations,
     )
     desired, _method = compute_eef_trajectory(
-        data.desired[start : end + 1], arm_side=arm_side
+        data.desired[start : end + 1],
+        arm_side=arm_side,
+        robot_type=robot_type,
+        arm_base_offset=arm_base_offset,
+        arm_base_rotations=arm_base_rotations,
     )
     result: dict[str, np.ndarray] = {}
     for side, values in measured.items():
