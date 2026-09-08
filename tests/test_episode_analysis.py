@@ -71,7 +71,7 @@ class EpisodeAnalysisTest(unittest.TestCase):
         state = np.zeros((2, 16), dtype=np.float64)
         payload = analysis_payload(analyze_episode(state, state))
         self.assertEqual(payload["arm_axis_signs"], {"left": [1, 1, 1], "right": [1, 1, 1]})
-        self.assertEqual(payload["arm_axis_convention"], "per_arm_base_frame_no_implicit_mirror")
+        self.assertEqual(payload["arm_axis_convention"], "per_arm_base_frame_explicit_rotations")
 
     def test_bimanual_eef_trajectory_applies_right_base_offset(self):
         state = np.zeros((2, 16), dtype=np.float64)
@@ -141,7 +141,7 @@ class EpisodeAnalysisTest(unittest.TestCase):
             atol=1e-12,
         )
 
-    def test_real_piper_keeps_explicit_common_frame_without_robotwin_rotation(self):
+    def test_real_piper_applies_right_arm_xy_central_symmetry(self):
         state = np.zeros((1, 14), dtype=np.float64)
         local = analyze_episode(
             state,
@@ -154,8 +154,15 @@ class EpisodeAnalysisTest(unittest.TestCase):
             dataset_origin="real",
             arm_base_offset=[0.8, 0.0, 0.0],
         )
-        for side in ("left", "right"):
-            np.testing.assert_allclose(real.eef[side]["position"], local.eef[side]["position"])
+        np.testing.assert_allclose(real.eef["left"]["position"], local.eef["left"]["position"])
+        expected_right = local.eef["right"]["position"].copy()
+        expected_right[:, :2] *= -1.0
+        expected_right[:, 0] += 0.8
+        np.testing.assert_allclose(real.eef["right"]["position"], expected_right)
+        np.testing.assert_allclose(
+            real.arm_base_rotations["right"],
+            [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
+        )
 
     def test_explicit_arm_base_rotation_transforms_position_and_orientation(self):
         state = np.zeros((1, 16), dtype=np.float64)

@@ -10,7 +10,7 @@ import numpy as np
 
 ARM_BASE_OFFSET_KEY = "arm_base_offset"
 ARM_BASE_ROTATIONS_KEY = "arm_base_rotations"
-ARM_BASE_AXIS_CONVENTION = "per_arm_base_frame_no_implicit_mirror"
+ARM_BASE_AXIS_CONVENTION = "per_arm_base_frame_explicit_rotations"
 ARM_AXIS_SIGNS = {
     "left": (1, 1, 1),
     "right": (1, 1, 1),
@@ -18,6 +18,12 @@ ARM_AXIS_SIGNS = {
 
 ROBOTWIN_EMBODIMENTS = frozenset(
     {"aloha-agilex", "piper", "arx-x5", "franka-panda"}
+)
+
+
+REAL_PIPER_RIGHT_BASE_ROTATION = np.asarray(
+    [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
+    dtype=np.float64,
 )
 
 
@@ -141,6 +147,7 @@ __all__ = [
     "ARM_BASE_ROTATIONS_KEY",
     "ARM_BASE_AXIS_CONVENTION",
     "ARM_AXIS_SIGNS",
+    "REAL_PIPER_RIGHT_BASE_ROTATION",
     "ROBOTWIN_EMBODIMENTS",
     "arm_base_axis_signs",
     "arm_base_offset_metadata",

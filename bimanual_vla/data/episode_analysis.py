@@ -25,6 +25,7 @@ from bimanual_vla.data.arm_geometry import (
     normalize_arm_base_offset,
     normalize_arm_base_rotations,
     normalize_robot_type,
+    REAL_PIPER_RIGHT_BASE_ROTATION,
 )
 
 
@@ -558,6 +559,17 @@ def _resolve_arm_geometry(
             merged_rotations = dict(default_rotations)
             merged_rotations.update(rotations or {})
             rotations = merged_rotations
+    elif (
+        str(dataset_origin or "").strip().lower() in {"real", "hardware", "physical"}
+        and normalize_robot_type(robot_type) == "piper"
+        and bimanual
+    ):
+        merged_rotations = {
+            "left": np.eye(3, dtype=np.float64),
+            "right": REAL_PIPER_RIGHT_BASE_ROTATION.copy(),
+        }
+        merged_rotations.update(rotations or {})
+        rotations = merged_rotations
     return offset, rotations
 
 
