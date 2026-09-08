@@ -146,7 +146,6 @@ class EpisodeAnalysisTest(unittest.TestCase):
         local = analyze_episode(
             state,
             robot_type="piper",
-            arm_base_offset=[0.8, 0.0, 0.0],
         )
         real = analyze_episode(
             state,
