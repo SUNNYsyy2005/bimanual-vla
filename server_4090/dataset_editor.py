@@ -46,7 +46,6 @@ from bimanual_vla.data.episode_analysis import (
     analyze_episode,
     frame_payload,
 )
-from bimanual_vla.data.arm_geometry import normalize_arm_base_offset
 
 
 EPISODE_FILE = re.compile(r"episode_(\d+)\.parquet$")
@@ -1306,6 +1305,8 @@ class DatasetEditor:
             fps=info.get("fps", 20),
             arm_side=str(contract.get("arm_side") or info.get("arm_side") or "right"),
             arm_base_offset=info.get("arm_base_offset"),
+            arm_base_rotations=info.get("arm_base_rotations"),
+            robot_type=info.get("robot_type"),
         )
         self._analysis_cache[cache_key] = analysis
         if len(self._analysis_cache) > 12:

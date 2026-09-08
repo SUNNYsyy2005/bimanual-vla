@@ -95,7 +95,7 @@ def inventory_refresh_snippet(target: dict[str, Any]) -> str:
         if robot_type == 'piper': return 'real'
         if __import__('re').search(r'(?:^|[._-])real(?:[._-]|$)', name) or name == 'my_dataset': return 'real'
         simulation_name = any(token in name for token in ('sim','synth','synthetic','smoke','robottwin'))
-        if simulation_name or robot_type in {{'aloha','sim','simulation'}} or (robot_type.startswith('piper_single_arm') and bool((info or {{}}).get('video_path'))): return 'simulation'
+        if simulation_name or robot_type in {{'aloha','aloha_agilex','aloha-agilex','arx-x5','franka-panda','franka_panda','sim','simulation'}} or (robot_type.startswith('piper_single_arm') and bool((info or {{}}).get('video_path'))): return 'simulation'
         if 'piper' in robot_type: return 'real'
         return 'unknown'
     rows=[]

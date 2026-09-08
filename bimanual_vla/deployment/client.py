@@ -71,6 +71,13 @@ from bimanual_vla.data.contract import (
     STATE_NAMES,
     build_delivery_state,
 )
+from bimanual_vla.deployment.trajectory import (
+    JerkLimitedJointTrajectory,
+    TrajectoryTrackingError,
+    gripper_open_lookahead,
+    rate_limit_grippers,
+    smootherstep,
+)
 
 
 RAD_FACTOR = 57295.7795  # Piper unit: 0.001 degree -> rad
@@ -110,6 +117,17 @@ DEFAULT_TRACKING_LAG_THRESHOLD_RAD = 0.10
 DEFAULT_TRACKING_LAG_CONFIRM_CYCLES = 3
 DEFAULT_ARM_HOLD_TOLERANCE_RAD = 0.05
 DEFAULT_JOINT_LIMIT_TOLERANCE_RAD = 0.05
+DEFAULT_TRAJECTORY_MAX_SPEED_RAD_S = 0.30
+DEFAULT_TRAJECTORY_MAX_ACCELERATION_RAD_S2 = 0.80
+DEFAULT_TRAJECTORY_MAX_JERK_RAD_S3 = 4.0
+DEFAULT_TRAJECTORY_SMOOTHING_CUTOFF_HZ = 3.0
+DEFAULT_TRAJECTORY_TRACKING_TIME_CONSTANT_S = 0.25
+DEFAULT_TRAJECTORY_COMMAND_LOOKAHEAD_RAD = 0.02
+DEFAULT_TRAJECTORY_MAX_TRACKING_ERROR_RAD = 0.35
+DEFAULT_GRIPPER_OPEN_LOOKAHEAD_STEPS = 30
+DEFAULT_RETURN_HZ = 20.0
+DEFAULT_RETURN_TIMEOUT_S = 30.0
+DEFAULT_EXTERNAL_CONTROL_HZ_THRESHOLD = 1.0
 GRIPPER_OPENING_FRACTION = NEW_GRIPPER_SEMANTICS
 GRIPPER_CLOSED_FRACTION = LEGACY_GRIPPER_SEMANTICS
 GRIPPER_OPENING_METRES = LEGACY_GRIPPER_OPENING_METRES_SEMANTICS
@@ -1384,6 +1402,95 @@ def _opening_fraction(
     raise ExecutionBlocked(f"unsupported gripper semantics: {semantics!r}")
 
 
+def _gripper_value_from_opening_fraction(
+    opening_fraction: float,
+    *,
+    semantics: str,
+) -> float:
+    """Encode a normalized opening fraction in the policy's wire semantics."""
+    opening = float(np.clip(opening_fraction, 0.0, 1.0))
+    if semantics == GRIPPER_OPENING_FRACTION:
+        return opening
+    if semantics == GRIPPER_CLOSED_FRACTION:
+        return 1.0 - opening
+    if semantics == GRIPPER_OPENING_METRES:
+        return opening * GRIPPER_MAX_M
+    raise ExecutionBlocked(f"unsupported gripper semantics: {semantics!r}")
+
+
+def apply_gripper_open_lookahead(
+    actions: list[DecodedQueuedAction],
+    protocol: PolicyProtocol,
+    *,
+    lookahead_steps: int,
+    tolerance: float = DEFAULT_GRIPPER_RANGE_TOLERANCE,
+) -> list[DecodedQueuedAction]:
+    """Advance opening requests across an accepted action chunk.
+
+    The queue stores decoded absolute targets, so this works for both joint
+    and delivery policies without changing the model's delta convention.
+    Closing is never anticipated: a future open request can only hold or
+    increase the current opening.
+    """
+    if lookahead_steps <= 0 or not actions:
+        return actions
+    arm_count = 2 if protocol.arm_mode == "bimanual" else 1
+    gripper_stride = 10 if protocol.schema == "delivery" else 7
+    output = list(actions)
+    for arm_index in range(arm_count):
+        target_index = arm_index * gripper_stride + (9 if protocol.schema == "delivery" else 6)
+        openings = np.asarray(
+            [
+                _opening_fraction(
+                    float(item.absolute_target[target_index]),
+                    semantics=protocol.gripper_semantics,
+                    tolerance=tolerance,
+                )
+                for item in actions
+            ],
+            dtype=np.float64,
+        )
+        for index, item in enumerate(actions):
+            stop = min(len(actions), index + int(lookahead_steps) + 1)
+            anticipated = float(np.max(openings[index:stop]))
+            if anticipated <= openings[index] + 1e-9:
+                continue
+            absolute = item.absolute_target.copy()
+            absolute[target_index] = _gripper_value_from_opening_fraction(
+                anticipated,
+                semantics=protocol.gripper_semantics,
+            )
+            output[index] = replace(item, absolute_target=absolute)
+    return output
+
+
+def check_external_control_streams(
+    piper: Any,
+    *,
+    threshold_hz: float = DEFAULT_EXTERNAL_CONTROL_HZ_THRESHOLD,
+) -> None:
+    """Reject a Piper already driven by another high-rate control stream.
+
+    The SDK exposes the active JointCtrl/GripperCtrl rates on real hardware.
+    Test doubles and older SDKs may omit these getters; those are treated as
+    unknown rather than making the deployment unusable.
+    """
+    for name in ("GetArmJointCtrl", "GetArmGripperCtrl"):
+        getter = getattr(piper, name, None)
+        if not callable(getter):
+            continue
+        try:
+            control = getter()
+            hz = float(getattr(control, "Hz", 0.0) or 0.0)
+        except Exception:
+            continue
+        if math.isfinite(hz) and hz > float(threshold_hz):
+            raise ExecutionBlocked(
+                f"external {name} stream detected at {hz:.2f}Hz; "
+                "refusing concurrent Piper control"
+            )
+
+
 def decode_action_queue(
     actions: Any,
     protocol: PolicyProtocol,
@@ -1799,6 +1906,7 @@ def blend_absolute_trajectories(
     protocol: PolicyProtocol,
     *,
     blend_steps: int,
+    blend_profile: str = "linear",
 ) -> list[DecodedQueuedAction]:
     """Build a complete candidate queue, then callers atomically swap it in."""
     if not old_actions:
@@ -1809,11 +1917,20 @@ def blend_absolute_trajectories(
         raise ExecutionBlocked(
             f"new trajectory has {len(new_actions)} rows, fewer than {blend_steps} blend rows"
         )
+    if blend_profile not in {"linear", "smootherstep"}:
+        raise ExecutionBlocked(
+            f"blend_profile must be linear or smootherstep, got {blend_profile!r}"
+        )
     blended: list[DecodedQueuedAction] = []
     for index in range(blend_steps):
         old_action = old_actions[min(index, len(old_actions) - 1)]
         new_action = new_actions[index]
-        alpha = (index + 1) / blend_steps
+        progress = (index + 1) / blend_steps
+        alpha = (
+            smootherstep(progress)
+            if blend_profile == "smootherstep"
+            else progress
+        )
         blended.append(
             DecodedQueuedAction(
                 queue_index=new_action.queue_index,
@@ -2026,6 +2143,55 @@ class ExecutionController:
         )
         self.action_chunk_steps = self.min_action_chunk_steps  # legacy telemetry alias
         self.blend_steps = int(getattr(args, "blend_steps", DEFAULT_BLEND_STEPS))
+        self.blend_profile = str(getattr(args, "blend_profile", "linear"))
+        self.trajectory_shaping = bool(getattr(args, "trajectory_shaping", False))
+        self.trajectory_max_speed_rad_s = float(
+            getattr(args, "trajectory_max_speed_rad_s", DEFAULT_TRAJECTORY_MAX_SPEED_RAD_S)
+        )
+        self.trajectory_max_acceleration_rad_s2 = float(
+            getattr(
+                args,
+                "trajectory_max_acceleration_rad_s2",
+                DEFAULT_TRAJECTORY_MAX_ACCELERATION_RAD_S2,
+            )
+        )
+        self.trajectory_max_jerk_rad_s3 = float(
+            getattr(args, "trajectory_max_jerk_rad_s3", DEFAULT_TRAJECTORY_MAX_JERK_RAD_S3)
+        )
+        self.trajectory_smoothing_cutoff_hz = float(
+            getattr(
+                args,
+                "trajectory_smoothing_cutoff_hz",
+                DEFAULT_TRAJECTORY_SMOOTHING_CUTOFF_HZ,
+            )
+        )
+        self.trajectory_tracking_time_constant_s = float(
+            getattr(
+                args,
+                "trajectory_tracking_time_constant_s",
+                DEFAULT_TRAJECTORY_TRACKING_TIME_CONSTANT_S,
+            )
+        )
+        self.trajectory_command_lookahead_rad = float(
+            getattr(
+                args,
+                "trajectory_command_lookahead_rad",
+                DEFAULT_TRAJECTORY_COMMAND_LOOKAHEAD_RAD,
+            )
+        )
+        self.trajectory_max_tracking_error_rad = float(
+            getattr(
+                args,
+                "trajectory_max_tracking_error_rad",
+                DEFAULT_TRAJECTORY_MAX_TRACKING_ERROR_RAD,
+            )
+        )
+        self.gripper_open_lookahead_steps = int(
+            getattr(args, "gripper_open_lookahead_steps", 0)
+        )
+        self.joint_trajectory: JerkLimitedJointTrajectory | None = None
+        self.last_command_monotonic: float | None = None
+        self.external_control_checked = False
         self.latency_skip_compensation_steps = int(
             getattr(args, "latency_skip_compensation_steps", 0)
         )
@@ -2208,6 +2374,26 @@ class ExecutionController:
             if self.rtc_enabled
             else requested_blend_steps
         )
+        # Minimal programmatic/test callers predate the CLI option and retain
+        # the historical linear profile.  The CLI always supplies the new
+        # smootherstep default explicitly.
+        self.blend_profile = str(
+            getattr(self.args, "blend_profile", "linear")
+        )
+        # Unit-test callers that construct a minimal Namespace retain the
+        # historical direct-command behavior.  The CLI explicitly enables
+        # shaping by default.
+        self.trajectory_shaping = bool(getattr(self.args, "trajectory_shaping", False))
+        self.gripper_open_lookahead_steps = int(
+            getattr(
+                self.args,
+                "gripper_open_lookahead_steps",
+                0,
+            )
+        )
+        self.joint_trajectory = None
+        self.last_command_monotonic = None
+        self.external_control_checked = False
         self.latency_skip_compensation_steps = int(
             getattr(self.args, "latency_skip_compensation_steps", 0)
         )
@@ -2294,6 +2480,75 @@ class ExecutionController:
     @property
     def pending_action_count(self) -> int:
         return len(self.pending_actions)
+
+    def _trajectory_limits(self, qpos_m: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Build per-joint limits while leaving gripper dimensions unconstrained."""
+        qpos = np.asarray(qpos_m, dtype=np.float32)
+        lower = np.full(qpos.shape, -np.inf, dtype=np.float32)
+        upper = np.full(qpos.shape, np.inf, dtype=np.float32)
+        arm_count = len(qpos) // 7
+        if len(qpos) != arm_count * 7 or arm_count not in {1, 2}:
+            raise ExecutionBlocked(f"trajectory qpos must be 7D or 14D, got {qpos.shape}")
+        for arm_index in range(arm_count):
+            offset = arm_index * 7
+            lower[offset : offset + 6] = JOINT_LIMITS_RAD[:, 0]
+            upper[offset : offset + 6] = JOINT_LIMITS_RAD[:, 1]
+        return lower, upper
+
+    def _shape_prepared_targets(
+        self,
+        qpos_m: np.ndarray,
+        prepared: dict[str, tuple[np.ndarray, float]],
+        command_pipeline: dict[str, dict[str, Any]],
+        sides: tuple[str, ...],
+        *,
+        now_monotonic: float,
+    ) -> list[int]:
+        """Shape all arms as one vector so a bimanual boundary stays coordinated."""
+        if not self.trajectory_shaping:
+            return []
+        qpos = np.asarray(qpos_m, dtype=np.float32)
+        lower, upper = self._trajectory_limits(qpos)
+        if self.joint_trajectory is None or self.joint_trajectory.lower.shape != qpos.shape:
+            self.joint_trajectory = JerkLimitedJointTrajectory(
+                qpos,
+                lower,
+                upper,
+                max_speed_rad_s=self.trajectory_max_speed_rad_s,
+                max_acceleration_rad_s2=self.trajectory_max_acceleration_rad_s2,
+                max_jerk_rad_s3=self.trajectory_max_jerk_rad_s3,
+                smoothing_cutoff_hz=self.trajectory_smoothing_cutoff_hz,
+                tracking_time_constant_s=self.trajectory_tracking_time_constant_s,
+                command_lookahead_rad=self.trajectory_command_lookahead_rad,
+                max_tracking_error_rad=self.trajectory_max_tracking_error_rad,
+            )
+        proposed = qpos.copy()
+        for index, side in enumerate(sides):
+            joints, _ = prepared[side]
+            proposed[index * 7 : index * 7 + 6] = np.asarray(joints, dtype=np.float32)
+        dt = (
+            1.0 / max(self.control_hz, 1.0)
+            if self.last_command_monotonic is None
+            else float(
+                np.clip(now_monotonic - self.last_command_monotonic, 0.5 / max(self.control_hz, 1.0), 1.5 / max(self.control_hz, 1.0))
+            )
+        )
+        try:
+            shaped, held = self.joint_trajectory.update(qpos, proposed, dt)
+        except TrajectoryTrackingError as exc:
+            raise ExecutionBlocked(str(exc)) from exc
+        for index, side in enumerate(sides):
+            _, gripper_m = prepared[side]
+            target_joints = shaped[index * 7 : index * 7 + 6].copy()
+            prepared[side] = (target_joints, gripper_m)
+            command_pipeline[side]["trajectory_shaped"] = True
+            command_pipeline[side]["trajectory_held_joint_indices"] = [
+                int(item - index * 7)
+                for item in held
+                if index * 7 <= item < index * 7 + 6
+            ]
+            command_pipeline[side]["commanded_joints_rad"] = target_joints.tolist()
+        return held
 
     def allocate_inference_generation(self) -> int:
         generation = self._next_inference_generation
@@ -2560,6 +2815,36 @@ class ExecutionController:
             "last_actuator_command": self.last_actuator_command,
             "last_command_feedback": self.last_command_feedback,
             "estimated_actuator_delay_s": self.estimated_actuator_delay_s,
+            "trajectory_shaper": {
+                "enabled": self.trajectory_shaping,
+                "blend_profile": self.blend_profile,
+                "max_speed_rad_s": self.trajectory_max_speed_rad_s,
+                "max_acceleration_rad_s2": self.trajectory_max_acceleration_rad_s2,
+                "max_jerk_rad_s3": self.trajectory_max_jerk_rad_s3,
+                "smoothing_cutoff_hz": self.trajectory_smoothing_cutoff_hz,
+                "tracking_time_constant_s": self.trajectory_tracking_time_constant_s,
+                "command_lookahead_rad": self.trajectory_command_lookahead_rad,
+                "max_tracking_error_rad": self.trajectory_max_tracking_error_rad,
+                "last_command_monotonic": self.last_command_monotonic,
+                "state": (
+                    self.joint_trajectory.metrics()
+                    if self.joint_trajectory is not None
+                    else None
+                ),
+            },
+            "external_control_interlock": {
+                "enabled": bool(
+                    getattr(self.args, "reject_external_control_streams", False)
+                ),
+                "checked": self.external_control_checked,
+                "threshold_hz": float(
+                    getattr(
+                        self.args,
+                        "external_control_hz_threshold",
+                        DEFAULT_EXTERNAL_CONTROL_HZ_THRESHOLD,
+                    )
+                ),
+            },
             "tracking_lag_guard": {
                 "active": self.tracking_lag_active,
                 "threshold_rad": self.tracking_lag_threshold_rad,
@@ -3718,6 +4003,7 @@ class ExecutionController:
                     fresh_actions,
                     protocol,
                     blend_steps=blend_steps,
+                    blend_profile=self.blend_profile,
                 )
             except ExecutionBlocked as exc:
                 return self._reject_result(launch.generation, str(exc), arrived_at)
@@ -3726,6 +4012,19 @@ class ExecutionController:
             candidate = list(fresh_actions)
         if not candidate:
             return self._reject_result(launch.generation, "result has no executable rows", arrived_at)
+
+        candidate = apply_gripper_open_lookahead(
+            candidate,
+            protocol,
+            lookahead_steps=self.gripper_open_lookahead_steps,
+            tolerance=float(
+                getattr(
+                    self.args,
+                    "gripper_range_tolerance",
+                    DEFAULT_GRIPPER_RANGE_TOLERANCE,
+                )
+            ),
+        )
 
         # All decoding/blending/authorization checks finished. The control thread
         # performs one atomic list replacement; inference never mutates this queue.
@@ -3886,6 +4185,23 @@ class ExecutionController:
                 f"connected Piper sides {sorted(self.pipers)} do not match policy sides {list(sides)}",
             )
 
+        if (
+            not self.external_control_checked
+            and bool(getattr(self.args, "reject_external_control_streams", False))
+        ):
+            for side in sides:
+                check_external_control_streams(
+                    self.pipers[side],
+                    threshold_hz=float(
+                        getattr(
+                            self.args,
+                            "external_control_hz_threshold",
+                            DEFAULT_EXTERNAL_CONTROL_HZ_THRESHOLD,
+                        )
+                    ),
+                )
+            self.external_control_checked = True
+
         safety_hold_only = False
         # Enable and post-enable hold are handled before timed-plan selection.
         # Otherwise the queue advances by wall time while the controller is still
@@ -4000,6 +4316,10 @@ class ExecutionController:
                     side,
                 )
                 self.robot_enabled.discard(side)
+            if lost_control_mode:
+                self.external_control_checked = False
+                self.joint_trajectory = None
+                self.last_command_monotonic = None
 
             missing_enabled = [side for side in sides if side not in self.robot_enabled]
             if missing_enabled:
@@ -4233,6 +4553,14 @@ class ExecutionController:
                     }
                 else:
                     raise ExecutionBlocked(f"unsupported execution schema: {protocol.schema}")
+
+            self._shape_prepared_targets(
+                qpos_m,
+                prepared,
+                command_pipeline,
+                sides,
+                now_monotonic=now_monotonic,
+            )
             target_prevalidation = False
 
             # Blend and hold never bypass safety: both arms are fully prevalidated
@@ -4373,6 +4701,7 @@ class ExecutionController:
             if not self.pending_actions:
                 self.timeline_resync_active = False
         self.last_queued_action_index = queued.queue_index
+        self.last_command_monotonic = time.monotonic()
         self.queued_action_index = self.pending_actions[0].queue_index if self.pending_actions else None
         self.last_wire_action = queued.wire_action.tolist()
         decoded_absolute_target = self._target_telemetry(
@@ -4700,6 +5029,129 @@ def build_client_transport_timing(
     }
 
 
+def return_pipers_to_initial(
+    pipers: dict[str, Any],
+    initial_qpos: np.ndarray,
+    *,
+    arm_mode: str,
+    speed_pct: int,
+    hz: float,
+    timeout_s: float,
+    max_feedback_age_s: float,
+    max_gripper_speed_m_s: float = 0.08,
+    max_joint_speed_rad_s: float = DEFAULT_TRAJECTORY_MAX_SPEED_RAD_S,
+    max_joint_acceleration_rad_s2: float = DEFAULT_TRAJECTORY_MAX_ACCELERATION_RAD_S2,
+    max_joint_jerk_rad_s3: float = DEFAULT_TRAJECTORY_MAX_JERK_RAD_S3,
+    smoothing_cutoff_hz: float = DEFAULT_TRAJECTORY_SMOOTHING_CUTOFF_HZ,
+    tracking_time_constant_s: float = DEFAULT_TRAJECTORY_TRACKING_TIME_CONSTANT_S,
+    command_lookahead_rad: float = DEFAULT_TRAJECTORY_COMMAND_LOOKAHEAD_RAD,
+    max_tracking_error_rad: float = DEFAULT_TRAJECTORY_MAX_TRACKING_ERROR_RAD,
+    hold_tolerance_rad: float = DEFAULT_ARM_HOLD_TOLERANCE_RAD,
+) -> dict[str, Any]:
+    """Move all commanded arms back to their captured startup pose safely."""
+    sides = ("left", "right") if arm_mode == "bimanual" else tuple(pipers)
+    initial = np.asarray(initial_qpos, dtype=np.float32)
+    if initial.shape != (7 * len(sides),) or not np.isfinite(initial).all():
+        raise ExecutionBlocked(f"initial return pose must be finite {7 * len(sides)}D")
+    if not math.isfinite(float(hz)) or hz <= 0:
+        raise ValueError("return hz must be positive")
+    if not math.isfinite(float(timeout_s)) or timeout_s <= 0:
+        raise ValueError("return timeout must be positive")
+    lower = np.full(initial.shape, -np.inf, dtype=np.float32)
+    upper = np.full(initial.shape, np.inf, dtype=np.float32)
+    for index in range(len(sides)):
+        offset = index * 7
+        lower[offset : offset + 6] = JOINT_LIMITS_RAD[:, 0]
+        upper[offset : offset + 6] = JOINT_LIMITS_RAD[:, 1]
+    home = initial.copy()
+    for index in range(len(sides)):
+        offset = index * 7
+        home[offset : offset + 6] = np.clip(
+            home[offset : offset + 6], lower[offset : offset + 6], upper[offset : offset + 6]
+        )
+    current = np.concatenate(
+        [read_output_qpos(pipers[side], max_feedback_age_s=max_feedback_age_s) for side in sides]
+    ).astype(np.float32)
+    shaper = JerkLimitedJointTrajectory(
+        current,
+        lower,
+        upper,
+        max_speed_rad_s=max_joint_speed_rad_s,
+        max_acceleration_rad_s2=max_joint_acceleration_rad_s2,
+        max_jerk_rad_s3=max_joint_jerk_rad_s3,
+        smoothing_cutoff_hz=smoothing_cutoff_hz,
+        tracking_time_constant_s=tracking_time_constant_s,
+        command_lookahead_rad=command_lookahead_rad,
+        max_tracking_error_rad=max_tracking_error_rad,
+    )
+    gripper_indices = np.asarray(
+        [index * 7 + 6 for index in range(len(sides))], dtype=np.int64
+    )
+    previous_gripper = current[gripper_indices].copy()
+    period = 1.0 / float(hz)
+    started = time.monotonic()
+    last_tick = started
+    sent = 0
+    joint_error = float("inf")
+    gripper_error = float("inf")
+    while time.monotonic() - started < float(timeout_s):
+        tick = time.monotonic()
+        dt = (
+            period
+            if sent == 0
+            else float(np.clip(tick - last_tick, 0.5 * period, 1.5 * period))
+        )
+        last_tick = tick
+        current = np.concatenate(
+            [read_output_qpos(pipers[side], max_feedback_age_s=max_feedback_age_s) for side in sides]
+        ).astype(np.float32)
+        joint_error = float(np.max(np.abs(current[shaper.joint_indices] - home[shaper.joint_indices])))
+        gripper_error = float(np.max(np.abs(current[gripper_indices] - home[gripper_indices])))
+        if joint_error <= float(hold_tolerance_rad) and gripper_error <= 0.001:
+            return {
+                "returned": True,
+                "elapsed_s": time.monotonic() - started,
+                "sent_commands": sent,
+                "joint_error_rad": joint_error,
+                "gripper_error_m": gripper_error,
+            }
+        for side in sides:
+            status = arm_status_dict(pipers[side])
+            if status.get("arm_status") != PIPER_ARM_STATUS_NORMAL or status.get("err_code") != 0:
+                raise ExecutionBlocked(f"{side} Piper unhealthy during return: {status}")
+        shaped, _ = shaper.update(current, home, dt)
+        gripper_target = rate_limit_grippers(
+            current[gripper_indices],
+            home[gripper_indices],
+            max_speed_m_s=max_gripper_speed_m_s,
+            dt=dt,
+            previous_target_m=previous_gripper,
+        )
+        previous_gripper = gripper_target.copy()
+        for side in sides:
+            pipers[side].ModeCtrl(0x01, 0x01, int(speed_pct), 0x00)
+        for index, side in enumerate(sides):
+            offset = index * 7
+            pipers[side].JointCtrl(
+                *[int(round(float(value) * RAD_FACTOR)) for value in shaped[offset : offset + 6]]
+            )
+        for index, side in enumerate(sides):
+            pipers[side].GripperCtrl(
+                int(round(float(gripper_target[index]) * GRIPPER_FACTOR)),
+                1000,
+                0x01,
+                0,
+            )
+        sent += 1
+        sleep_s = started + sent * period - time.monotonic()
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+    raise TimeoutError(
+        f"return-to-initial timed out after {timeout_s:.1f}s; "
+        f"joint_error={joint_error:.4f}rad gripper_error={gripper_error:.4f}m"
+    )
+
+
 def run_rtc_client(args: argparse.Namespace) -> None:
     """Run the physical robot RTC control loop, never a GUI inference preview.
 
@@ -4764,6 +5216,9 @@ def run_rtc_client(args: argparse.Namespace) -> None:
     protocol = None
     count = 0
     command_count = 0
+    initial_qpos: np.ndarray | None = None
+    return_attempted = False
+    returned_to_initial = False
     once_result_accepted = False
     last_reconnect_attempt = 0.0
     prompt_revision = 0
@@ -4796,6 +5251,19 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                 info["shape"],
                 info["latency_ms"],
             )
+        sides_for_initial = (
+            ("left", "right") if args.arm_mode == "bimanual" else (args.arm_side,)
+        )
+        initial_qpos = np.concatenate(
+            [
+                read_output_qpos(
+                    pipers[side],
+                    max_feedback_age_s=args.max_feedback_age_s,
+                )
+                for side in sides_for_initial
+            ]
+        ).astype(np.float32)
+        monitoring.record("initial_pose_captured", qpos_m=initial_qpos)
         recorder.start(
             {
                 "source_name": source_name,
@@ -5342,8 +5810,98 @@ def run_rtc_client(args: argparse.Namespace) -> None:
         close_policy(policy)
         preview.close()
         cameras.close()
+        if (
+            bool(getattr(args, "auto_return", True))
+            and initial_qpos is not None
+            and command_count > 0
+        ):
+            return_attempted = True
+            try:
+                return_summary = return_pipers_to_initial(
+                    pipers,
+                    initial_qpos,
+                    arm_mode=args.arm_mode,
+                    speed_pct=int(
+                        getattr(args, "return_speed_pct", None) or args.speed_pct
+                    ),
+                    hz=float(getattr(args, "return_hz", DEFAULT_RETURN_HZ)),
+                    timeout_s=float(
+                        getattr(args, "return_timeout_s", DEFAULT_RETURN_TIMEOUT_S)
+                    ),
+                    max_feedback_age_s=float(args.max_feedback_age_s),
+                    max_gripper_speed_m_s=0.08,
+                    max_joint_speed_rad_s=float(
+                        getattr(
+                            args,
+                            "trajectory_max_speed_rad_s",
+                            DEFAULT_TRAJECTORY_MAX_SPEED_RAD_S,
+                        )
+                    ),
+                    max_joint_acceleration_rad_s2=float(
+                        getattr(
+                            args,
+                            "trajectory_max_acceleration_rad_s2",
+                            DEFAULT_TRAJECTORY_MAX_ACCELERATION_RAD_S2,
+                        )
+                    ),
+                    max_joint_jerk_rad_s3=float(
+                        getattr(
+                            args,
+                            "trajectory_max_jerk_rad_s3",
+                            DEFAULT_TRAJECTORY_MAX_JERK_RAD_S3,
+                        )
+                    ),
+                    smoothing_cutoff_hz=float(
+                        getattr(
+                            args,
+                            "trajectory_smoothing_cutoff_hz",
+                            DEFAULT_TRAJECTORY_SMOOTHING_CUTOFF_HZ,
+                        )
+                    ),
+                    tracking_time_constant_s=float(
+                        getattr(
+                            args,
+                            "trajectory_tracking_time_constant_s",
+                            DEFAULT_TRAJECTORY_TRACKING_TIME_CONSTANT_S,
+                        )
+                    ),
+                    command_lookahead_rad=float(
+                        getattr(
+                            args,
+                            "trajectory_command_lookahead_rad",
+                            DEFAULT_TRAJECTORY_COMMAND_LOOKAHEAD_RAD,
+                        )
+                    ),
+                    max_tracking_error_rad=float(
+                        getattr(
+                            args,
+                            "trajectory_max_tracking_error_rad",
+                            DEFAULT_TRAJECTORY_MAX_TRACKING_ERROR_RAD,
+                        )
+                    ),
+                    hold_tolerance_rad=float(
+                        getattr(args, "arm_hold_tolerance_rad", DEFAULT_ARM_HOLD_TOLERANCE_RAD)
+                    ),
+                )
+                returned_to_initial = bool(return_summary.get("returned"))
+                monitoring.record("return_to_initial_completed", **return_summary)
+            except Exception as exc:
+                monitoring.record(
+                    "return_to_initial_failed",
+                    error=repr(exc),
+                )
+                logging.exception("Failed to return Piper to initial pose")
         for piper in pipers.values():
-            piper.DisconnectPort()
+            try:
+                piper.DisconnectPort()
+            except Exception:
+                logging.exception("Failed to disconnect Piper")
+        monitoring.record(
+            "deployment_finished",
+            command_count=command_count,
+            return_attempted=return_attempted,
+            returned_to_initial=returned_to_initial,
+        )
         monitoring.close(reason="stopped")
 
 
@@ -5461,6 +6019,53 @@ def main() -> None:
         help="pose/joint old/new blend length (default 3; gripper is not interpolated)",
     )
     parser.add_argument(
+        "--blend-profile",
+        choices=("linear", "smootherstep"),
+        default="smootherstep",
+        help="boundary interpolation profile; smootherstep has zero slope at both ends",
+    )
+    parser.add_argument(
+        "--trajectory-shaping",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="apply velocity/acceleration/jerk-limited joint trajectory shaping",
+    )
+    parser.add_argument(
+        "--trajectory-max-speed-rad-s",
+        type=float,
+        default=DEFAULT_TRAJECTORY_MAX_SPEED_RAD_S,
+    )
+    parser.add_argument(
+        "--trajectory-max-acceleration-rad-s2",
+        type=float,
+        default=DEFAULT_TRAJECTORY_MAX_ACCELERATION_RAD_S2,
+    )
+    parser.add_argument(
+        "--trajectory-max-jerk-rad-s3",
+        type=float,
+        default=DEFAULT_TRAJECTORY_MAX_JERK_RAD_S3,
+    )
+    parser.add_argument(
+        "--trajectory-smoothing-cutoff-hz",
+        type=float,
+        default=DEFAULT_TRAJECTORY_SMOOTHING_CUTOFF_HZ,
+    )
+    parser.add_argument(
+        "--trajectory-tracking-time-constant-s",
+        type=float,
+        default=DEFAULT_TRAJECTORY_TRACKING_TIME_CONSTANT_S,
+    )
+    parser.add_argument(
+        "--trajectory-command-lookahead-rad",
+        type=float,
+        default=DEFAULT_TRAJECTORY_COMMAND_LOOKAHEAD_RAD,
+    )
+    parser.add_argument(
+        "--trajectory-max-tracking-error-rad",
+        type=float,
+        default=DEFAULT_TRAJECTORY_MAX_TRACKING_ERROR_RAD,
+    )
+    parser.add_argument(
         "--actuator-delay-s",
         type=float,
         default=DEFAULT_ACTUATOR_DELAY_S,
@@ -5510,6 +6115,12 @@ def main() -> None:
         type=int,
         default=DEFAULT_GRIPPER_CONFIRM_STEPS,
         help="consecutive endpoint requests required before open/closed transition",
+    )
+    parser.add_argument(
+        "--gripper-open-lookahead-steps",
+        type=int,
+        default=DEFAULT_GRIPPER_OPEN_LOOKAHEAD_STEPS,
+        help="advance opening requests using a future action window; closing is never anticipated",
     )
     parser.add_argument("--instruction", default="pick up the cube")
     parser.add_argument("--source-name", default=None)
@@ -5651,6 +6262,31 @@ def main() -> None:
     parser.add_argument("--speed-pct", type=int, default=10)
     parser.add_argument("--gripper-effort", type=int, default=1000)
     parser.add_argument("--enable-timeout-s", type=float, default=3.0)
+    parser.add_argument(
+        "--reject-external-control-streams",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="refuse deployment when Piper reports another high-rate control stream",
+    )
+    parser.add_argument(
+        "--external-control-hz-threshold",
+        type=float,
+        default=DEFAULT_EXTERNAL_CONTROL_HZ_THRESHOLD,
+    )
+    parser.add_argument(
+        "--auto-return",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="smoothly return commanded arms to their startup pose before disconnect",
+    )
+    parser.add_argument("--return-hz", type=float, default=DEFAULT_RETURN_HZ)
+    parser.add_argument("--return-timeout-s", type=float, default=DEFAULT_RETURN_TIMEOUT_S)
+    parser.add_argument(
+        "--return-speed-pct",
+        type=int,
+        default=None,
+        help="return speed percentage; default reuses --speed-pct",
+    )
     args = parser.parse_args()
     if args.max_joint_gripper_step is not None and args.max_joint_gripper_step_m is not None:
         parser.error(
@@ -5662,6 +6298,8 @@ def main() -> None:
             if args.max_joint_gripper_step_m is not None
             else 0.25
         )
+    if args.return_speed_pct is None:
+        args.return_speed_pct = args.speed_pct
     args.max_image_state_skew_s = args.max_image_state_skew_ms / 1000.0
     if not 1 <= args.port <= 65535:
         parser.error("port must be in [1, 65535]")
@@ -5691,6 +6329,16 @@ def main() -> None:
         args.ik_rotation_tolerance_rad,
         args.gripper_lowpass_alpha,
         args.gripper_hysteresis,
+        args.trajectory_max_speed_rad_s,
+        args.trajectory_max_acceleration_rad_s2,
+        args.trajectory_max_jerk_rad_s3,
+        args.trajectory_smoothing_cutoff_hz,
+        args.trajectory_tracking_time_constant_s,
+        args.trajectory_command_lookahead_rad if args.trajectory_command_lookahead_rad > 0 else 1.0,
+        args.trajectory_max_tracking_error_rad,
+        args.external_control_hz_threshold,
+        args.return_hz,
+        args.return_timeout_s,
         args.arm_settle_s,
         args.arm_hold_tolerance_rad,
         args.enable_timeout_s,
@@ -5716,6 +6364,12 @@ def main() -> None:
         parser.error("latency-skip-compensation-steps must be non-negative")
     if args.actuator_delay_s < 0:
         parser.error("actuator-delay-s must be non-negative")
+    if args.trajectory_command_lookahead_rad < 0:
+        parser.error("trajectory-command-lookahead-rad must be non-negative")
+    if args.gripper_open_lookahead_steps < 0:
+        parser.error("gripper-open-lookahead-steps must be non-negative")
+    if not 1 <= args.return_speed_pct <= 100:
+        parser.error("return-speed-pct must be in [1,100]")
     if args.gripper_lowpass_alpha > 1:
         parser.error("gripper-lowpass-alpha must be in (0,1]")
     if not 0 < args.gripper_hysteresis < 0.5:

@@ -40,7 +40,7 @@ try:
 except ImportError:
     _piper_action_conventions = None
 
-from bimanual_vla.data.arm_geometry import normalize_arm_base_offset
+from bimanual_vla.data.arm_geometry import normalize_arm_base_offset, normalize_robot_type
 
 
 def _action_constant(name: str, default: str) -> str:
@@ -750,6 +750,7 @@ def dataset_origin_info(
 
     name = dataset_id.lower()
     robot_type = str(info.get("robot_type", "")).strip().lower()
+    normalized_robot_type = normalize_robot_type(robot_type)
     real_name = bool(re.search(r"(?:^|[._-])real(?:[._-]|$)", name) or name == "my_dataset")
     if robot_type == "piper" or real_name:
         return {
@@ -762,7 +763,7 @@ def dataset_origin_info(
     )
     if (
         simulation_name
-        or robot_type == "aloha"
+        or normalized_robot_type in {"aloha-agilex", "arx-x5", "franka-panda"}
         or (robot_type.startswith("piper_single_arm") and bool(info.get("video_path")))
     ):
         return {

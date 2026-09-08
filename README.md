@@ -243,6 +243,34 @@ gripper changes, IK feasibility, Piper state, and authorization on every control
 cycle. RTC is applied inside model denoising; it is not client-side interpolation.
 See the [RTC deployment guide](docs/deployment/RTC_CLIENT_GUIDE.md).
 
+### Smooth and fail-closed Piper execution
+
+The client now includes the execution-side techniques used by the Piper
+reference client:
+
+- `--trajectory-shaping` (enabled by default) applies a shared 7D/14D
+  velocity-, acceleration-, and jerk-limited trajectory state to both arms.
+  `--no-trajectory-shaping` is available for controlled A/B comparisons.
+- `--blend-profile smootherstep` gives action-chunk boundaries zero endpoint
+  slope. With RTC enabled, the extra client blend is disabled by default; use
+  `--rtc-client-blend-steps 2|3|4` only when an additional boundary blend is
+  wanted.
+- `--gripper-open-lookahead-steps 30` anticipates opening requests in the
+  accepted chunk while never anticipating a closing request. Grippers still
+  pass the independent low-pass, hysteresis, and rate limits.
+- `--reject-external-control-streams` refuses to start or resume when Piper
+  reports another high-rate `JointCtrl`/`GripperCtrl` stream.
+- `--auto-return` (enabled by default) records the startup pose and performs a
+  bounded, monitored return before disconnecting. Use `--no-auto-return` for a
+  deliberate exception.
+
+Useful tuning knobs are `--trajectory-max-speed-rad-s`,
+`--trajectory-max-acceleration-rad-s2`, `--trajectory-max-jerk-rad-s3`,
+`--trajectory-smoothing-cutoff-hz`, `--trajectory-tracking-time-constant-s`,
+and `--trajectory-command-lookahead-rad`. The active shaper state,
+interlock status, return result, and tracking errors are recorded in
+`monitoring_data/<session>/events.jsonl` and deployment recordings.
+
 ## Demo
 
 <p align="center">

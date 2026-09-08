@@ -3162,6 +3162,8 @@ def run_serve(args: argparse.Namespace) -> None:
             prefix_attention_schedule=args.rtc_prefix_attention_schedule,
             physical_action_dim=int(contract.model_action_dim),
             reanchor_action_mask=reanchor_action_mask,
+            temporal_consistency=bool(args.rtc_temporal_consistency),
+            temporal_seed=int(args.rtc_temporal_seed),
         )
         policy = build_rtc_policy(policy, rtc_config)
         policy_metadata.update(
@@ -3176,6 +3178,7 @@ def run_serve(args: argparse.Namespace) -> None:
                 "rtc_backend": rtc_backend,
                 "rtc_physical_action_dim": rtc_config.physical_action_dim,
                 "rtc_chunk_origin_reanchoring": bool(reanchor_action_mask),
+                "rtc_temporal_consistency": bool(rtc_config.temporal_consistency),
             }
         )
     else:
@@ -3313,6 +3316,18 @@ def parse_args() -> argparse.Namespace:
         "--rtc-prefix-attention-schedule",
         choices=("zeros", "ones", "linear", "exp"),
         default="linear",
+    )
+    serve.add_argument(
+        "--rtc-temporal-consistency",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="reuse a session-scoped JAX flow key across adjacent RTC chunks",
+    )
+    serve.add_argument(
+        "--rtc-temporal-seed",
+        type=int,
+        default=0,
+        help="base seed for session-scoped RTC temporal consistency",
     )
 
     args = parser.parse_args()

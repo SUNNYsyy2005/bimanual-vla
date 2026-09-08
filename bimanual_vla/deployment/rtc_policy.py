@@ -21,6 +21,7 @@ timing and queue progress never become VLA input features.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 import logging
 import threading
 import types
@@ -41,6 +42,8 @@ class RTCConfig:
     prefix_attention_schedule: str = "linear"
     physical_action_dim: int | None = None
     reanchor_action_mask: tuple[bool, ...] | None = None
+    temporal_consistency: bool = True
+    temporal_seed: int = 0
 
     def __post_init__(self) -> None:
         if self.execution_horizon <= 0:
@@ -64,6 +67,10 @@ class RTCConfig:
                 raise ValueError(
                     "RTC reanchor_action_mask length must equal physical_action_dim"
                 )
+        try:
+            object.__setattr__(self, "temporal_seed", int(self.temporal_seed))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("RTC temporal_seed must be an integer") from exc
 
 
 def _physical_action_mask_numpy(config: RTCConfig, action_dim: int) -> np.ndarray:
@@ -666,6 +673,7 @@ class _RTCSession:
     prompt_revision: int | None = None
     rtc_config: dict[str, Any] | None = None
     rtc_config_revision: int | None = None
+    temporal_rng: Any | None = None
 
 
 class RTCAwarePolicy:
@@ -677,10 +685,11 @@ class RTCAwarePolicy:
         self._sessions: dict[str, _RTCSession] = {}
         self._lock = threading.Lock()
         self._last_normalized_actions: np.ndarray | None = None
+        self._is_pytorch = bool(getattr(policy, "_is_pytorch_model", False))
         model = getattr(policy, "_model", None)
         if model is None:
             raise TypeError("OpenPI Policy does not expose its model")
-        if bool(getattr(policy, "_is_pytorch_model", False)):
+        if self._is_pytorch:
             patch_pytorch_model(model, config)
             sample_actions = model.sample_actions
         else:
@@ -707,6 +716,24 @@ class RTCAwarePolicy:
 
         # Policy.__init__ cached the old bound method in _sample_actions.
         policy._sample_actions = capture_normalized_actions
+
+    def _session_temporal_rng(self, session_id: str, session: _RTCSession) -> Any | None:
+        """Return a stable per-session JAX key for adjacent chunk consistency."""
+        if self._is_pytorch or not bool(self.config.temporal_consistency):
+            return None
+        if session.temporal_rng is not None:
+            return session.temporal_rng
+        try:
+            import jax
+        except ImportError:  # pragma: no cover - only relevant on non-JAX hosts
+            return None
+        digest = hashlib.blake2s(
+            f"{int(self.config.temporal_seed)}:{session_id}".encode("utf-8"),
+            digest_size=4,
+        ).digest()
+        seed = int.from_bytes(digest, "little", signed=False)
+        session.temporal_rng = jax.random.key(seed)
+        return session.temporal_rng
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -910,6 +937,14 @@ class RTCAwarePolicy:
                 sample_kwargs.pop("rtc_prefix_attention_schedule_id", None)
             old_kwargs = getattr(self.policy, "_sample_kwargs", {})
             self.policy._sample_kwargs = sample_kwargs
+            temporal_rng = self._session_temporal_rng(session_id, session)
+            if temporal_rng is not None:
+                # The upstream JAX Policy advances its private RNG during
+                # inference.  Reassigning the same session key before each
+                # receding-horizon request mirrors piper-pi05-client's
+                # temporal-consistency wrapper without sharing keys between
+                # independent robot sessions.
+                self.policy._rng = temporal_rng
             try:
                 result = dict(self.policy.infer(observation))
             finally:
@@ -1029,6 +1064,13 @@ class RTCAwarePolicy:
                 new_absolute_first.tolist() if new_absolute_first is not None else None
             ),
             "position_boundary_jump_l2": position_boundary_jump_l2,
+            "temporal_consistency": {
+                "enabled": bool(
+                    self.config.temporal_consistency and not self._is_pytorch
+                ),
+                "backend": "pytorch" if self._is_pytorch else "jax",
+                "session_scoped": True,
+            },
         }
         result["prompt"] = session.prompt
         result["prompt_revision"] = session.prompt_revision

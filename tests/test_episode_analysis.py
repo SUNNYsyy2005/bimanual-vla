@@ -67,11 +67,11 @@ class EpisodeAnalysisTest(unittest.TestCase):
         self.assertEqual(len(result["eef"]["left"]["position"]), 5)
         self.assertEqual(len(result["eef"]["right"]["position"]), 5)
 
-    def test_bimanual_payload_declares_right_x_mirror_without_offset(self):
+    def test_bimanual_payload_uses_non_mirrored_axes_without_offset(self):
         state = np.zeros((2, 16), dtype=np.float64)
         payload = analysis_payload(analyze_episode(state, state))
-        self.assertEqual(payload["arm_axis_signs"], {"left": [1, 1, 1], "right": [-1, 1, 1]})
-        self.assertEqual(payload["arm_axis_convention"], "left_base_common_frame_right_x_mirrored")
+        self.assertEqual(payload["arm_axis_signs"], {"left": [1, 1, 1], "right": [1, 1, 1]})
+        self.assertEqual(payload["arm_axis_convention"], "per_arm_base_frame_no_implicit_mirror")
 
     def test_bimanual_eef_trajectory_applies_right_base_offset(self):
         state = np.zeros((2, 16), dtype=np.float64)
@@ -92,7 +92,52 @@ class EpisodeAnalysisTest(unittest.TestCase):
         payload = analysis_payload(with_offset)
         self.assertEqual(payload["arm_base_offset"], [0.8, 0.0, 0.0])
         self.assertEqual(payload["arm_origins"]["right"], [0.8, 0.0, 0.0])
-        self.assertEqual(payload["arm_axis_signs"]["right"], [-1, 1, 1])
+        self.assertEqual(payload["arm_axis_signs"]["right"], [1, 1, 1])
+
+    def test_robot_type_routes_to_matching_joint_model(self):
+        state = np.zeros((2, 14), dtype=np.float64)
+        for robot_type in ("piper", "aloha-agilex", "ARX-X5"):
+            with self.subTest(robot_type=robot_type):
+                analysis = analyze_episode(state, state, robot_type=robot_type)
+                self.assertEqual(set(analysis.eef), {"left", "right"})
+                self.assertIn(robot_type.lower().split("-")[0], analysis.eef_method)
+                self.assertEqual(len(analysis.joint_names), 14)
+        franka = analyze_episode(np.zeros((2, 16)), np.zeros((2, 16)), robot_type="franka-panda")
+        self.assertEqual(franka.eef_method, "franka_panda_fk")
+        self.assertEqual(analyze_episode(state, state, robot_type="franka-panda").eef_method, "unavailable")
+
+    def test_aloha_uses_robotwin_embedded_base_geometry(self):
+        analysis = analyze_episode(np.zeros((1, 14)), robot_type="aloha-agilex")
+        payload = analysis_payload(analysis)
+        self.assertAlmostEqual(payload["arm_base_offset"][1], -0.6033, places=3)
+        self.assertEqual(payload["arm_base_rotations"]["left"], np.eye(3).tolist())
+        self.assertNotEqual(payload["arm_base_rotations"]["right"], np.eye(3).tolist())
+
+    def test_explicit_arm_base_rotation_transforms_position_and_orientation(self):
+        state = np.zeros((1, 16), dtype=np.float64)
+        rotation = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+        baseline = analyze_episode(state, robot_type="franka-panda")
+        analysis = analyze_episode(
+            state,
+            robot_type="franka-panda",
+            arm_base_rotations={"right": rotation},
+        )
+        baseline_position = baseline.eef["right"]["position"][0]
+        np.testing.assert_allclose(
+            analysis.eef["right"]["position"][0],
+            [
+                -baseline_position[1],
+                baseline_position[0],
+                baseline_position[2],
+            ],
+        )
+        self.assertFalse(
+            np.allclose(
+                analysis.eef["right"]["orientation"],
+                baseline.eef["right"]["orientation"],
+            )
+        )
+        self.assertEqual(analysis.arm_base_rotations["right"].tolist(), rotation)
 
     def test_motion_anomaly_detector_marks_reversal_jitter_and_spike(self):
         timestamps = np.arange(9, dtype=np.float64) / 20.0
