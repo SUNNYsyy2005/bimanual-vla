@@ -67,6 +67,33 @@ class EpisodeAnalysisTest(unittest.TestCase):
         self.assertEqual(len(result["eef"]["left"]["position"]), 5)
         self.assertEqual(len(result["eef"]["right"]["position"]), 5)
 
+    def test_bimanual_payload_declares_right_x_mirror_without_offset(self):
+        state = np.zeros((2, 16), dtype=np.float64)
+        payload = analysis_payload(analyze_episode(state, state))
+        self.assertEqual(payload["arm_axis_signs"], {"left": [1, 1, 1], "right": [-1, 1, 1]})
+        self.assertEqual(payload["arm_axis_convention"], "left_base_common_frame_right_x_mirrored")
+
+    def test_bimanual_eef_trajectory_applies_right_base_offset(self):
+        state = np.zeros((2, 16), dtype=np.float64)
+        without_offset = analyze_episode(state, state, arm_base_offset=None)
+        with_offset = analyze_episode(state, state, arm_base_offset=[0.8, 0.0, 0.0])
+        np.testing.assert_allclose(
+            with_offset.eef["left"]["position"],
+            without_offset.eef["left"]["position"],
+        )
+        np.testing.assert_allclose(
+            with_offset.eef["right"]["position"],
+            np.column_stack((
+                without_offset.eef["right"]["position"][:, 0] + 0.8,
+                without_offset.eef["right"]["position"][:, 1],
+                without_offset.eef["right"]["position"][:, 2],
+            )),
+        )
+        payload = analysis_payload(with_offset)
+        self.assertEqual(payload["arm_base_offset"], [0.8, 0.0, 0.0])
+        self.assertEqual(payload["arm_origins"]["right"], [0.8, 0.0, 0.0])
+        self.assertEqual(payload["arm_axis_signs"]["right"], [-1, 1, 1])
+
     def test_motion_anomaly_detector_marks_reversal_jitter_and_spike(self):
         timestamps = np.arange(9, dtype=np.float64) / 20.0
         state = np.zeros((9, 7), dtype=np.float64)

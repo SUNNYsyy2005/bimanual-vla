@@ -40,6 +40,8 @@ try:
 except ImportError:
     _piper_action_conventions = None
 
+from bimanual_vla.data.arm_geometry import normalize_arm_base_offset
+
 
 def _action_constant(name: str, default: str) -> str:
     return str(getattr(_piper_action_conventions, name, default))
@@ -1089,6 +1091,10 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
     # intentionally supported training dataset.
     training_supported = model_contract_supported
     training_error = None
+    try:
+        normalized_arm_base_offset = normalize_arm_base_offset(info.get("arm_base_offset"))
+    except ValueError:
+        normalized_arm_base_offset = None
     return {
         "schema": schema,
         "schema_label": schema_label,
@@ -1133,6 +1139,8 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
         "wire_gripper_semantics": model_gripper_semantics,
         "action_source": info.get("action_source"),
         "action_alignment": info.get("action_alignment"),
+        "arm_base_offset": info.get("arm_base_offset"),
+        "arm_base_offset_m": list(normalized_arm_base_offset) if normalized_arm_base_offset is not None else None,
         "action_offset": action_offset,
         "model_action_start_offset": model_action_start_offset,
         "model_action_start_offset_steps": model_action_start_offset,

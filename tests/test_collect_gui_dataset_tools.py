@@ -370,6 +370,20 @@ class DatasetSummaryTest(unittest.TestCase):
         self.assertIn("--merge", command)
         self.assertNotIn("--token", command)
 
+    def test_upload_command_carries_bimanual_arm_base_offset(self):
+        command = build_dataset_tool_command(
+            python_executable="/env/bin/python",
+            module_name="bimanual_vla.data.upload",
+            source_dir="episodes",
+            dataset_name="pick_cube_v1",
+            fps=20,
+            action="upload",
+            server="http://192.168.101.9:8090",
+            arm_base_offset=(0.8, 0.0, 0.0),
+        )
+        index = command.index("--arm-base-offset")
+        self.assertEqual(command[index + 1:index + 4], ["0.8", "0.0", "0.0"])
+
 
 class DatasetDiscoveryTest(unittest.TestCase):
     def test_existing_root_and_child_datasets_are_listed(self):

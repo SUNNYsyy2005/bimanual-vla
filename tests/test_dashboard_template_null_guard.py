@@ -132,8 +132,29 @@ class DashboardTemplateNullGuardTest(unittest.TestCase):
         self.assertIn("button.dataset.cameraSyncControl = 'play-pause-all'", template)
         self.assertIn("slider.dataset.cameraSyncControl = 'seek-all'", template)
         self.assertIn("三路强制同步", template)
+        self.assertIn("function toggleEpisodeFramePause()", template)
+        self.assertIn("function updateEpisodeFramePauseControl()", template)
+        self.assertIn("grid-auto-flow:column", template)
         self.assertIn("const DASHBOARD_BUILD =", template)
         self.assertIn("serverBuild !== DASHBOARD_BUILD", template)
+
+    def test_episode_editor_is_stacked_and_camera_module_follows_analysis_and_events(self):
+        template = (
+            REPO_ROOT / "server_4090/templates/index.html"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('id="episodeEditorSelector"', template)
+        self.assertIn("function renderEpisodeEditorSelector(episodes)", template)
+        self.assertIn("function setEpisodeEditorTab(tabName)", template)
+        self.assertIn('data-episode-editor-tab="analysis"', template)
+        self.assertIn('data-episode-editor-tab="events"', template)
+        self.assertIn('id="episodeCameraSlotAnalysis"', template)
+        self.assertIn('id="episodeCameraSlotEvents"', template)
+        self.assertIn('id="episodeCameraModule"', template)
+        self.assertIn("activeName === 'events' ? 'episodeCameraSlotEvents' : 'episodeCameraSlotAnalysis'", template)
+        self.assertIn("arm_axis_signs", template)
+        self.assertNotIn('id="episodeEditorTabMedia"', template)
+        self.assertNotIn("setEpisodeEditorTab('media')", template)
 
     def test_dataset_without_event_track_can_create_manual_track(self):
         template = (

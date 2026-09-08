@@ -84,7 +84,12 @@
     .episode-panel { padding:12px; border:1px solid #334c69; border-radius:11px; background:#091727; }
     .episode-panel.table-wrap { max-height:430px; overflow:auto; }
     .episode-panel.table-wrap thead th { position:sticky; top:0; z-index:2; background:#0b1d31; }
-    .episode-videos,.preview-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:12px 0; }
+    .episode-detail-toolbar { display:flex; flex-wrap:wrap; align-items:end; gap:8px; margin-bottom:10px; }
+    .episode-detail-toolbar label { margin:0; }
+    .episode-detail-toolbar select { min-width:180px; }
+    .episode-camera-module { margin-bottom:14px; padding-bottom:12px; border-bottom:1px solid #29445f; }
+    .episode-camera-module h3 { margin-top:0; }
+    .episode-videos,.preview-grid { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(260px,1fr); grid-template-columns:none; gap:12px; margin:12px 0; overflow-x:auto; }
     .media-card { min-width:0; padding:10px; border:1px solid #304b68; border-radius:11px; background:#07121f; }
     .media-card header { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:8px; }
     .media-card video,.media-card img,.preview-grid img { display:block; width:100%; max-height:330px; object-fit:contain; border:1px solid #2e465f; border-radius:9px; background:#03070c; }
@@ -170,6 +175,12 @@
     .trajectory-header { display:flex; justify-content:space-between; align-items:center; gap:8px; }
     .trajectory-header h3 { margin-bottom:0; }
     .trajectory-hint { margin-top:4px; }
+    .episode-editor-tabs { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; padding-bottom:8px; border-bottom:1px solid #29445f; }
+    .episode-editor-tabs button { width:auto; padding:7px 11px; color:#aac0d8; border:1px solid #29445f; background:#0a1a2c; }
+    .episode-editor-tabs button.active { color:#f7fbff; border-color:#42c7ff; background:#12304a; }
+    .episode-editor-tab-panel[hidden] { display:none; }
+    .episode-frame-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:8px 0; }
+    .episode-frame-toolbar button { width:auto; }
     .analysis-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
     .analysis-card { min-width:0; padding:10px; border:1px solid #304b68; border-radius:10px; background:#07121f; }
     .analysis-card h3 { margin-top:0; }
@@ -182,10 +193,9 @@
     .anomaly-reversal { color:#ff9f68; }
     .anomaly-abrupt { color:#ff5f6d; }
     .analysis-anomaly-legend { display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 2px; color:#b8cbe0; font-size:11px; }
-    @media(min-width:1480px){.episode-editor-grid{grid-template-columns:minmax(520px,1.05fr) minmax(620px,1.25fr)}}
-    @media(max-width:1280px){.analysis-grid{grid-template-columns:1fr}.episode-videos{grid-template-columns:1fr}}
+    @media(max-width:1280px){.analysis-grid{grid-template-columns:1fr}}
     @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid,.telemetry-latency-grid{grid-template-columns:repeat(2,1fr)}}
-    @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid,.telemetry-vector-grid,.analysis-grid{grid-template-columns:1fr}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
+    @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid,.telemetry-vector-grid,.analysis-grid{grid-template-columns:1fr;grid-auto-flow:row;grid-auto-columns:auto;overflow-x:visible}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
   </style>
 </head>
 <body>
@@ -255,9 +265,27 @@
           <div class="episode-editor-grid">
             <div class="episode-panel table-wrap"><table><thead><tr><th></th><th>Episode</th><th>帧数</th><th>Instruction</th><th>Task</th><th>Success</th><th>Event</th><th>操作</th></tr></thead><tbody id="episodeRows"></tbody></table><div class="toolbar" style="margin:10px"><button class="inline secondary" type="button" onclick="changeEpisodePage(-1)">上一页</button><span id="episodePage" class="muted">-</span><button class="inline secondary" type="button" onclick="changeEpisodePage(1)">下一页</button></div></div>
             <div class="episode-panel">
-              <form id="episodeForm"><input id="episodeIndex" type="hidden"><label>Episode</label><input id="episodeIndexDisplay" disabled><label>Instruction</label><textarea id="episodeInstruction" rows="3" required></textarea><label>Task name（可选）</label><input id="episodeTaskName" placeholder="未设置"><label>Success（可选）</label><select id="episodeSuccess"><option value="">未设置</option><option value="true">true</option><option value="false">false</option></select><label>附加 metadata（JSON object）</label><textarea id="episodeMetadata" rows="7">{}</textarea><label>删除 metadata 字段（逗号分隔）</label><input id="episodeRemoveMetadata" placeholder="operator_note, bad_reason"><p><button type="submit">保存 Episode 参数</button></p></form>
-              <h3>Event track（可选）</h3><div id="episodeEventTrack" class="event-status no-track">选择 episode 后加载。</div>
-              <h3>相机媒体 <span class="event-pill">三路强制同步</span></h3><div class="muted">任意一路播放、暂停或拖动，其他相机同步到同一帧。</div><div id="episodeVideos" class="episode-videos"><span class="muted">选择 episode 后加载。</span></div>
+              <div class="episode-detail-toolbar"><div><label for="episodeEditorSelector">当前编辑 Episode</label><select id="episodeEditorSelector" disabled><option value="">请先从上方列表选择</option></select></div><span id="episodeEditorSelectionStatus" class="muted">编辑区位于列表下方；可在这里切换当前页 Episode。</span></div>
+              <div class="episode-editor-tabs" role="tablist" aria-label="Episode 编辑模块">
+                <button type="button" class="active" data-episode-editor-tab="analysis" role="tab" aria-selected="true" aria-controls="episodeEditorTabAnalysis" onclick="setEpisodeEditorTab('analysis')">帧分析 + 相机帧</button>
+                <button type="button" data-episode-editor-tab="events" role="tab" aria-selected="false" aria-controls="episodeEditorTabEvents" onclick="setEpisodeEditorTab('events')">Event 标注</button>
+                <button type="button" data-episode-editor-tab="params" role="tab" aria-selected="false" aria-controls="episodeEditorTabParams" onclick="setEpisodeEditorTab('params')">Episode 参数</button>
+              </div>
+              <section id="episodeEditorTabParams" class="episode-editor-tab-panel" data-episode-editor-panel="params" role="tabpanel" hidden>
+                <form id="episodeForm"><input id="episodeIndex" type="hidden"><label>Episode</label><input id="episodeIndexDisplay" disabled><label>Instruction</label><textarea id="episodeInstruction" rows="3" required></textarea><label>Task name（可选）</label><input id="episodeTaskName" placeholder="未设置"><label>Success（可选）</label><select id="episodeSuccess"><option value="">未设置</option><option value="true">true</option><option value="false">false</option></select><label>附加 metadata（JSON object）</label><textarea id="episodeMetadata" rows="7">{}</textarea><label>删除 metadata 字段（逗号分隔）</label><input id="episodeRemoveMetadata" placeholder="operator_note, bad_reason"><p><button type="submit">保存 Episode 参数</button></p></form>
+              </section>
+              <section id="episodeEditorTabEvents" class="episode-editor-tab-panel" data-episode-editor-panel="events" role="tabpanel" hidden>
+                <div id="episodeCameraSlotEvents" class="episode-camera-slot"></div>
+                <h3>Event track（可选）</h3><div id="episodeEventTrack" class="event-status no-track">选择 episode 后加载。</div>
+              </section>
+              <section id="episodeEditorTabAnalysis" class="episode-editor-tab-panel" data-episode-editor-panel="analysis" role="tabpanel">
+                <div id="episodeCameraSlotAnalysis" class="episode-camera-slot">
+                  <section id="episodeCameraModule" class="episode-camera-module" aria-label="Episode 相机帧">
+                    <h3>相机帧 <span class="event-pill">三路强制同步</span></h3><div class="muted">帧分析和 Event 标注共用当前相机模块；任意一路播放、暂停或拖动，其他相机同步到同一帧。</div>
+                    <div class="episode-frame-toolbar"><button id="episodeFramePauseButton" class="inline secondary" type="button" onclick="toggleEpisodeFramePause()" disabled>暂停当前帧</button><span id="episodeFramePauseStatus" class="muted">选择 episode 后加载相机。</span></div>
+                    <div id="episodeVideos" class="episode-videos"><span class="muted">选择 episode 后加载。</span></div>
+                  </section>
+                </div>
               <section class="episode-analysis" aria-label="Episode 逐帧分析">
                 <h3>逐帧数据分析</h3>
                 <div class="muted">当前帧会同步显示关节角、关节速度和末端位置（保持数据集原始单位）；黄色区域为自动识别的空闲帧。</div>
@@ -275,6 +303,7 @@
                   <div class="analysis-card"><div class="trajectory-header"><h3>末端位姿 3D 轨迹</h3><button class="inline secondary" type="button" onclick="resetEpisodeTrajectoryView()">重置视角</button></div><div class="muted trajectory-hint">显示第 0 帧到当前帧的历史轨迹；当前末端位置以高亮点标出。拖拽旋转，滚轮缩放。</div><canvas id="episodeTrajectoryChart" width="1000" height="360" aria-label="末端位姿三维历史轨迹"></canvas><div id="episodeTrajectoryLegend" class="metric-legend"></div></div>
                   <div class="analysis-card"><h3>当前帧关节状态</h3><div id="episodeFrameSummary" class="muted">尚未加载当前帧。</div><div class="joint-table"><table><thead><tr><th>关节</th><th>角度 / 值</th><th>速度 / s</th><th>加速度 / s²</th><th>目标</th><th>异常</th></tr></thead><tbody id="episodeJointRows"><tr><td colspan="6" class="muted">选择 episode 后加载。</td></tr></tbody></table></div><div id="episodeEefFrame" class="muted" style="margin-top:8px"></div></div>
                 </div>
+              </section>
               </section>
             </div>
           </div>
@@ -469,6 +498,7 @@ let episodeFrameLastRequestAt = 0;
 let episodeFramePending = null;
 let episodeFrameThrottleTimer = null;
 let episodeTrajectoryView = {yaw: -0.7, pitch: 0.45, zoom: 1, dragging: false, lastX: 0, lastY: 0};
+let episodeTrajectoryRenderCache = null;
 let trainingMetricsData = null;
 let enabledMetrics = new Set();
 let metricsRequestSerial = 0;
@@ -1381,6 +1411,24 @@ function renderEpisodeRows() {
   const mediaNote = videoCount ? `MP4=${videoCount}` : 'MP4=0（可能为逐帧图片）';
   document.getElementById('episodeEditorSummary').textContent = `dataset=${data.id || '-'} · episodes=${data.total} · frames=${info.total_frames ?? '-'} · ${mediaNote} · tasks=${info.total_tasks ?? '-'} · 当前 ${start}-${end}`;
   document.getElementById('episodePage').textContent = `${start}-${end} / ${data.total}`;
+  renderEpisodeEditorSelector(data.episodes || []);
+}
+
+function renderEpisodeEditorSelector(episodes) {
+  const selector = document.getElementById('episodeEditorSelector');
+  const status = document.getElementById('episodeEditorSelectionStatus');
+  if (!selector) return;
+  const current = String(document.getElementById('episodeIndex')?.value || '');
+  selector.innerHTML = '<option value="">请选择当前页 Episode</option>' + episodes.map(episode => (
+    `<option value="${esc(episode.episode_index)}">Episode ${esc(episode.episode_index)} · ${esc(episode.length)} frames</option>`
+  )).join('');
+  selector.disabled = !episodes.length;
+  selector.value = episodes.some(episode => String(episode.episode_index) === current) ? current : '';
+  if (status) {
+    status.textContent = selector.value
+      ? `当前正在编辑 Episode ${selector.value}；相机帧与逐帧分析同步更新。`
+      : '编辑区位于列表下方；可在这里切换当前页 Episode。';
+  }
 }
 
 function renderEpisodeEventCell(episode) {
@@ -1398,6 +1446,27 @@ function changeEpisodePage(direction) {
   const next = episodeOffset + direction * episodeLimit;
   if (next < 0 || next >= episodeDatasetData.total) return;
   loadDatasetEpisodes(next);
+}
+
+function setEpisodeEditorTab(tabName) {
+  const requested = String(tabName || 'analysis');
+  const available = [...document.querySelectorAll('[data-episode-editor-tab]')];
+  const activeName = available.some(button => button.dataset.episodeEditorTab === requested)
+    ? requested
+    : 'analysis';
+  for (const button of available) {
+    const active = button.dataset.episodeEditorTab === activeName;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', active ? 'true' : 'false');
+  }
+  for (const panel of document.querySelectorAll('[data-episode-editor-panel]')) {
+    panel.hidden = panel.dataset.episodeEditorPanel !== activeName;
+  }
+  const cameraModule = document.getElementById('episodeCameraModule');
+  const cameraSlot = document.getElementById(
+    activeName === 'events' ? 'episodeCameraSlotEvents' : 'episodeCameraSlotAnalysis'
+  );
+  if (cameraModule && cameraSlot) cameraSlot.appendChild(cameraModule);
 }
 
 const EPISODE_VIDEO_SYNC_DRIFT_SECONDS = 0.08;
@@ -1462,6 +1531,13 @@ function syncEpisodeVideoPlayback(source, playing) {
   episodeVideoSyncState.playing = Boolean(playing);
   episodeVideoSyncState.playbackRate = Number(source.video.playbackRate || 1);
   syncEpisodeVideoTime(source, true);
+  if (playing && source.video.paused) {
+    source.syncingPlayback = 'play';
+    source.video.play().catch(() => {
+      source.syncingPlayback = null;
+      updateEpisodeFramePauseControl();
+    });
+  }
   for (const player of activeEpisodeVideoPlayers(source)) {
     if (player === source) continue;
     player.video.playbackRate = episodeVideoSyncState.playbackRate;
@@ -1477,6 +1553,7 @@ function syncEpisodeVideoPlayback(source, playing) {
       player.video.pause();
     }
   }
+  updateEpisodeFramePauseControl();
 }
 
 function syncEpisodeVideoRate(source) {
@@ -1491,6 +1568,46 @@ function syncEpisodeVideoRate(source) {
   }
 }
 
+function episodeMediaIsPlaying() {
+  return activeEpisodeVideoPlayers().some(player => player.video && !player.video.paused)
+    || episodeImageSyncState.playing;
+}
+
+function updateEpisodeFramePauseControl() {
+  const button = document.getElementById('episodeFramePauseButton');
+  const status = document.getElementById('episodeFramePauseStatus');
+  if (!button) return;
+  const videoPlayers = activeEpisodeVideoPlayers();
+  const imagePlayers = activeEpisodeImagePlayers();
+  const hasPlayers = videoPlayers.length > 0 || imagePlayers.length > 0;
+  const playing = episodeMediaIsPlaying();
+  button.disabled = !hasPlayers;
+  button.textContent = playing ? '暂停当前帧' : '继续播放当前帧';
+  if (status) {
+    const frame = episodeFrameCache.current?.frame_index
+      ?? (imagePlayers.length ? Math.round(episodeImageSyncState.position) : null);
+    status.textContent = !hasPlayers
+      ? '选择 episode 后加载相机。'
+      : playing
+        ? `正在播放${frame == null ? '' : ` · frame ${frame}`}`
+        : `当前帧已暂停${frame == null ? '' : ` · frame ${frame}`}；可继续播放。`;
+  }
+}
+
+function toggleEpisodeFramePause() {
+  const videoPlayers = activeEpisodeVideoPlayers();
+  const imagePlayers = activeEpisodeImagePlayers();
+  if (!videoPlayers.length && !imagePlayers.length) return;
+  const playing = episodeMediaIsPlaying();
+  if (videoPlayers.length) {
+    const source = videoPlayers.find(player => player.video && !player.video.paused) || videoPlayers[0];
+    syncEpisodeVideoPlayback(source, !playing);
+  } else {
+    setEpisodeImagePlaying(!playing, imagePlayers[0]);
+  }
+  updateEpisodeFramePauseControl();
+}
+
 function clearEpisodeMedia() {
   const oldPlayers = episodeMediaPlayers;
   episodeMediaPlayers = [];
@@ -1503,6 +1620,7 @@ function clearEpisodeMedia() {
     if (player.video) player.video.pause();
     if (player.objectUrl) URL.revokeObjectURL(player.objectUrl);
   }
+  updateEpisodeFramePauseControl();
 }
 
 function currentAnalysisEpisode() {
@@ -1531,6 +1649,7 @@ function renderEpisodeAnalysisSummary(data) {
     `<span class="pill ${Number(data.anomaly_frames) ? 'anomaly-frame' : ''}">异常 ${esc(data.anomaly_frames || 0)} · jitter ${esc(data.jitter_frames || 0)} · reversal ${esc(data.velocity_reversal_frames || 0)} · abrupt ${esc(data.abrupt_change_frames || 0)}</span>`,
     `<span class="pill">建议保留 ${esc(crop.start_frame ?? 0)}-${esc(crop.end_frame ?? data.frame_count - 1)}</span>`,
     `<span class="pill">EEF=${esc(data.eef_method || 'unavailable')}</span>`,
+    data.arm_base_offset ? `<span class="pill">base ΔR-L=${esc(data.arm_base_offset.map(value => analysisNumber(value, 3)).join(', '))}m</span>` : '<span class="pill warn">base offset unavailable</span>',
     `<span class="muted">sample stride=${esc(data.sample_stride || 1)}</span>`,
   ].join('');
   const start = document.getElementById('episodeCropStart');
@@ -1627,6 +1746,32 @@ function trajectoryPoint(value) {
   return point.length === 3 && point.every(Number.isFinite) ? point : null;
 }
 
+function trajectoryOrigins(data) {
+  const origins = {};
+  const raw = data?.arm_origins && typeof data.arm_origins === 'object' ? data.arm_origins : {};
+  for (const side of ['left', 'right']) {
+    const point = trajectoryPoint(raw[side]);
+    if (point) origins[side] = point;
+  }
+  if (!origins.left && !origins.right && Array.isArray(data?.arm_base_offset)) {
+    const offset = trajectoryPoint(data.arm_base_offset);
+    if (offset) {
+      origins.left = [0, 0, 0];
+      origins.right = offset;
+    }
+  }
+  return origins;
+}
+
+function trajectoryAxisSigns(data) {
+  const raw = data?.arm_axis_signs && typeof data.arm_axis_signs === 'object' ? data.arm_axis_signs : {};
+  const bimanual = Boolean(data?.eef && data.eef.left && data.eef.right);
+  return {
+    left: trajectoryPoint(raw.left) || [1, 1, 1],
+    right: trajectoryPoint(raw.right) || (bimanual ? [-1, 1, 1] : [1, 1, 1]),
+  };
+}
+
 function ensureEpisodeTrajectoryInteractions() {
   const canvas = document.getElementById('episodeTrajectoryChart');
   if (!canvas || canvas.dataset.interactive === '1') return;
@@ -1662,10 +1807,11 @@ function ensureEpisodeTrajectoryInteractions() {
 
 function resetEpisodeTrajectoryView() {
   episodeTrajectoryView = {yaw: -0.7, pitch: 0.45, zoom: 1, dragging: false, lastX: 0, lastY: 0};
+  episodeTrajectoryRenderCache = null;
   drawEpisodeTrajectory(episodeAnalysisData, episodeFrameCache.current?.frame_index || 0, episodeFrameCache.current);
 }
 
-function drawEpisodeTrajectory(data, frame = 0, frameData = null) {
+function drawEpisodeTrajectoryFull(data, frame = 0, frameData = null) {
   const canvas = document.getElementById('episodeTrajectoryChart');
   const legend = document.getElementById('episodeTrajectoryLegend');
   if (!canvas) return;
@@ -1685,6 +1831,8 @@ function drawEpisodeTrajectory(data, frame = 0, frameData = null) {
   const sampledFrames = Array.isArray(data?.sampled_frames) ? data.sampled_frames : [];
   const tracks = [];
   const allPoints = [];
+  const origins = trajectoryOrigins(data);
+  Object.values(origins).forEach(point => allPoints.push(point));
   for (const [side, value] of Object.entries(data?.eef || {})) {
     const positions = Array.isArray(value?.position) ? value.position : [];
     const samples = [];
@@ -1759,24 +1907,47 @@ function drawEpisodeTrajectory(data, frame = 0, frameData = null) {
     drawSegment([center[0] - gridSize, center[1] + offset, gridZ], [center[0] + gridSize, center[1] + offset, gridZ], '#18324b', 1, 0.9);
     drawSegment([center[0] + offset, center[1] - gridSize, gridZ], [center[0] + offset, center[1] + gridSize, gridZ], '#18324b', 1, 0.9);
   }
-  const origin = center;
   const axisLength = extent * 0.32;
-  const axes = [
-    {label: 'X', point: [origin[0] + axisLength, origin[1], origin[2]], color: '#ff6f91'},
-    {label: 'Y', point: [origin[0], origin[1] + axisLength, origin[2]], color: '#3ee6a8'},
-    {label: 'Z', point: [origin[0], origin[1], origin[2] + axisLength], color: '#42c7ff'},
-  ];
-  for (const axis of axes) {
-    drawSegment(origin, axis.point, axis.color, 1.5, 0.9);
-    const labelPoint = project(axis.point);
-    ctx.fillStyle = axis.color;
-    ctx.font = 'bold 11px ui-sans-serif, sans-serif';
-    ctx.fillText(axis.label, labelPoint.x + 4, labelPoint.y - 4);
+  const axisSigns = trajectoryAxisSigns(data);
+  const frameOrigins = Object.keys(origins).length ? Object.entries(origins) : [['world', center]];
+  for (const [side, frameOrigin] of frameOrigins) {
+    const signs = axisSigns[side] || [1, 1, 1];
+    const axes = [
+      {label: 'X', point: [frameOrigin[0] + axisLength * signs[0], frameOrigin[1], frameOrigin[2]], color: '#ff6f91'},
+      {label: 'Y', point: [frameOrigin[0], frameOrigin[1] + axisLength * signs[1], frameOrigin[2]], color: '#3ee6a8'},
+      {label: 'Z', point: [frameOrigin[0], frameOrigin[1], frameOrigin[2] + axisLength * signs[2]], color: '#42c7ff'},
+    ];
+    for (const axis of axes) {
+      drawSegment(frameOrigin, axis.point, axis.color, 1.5, 0.9);
+      const labelPoint = project(axis.point);
+      ctx.fillStyle = axis.color;
+      ctx.font = 'bold 11px ui-sans-serif, sans-serif';
+      ctx.fillText(`${side === 'world' ? '' : side + ' '}${axis.label}`, labelPoint.x + 4, labelPoint.y - 4);
+    }
+  }
+
+  const baseColors = {left: '#42c7ff', right: '#ff9f68'};
+  if (origins.left && origins.right) drawSegment(origins.left, origins.right, '#d9a441', 2, 0.9);
+  for (const [side, base] of Object.entries(origins)) {
+    const projected = project(base);
+    ctx.fillStyle = baseColors[side] || '#d9ebff';
+    ctx.strokeStyle = '#f7fbff';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.rect(projected.x - 4, projected.y - 4, 8, 8);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#f7fbff';
+    ctx.font = '11px ui-sans-serif, sans-serif';
+    ctx.fillText(side + ' base', projected.x + 8, projected.y + 4);
   }
 
   const colors = {left: '#42c7ff', right: '#ff9f68'};
   for (const track of tracks) {
     const color = colors[track.side] || '#d9ebff';
+    const base = origins[track.side];
+    const firstPoint = track.history[0]?.point || track.samples[0]?.point;
+    if (base && firstPoint) drawSegment(base, firstPoint, color, 1, 0.55);
     const history = track.history;
     if (history.length > 1) {
       ctx.globalAlpha = 0.9;
@@ -1813,7 +1984,283 @@ function drawEpisodeTrajectory(data, frame = 0, frameData = null) {
   ctx.fillText('history: 0 → current · unit: m · view: ' + episodeTrajectoryView.zoom.toFixed(2) + 'x', 10, height - 10);
   if (legend) {
     legend.innerHTML = tracks.map(track => '<span class="pill" style="border-color:' + (colors[track.side] || '#d9ebff') + '">' + esc(track.side) + ' history + latest</span>').join('')
+      + (origins.left && origins.right ? '<span class="pill" style="border-color:#d9a441">left/right base origins</span>' : '<span class="pill warn">base offset unavailable</span>')
       + '<span class="pill">frame ' + esc(currentFrame) + ' / ' + esc(Math.max(0, frameCount - 1)) + '</span>';
+  }
+}
+
+function trajectorySamePoint(left, right) {
+  return Boolean(left && right && left.length === 3 && right.length === 3
+    && left.every((value, index) => Math.abs(Number(value) - Number(right[index])) < 1e-10));
+}
+
+function drawTrajectorySegment(context, project, from, to, color, lineWidth = 1, alpha = 1) {
+  const start = project(from);
+  const end = project(to);
+  context.globalAlpha = alpha;
+  context.strokeStyle = color;
+  context.lineWidth = lineWidth;
+  context.beginPath();
+  context.moveTo(start.x, start.y);
+  context.lineTo(end.x, end.y);
+  context.stroke();
+  context.globalAlpha = 1;
+}
+
+function createEpisodeTrajectoryRenderCache(data, width, height, ratio) {
+  const sampledFrames = Array.isArray(data?.sampled_frames) ? data.sampled_frames : [];
+  const tracks = [];
+  const allPoints = [];
+  const origins = trajectoryOrigins(data);
+  Object.values(origins).forEach(point => allPoints.push(point));
+  for (const [side, value] of Object.entries(data?.eef || {})) {
+    const positions = Array.isArray(value?.position) ? value.position : [];
+    const samples = [];
+    positions.forEach((row, index) => {
+      const point = trajectoryPoint(row);
+      if (!point) return;
+      samples.push({frame: Number(sampledFrames[index] ?? index), point});
+      allPoints.push(point);
+    });
+    tracks.push({side, samples, nextSampleIndex: 0, lastFrame: -1, lastPoint: null});
+  }
+  if (!allPoints.length) return null;
+
+  const minimum = [0, 1, 2].map(axis => Math.min(...allPoints.map(point => point[axis])));
+  const maximum = [0, 1, 2].map(axis => Math.max(...allPoints.map(point => point[axis])));
+  const extent = Math.max(...[0, 1, 2].map(axis => maximum[axis] - minimum[axis]), 0.08);
+  const center = [0, 1, 2].map(axis => (minimum[axis] + maximum[axis]) / 2);
+  const cache = {
+    data,
+    width,
+    height,
+    ratio,
+    yaw: episodeTrajectoryView.yaw,
+    pitch: episodeTrajectoryView.pitch,
+    zoom: episodeTrajectoryView.zoom,
+    center,
+    extent,
+    tracks,
+    origins,
+    frame: -1,
+    historyCanvas: document.createElement('canvas'),
+  };
+  cache.historyCanvas.width = Math.round(width * ratio);
+  cache.historyCanvas.height = Math.round(height * ratio);
+  const context = cache.historyCanvas.getContext('2d');
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  const cosYaw = Math.cos(cache.yaw);
+  const sinYaw = Math.sin(cache.yaw);
+  const cosPitch = Math.cos(cache.pitch);
+  const sinPitch = Math.sin(cache.pitch);
+  const scale = Math.min(width - 72, height - 72) * 0.82 * cache.zoom;
+  cache.project = point => {
+    const x = (point[0] - cache.center[0]) / cache.extent;
+    const y = (point[1] - cache.center[1]) / cache.extent;
+    const z = (point[2] - cache.center[2]) / cache.extent;
+    const yawX = cosYaw * x - sinYaw * y;
+    const yawY = sinYaw * x + cosYaw * y;
+    const screenY = cosPitch * yawY - sinPitch * z;
+    const depth = sinPitch * yawY + cosPitch * z;
+    const perspective = 1 / (1 + depth * 0.35);
+    return {
+      x: width / 2 + yawX * scale * perspective,
+      y: height / 2 - screenY * scale * perspective,
+      depth,
+    };
+  };
+
+  context.fillStyle = '#07121f';
+  context.fillRect(0, 0, width, height);
+  const drawStaticSegment = (from, to, color, lineWidth = 1, alpha = 1) => (
+    drawTrajectorySegment(context, cache.project, from, to, color, lineWidth, alpha)
+  );
+  const gridZ = minimum[2];
+  const gridSize = extent * 0.62;
+  for (let step = -3; step <= 3; step++) {
+    const offset = gridSize * step / 3;
+    drawStaticSegment([center[0] - gridSize, center[1] + offset, gridZ], [center[0] + gridSize, center[1] + offset, gridZ], '#18324b', 1, 0.9);
+    drawStaticSegment([center[0] + offset, center[1] - gridSize, gridZ], [center[0] + offset, center[1] + gridSize, gridZ], '#18324b', 1, 0.9);
+  }
+  const axisLength = extent * 0.32;
+  const axisSigns = trajectoryAxisSigns(data);
+  const frameOrigins = Object.keys(origins).length ? Object.entries(origins) : [['world', center]];
+  for (const [side, frameOrigin] of frameOrigins) {
+    const signs = axisSigns[side] || [1, 1, 1];
+    const axes = [
+      {label: 'X', point: [frameOrigin[0] + axisLength * signs[0], frameOrigin[1], frameOrigin[2]], color: '#ff6f91'},
+      {label: 'Y', point: [frameOrigin[0], frameOrigin[1] + axisLength * signs[1], frameOrigin[2]], color: '#3ee6a8'},
+      {label: 'Z', point: [frameOrigin[0], frameOrigin[1], frameOrigin[2] + axisLength * signs[2]], color: '#42c7ff'},
+    ];
+    for (const axis of axes) {
+      drawStaticSegment(frameOrigin, axis.point, axis.color, 1.5, 0.9);
+      const labelPoint = cache.project(axis.point);
+      context.fillStyle = axis.color;
+      context.font = 'bold 11px ui-sans-serif, sans-serif';
+      context.fillText(`${side === 'world' ? '' : side + ' '}${axis.label}`, labelPoint.x + 4, labelPoint.y - 4);
+    }
+  }
+  const baseColors = {left: '#42c7ff', right: '#ff9f68'};
+  if (origins.left && origins.right) drawStaticSegment(origins.left, origins.right, '#d9a441', 2, 0.9);
+  for (const [side, base] of Object.entries(origins)) {
+    const projected = cache.project(base);
+    context.fillStyle = baseColors[side] || '#d9ebff';
+    context.strokeStyle = '#f7fbff';
+    context.lineWidth = 1.5;
+    context.beginPath();
+    context.rect(projected.x - 4, projected.y - 4, 8, 8);
+    context.fill();
+    context.stroke();
+    context.fillStyle = '#f7fbff';
+    context.font = '11px ui-sans-serif, sans-serif';
+    context.fillText(side + ' base', projected.x + 8, projected.y + 4);
+  }
+  const trajectoryColors = {left: '#42c7ff', right: '#ff9f68'};
+  for (const track of tracks) {
+    const base = origins[track.side];
+    const firstPoint = track.samples[0]?.point;
+    if (base && firstPoint) drawStaticSegment(base, firstPoint, trajectoryColors[track.side] || '#d9ebff', 1, 0.55);
+  }
+  return cache;
+}
+
+function appendEpisodeTrajectoryHistory(cache, currentFrame, exactPoints) {
+  const colors = {left: '#42c7ff', right: '#ff9f68'};
+  for (const track of cache.tracks) {
+    const exact = exactPoints[track.side] || null;
+    while (track.nextSampleIndex < track.samples.length
+      && track.samples[track.nextSampleIndex].frame <= currentFrame) {
+      const sample = track.samples[track.nextSampleIndex];
+      const point = sample.frame === currentFrame && exact ? exact : sample.point;
+      if (sample.frame > track.lastFrame) {
+        if (track.lastPoint) {
+          drawTrajectorySegment(
+            cache.historyCanvas.getContext('2d'),
+            cache.project,
+            track.lastPoint,
+            point,
+            colors[track.side] || '#d9ebff',
+            3,
+            0.9,
+          );
+        }
+        track.lastPoint = point;
+        track.lastFrame = sample.frame;
+      } else if (sample.frame === track.lastFrame && !trajectorySamePoint(track.lastPoint, point)) {
+        return false;
+      }
+      track.nextSampleIndex += 1;
+    }
+    if (exact && currentFrame >= track.lastFrame) {
+      if (currentFrame > track.lastFrame) {
+        if (track.lastPoint) {
+          drawTrajectorySegment(
+            cache.historyCanvas.getContext('2d'),
+            cache.project,
+            track.lastPoint,
+            exact,
+            colors[track.side] || '#d9ebff',
+            3,
+            0.9,
+          );
+        }
+        track.lastPoint = exact;
+        track.lastFrame = currentFrame;
+      } else if (!trajectorySamePoint(track.lastPoint, exact)) {
+        return false;
+      }
+    }
+  }
+  cache.frame = currentFrame;
+  return true;
+}
+
+function trajectoryCacheMatches(cache, data, width, height, ratio) {
+  return Boolean(cache
+    && cache.data === data
+    && cache.width === width
+    && cache.height === height
+    && cache.ratio === ratio
+    && cache.yaw === episodeTrajectoryView.yaw
+    && cache.pitch === episodeTrajectoryView.pitch
+    && cache.zoom === episodeTrajectoryView.zoom);
+}
+
+function drawEpisodeTrajectoryIncremental(data, frame = 0, frameData = null) {
+  const canvas = document.getElementById('episodeTrajectoryChart');
+  const legend = document.getElementById('episodeTrajectoryLegend');
+  if (!canvas) return;
+  ensureEpisodeTrajectoryInteractions();
+  const width = Math.max(320, canvas.clientWidth || 1000);
+  const height = 360;
+  const ratio = window.devicePixelRatio || 1;
+  const frameCount = Math.max(1, Number(data?.frame_count || 1));
+  const currentFrame = Math.max(0, Math.min(frameCount - 1, Math.round(Number(frame) || 0)));
+  const exactPoints = {};
+  for (const [side, value] of Object.entries(frameData?.eef || {})) {
+    const point = trajectoryPoint(value?.position);
+    if (point) exactPoints[side] = point;
+  }
+
+  let cache = episodeTrajectoryRenderCache;
+  if (!trajectoryCacheMatches(cache, data, width, height, ratio) || currentFrame < cache.frame) {
+    cache = createEpisodeTrajectoryRenderCache(data, width, height, ratio);
+  }
+  if (!cache) {
+    if (legend) legend.innerHTML = '';
+    return;
+  }
+  if (!appendEpisodeTrajectoryHistory(cache, currentFrame, exactPoints)) {
+    cache = createEpisodeTrajectoryRenderCache(data, width, height, ratio);
+    if (!cache || !appendEpisodeTrajectoryHistory(cache, currentFrame, exactPoints)) {
+      episodeTrajectoryRenderCache = null;
+      return;
+    }
+  }
+  episodeTrajectoryRenderCache = cache;
+
+  const context = canvas.getContext('2d');
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.clearRect(0, 0, width, height);
+  context.drawImage(cache.historyCanvas, 0, 0, width, height);
+  const colors = {left: '#42c7ff', right: '#ff9f68'};
+  for (const track of cache.tracks) {
+    const point = exactPoints[track.side] || (track.lastFrame <= currentFrame ? track.lastPoint : null);
+    if (!point) continue;
+    const projected = cache.project(point);
+    const color = colors[track.side] || '#d9ebff';
+    context.fillStyle = color;
+    context.strokeStyle = '#f7fbff';
+    context.lineWidth = 2;
+    context.beginPath();
+    context.arc(projected.x, projected.y, 6, 0, Math.PI * 2);
+    context.fill();
+    context.stroke();
+    context.fillStyle = '#f7fbff';
+    context.font = '11px ui-sans-serif, sans-serif';
+    context.fillText(track.side + ' latest', projected.x + 9, projected.y - 8);
+  }
+  context.fillStyle = '#cfe2f7';
+  context.font = '12px ui-monospace, monospace';
+  context.fillText('frame ' + currentFrame + ' / ' + Math.max(0, frameCount - 1), 10, 18);
+  context.fillStyle = '#8fa9c3';
+  context.font = '11px ui-sans-serif, sans-serif';
+  context.fillText('history: 0 → current · unit: m · view: ' + episodeTrajectoryView.zoom.toFixed(2) + 'x', 10, height - 10);
+  if (legend) {
+    legend.innerHTML = cache.tracks.map(track => '<span class="pill" style="border-color:' + (colors[track.side] || '#d9ebff') + '">' + esc(track.side) + ' history + latest</span>').join('')
+      + (cache.origins.left && cache.origins.right ? '<span class="pill" style="border-color:#d9a441">left/right base origins</span>' : '<span class="pill warn">base offset unavailable</span>')
+      + '<span class="pill">frame ' + esc(currentFrame) + ' / ' + esc(Math.max(0, frameCount - 1)) + '</span>';
+  }
+}
+
+function drawEpisodeTrajectory(data, frame = 0, frameData = null) {
+  try {
+    drawEpisodeTrajectoryIncremental(data, frame, frameData);
+  } catch (_error) {
+    episodeTrajectoryRenderCache = null;
+    drawEpisodeTrajectoryFull(data, frame, frameData);
   }
 }
 
@@ -2026,9 +2473,15 @@ function setEpisodeImagePlaying(playing, source = null) {
     player.playing = episodeImageSyncState.playing;
     player.button.textContent = episodeImageSyncState.playing ? '暂停全部' : '播放全部';
   }
-  if (!episodeImageSyncState.playing || !players.length) return;
+  if (!episodeImageSyncState.playing || !players.length) {
+    updateEpisodeFramePauseControl();
+    return;
+  }
   const sharedFrames = Math.max(1, Math.min(...players.map(player => Math.max(1, Number(player.frames) || 1))));
-  if (sharedFrames <= 1) return;
+  if (sharedFrames <= 1) {
+    updateEpisodeFramePauseControl();
+    return;
+  }
   const sourceFps = Math.max(1, Number((source && source.fps) || players[0].fps) || 20);
   const renderFps = Math.max(1, Math.min(sourceFps, 10));
   episodeImageSyncState.fps = sourceFps;
@@ -2037,6 +2490,7 @@ function setEpisodeImagePlaying(playing, source = null) {
     episodeImageSyncState.position = (episodeImageSyncState.position + sourceFps / renderFps) % sharedFrames;
     seekEpisodeImagePlayers(players[0], Math.floor(episodeImageSyncState.position));
   }, 1000 / renderFps);
+  updateEpisodeFramePauseControl();
 }
 
 function createImagePlayer(container, datasetId, episode, media) {
@@ -2145,22 +2599,27 @@ async function createVideoPlayer(container, datasetId, episode, media) {
       video.play().catch(() => { player.syncingPlayback = null; });
     }
     updateEvent();
+    updateEpisodeFramePauseControl();
   });
   video.addEventListener('play', () => {
     if (!isActiveEpisodeVideoPlayer(player)) return;
     if (player.syncingPlayback === 'play') {
       player.syncingPlayback = null;
+      updateEpisodeFramePauseControl();
       return;
     }
     syncEpisodeVideoPlayback(player, true);
+    updateEpisodeFramePauseControl();
   });
   video.addEventListener('pause', () => {
     if (!isActiveEpisodeVideoPlayer(player)) return;
     if (player.syncingPlayback === 'pause') {
       player.syncingPlayback = null;
+      updateEpisodeFramePauseControl();
       return;
     }
     syncEpisodeVideoPlayback(player, false);
+    updateEpisodeFramePauseControl();
   });
   video.addEventListener('seeking', () => {
     updateEvent();
@@ -2188,7 +2647,10 @@ async function createVideoPlayer(container, datasetId, episode, media) {
     }
     syncEpisodeVideoRate(player);
   });
-  video.addEventListener('ended', () => syncEpisodeVideoPlayback(player, false));
+  video.addEventListener('ended', () => {
+    syncEpisodeVideoPlayback(player, false);
+    updateEpisodeFramePauseControl();
+  });
   video.addEventListener('error', () => {
     status.textContent = '加载失败：视频请求未授权或浏览器无法解码';
     status.className = 'bad';
@@ -2207,6 +2669,10 @@ async function editEpisode(index) {
   document.getElementById('episodeSuccess').value = episode.success == null ? '' : episode.success === false ? 'false' : 'true';
   document.getElementById('episodeMetadata').value = JSON.stringify(episode.parameters || {}, null, 2);
   document.getElementById('episodeRemoveMetadata').value = '';
+  const selector = document.getElementById('episodeEditorSelector');
+  const selectionStatus = document.getElementById('episodeEditorSelectionStatus');
+  if (selector) selector.value = String(episode.episode_index);
+  if (selectionStatus) selectionStatus.textContent = `当前正在编辑 Episode ${episode.episode_index}；相机帧与当前书签内容同步更新。`;
   episodeAnalysisEpisode = episode;
   episodeAnalysisData = null;
   episodeFrameCache = new Map();
@@ -4241,6 +4707,10 @@ document.getElementById('editorDataset').addEventListener('change', () => {
   updateMergeSourceOptions();
   document.getElementById('datasetEventSemanticsStatus').textContent = '正在加载数据集 Event 语义…';
   loadDatasetEpisodes(0);
+});
+document.getElementById('episodeEditorSelector').addEventListener('change', event => {
+  const index = Number(event.target.value);
+  if (Number.isInteger(index)) editEpisode(index);
 });
 document.getElementById('trainMetricsTask').addEventListener('change', () => {
   trainingMetricsData = null;

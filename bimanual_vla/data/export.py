@@ -35,6 +35,7 @@ from bimanual_vla.data.lerobot import (
     BIMANUAL_JOINT_NAMES,
 )
 from bimanual_vla.data.contract import LEROBOT_FEATURES
+from bimanual_vla.data.arm_geometry import normalize_arm_base_offset
 
 
 FEATURES = LEROBOT_FEATURES
@@ -457,6 +458,7 @@ def export_dataset(
     fps: int = 20,
     allow_incomplete_gripper_coverage: bool = False,
     validate_only: bool = False,
+    arm_base_offset: Any = None,
 ) -> Path | None:
     """Validate GUI NPZ episodes and export successful ones to LeRobot v2.1."""
     input_root = Path(input_dir).expanduser()
@@ -472,6 +474,7 @@ def export_dataset(
         return None
 
     first = episodes[0]
+    normalized_arm_base_offset = normalize_arm_base_offset(arm_base_offset)
     output_root = Path(root).expanduser()
     writer = Pi0LeRobotDatasetWriter(
         output_root,
@@ -495,6 +498,7 @@ def export_dataset(
         rotation_semantics=first["rotation_semantics"],
         coordinate_frame=first["coordinate_frame"],
         legacy_format=first["legacy_format"],
+        arm_base_offset=normalized_arm_base_offset,
     )
 
     frames = 0
@@ -521,6 +525,7 @@ def run(args):
         fps=args.fps,
         allow_incomplete_gripper_coverage=args.allow_incomplete_gripper_coverage,
         validate_only=args.validate_only,
+        arm_base_offset=args.arm_base_offset,
     )
 
 
@@ -531,6 +536,7 @@ def main():
     ap.add_argument("--root", default="piper/piper_v1")
     ap.add_argument("--fps", type=int, default=20)
     ap.add_argument("--validate-only", action="store_true")
+    ap.add_argument("--arm-base-offset", nargs=3, type=float, metavar=("X_M", "Y_M", "Z_M"))
     ap.add_argument(
         "--allow-incomplete-gripper-coverage",
         action="store_true",

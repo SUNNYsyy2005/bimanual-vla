@@ -46,6 +46,7 @@ from bimanual_vla.data.episode_analysis import (
     analyze_episode,
     frame_payload,
 )
+from bimanual_vla.data.arm_geometry import normalize_arm_base_offset
 
 
 EPISODE_FILE = re.compile(r"episode_(\d+)\.parquet$")
@@ -1113,7 +1114,7 @@ class DatasetEditor:
         self.video_cache_root = self.dataset_root / ".dashboard_video_cache"
         self._locks: dict[str, threading.Lock] = {}
         self._global_lock = threading.Lock()
-        self._analysis_cache: dict[tuple[str, int, int, int], Any] = {}
+        self._analysis_cache: dict[tuple[Any, ...], Any] = {}
 
     def _dataset_path(self, dataset_id: str) -> Path:
         return self.dataset_root / dataset_id
@@ -1255,7 +1256,15 @@ class DatasetEditor:
         if parquet_path is None:
             raise FileNotFoundError(f"episode {episode_index} does not exist in {dataset_id}")
         stat = parquet_path.stat()
-        cache_key = (dataset_id, int(episode_index), int(stat.st_mtime_ns), int(stat.st_size))
+        info_stat = (root / "meta" / "info.json").stat()
+        cache_key = (
+            dataset_id,
+            int(episode_index),
+            int(stat.st_mtime_ns),
+            int(stat.st_size),
+            int(info_stat.st_mtime_ns),
+            int(info_stat.st_size),
+        )
         cached = self._analysis_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -1296,6 +1305,7 @@ class DatasetEditor:
             action_names=action_names,
             fps=info.get("fps", 20),
             arm_side=str(contract.get("arm_side") or info.get("arm_side") or "right"),
+            arm_base_offset=info.get("arm_base_offset"),
         )
         self._analysis_cache[cache_key] = analysis
         if len(self._analysis_cache) > 12:
