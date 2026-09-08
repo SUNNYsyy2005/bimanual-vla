@@ -36,7 +36,7 @@ def _scalar(value: Any, default: Any = None) -> Any:
         return default
     try:
         value = value.item()
-    except AttributeError:
+    except (AttributeError, ValueError):
         pass
     return value
 
