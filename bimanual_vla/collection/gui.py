@@ -55,6 +55,7 @@ from bimanual_vla.collection.output import (
 from bimanual_vla.data.contract import BIMANUAL, DELIVERY_SCHEMA, JOINT_SCHEMA, SINGLE_ARM, EpisodeContract
 from bimanual_vla.data.action_conventions import rotation6d_to_matrix
 from bimanual_vla.data.upload import DEFAULT_SERVER, safe_dataset_name
+from bimanual_vla.data.arm_geometry import normalize_arm_base_offset
 from bimanual_vla.data.panel import DataProcessPanel
 
 
@@ -441,6 +442,7 @@ def build_dataset_tool_command(
     install_mode: str = "merge",
     allow_incomplete_gripper_coverage: bool = False,
     rebuild: bool = False,
+    arm_base_offset: tuple[float, float, float] | None = None,
 ) -> list[str]:
     """Build a token-free uploader command for the GUI background worker."""
     name = safe_dataset_name(dataset_name.strip())
@@ -465,6 +467,9 @@ def build_dataset_tool_command(
         command.append("--allow-incomplete-gripper-coverage")
     if rebuild:
         command.append("--rebuild")
+    if arm_base_offset is not None:
+        normalized_offset = normalize_arm_base_offset(arm_base_offset, required=True)
+        command.extend(("--arm-base-offset", *(str(value) for value in normalized_offset)))
     if action == "prepare":
         command.append("--prepare-only")
         return command
@@ -863,6 +868,9 @@ class CollectorGUI:
         self.dataset_install_mode_var = tk.StringVar(value="merge")
         self.dataset_allow_gripper_var = tk.BooleanVar(value=False)
         self.dataset_rebuild_var = tk.BooleanVar(value=False)
+        self.arm_base_offset_x_var = tk.StringVar(value=str(self.gui_preferences.get("arm_base_offset_x_m") or ""))
+        self.arm_base_offset_y_var = tk.StringVar(value=str(self.gui_preferences.get("arm_base_offset_y_m") or ""))
+        self.arm_base_offset_z_var = tk.StringVar(value=str(self.gui_preferences.get("arm_base_offset_z_m") or ""))
         self.status_var = tk.StringVar(value="Disconnected")
         self.progress_var = tk.StringVar(value="No episode started")
         self.dataset_stats_var = tk.StringVar(value="Dataset: no episodes")
@@ -3072,21 +3080,32 @@ class CollectorGUI:
             )
             entry.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=4)
 
+        ttk.Label(form, text="Right base - left base (m)", width=18).grid(row=5, column=0, sticky="w", pady=4)
+        offset_frame = ttk.Frame(form)
+        offset_frame.grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=4)
+        for label, variable in (("X", self.arm_base_offset_x_var), ("Y", self.arm_base_offset_y_var), ("Z", self.arm_base_offset_z_var)):
+            ttk.Label(offset_frame, text=label).pack(side="left", padx=(0, 3))
+            ttk.Entry(offset_frame, textvariable=variable, width=9).pack(side="left", padx=(0, 10))
+        ttk.Label(
+            form,
+            text="Required for bimanual upload; positive X means the right base is to the right of the left base.",
+        ).grid(row=6, column=1, sticky="w", padx=(8, 0), pady=(0, 4))
+
         ttk.Checkbutton(
             form,
             text="Remember upload token on this computer",
             variable=self.remember_upload_token_var,
             takefocus=False,
-        ).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(2, 6))
-        ttk.Label(form, text="Install mode", width=18).grid(row=6, column=0, sticky="w", pady=4)
+        ).grid(row=7, column=1, sticky="w", padx=(8, 0), pady=(2, 6))
+        ttk.Label(form, text="Install mode", width=18).grid(row=8, column=0, sticky="w", pady=4)
         ttk.Combobox(
             form,
             textvariable=self.dataset_install_mode_var,
             values=("merge", "install", "overwrite"),
             state="readonly",
-        ).grid(row=6, column=1, sticky="ew", padx=(8, 0), pady=4)
+        ).grid(row=8, column=1, sticky="ew", padx=(8, 0), pady=4)
         options = ttk.Frame(form)
-        options.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        options.grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(
             options,
             text="Allow incomplete gripper coverage",
@@ -3181,6 +3200,7 @@ class CollectorGUI:
                 install_mode=self.dataset_install_mode_var.get(),
                 allow_incomplete_gripper_coverage=self.dataset_allow_gripper_var.get(),
                 rebuild=self.dataset_rebuild_var.get(),
+                arm_base_offset=self._dataset_arm_base_offset(action),
             )
             environment = os.environ.copy()
             if action == "upload":
@@ -3245,6 +3265,24 @@ class CollectorGUI:
         self.dataset_task_thread.start()
         self._update_start_button()
         self._update_dataset_action_buttons()
+
+    def _dataset_arm_base_offset(self, action: str) -> tuple[float, float, float] | None:
+        values = (
+            self.arm_base_offset_x_var.get().strip(),
+            self.arm_base_offset_y_var.get().strip(),
+            self.arm_base_offset_z_var.get().strip(),
+        )
+        if not any(values):
+            if action == "upload" and self.arm_mode_var.get() == BIMANUAL:
+                raise ValueError("bimanual upload requires right base - left base X/Y/Z in metres")
+            return None
+        if not all(values):
+            raise ValueError("enter all three arm base offset values: X, Y, and Z")
+        offset = normalize_arm_base_offset(tuple(float(value) for value in values), required=True)
+        self.gui_preferences["arm_base_offset_x_m"] = values[0]
+        self.gui_preferences["arm_base_offset_y_m"] = values[1]
+        self.gui_preferences["arm_base_offset_z_m"] = values[2]
+        return offset
 
     def _finish_dataset_task(self, label: str, return_code: int, error: str | None) -> None:
         self.dataset_task_process = None

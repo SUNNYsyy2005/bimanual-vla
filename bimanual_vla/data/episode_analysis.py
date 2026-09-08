@@ -16,6 +16,13 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from bimanual_vla.data.arm_geometry import (
+    ARM_BASE_AXIS_CONVENTION,
+    arm_base_axis_signs,
+    arm_base_origins,
+    normalize_arm_base_offset,
+)
+
 
 DEFAULT_JOINT_NAMES = tuple(
     value
@@ -50,6 +57,7 @@ class EpisodeAnalysis:
     eef: dict[str, dict[str, np.ndarray]]
     eef_method: str
     fps: float
+    arm_base_offset: tuple[float, float, float] | None
 
     @property
     def frame_count(self) -> int:
@@ -398,11 +406,30 @@ def _rotation_to_rpy(rotation: np.ndarray) -> np.ndarray:
     return np.asarray([roll, pitch, yaw], dtype=np.float64)
 
 
+def _apply_arm_base_offset(
+    eef: dict[str, dict[str, np.ndarray]],
+    arm_base_offset: Any,
+) -> tuple[dict[str, dict[str, np.ndarray]], tuple[float, float, float] | None]:
+    offset = normalize_arm_base_offset(arm_base_offset)
+    if not {"left", "right"}.issubset(eef):
+        return eef, offset
+    origins = {"left": (0.0, 0.0, 0.0), "right": offset or (0.0, 0.0, 0.0)}
+    signs = arm_base_axis_signs(offset, bimanual=True)
+    for side, origin in origins.items():
+        positions = np.asarray(eef[side].get("position", []), dtype=np.float64)
+        if positions.ndim == 2 and positions.shape[1] == 3:
+            local_positions = positions.copy()
+            local_positions *= np.asarray(signs[side], dtype=np.float64)
+            eef[side]["position"] = local_positions + np.asarray(origin, dtype=np.float64)
+    return eef, offset
+
+
 def compute_eef_trajectory(
     state: Any,
     *,
     names: Sequence[Any] | None = None,
     arm_side: str = "right",
+    arm_base_offset: Any = None,
 ) -> tuple[dict[str, dict[str, np.ndarray]], str]:
     """Return per-arm XYZ trajectories and the method used.
 
@@ -424,7 +451,7 @@ def compute_eef_trajectory(
                 "position": block[:, :3],
                 "orientation": block[:, 3:9],
             }
-        return result, "recorded_eef"
+        return _apply_arm_base_offset(result, arm_base_offset)[0], "recorded_eef"
     if width in {8, 16}:
         arms = 1 if width == 8 else 2
         sides = (arm_side if arm_side in {"left", "right"} else "right",) if arms == 1 else ("left", "right")
@@ -438,7 +465,7 @@ def compute_eef_trajectory(
                 positions[index], rotation = _franka_fk(joints)
                 orientations[index] = _rotation_to_rpy(rotation)
             result[side] = {"position": positions, "orientation": orientations}
-        return result, "franka_panda_fk"
+        return _apply_arm_base_offset(result, arm_base_offset)[0], "franka_panda_fk"
     if width not in {7, 14}:
         return {}, "unavailable"
     arms = 1 if width == 7 else 2
@@ -468,7 +495,7 @@ def compute_eef_trajectory(
             if fk is None:
                 orientation[index] = np.asarray([0.0, 0.0, float(np.sum(joints))], dtype=np.float64)
         result[side] = {"position": positions, "orientation": orientation}
-    return result, "piper_sdk_fk" if fk is not None else "approx_fk"
+    return _apply_arm_base_offset(result, arm_base_offset)[0], "piper_sdk_fk" if fk is not None else "approx_fk"
 
 
 def analyze_episode(
@@ -480,6 +507,7 @@ def analyze_episode(
     action_names: Sequence[Any] | None = None,
     fps: float | int | None = None,
     arm_side: str = "right",
+    arm_base_offset: Any = None,
     velocity_threshold: float = 0.035,
     action_delta_threshold: float = 0.012,
     min_idle_run: int = 2,
@@ -502,7 +530,12 @@ def analyze_episode(
         action_delta_threshold=action_delta_threshold,
         min_run=min_idle_run,
     )
-    eef, eef_method = compute_eef_trajectory(measured, names=state_names, arm_side=arm_side)
+    eef, eef_method = compute_eef_trajectory(
+        measured,
+        names=state_names,
+        arm_side=arm_side,
+        arm_base_offset=arm_base_offset,
+    )
     inferred_fps = float(fps or (1.0 / np.median(np.diff(time_axis)) if count > 1 else 20.0))
     return EpisodeAnalysis(
         timestamps=time_axis,
@@ -521,6 +554,7 @@ def analyze_episode(
         eef=eef,
         eef_method=eef_method,
         fps=inferred_fps,
+        arm_base_offset=normalize_arm_base_offset(arm_base_offset),
     )
 
 
@@ -591,6 +625,17 @@ def frame_payload(analysis: EpisodeAnalysis, frame_index: int) -> dict[str, Any]
         ],
         "joints": joints,
         "eef": eef,
+        "arm_base_offset": list(analysis.arm_base_offset) if analysis.arm_base_offset is not None else None,
+        "arm_axis_convention": (
+            ARM_BASE_AXIS_CONVENTION
+            if analysis.arm_base_offset is not None or {"left", "right"}.issubset(analysis.eef)
+            else None
+        ),
+        "arm_axis_signs": arm_base_axis_signs(
+            analysis.arm_base_offset,
+            bimanual={"left", "right"}.issubset(analysis.eef),
+        ),
+        "arm_origins": arm_base_origins(analysis.arm_base_offset),
     }
 
 
@@ -599,7 +644,23 @@ def analysis_payload(analysis: EpisodeAnalysis, *, max_points: int = 1200) -> di
 
     count = analysis.frame_count
     if count <= 0:
-        return {"frame_count": 0, "idle_runs": [], "suggested_crop": suggested_crop(analysis.idle), "frames": []}
+        return {
+            "frame_count": 0,
+            "idle_runs": [],
+            "suggested_crop": suggested_crop(analysis.idle),
+            "frames": [],
+            "arm_base_offset": list(analysis.arm_base_offset) if analysis.arm_base_offset is not None else None,
+            "arm_axis_convention": (
+                ARM_BASE_AXIS_CONVENTION
+                if analysis.arm_base_offset is not None or {"left", "right"}.issubset(analysis.eef)
+                else None
+            ),
+            "arm_axis_signs": arm_base_axis_signs(
+                analysis.arm_base_offset,
+                bimanual={"left", "right"}.issubset(analysis.eef),
+            ),
+            "arm_origins": arm_base_origins(analysis.arm_base_offset),
+        }
     stride = max(1, int(np.ceil(count / max(1, int(max_points)))))
     indexes = np.arange(0, count, stride, dtype=np.int64)
     if indexes[-1] != count - 1:
@@ -617,6 +678,17 @@ def analysis_payload(analysis: EpisodeAnalysis, *, max_points: int = 1200) -> di
         "duration_s": float(analysis.timestamps[-1] - analysis.timestamps[0]) if count > 1 else 0.0,
         "joint_names": list(analysis.joint_names),
         "eef_method": analysis.eef_method,
+        "arm_base_offset": list(analysis.arm_base_offset) if analysis.arm_base_offset is not None else None,
+        "arm_axis_convention": (
+            ARM_BASE_AXIS_CONVENTION
+            if analysis.arm_base_offset is not None or {"left", "right"}.issubset(analysis.eef)
+            else None
+        ),
+        "arm_axis_signs": arm_base_axis_signs(
+            analysis.arm_base_offset,
+            bimanual={"left", "right"}.issubset(analysis.eef),
+        ),
+        "arm_origins": arm_base_origins(analysis.arm_base_offset),
         "idle_frames": int(np.count_nonzero(analysis.idle)),
         "idle_fraction": float(np.mean(analysis.idle)),
         "anomaly_frames": int(np.count_nonzero(analysis.abrupt_change | np.any(analysis.velocity_reversal, axis=1) | np.any(analysis.jitter, axis=1))),

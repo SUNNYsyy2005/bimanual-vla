@@ -24,6 +24,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from bimanual_vla.data.arm_geometry import arm_base_offset_metadata, normalize_arm_base_offset
+
 
 DEFAULT_SERVER = "http://192.168.101.9:8090"
 PRINT_LOCK = threading.Lock()
@@ -162,6 +164,7 @@ def prepare_raw_npz_dataset(
     fps: int,
     allow_incomplete_gripper_coverage: bool,
     rebuild: bool,
+    arm_base_offset: Any = None,
 ) -> Path:
     """Export raw GUI episodes to a reusable, atomically published cache."""
     source_hash, export_key = _raw_export_key(
@@ -169,6 +172,7 @@ def prepare_raw_npz_dataset(
         fps=fps,
         allow_incomplete_gripper_coverage=allow_incomplete_gripper_coverage,
     )
+    normalized_arm_base_offset = normalize_arm_base_offset(arm_base_offset)
     export_cache = cache_dir / "exports"
     export_cache.mkdir(parents=True, exist_ok=True)
     output_root = export_cache / f"{dataset_name}-{export_key[:16]}"
@@ -180,6 +184,7 @@ def prepare_raw_npz_dataset(
         "export_key": export_key,
         "fps": fps,
         "allow_incomplete_gripper_coverage": allow_incomplete_gripper_coverage,
+        "arm_base_offset": list(normalized_arm_base_offset) if normalized_arm_base_offset is not None else None,
     }
     if output_root.is_dir() and marker.is_file() and not rebuild:
         try:
@@ -203,12 +208,13 @@ def prepare_raw_npz_dataset(
     try:
         from bimanual_vla.data.export import export_dataset
 
-        exported = export_dataset(
-            source,
-            temp_root,
-            fps=fps,
-            allow_incomplete_gripper_coverage=allow_incomplete_gripper_coverage,
-        )
+        export_kwargs = {
+            "fps": fps,
+            "allow_incomplete_gripper_coverage": allow_incomplete_gripper_coverage,
+        }
+        if normalized_arm_base_offset is not None:
+            export_kwargs["arm_base_offset"] = normalized_arm_base_offset
+        exported = export_dataset(source, temp_root, **export_kwargs)
         if exported != temp_root or not (temp_root / "meta" / "info.json").is_file():
             raise RuntimeError("raw NPZ export did not produce a valid LeRobot meta/info.json")
         shutil.rmtree(output_root, ignore_errors=True)
@@ -557,6 +563,85 @@ def prepare_lerobot_dataset(
     return normalized
 
 
+def _is_bimanual_info(info: dict[str, Any]) -> bool:
+    if str(info.get("arm_mode", "")).lower() == "bimanual":
+        return True
+    features = info.get("features", {})
+    if not isinstance(features, dict):
+        return False
+    for key in ("observation.state", "state"):
+        feature = features.get(key)
+        shape = feature.get("shape") if isinstance(feature, dict) else None
+        if isinstance(shape, (list, tuple)) and shape and int(shape[-1]) in {14, 16, 20}:
+            return True
+    return False
+
+
+def _annotate_arm_base_offset(
+    source: Path,
+    dataset_name: str,
+    cache_dir: Path,
+    *,
+    arm_base_offset: Any,
+    require_bimanual_offset: bool,
+    rebuild: bool,
+) -> Path:
+    info_path = source / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    existing = normalize_arm_base_offset(info.get("arm_base_offset"))
+    requested = normalize_arm_base_offset(arm_base_offset)
+    if existing is not None:
+        if requested is not None and existing != requested:
+            raise ValueError(
+                f"dataset arm_base_offset={existing!r} disagrees with upload value {requested!r}"
+            )
+        return source
+    if requested is None:
+        if require_bimanual_offset and _is_bimanual_info(info):
+            raise ValueError("bimanual upload requires --arm-base-offset X_M Y_M Z_M")
+        return source
+
+    signature = source_signature(source)
+    key = hashlib.sha256(
+        f"arm_base_offset={list(requested)}\nsource={signature}\n".encode()
+    ).hexdigest()
+    normalized = cache_dir / "arm_base_offset" / f"{dataset_name}-{key[:16]}"
+    marker = normalized.with_name(normalized.name + ".json")
+    if normalized.is_dir() and marker.is_file() and not rebuild:
+        try:
+            cached = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cached = {}
+        if cached.get("source_signature") == signature and cached.get("arm_base_offset") == list(requested):
+            return normalized
+
+    temporary = normalized.with_name(normalized.name + ".building")
+    shutil.rmtree(temporary, ignore_errors=True)
+    normalized.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, temporary, copy_function=_link_copy)
+    normalized_info_path = temporary / "meta" / "info.json"
+    normalized_info = json.loads(normalized_info_path.read_text(encoding="utf-8"))
+    normalized_info["arm_base_offset"] = arm_base_offset_metadata(requested)
+    normalized_info_path.unlink()
+    normalized_info_path.write_text(json.dumps(normalized_info, ensure_ascii=False, indent=2), encoding="utf-8")
+    policy_path = temporary / "meta" / "policy_contract.json"
+    policy = json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.is_file() else {}
+    policy["arm_base_offset"] = arm_base_offset_metadata(requested)
+    policy_path.unlink(missing_ok=True)
+    policy_path.write_text(json.dumps(policy, ensure_ascii=False, indent=2), encoding="utf-8")
+    shutil.rmtree(normalized, ignore_errors=True)
+    os.replace(temporary, normalized)
+    marker.write_text(
+        json.dumps(
+            {"source": str(source), "source_signature": signature, "arm_base_offset": list(requested)},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return normalized
+
+
 def prepare_dataset_directory(
     source: Path,
     dataset_name: str,
@@ -565,6 +650,8 @@ def prepare_dataset_directory(
     fps: int,
     allow_incomplete_gripper_coverage: bool,
     rebuild: bool,
+    arm_base_offset: Any = None,
+    require_bimanual_offset: bool = False,
 ) -> tuple[Path, str]:
     """Resolve a LeRobot input directly or auto-export a GUI NPZ directory."""
     kind = classify_dataset_source(source)
@@ -572,15 +659,30 @@ def prepare_dataset_directory(
         prepared = prepare_lerobot_dataset(
             source, dataset_name, cache_dir, rebuild=rebuild
         )
-        print(f"Detected LeRobot dataset directory: {source}")
-        return prepared, kind
-    exported = prepare_raw_npz_dataset(
-            source,
+        prepared = _annotate_arm_base_offset(
+            prepared,
             dataset_name,
             cache_dir,
-            fps=fps,
-            allow_incomplete_gripper_coverage=allow_incomplete_gripper_coverage,
+            arm_base_offset=arm_base_offset,
+            require_bimanual_offset=require_bimanual_offset,
             rebuild=rebuild,
+        )
+        print(f"Detected LeRobot dataset directory: {source}")
+        return prepared, kind
+    if require_bimanual_offset and arm_base_offset is None:
+        from bimanual_vla.data.export import inspect_npz_episode
+
+        first_path = next(iter(sorted((*source.glob("ep_*.npz"), *source.glob("episode_*.npz")))), None)
+        if first_path is not None and inspect_npz_episode(first_path, fps=fps)["arm_mode"] == "bimanual":
+            raise ValueError("bimanual upload requires --arm-base-offset X_M Y_M Z_M")
+    exported = prepare_raw_npz_dataset(
+        source,
+        dataset_name,
+        cache_dir,
+        fps=fps,
+        allow_incomplete_gripper_coverage=allow_incomplete_gripper_coverage,
+        rebuild=rebuild,
+        arm_base_offset=arm_base_offset,
     )
     return prepare_lerobot_dataset(
         exported, dataset_name, cache_dir, rebuild=rebuild
@@ -706,6 +808,13 @@ def main() -> int:
         default="real",
         help="separate real-robot uploads from simulation uploads (default: real)",
     )
+    parser.add_argument(
+        "--arm-base-offset",
+        nargs=3,
+        type=float,
+        metavar=("X_M", "Y_M", "Z_M"),
+        help="right arm base minus left arm base, in metres",
+    )
     parser.add_argument("--server", default=os.environ.get("BIMANUAL_VLA_SERVER", DEFAULT_SERVER))
     parser.add_argument("--token", default=os.environ.get("BIMANUAL_VLA_SERVER_TOKEN"))
     parser.add_argument("--workers", type=int, default=4)
@@ -782,6 +891,8 @@ def main() -> int:
                 fps=args.fps,
                 allow_incomplete_gripper_coverage=args.allow_incomplete_gripper_coverage,
                 rebuild=args.rebuild,
+                arm_base_offset=args.arm_base_offset,
+                require_bimanual_offset=not args.prepare_only,
             )
             episode_count = dataset_episode_count(dataset_root)
             counts = []

@@ -23,6 +23,7 @@ from bimanual_vla.data.contract import (
     JOINT_SCHEMA,
     EpisodeContract,
 )
+from bimanual_vla.data.arm_geometry import arm_base_offset_metadata, normalize_arm_base_offset
 
 LEROBOT_CODEBASE_VERSION = "v2.1"
 DEFAULT_CHUNK_SIZE = 1000
@@ -244,6 +245,7 @@ class Pi0LeRobotDatasetWriter:
         coordinate_frame: str = COORDINATE_FRAME,
         legacy_format: str | bool | None = None,
         source_frame: str = "",
+        arm_base_offset: Any = None,
     ):
         self.root = Path(root).expanduser()
         self.fps = int(fps)
@@ -345,6 +347,8 @@ class Pi0LeRobotDatasetWriter:
         self.delivery_action_format = dimensions["delivery_action_format"]
         self.contract_version = 2 if self.legacy else CONTRACT_VERSION
         self.source_frame = str(source_frame).strip()
+        requested_arm_base_offset = normalize_arm_base_offset(arm_base_offset)
+        self.arm_base_offset = requested_arm_base_offset
         default_action_semantics = self.contract.action_semantics
         if self.schema == "delivery" and self.legacy:
             default_action_semantics = DELIVERY_LEGACY_ACTION_SEMANTICS
@@ -428,6 +432,16 @@ class Pi0LeRobotDatasetWriter:
 
         self.tasks: dict[str, int] = {}
         self.info = self._load_or_init_info()
+        existing_arm_base_offset = normalize_arm_base_offset(self.info.get("arm_base_offset"))
+        if requested_arm_base_offset is not None and existing_arm_base_offset is not None and requested_arm_base_offset != existing_arm_base_offset:
+            raise ValueError(
+                f"existing dataset arm_base_offset={existing_arm_base_offset!r} "
+                f"!= requested {requested_arm_base_offset!r}"
+            )
+        self.arm_base_offset = requested_arm_base_offset or existing_arm_base_offset
+        if self.arm_base_offset is not None and self.info.get("arm_base_offset") != arm_base_offset_metadata(self.arm_base_offset):
+            self.info["arm_base_offset"] = arm_base_offset_metadata(self.arm_base_offset)
+            self._write_info()
         self._load_existing_tasks()
         self._validate_existing_dataset()
         self._write_policy_contract()
@@ -700,6 +714,8 @@ class Pi0LeRobotDatasetWriter:
             "features": features,
             **self._contract_dict(),
         }
+        if self.arm_base_offset is not None:
+            info["arm_base_offset"] = arm_base_offset_metadata(self.arm_base_offset)
         self.info_path.write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
         return info
 
@@ -790,6 +806,8 @@ class Pi0LeRobotDatasetWriter:
             "robot_type": self.robot_type,
             **{key: value for key, value in self._contract_dict().items() if key != "contract_version"},
         }
+        if self.arm_base_offset is not None:
+            payload["arm_base_offset"] = arm_base_offset_metadata(self.arm_base_offset)
         self.policy_contract_path.write_text(
             json.dumps(payload, indent=2, ensure_ascii=False),
             encoding="utf-8",
