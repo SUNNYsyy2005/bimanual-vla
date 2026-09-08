@@ -122,6 +122,23 @@ class DataProcessAnalysisTest(unittest.TestCase):
             self.assertEqual(poses["left_measured"].shape, (3, 3))
             self.assertTrue(np.isfinite(poses["left_measured"]).all())
 
+    def test_legacy_piper_episode_without_origin_uses_real_arm_geometry(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ep_0001.npz"
+            state = np.zeros((1, 14), dtype=np.float32)
+            np.savez(
+                path,
+                state=state,
+                actions=state,
+                timestamps=np.array([0.0]),
+                robot_type=np.asarray("piper_bimanual"),
+                arm_base_offset=np.asarray([0.8, 0.0, 0.0]),
+            )
+            data = load_analysis_data(path)
+            poses = compute_end_effector_positions(data)
+            self.assertLess(float(poses["right_measured"][0, 0]), 0.8)
+            self.assertLess(float(poses["right_measured"][0, 1]), 0.0)
+
     def test_scans_both_source_types_without_model_command_chunks(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
