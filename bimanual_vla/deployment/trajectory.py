@@ -48,6 +48,8 @@ class JerkLimitedJointTrajectory:
             raise ValueError("initial/lower/upper must be matching 1D arrays")
         if not np.isfinite(initial).all():
             raise ValueError("initial joint state must be finite")
+        if np.isnan(lower).any() or np.isnan(upper).any() or np.any(lower > upper):
+            raise ValueError("joint bounds must be ordered and cannot contain NaN")
         if joint_indices is None:
             joint_indices = [
                 index
@@ -216,6 +218,10 @@ def rate_limit_grippers(
     proposed = np.asarray(proposed_m, dtype=np.float64)
     if current.shape != proposed.shape or current.ndim != 1:
         raise ValueError("current_m and proposed_m must be matching 1D arrays")
+    if not math.isfinite(float(max_speed_m_s)) or float(max_speed_m_s) <= 0:
+        raise ValueError("max_speed_m_s must be positive")
+    if not math.isfinite(float(max_command_lead_m)) or float(max_command_lead_m) < 0:
+        raise ValueError("max_command_lead_m must be non-negative")
     previous = current if previous_target_m is None else np.asarray(previous_target_m, dtype=np.float64)
     if previous.shape != current.shape:
         raise ValueError("previous_target_m must match current_m")

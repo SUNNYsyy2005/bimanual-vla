@@ -3179,6 +3179,7 @@ def run_serve(args: argparse.Namespace) -> None:
                 "rtc_physical_action_dim": rtc_config.physical_action_dim,
                 "rtc_chunk_origin_reanchoring": bool(reanchor_action_mask),
                 "rtc_temporal_consistency": bool(rtc_config.temporal_consistency),
+                "rtc_temporal_seed": int(rtc_config.temporal_seed),
             }
         )
     else:

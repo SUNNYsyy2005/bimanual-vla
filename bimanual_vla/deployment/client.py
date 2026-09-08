@@ -74,7 +74,6 @@ from bimanual_vla.data.contract import (
 from bimanual_vla.deployment.trajectory import (
     JerkLimitedJointTrajectory,
     TrajectoryTrackingError,
-    gripper_open_lookahead,
     rate_limit_grippers,
     smootherstep,
 )
@@ -5049,6 +5048,20 @@ def return_pipers_to_initial(
     hold_tolerance_rad: float = DEFAULT_ARM_HOLD_TOLERANCE_RAD,
 ) -> dict[str, Any]:
     """Move all commanded arms back to their captured startup pose safely."""
+    if arm_mode not in {"single", "bimanual"}:
+        raise ValueError(f"unsupported arm_mode for return: {arm_mode!r}")
+    expected_sides = {"left", "right"} if arm_mode == "bimanual" else None
+    if expected_sides is not None:
+        if set(pipers) != expected_sides:
+            raise ExecutionBlocked(
+                "bimanual return requires exactly left/right Piper handles; "
+                f"got {sorted(pipers)}"
+            )
+    elif len(pipers) != 1:
+        raise ExecutionBlocked(
+            "single-arm return requires exactly one Piper handle; "
+            f"got {sorted(pipers)}"
+        )
     sides = ("left", "right") if arm_mode == "bimanual" else tuple(pipers)
     initial = np.asarray(initial_qpos, dtype=np.float32)
     if initial.shape != (7 * len(sides),) or not np.isfinite(initial).all():
@@ -5094,6 +5107,27 @@ def return_pipers_to_initial(
     sent = 0
     joint_error = float("inf")
     gripper_error = float("inf")
+
+    def send_exact_home() -> None:
+        """Leave the firmware with the exact captured target, without lookahead."""
+        for side in sides:
+            pipers[side].ModeCtrl(0x01, 0x01, int(speed_pct), 0x00)
+        for index, side in enumerate(sides):
+            offset = index * 7
+            pipers[side].JointCtrl(
+                *[
+                    int(round(float(value) * RAD_FACTOR))
+                    for value in home[offset : offset + 6]
+                ]
+            )
+        for index, side in enumerate(sides):
+            pipers[side].GripperCtrl(
+                int(round(float(home[index * 7 + 6]) * GRIPPER_FACTOR)),
+                1000,
+                0x01,
+                0,
+            )
+
     while time.monotonic() - started < float(timeout_s):
         tick = time.monotonic()
         dt = (
@@ -5108,13 +5142,32 @@ def return_pipers_to_initial(
         joint_error = float(np.max(np.abs(current[shaper.joint_indices] - home[shaper.joint_indices])))
         gripper_error = float(np.max(np.abs(current[gripper_indices] - home[gripper_indices])))
         if joint_error <= float(hold_tolerance_rad) and gripper_error <= 0.001:
-            return {
-                "returned": True,
-                "elapsed_s": time.monotonic() - started,
-                "sent_commands": sent,
-                "joint_error_rad": joint_error,
-                "gripper_error_m": gripper_error,
-            }
+            send_exact_home()
+            sent += 1
+            time.sleep(min(0.15, 2.0 * period))
+            final = np.concatenate(
+                [
+                    read_output_qpos(
+                        pipers[side], max_feedback_age_s=max_feedback_age_s
+                    )
+                    for side in sides
+                ]
+            ).astype(np.float32)
+            joint_error = float(
+                np.max(np.abs(final[shaper.joint_indices] - home[shaper.joint_indices]))
+            )
+            gripper_error = float(
+                np.max(np.abs(final[gripper_indices] - home[gripper_indices]))
+            )
+            if joint_error <= float(hold_tolerance_rad) and gripper_error <= 0.001:
+                return {
+                    "returned": True,
+                    "elapsed_s": time.monotonic() - started,
+                    "sent_commands": sent,
+                    "joint_error_rad": joint_error,
+                    "gripper_error_m": gripper_error,
+                }
+            current = final
         for side in sides:
             status = arm_status_dict(pipers[side])
             if status.get("arm_status") != PIPER_ARM_STATUS_NORMAL or status.get("err_code") != 0:
