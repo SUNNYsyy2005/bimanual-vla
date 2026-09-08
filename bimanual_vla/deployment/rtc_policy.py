@@ -732,7 +732,13 @@ class RTCAwarePolicy:
             digest_size=4,
         ).digest()
         seed = int.from_bytes(digest, "little", signed=False)
-        session.temporal_rng = jax.random.key(seed)
+        # ``jax.random.key`` is the typed-key API used by current OpenPI
+        # releases.  Keep a legacy fallback for older JAX installations that
+        # only expose ``PRNGKey``.
+        key_factory = getattr(jax.random, "key", None)
+        session.temporal_rng = (
+            key_factory(seed) if callable(key_factory) else jax.random.PRNGKey(seed)
+        )
         return session.temporal_rng
 
     @property
@@ -1070,6 +1076,7 @@ class RTCAwarePolicy:
                 ),
                 "backend": "pytorch" if self._is_pytorch else "jax",
                 "session_scoped": True,
+                "seed": int(self.config.temporal_seed),
             },
         }
         result["prompt"] = session.prompt
