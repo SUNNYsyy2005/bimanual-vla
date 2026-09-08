@@ -15,7 +15,11 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from bimanual_vla.data.arm_geometry import normalize_arm_base_offset, normalize_arm_base_rotations
+from bimanual_vla.data.arm_geometry import (
+    normalize_arm_base_offset,
+    normalize_arm_base_rotations,
+    normalize_robot_type,
+)
 from bimanual_vla.data.episode_analysis import compute_eef_trajectory
 
 
@@ -399,6 +403,12 @@ def compute_end_effector_positions(
     arm_side = str(data.metadata.get("arm_side") or "right")
     robot_type = data.metadata.get("robot_type")
     dataset_origin = data.metadata.get("dataset_origin")
+    if (
+        dataset_origin is None
+        and normalize_robot_type(robot_type) == "piper"
+        and data.measured.shape[1] in {14, 20}
+    ):
+        dataset_origin = "real"
     arm_base_offset = data.metadata.get("arm_base_offset")
     arm_base_rotations = data.metadata.get("arm_base_rotations")
     if arm_base_offset is not None:
