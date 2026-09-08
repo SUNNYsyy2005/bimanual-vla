@@ -158,6 +158,7 @@ def _load_episode(path: Path) -> AnalysisData:
                 "fps",
                 "success",
                 "robot_type",
+                "dataset_origin",
                 "arm_base_offset",
                 "arm_base_rotations",
             )
@@ -397,6 +398,7 @@ def compute_end_effector_positions(
     start = max(0, min(start_index, end))
     arm_side = str(data.metadata.get("arm_side") or "right")
     robot_type = data.metadata.get("robot_type")
+    dataset_origin = data.metadata.get("dataset_origin")
     arm_base_offset = data.metadata.get("arm_base_offset")
     arm_base_rotations = data.metadata.get("arm_base_rotations")
     if arm_base_offset is not None:
@@ -407,6 +409,7 @@ def compute_end_effector_positions(
         data.measured[start : end + 1],
         arm_side=arm_side,
         robot_type=robot_type,
+        dataset_origin=dataset_origin,
         arm_base_offset=arm_base_offset,
         arm_base_rotations=arm_base_rotations,
     )
@@ -414,6 +417,7 @@ def compute_end_effector_positions(
         data.desired[start : end + 1],
         arm_side=arm_side,
         robot_type=robot_type,
+        dataset_origin=dataset_origin,
         arm_base_offset=arm_base_offset,
         arm_base_rotations=arm_base_rotations,
     )

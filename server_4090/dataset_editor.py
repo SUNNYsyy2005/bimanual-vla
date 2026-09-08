@@ -1296,6 +1296,24 @@ class DatasetEditor:
         contract = _contract_metadata(info)
         state_names = _feature_names(info, state_key) or contract.get("state_names")
         action_names = _feature_names(info, action_key) or contract.get("action_names")
+        origin_marker = read_dataset_origin_marker(root)
+        dataset_origin = (
+            origin_marker.get("origin")
+            if origin_marker is not None
+            else info.get("dataset_origin")
+        )
+        if dataset_origin is None:
+            robot_type = str(info.get("robot_type") or "").strip().lower()
+            dataset_origin = (
+                "simulation"
+                if "franka" in robot_type
+                or "panda" in robot_type
+                or "aloha" in robot_type
+                or "agilex" in robot_type
+                or robot_type.startswith("arx")
+                or "x5" in robot_type
+                else "real" if "piper" in robot_type else None
+            )
         analysis = analyze_episode(
             state,
             action,
@@ -1307,6 +1325,7 @@ class DatasetEditor:
             arm_base_offset=info.get("arm_base_offset"),
             arm_base_rotations=info.get("arm_base_rotations"),
             robot_type=info.get("robot_type"),
+            dataset_origin=dataset_origin,
         )
         self._analysis_cache[cache_key] = analysis
         if len(self._analysis_cache) > 12:

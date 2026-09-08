@@ -497,7 +497,7 @@ let episodeFrameCache = new Map();
 let episodeFrameLastRequestAt = 0;
 let episodeFramePending = null;
 let episodeFrameThrottleTimer = null;
-let episodeTrajectoryView = {yaw: -0.7, pitch: 0.45, zoom: 1, dragging: false, lastX: 0, lastY: 0};
+let episodeTrajectoryView = {yaw: 0, pitch: 0.45, zoom: 1, dragging: false, lastX: 0, lastY: 0};
 let episodeTrajectoryRenderCache = null;
 let trainingMetricsData = null;
 let enabledMetrics = new Set();
@@ -1829,7 +1829,7 @@ function ensureEpisodeTrajectoryInteractions() {
 }
 
 function resetEpisodeTrajectoryView() {
-  episodeTrajectoryView = {yaw: -0.7, pitch: 0.45, zoom: 1, dragging: false, lastX: 0, lastY: 0};
+  episodeTrajectoryView = {yaw: 0, pitch: 0.45, zoom: 1, dragging: false, lastX: 0, lastY: 0};
   episodeTrajectoryRenderCache = null;
   drawEpisodeTrajectory(episodeAnalysisData, episodeFrameCache.current?.frame_index || 0, episodeFrameCache.current);
 }
@@ -1932,13 +1932,13 @@ function drawEpisodeTrajectoryFull(data, frame = 0, frameData = null) {
   }
   const axisLength = extent * 0.32;
   const axisRotations = trajectoryAxisRotations(data);
-  const frameOrigins = Object.keys(origins).length ? Object.entries(origins) : [['world', center]];
+  const frameOrigins = [['world', origins.left || center], ...Object.entries(origins)];
   for (const [side, frameOrigin] of frameOrigins) {
-    const points = trajectoryAxisPoints(frameOrigin, axisRotations[side] || [[1, 0, 0], [0, 1, 0], [0, 0, 1]], axisLength);
+    const points = trajectoryAxisPoints(frameOrigin, side === 'world' ? [[1, 0, 0], [0, 1, 0], [0, 0, 1]] : axisRotations[side] || [[1, 0, 0], [0, 1, 0], [0, 0, 1]], axisLength);
     const axes = [
-      {label: 'X', point: points[0], color: '#ff6f91'},
-      {label: 'Y', point: points[1], color: '#3ee6a8'},
-      {label: 'Z', point: points[2], color: '#42c7ff'},
+      {label: side === 'world' ? 'World X' : side + ' local X', point: points[0], color: '#ff6f91'},
+      {label: side === 'world' ? 'World Y' : side + ' local Y', point: points[1], color: '#3ee6a8'},
+      {label: side === 'world' ? 'World Z' : side + ' local Z', point: points[2], color: '#42c7ff'},
     ];
     for (const axis of axes) {
       drawSegment(frameOrigin, axis.point, axis.color, 1.5, 0.9);
@@ -2107,13 +2107,13 @@ function createEpisodeTrajectoryRenderCache(data, width, height, ratio) {
   }
   const axisLength = extent * 0.32;
   const axisRotations = trajectoryAxisRotations(data);
-  const frameOrigins = Object.keys(origins).length ? Object.entries(origins) : [['world', center]];
+  const frameOrigins = [['world', origins.left || center], ...Object.entries(origins)];
   for (const [side, frameOrigin] of frameOrigins) {
-    const points = trajectoryAxisPoints(frameOrigin, axisRotations[side] || [[1, 0, 0], [0, 1, 0], [0, 0, 1]], axisLength);
+    const points = trajectoryAxisPoints(frameOrigin, side === 'world' ? [[1, 0, 0], [0, 1, 0], [0, 0, 1]] : axisRotations[side] || [[1, 0, 0], [0, 1, 0], [0, 0, 1]], axisLength);
     const axes = [
-      {label: 'X', point: points[0], color: '#ff6f91'},
-      {label: 'Y', point: points[1], color: '#3ee6a8'},
-      {label: 'Z', point: points[2], color: '#42c7ff'},
+      {label: side === 'world' ? 'World X' : side + ' local X', point: points[0], color: '#ff6f91'},
+      {label: side === 'world' ? 'World Y' : side + ' local Y', point: points[1], color: '#3ee6a8'},
+      {label: side === 'world' ? 'World Z' : side + ' local Z', point: points[2], color: '#42c7ff'},
     ];
     for (const axis of axes) {
       drawStaticSegment(frameOrigin, axis.point, axis.color, 1.5, 0.9);
