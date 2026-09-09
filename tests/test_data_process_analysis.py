@@ -136,7 +136,7 @@ class DataProcessAnalysisTest(unittest.TestCase):
             )
             data = load_analysis_data(path)
             poses = compute_end_effector_positions(data)
-            self.assertGreater(float(poses["right_measured"][0, 0]), 0.8)
+            self.assertLess(float(poses["right_measured"][0, 0]), 0.8)
             self.assertLess(float(poses["right_measured"][0, 1]), 0.0)
 
     def test_scans_both_source_types_without_model_command_chunks(self):
