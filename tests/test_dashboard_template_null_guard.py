@@ -56,7 +56,7 @@ class DashboardTemplateNullGuardTest(unittest.TestCase):
         self.assertIn('@app.post("/api/tasks/batch-delete")', app_source)
         self.assertIn("def delete_many", app_source)
 
-    def test_training_task_filters_include_type_and_empty_metrics(self):
+    def test_training_and_evaluation_task_filters_are_separated(self):
         template = (
             REPO_ROOT / "server_4090/templates/index.html"
         ).read_text(encoding="utf-8")
@@ -65,9 +65,11 @@ class DashboardTemplateNullGuardTest(unittest.TestCase):
         self.assertIn('id="trainingTaskTypeFilter"', template)
         self.assertIn('<option value="train">Train</option>', template)
         self.assertIn('<option value="norm">Norm</option>', template)
-        self.assertIn('<option value="eval">Eval</option>', template)
+        self.assertNotIn('<option value="eval">Eval</option>', template)
         self.assertIn('id="trainingMetricFilter"', template)
         self.assertIn('<option value="no_metrics_terminal">无指标曲线且已结束</option>', template)
+        self.assertIn('id="evalTaskStateFilter"', template)
+        self.assertIn('id="evalJobs"', template)
         self.assertIn('function filteredTrainingJobs(items)', template)
         self.assertIn('training_metrics', app_source)
         self.assertIn('def training_metrics_probe', app_source)
