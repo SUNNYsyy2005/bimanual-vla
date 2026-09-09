@@ -262,8 +262,13 @@ def resolve_episode_split(
     test_ratio: float = DEFAULT_TEST_RATIO,
     seed: int = DEFAULT_SPLIT_SEED,
     contract: Mapping[str, Any] | None = None,
+    persist: bool = True,
 ) -> EpisodeSplit:
-    """Load or create a deterministic episode-level split for a local dataset."""
+    """Load or create a deterministic episode-level split for a dataset.
+
+    Read-only dataset roots can request ``persist=False`` so merely training or
+    evaluating an externally mounted dataset does not modify its metadata.
+    """
     test_ratio = float(test_ratio)
     seed = int(seed)
     if not 0.0 <= test_ratio < 1.0:
@@ -303,7 +308,8 @@ def resolve_episode_split(
         test_episodes=tuple(index for index in episodes if index in test_set),
         **contract_fingerprint,
     )
-    _atomic_json(split_path, split.as_dict())
+    if persist:
+        _atomic_json(split_path, split.as_dict())
     return split
 
 

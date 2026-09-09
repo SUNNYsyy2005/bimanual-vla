@@ -22,7 +22,7 @@ import shutil
 import subprocess
 import threading
 import time
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 import uuid
 
 import numpy as np
@@ -1099,12 +1099,22 @@ class DatasetEditor:
         self,
         *,
         dataset_root: Path,
+        dataset_read_roots: Iterable[Path] | None = None,
         assets_base_dir: Path,
         validate_staging: Callable[[Path], str],
         validate_installed: Callable[[str], str],
         assert_idle: Callable[[str], None] | None = None,
     ):
         self.dataset_root = dataset_root
+        self.dataset_read_roots = []
+        for candidate in (dataset_read_roots or [dataset_root]):
+            path = Path(candidate).expanduser().resolve()
+            if path not in self.dataset_read_roots:
+                self.dataset_read_roots.append(path)
+        storage_root = Path(dataset_root).expanduser().resolve()
+        if storage_root not in self.dataset_read_roots:
+            self.dataset_read_roots.insert(0, storage_root)
+        self.storage_root = storage_root
         self.assets_base_dir = assets_base_dir
         self.validate_staging = validate_staging
         self.validate_installed = validate_installed
@@ -1116,7 +1126,22 @@ class DatasetEditor:
         self._analysis_cache: dict[tuple[Any, ...], Any] = {}
 
     def _dataset_path(self, dataset_id: str) -> Path:
-        return self.dataset_root / dataset_id
+        dataset_id = _safe_dataset_id(dataset_id)
+        for root in self.dataset_read_roots:
+            candidate = root / dataset_id
+            if candidate.is_dir():
+                return candidate
+        return self.storage_root / dataset_id
+
+    def _assert_writable(self, dataset_id: str, path: Path | None = None) -> Path:
+        target = path or self._dataset_path(dataset_id)
+        try:
+            target.resolve().relative_to(self.storage_root)
+        except ValueError as exc:
+            raise PermissionError(
+                f"dataset is read-only because it is outside dataset_root: {dataset_id}"
+            ) from exc
+        return target
 
     @contextlib.contextmanager
     def _lock(self, dataset_id: str) -> Iterator[None]:
@@ -1413,7 +1438,7 @@ class DatasetEditor:
         dataset_id = _safe_dataset_id(dataset_id)
         if not isinstance(payload, dict):
             raise ValueError("request body must be a JSON object")
-        root = self._dataset_path(dataset_id)
+        root = self._assert_writable(dataset_id)
         info = _read_json(root / "meta" / "info.json")
         if not isinstance(info, dict):
             raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
@@ -1450,7 +1475,7 @@ class DatasetEditor:
         dataset_id = _safe_dataset_id(dataset_id)
         if not isinstance(payload, dict):
             raise ValueError("request body must be a JSON object")
-        root = self._dataset_path(dataset_id)
+        root = self._assert_writable(dataset_id)
         info = _read_json(root / "meta" / "info.json")
         if not isinstance(info, dict):
             raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
@@ -1577,7 +1602,7 @@ class DatasetEditor:
         dataset_id = _safe_dataset_id(dataset_id)
         normalized = normalize_dataset_origin(origin)
         with self._lock(dataset_id):
-            target = self._dataset_path(dataset_id)
+            target = self._assert_writable(dataset_id)
             if not target.is_dir():
                 raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
             marker = write_dataset_origin_marker(
@@ -1598,8 +1623,8 @@ class DatasetEditor:
             raise ValueError("new dataset id must differ from the current id")
         with self._locks_for(old_id, new_id):
             self.assert_idle(old_id)
-            source = self._dataset_path(old_id)
-            target = self._dataset_path(new_id)
+            source = self._assert_writable(old_id)
+            target = self.storage_root / new_id
             if not source.is_dir():
                 raise FileNotFoundError(f"dataset is not installed: {old_id}")
             if target.exists():
@@ -1650,7 +1675,7 @@ class DatasetEditor:
         dataset_id = _safe_dataset_id(dataset_id)
         with self._lock(dataset_id):
             self.assert_idle(dataset_id)
-            target = self._dataset_path(dataset_id)
+            target = self._assert_writable(dataset_id)
             if not target.is_dir():
                 raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
 
@@ -1702,7 +1727,7 @@ class DatasetEditor:
         normalized_origin = normalize_dataset_origin(dataset_origin, allow_unknown=False)
         write_dataset_origin_marker(extracted, normalized_origin, source="upload")
         with self._lock(dataset_id):
-            target = self._dataset_path(dataset_id)
+            target = self.storage_root / dataset_id
             source_validation = self.validate_staging(extracted)
             operation = "install"
             candidate = extracted
@@ -1747,8 +1772,8 @@ class DatasetEditor:
     def merge_existing(self, target_id: str, source_id: str) -> dict[str, Any]:
         if target_id == source_id:
             raise ValueError("source and target dataset must be different")
-        target = self._dataset_path(target_id)
-        source = self._dataset_path(source_id)
+        target = self._assert_writable(target_id)
+        source = self._assert_writable(source_id)
         if not target.is_dir() or not source.is_dir():
             raise FileNotFoundError("source or target dataset is not installed")
         with self._locks_for(target_id, source_id):
@@ -1759,7 +1784,7 @@ class DatasetEditor:
             return result
 
     def update_episode(self, dataset_id: str, episode_index: int, updates: dict[str, Any]) -> dict[str, Any]:
-        target = self._dataset_path(dataset_id)
+        target = self._assert_writable(dataset_id)
         if not target.is_dir():
             raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
         normalized = self._normalize_updates(updates)
@@ -1782,7 +1807,7 @@ class DatasetEditor:
         """Atomically keep an inclusive frame range from one episode."""
 
         dataset_id = _safe_dataset_id(dataset_id)
-        target = self._dataset_path(dataset_id)
+        target = self._assert_writable(dataset_id)
         if not target.is_dir():
             raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
         parquet_path = _parquet_paths(target).get(int(episode_index))
@@ -1819,7 +1844,7 @@ class DatasetEditor:
             return result
 
     def delete_episodes(self, dataset_id: str, episode_indexes: list[int]) -> dict[str, Any]:
-        target = self._dataset_path(dataset_id)
+        target = self._assert_writable(dataset_id)
         if not target.is_dir():
             raise FileNotFoundError(f"dataset is not installed: {dataset_id}")
         selected = sorted(set(int(item) for item in episode_indexes))

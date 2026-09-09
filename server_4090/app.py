@@ -1244,6 +1244,26 @@ def resolve_under(value: str | Path, roots: list[Path], *, must_exist: bool = Tr
     return candidate
 
 
+def lexical_absolute_path(value: str | Path) -> Path:
+    """Normalize a path without resolving directory symlinks.
+
+    Dashboard checkpoint layouts may intentionally use symlinks to move large
+    model trees between disks.  The directory browser must keep the logical
+    path so users can select it even when its resolved target is elsewhere.
+    """
+    return Path(os.path.abspath(os.path.expanduser(str(value))))
+
+
+def lexical_path_is_within(path: Path, root: Path) -> bool:
+    path = lexical_absolute_path(path)
+    root = lexical_absolute_path(root)
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -1432,6 +1452,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "cluster_targets": {},
         "local_storage_locations": {},
         "cache_root": str(Path.home() / ".cache"),
+        "dataset_read_roots": [],
         "eval_video_roots": [],
         "cluster_resources_script": str(REPO_DIR / "scripts" / "query_h100_h200_resources.sh"),
         "transfer_parallelism": 4,
@@ -1460,6 +1481,14 @@ def load_config(path: Path) -> dict[str, Any]:
         "base_checkpoint",
     ):
         defaults[key] = str(Path(defaults[key]).expanduser().resolve())
+    dataset_read_roots = [
+        str(Path(item).expanduser().resolve())
+        for item in defaults.get("dataset_read_roots", [])
+        if str(item).strip()
+    ]
+    if defaults["dataset_root"] not in dataset_read_roots:
+        dataset_read_roots.insert(0, defaults["dataset_root"])
+    defaults["dataset_read_roots"] = list(dict.fromkeys(dataset_read_roots))
     checkpoint_allowed_roots = [
         str(Path(item).expanduser().resolve()) for item in defaults.get("checkpoint_allowed_roots", [])
     ]
@@ -1511,6 +1540,7 @@ def load_config(path: Path) -> dict[str, Any]:
             "openpi_repo",
             "dashboard_repo",
             "dataset_root",
+            "dataset_read_roots",
             "assets_base_dir",
             "checkpoint_base_dir",
             "base_checkpoint",
@@ -1520,7 +1550,7 @@ def load_config(path: Path) -> dict[str, Any]:
             "nas_dataset_staging_root",
         ):
             if item.get(path_key):
-                if path_key == "eval_video_roots" and isinstance(item[path_key], list):
+                if path_key in {"eval_video_roots", "dataset_read_roots"} and isinstance(item[path_key], list):
                     item[path_key] = [str(value) for value in item[path_key]]
                 else:
                     item[path_key] = str(item[path_key])
@@ -1987,6 +2017,8 @@ class TaskManager:
                 self.config,
                 task.get("metadata", {}).get("gpu_ids", []),
                 xla_memory_fraction=task.get("metadata", {}).get("xla_memory_fraction"),
+                dataset_root_override=task.get("metadata", {}).get("dataset_root_path"),
+                dataset_read_only=bool(task.get("metadata", {}).get("dataset_read_only", False)),
             ),
             raise_on_error=False,
         )
@@ -2324,6 +2356,8 @@ class TaskManager:
             "trigger": "checkpoint_complete",
             "dedupe_key": f"{train_task['id']}:{checkpoint_step}",
             "dataset_id": train_metadata.get("dataset_id"),
+            "dataset_root_path": train_metadata.get("dataset_root_path"),
+            "dataset_read_only": train_metadata.get("dataset_read_only", False),
             "arm_mode": train_metadata.get("arm_mode"),
             "arm_side": train_metadata.get("arm_side"),
             "schema": train_metadata.get("schema"),
@@ -2370,6 +2404,8 @@ class TaskManager:
                 self.config,
                 [int(gpu_id)],
                 xla_memory_fraction=float(settings["xla_memory_fraction"]),
+                dataset_root_override=task.get("metadata", {}).get("dataset_root_path"),
+                dataset_read_only=bool(task.get("metadata", {}).get("dataset_read_only", False)),
             ),
             raise_on_error=False,
         )
@@ -3986,6 +4022,8 @@ def build_environment(
     *,
     xla_memory_fraction: float | None = None,
     xla_preallocate: bool | None = None,
+    dataset_root_override: str | Path | None = None,
+    dataset_read_only: bool = False,
 ) -> dict[str, str]:
     env = os.environ.copy()
     for sensitive_key in ("BIMANUAL_VLA_SERVER_TOKEN", "BIMANUAL_VLA_LOGIN_PASSWORD"):
@@ -4004,7 +4042,7 @@ def build_environment(
         {
             "XDG_CACHE_HOME": str(cache_root),
             "HF_HOME": str(cache_root / "huggingface"),
-            "HF_LEROBOT_HOME": config["dataset_root"],
+            "HF_LEROBOT_HOME": str(dataset_root_override or config["dataset_root"]),
             "LD_LIBRARY_PATH": ":".join(ld_parts),
             "PYTHONUNBUFFERED": "1",
             "TOKENIZERS_PARALLELISM": "false",
@@ -4024,6 +4062,10 @@ def build_environment(
         env["LD_PRELOAD"] = str(nccl_preload) + ((":" + inherited_preload) if inherited_preload else "")
     if xla_preallocate is not None:
         env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true" if xla_preallocate else "false"
+    if dataset_read_only:
+        env["BIMANUAL_VLA_DATASET_READ_ONLY"] = "1"
+    else:
+        env.pop("BIMANUAL_VLA_DATASET_READ_ONLY", None)
     if gpu_ids is None:
         env["JAX_PLATFORMS"] = "cpu"
         env["CUDA_VISIBLE_DEVICES"] = ""
@@ -4038,7 +4080,8 @@ def build_environment(
 
 
 def create_app(config_path: Path) -> Flask:
-    config = load_config(config_path)
+    config_file = Path(config_path).expanduser().resolve()
+    config = load_config(config_file)
     token = os.environ.get("BIMANUAL_VLA_SERVER_TOKEN", "")
     if len(token) < 20:
         raise RuntimeError("set BIMANUAL_VLA_SERVER_TOKEN to a random value of at least 20 characters")
@@ -4051,6 +4094,10 @@ def create_app(config_path: Path) -> Flask:
     tasks = TaskManager(config)
     dataset_root = Path(config["dataset_root"])
     dataset_root.mkdir(parents=True, exist_ok=True)
+    dataset_read_roots = [Path(item) for item in config.get("dataset_read_roots", [])]
+    if dataset_root not in dataset_read_roots:
+        dataset_read_roots.insert(0, dataset_root)
+    dataset_read_roots = list(dict.fromkeys(dataset_read_roots))
 
     def assert_dataset_idle(dataset_id: str) -> None:
         active = [
@@ -4098,6 +4145,7 @@ def create_app(config_path: Path) -> Flask:
 
     dataset_editor = DatasetEditor(
         dataset_root=dataset_root,
+        dataset_read_roots=dataset_read_roots,
         assets_base_dir=Path(config["assets_base_dir"]),
         validate_staging=validate_staging_dataset,
         validate_installed=validate_installed_dataset,
@@ -4109,6 +4157,278 @@ def create_app(config_path: Path) -> Flask:
     checkpoint_roots = [Path(item) for item in config["checkpoint_allowed_roots"]]
     openpi_helper = str(APP_DIR / "openpi_single_arm.py")
     checkpoint_size_cache: dict[str, tuple[float, int]] = {}
+    settings_lock = threading.RLock()
+
+    settings_path_keys = (
+        "dataset_root",
+        "checkpoint_base_dir",
+        "base_checkpoint",
+        "assets_base_dir",
+        "workspace_root",
+        "cache_root",
+    )
+
+    def dataset_path_for_id(dataset_id: str) -> Path:
+        dataset_id = safe_name(dataset_id, "dataset id")
+        roots = [Path(item) for item in config.get("dataset_read_roots", [])]
+        storage = Path(config["dataset_root"])
+        if storage not in roots:
+            roots.insert(0, storage)
+        for root in roots:
+            candidate = root / dataset_id
+            if candidate.is_dir() and (candidate / "meta" / "info.json").is_file():
+                return candidate
+        return storage / dataset_id
+
+    def dataset_root_for_id(dataset_id: str) -> tuple[Path, bool]:
+        path = dataset_path_for_id(dataset_id)
+        storage = Path(config["dataset_root"]).expanduser().resolve()
+        try:
+            path.resolve().relative_to(storage)
+            writable = True
+        except ValueError:
+            writable = False
+        return path, writable
+
+    def dataset_env_kwargs(dataset_id: str) -> dict[str, Any]:
+        path, writable = dataset_root_for_id(dataset_id)
+        return {
+            "dataset_root_override": path.parent,
+            "dataset_read_only": not writable,
+        }
+    def settings_browser_roots() -> list[Path]:
+        """Return safe starting points for the authenticated directory browser."""
+        candidates: list[Path] = []
+        configured = config.get("directory_browser_roots", [])
+        if isinstance(configured, list):
+            candidates.extend(Path(str(item)).expanduser() for item in configured if str(item).strip())
+        for key in settings_path_keys:
+            value = config.get(key)
+            if value:
+                path = Path(str(value)).expanduser()
+                candidates.extend((path, path.parent))
+        candidates.append(Path.home())
+        for anchor in (Path("/mnt"), Path("/DATA")):
+            if anchor.exists():
+                candidates.append(anchor)
+        result: list[Path] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                path = lexical_absolute_path(candidate)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if not path.exists() or not path.is_dir():
+                continue
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(path)
+        return result
+
+    def settings_payload() -> dict[str, Any]:
+        paths = {key: str(config.get(key, "")) for key in settings_path_keys}
+        paths["dataset_read_roots"] = [
+            str(item) for item in config.get("dataset_read_roots", [config.get("dataset_root", "")])
+        ]
+        paths["checkpoint_allowed_roots"] = [
+            str(item) for item in config.get("checkpoint_allowed_roots", [])
+        ]
+        paths["eval_video_roots"] = [
+            str(item) for item in config.get("eval_video_roots", [])
+        ]
+        readonly = {
+            "openpi_repo": str(config.get("openpi_repo", "")),
+            "openpi_python": str(config.get("openpi_python", "")),
+            "config_file": str(config_file),
+        }
+        browser_roots = [
+            {"path": str(path), "label": str(path)} for path in settings_browser_roots()
+        ]
+        return {
+            "paths": paths,
+            "readonly": readonly,
+            "browser_roots": browser_roots,
+            "restart_required_for": [
+                "dataset_root",
+                "dataset_read_roots",
+                "assets_base_dir",
+                "workspace_root",
+                "cache_root",
+                "eval_video_roots",
+            ],
+        }
+
+    def settings_path(value: Any, label: str, *, require_params: bool = False) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            raise ValueError(f"{label} cannot be empty")
+        path = Path(raw).expanduser().resolve()
+        if not path.is_dir():
+            raise ValueError(f"{label} must be an existing directory: {path}")
+        if require_params and not (path / "params").is_dir():
+            raise ValueError(f"{label} must contain a params directory: {path}")
+        return str(path)
+
+    def settings_path_list(value: Any, label: str) -> list[str]:
+        if isinstance(value, str):
+            values = [line.strip() for line in value.splitlines() if line.strip()]
+        elif isinstance(value, list):
+            values = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            raise ValueError(f"{label} must be a list or one path per line")
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in values:
+            normalized = settings_path(item, label)
+            if normalized not in seen:
+                seen.add(normalized)
+                result.append(normalized)
+        if not result:
+            raise ValueError(f"{label} cannot be empty")
+        return result
+
+    def persist_settings(patch: dict[str, Any]) -> None:
+        with settings_lock:
+            current = read_json(config_file)
+            if not isinstance(current, dict):
+                raise ValueError(f"invalid Dashboard config: {config_file}")
+            current.update(patch)
+            temporary = config_file.with_name(f".{config_file.name}.{os.getpid()}.tmp")
+            temporary.write_text(
+                json.dumps(current, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, config_file)
+
+    @app.get("/api/settings")
+    def get_settings():
+        return jsonify(settings_payload())
+
+    @app.put("/api/settings")
+    def update_settings():
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        requested = payload.get("paths", payload)
+        if not isinstance(requested, dict):
+            raise ValueError("paths must be a JSON object")
+
+        normalized: dict[str, Any] = {}
+        for key in settings_path_keys:
+            if key in requested:
+                normalized[key] = settings_path(
+                    requested[key],
+                    key,
+                    require_params=key == "base_checkpoint",
+                )
+            else:
+                normalized[key] = str(config.get(key, ""))
+        if "dataset_read_roots" in requested:
+            dataset_roots = settings_path_list(
+                requested["dataset_read_roots"], "dataset_read_roots"
+            )
+        else:
+            dataset_roots = [
+                str(item) for item in config.get("dataset_read_roots", [config["dataset_root"]])
+            ]
+        if normalized["dataset_root"] not in dataset_roots:
+            dataset_roots.insert(0, normalized["dataset_root"])
+        normalized["dataset_read_roots"] = list(dict.fromkeys(dataset_roots))
+        if "checkpoint_allowed_roots" in requested:
+            allowed_roots = settings_path_list(
+                requested["checkpoint_allowed_roots"], "checkpoint_allowed_roots"
+            )
+        else:
+            allowed_roots = [
+                str(item) for item in config.get("checkpoint_allowed_roots", [])
+            ]
+        for required in (normalized["checkpoint_base_dir"], normalized["base_checkpoint"]):
+            if required not in allowed_roots:
+                allowed_roots.append(required)
+        normalized["checkpoint_allowed_roots"] = allowed_roots
+
+        if "eval_video_roots" in requested:
+            raw_eval_roots = requested["eval_video_roots"]
+            if isinstance(raw_eval_roots, str) and not raw_eval_roots.strip():
+                normalized["eval_video_roots"] = []
+            elif isinstance(raw_eval_roots, list) and not raw_eval_roots:
+                normalized["eval_video_roots"] = []
+            else:
+                normalized["eval_video_roots"] = settings_path_list(
+                    raw_eval_roots, "eval_video_roots"
+                )
+        else:
+            normalized["eval_video_roots"] = [
+                str(item) for item in config.get("eval_video_roots", [])
+            ]
+
+        changed = {
+            key for key in (*settings_path_keys, "dataset_read_roots", "checkpoint_allowed_roots", "eval_video_roots")
+            if normalized.get(key) != config.get(key)
+        }
+        persist_patch = {
+            key: normalized[key]
+            for key in (*settings_path_keys, "dataset_read_roots", "checkpoint_allowed_roots", "eval_video_roots")
+        }
+        persist_settings(persist_patch)
+        config.update(persist_patch)
+        checkpoint_roots[:] = [Path(item) for item in normalized["checkpoint_allowed_roots"]]
+        restart_fields = {
+            "dataset_root",
+            "dataset_read_roots",
+            "assets_base_dir",
+            "workspace_root",
+            "cache_root",
+            "eval_video_roots",
+        }
+        restart_required = bool(changed & restart_fields)
+        return jsonify(
+            {
+                "ok": True,
+                "settings": settings_payload(),
+                "changed": sorted(changed),
+                "restart_required": restart_required,
+                "restart_required_for": sorted(changed & restart_fields),
+            }
+        )
+
+    @app.get("/api/fs/directories")
+    def list_server_directories():
+        roots = settings_browser_roots()
+        if not roots:
+            raise ValueError("no browsable server directories are configured")
+        requested = request.args.get("path", "").strip()
+        path = lexical_absolute_path(requested) if requested else roots[0]
+        if not any(lexical_path_is_within(path, root) for root in roots):
+            raise ValueError("directory is outside configured browser roots")
+        if not path.is_dir():
+            raise FileNotFoundError(str(path))
+        entries = []
+        for entry in sorted(path.iterdir(), key=lambda item: item.name.lower()):
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                is_dir = False
+            if not is_dir or entry.name.startswith("."):
+                continue
+            entries.append(
+                {
+                    "name": entry.name,
+                    "path": str(lexical_absolute_path(entry)),
+                    "symlink": entry.is_symlink(),
+                }
+            )
+        parent = path.parent if any(lexical_path_is_within(path.parent, root) for root in roots) else None
+        return jsonify(
+            {
+                "path": str(path),
+                "parent": str(parent) if parent else None,
+                "roots": [{"path": str(root), "label": str(root)} for root in roots],
+                "entries": entries,
+            }
+        )
 
     @app.before_request
     def authenticate():
@@ -4208,7 +4528,24 @@ def create_app(config_path: Path) -> Flask:
 
     def list_datasets() -> list[dict[str, Any]]:
         datasets = []
-        for directory in sorted(dataset_root.iterdir() if dataset_root.exists() else []):
+        storage_root = Path(config["dataset_root"]).expanduser().resolve()
+        roots = [Path(item).expanduser().resolve() for item in config.get("dataset_read_roots", [])]
+        if storage_root not in roots:
+            roots.insert(0, storage_root)
+        selected: dict[str, tuple[Path, bool]] = {}
+        for root in roots:
+            for directory in sorted(root.iterdir() if root.exists() else []):
+                if not directory.is_dir() or directory.name.startswith("."):
+                    continue
+                if not (directory / "meta" / "info.json").is_file():
+                    continue
+                # The storage root wins when the same dataset id is present in
+                # both storage and an external read-only archive.
+                selected.setdefault(
+                    directory.name,
+                    (directory, root == storage_root),
+                )
+        for directory, writable in sorted(selected.values(), key=lambda item: item[0].name.lower()):
             if not directory.is_dir() or directory.name.startswith("."):
                 continue
             info = read_json(directory / "meta" / "info.json")
@@ -4259,6 +4596,9 @@ def create_app(config_path: Path) -> Flask:
                 {
                     "id": directory.name,
                     "path": str(directory),
+                    "root": str(directory.parent),
+                    "storage": writable,
+                    "read_only": not writable,
                     "episodes": info.get("total_episodes"),
                     "frames": info.get("total_frames"),
                     "fps": info.get("fps"),
@@ -4281,7 +4621,8 @@ def create_app(config_path: Path) -> Flask:
                             "label": "4×4090",
                             "kind": "local",
                             "path": str(directory),
-                            "root": str(dataset_root),
+                            "root": str(directory.parent),
+                            "read_only": not writable,
                             "origin": origin.get("dataset_origin", "unknown"),
                             "episodes": info.get("total_episodes"),
                             "frames": info.get("total_frames"),
@@ -4298,7 +4639,7 @@ def create_app(config_path: Path) -> Flask:
         return set(config.get("visible_dataset_origins", ["real", "unknown"]))
 
     def dataset_origin_for_id(dataset_id: str) -> str:
-        dataset_path = dataset_root / dataset_id
+        dataset_path = dataset_path_for_id(dataset_id)
         info = read_json(dataset_path / "meta" / "info.json")
         if isinstance(info, dict):
             return dataset_origin_info(dataset_id, dataset_path, info).get("dataset_origin", "unknown")
@@ -4674,6 +5015,7 @@ def create_app(config_path: Path) -> Flask:
                     },
                     "eval_video_roots": config.get("eval_video_roots", []),
                     "dataset_root": config["dataset_root"],
+                    "dataset_read_roots": config.get("dataset_read_roots", [config["dataset_root"]]),
                     "workspace_root": config["workspace_root"],
                     "cache_root": config.get("cache_root"),
                     "upload_roots": {
@@ -4852,8 +5194,8 @@ def create_app(config_path: Path) -> Flask:
         dataset_id = safe_name(dataset_id, "dataset id")
         payload = request.get_json(force=True)
         source_id = safe_name(payload.get("source_dataset_id") if isinstance(payload, dict) else None, "source dataset id")
-        target_path = dataset_root / dataset_id
-        source_path = dataset_root / source_id
+        target_path = dataset_path_for_id(dataset_id)
+        source_path = dataset_path_for_id(source_id)
         target_info = read_json(target_path / "meta" / "info.json", {})
         source_info = read_json(source_path / "meta" / "info.json", {})
         target_origin = dataset_origin_info(dataset_id, target_path, target_info).get("dataset_origin")
@@ -4876,7 +5218,7 @@ def create_app(config_path: Path) -> Flask:
 
     def parse_dataset(payload: dict[str, Any]) -> tuple[str, str, str, str, dict[str, Any]]:
         dataset_id = safe_name(payload.get("dataset_id"), "dataset id")
-        dataset_path = dataset_root / dataset_id
+        dataset_path = dataset_path_for_id(dataset_id)
         info = read_json(dataset_path / "meta" / "info.json")
         if not isinstance(info, dict):
             raise ValueError(f"dataset is not installed: {dataset_id}")
@@ -5162,12 +5504,14 @@ def create_app(config_path: Path) -> Flask:
             2**31 - 1,
         )
         contract = action_contract_for_model(dataset_contract)
+        dataset_path, writable = dataset_root_for_id(dataset_id)
         return resolve_episode_split(
-            dataset_root,
+            dataset_path.parent,
             dataset_id,
             test_ratio=test_ratio,
             seed=split_seed,
             contract=contract["contract_fingerprint"],
+            persist=writable,
         )
 
     def training_episode_split(
@@ -5179,8 +5523,9 @@ def create_app(config_path: Path) -> Flask:
     ) -> tuple[EpisodeSplit, str]:
         contract = model_contract or action_contract_for_model(dataset_contract)
         fingerprint = contract["contract_fingerprint"]
+        dataset_path, writable = dataset_root_for_id(dataset_id)
         persisted = load_episode_split(
-            dataset_root, dataset_id, contract=fingerprint
+            dataset_path.parent, dataset_id, contract=fingerprint
         )
         explicit_ratio = payload.get("test_ratio") not in (None, "")
         explicit_seed = payload.get("split_seed") not in (None, "")
@@ -5205,11 +5550,12 @@ def create_app(config_path: Path) -> Flask:
             2**31 - 1,
         )
         split = resolve_episode_split(
-            dataset_root,
+            dataset_path.parent,
             dataset_id,
             test_ratio=test_ratio,
             seed=split_seed,
             contract=fingerprint,
+            persist=writable,
         )
         return split, "request" if explicit_ratio or explicit_seed else "default"
 
@@ -6722,9 +7068,11 @@ print(json.dumps(rows, ensure_ascii=False))
         )
         task = tasks.start(
             "norm", command,
-            env=build_environment(config, None),
+            env=build_environment(config, None, **dataset_env_kwargs(dataset_id)),
             metadata={
                 "dataset_id": dataset_id,
+                "dataset_root_path": str(dataset_root_for_id(dataset_id)[0].parent),
+                "dataset_read_only": not dataset_root_for_id(dataset_id)[1],
                 "arm_mode": arm_mode,
                 "arm_side": arm_side,
                 "schema": schema,
@@ -7139,6 +7487,8 @@ print(json.dumps(rows, ensure_ascii=False))
                 command = slurm_command
         metadata = {
             "dataset_id": dataset_id,
+            "dataset_root_path": str(dataset_root_for_id(dataset_id)[0].parent),
+            "dataset_read_only": not dataset_root_for_id(dataset_id)[1],
             "arm_mode": arm_mode,
             "arm_side": arm_side,
             "schema": schema,
@@ -7217,7 +7567,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 task = tasks.start(
                     "train",
                     command,
-                    env=build_environment(config, None),
+                    env=build_environment(config, None, **dataset_env_kwargs(dataset_id)),
                     metadata={
                         **metadata,
                         "slurm_target": execution_target,
@@ -7244,6 +7594,7 @@ print(json.dumps(rows, ensure_ascii=False))
                         config,
                         gpu_ids,
                         xla_memory_fraction=xla_memory_fraction,
+                        **dataset_env_kwargs(dataset_id),
                     ),
                     metadata=metadata,
                 )
@@ -7296,6 +7647,8 @@ print(json.dumps(rows, ensure_ascii=False))
                     env=build_environment(config, None),
                     metadata={
                         "dataset_id": dataset_id,
+                        "dataset_root_path": str(dataset_root_for_id(dataset_id)[0].parent),
+                        "dataset_read_only": not dataset_root_for_id(dataset_id)[1],
                         "arm_mode": arm_mode,
                         "arm_side": arm_side,
                         "schema": schema,
@@ -7409,13 +7762,20 @@ print(json.dumps(rows, ensure_ascii=False))
                 eval_seed=eval_seed,
                 model_contract=model_contract,
             )
-            env = build_environment(config, gpu_ids, xla_memory_fraction=xla_memory_fraction)
+            env = build_environment(
+                config,
+                gpu_ids,
+                xla_memory_fraction=xla_memory_fraction,
+                **dataset_env_kwargs(dataset_id),
+            )
         task = tasks.start(
             "eval",
             command,
             env=env,
             metadata={
                 "dataset_id": dataset_id,
+                "dataset_root_path": str(dataset_root_for_id(dataset_id)[0].parent),
+                "dataset_read_only": not dataset_root_for_id(dataset_id)[1],
                 "arm_mode": arm_mode,
                 "arm_side": arm_side,
                 "schema": schema,

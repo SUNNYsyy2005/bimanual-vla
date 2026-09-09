@@ -41,6 +41,8 @@
     .auth-panel { display:flex; flex-direction:column; align-items:flex-end; gap:8px; max-width:760px; }
     .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
     .auth-panel input { width:190px; }
+    .auth-status { display:flex; align-items:center; gap:8px; color:var(--muted); }
+    .auth-status strong { color:var(--heading); }
     .module-nav { max-width:1640px; margin:auto; padding:0 28px 14px; display:flex; gap:7px; overflow-x:auto; scrollbar-width:thin; }
     .nav-button { width:auto; flex:0 0 auto; display:flex; align-items:center; gap:8px; padding:9px 14px; border:1px solid transparent; border-radius:11px; color:var(--muted); background:transparent; font-weight:750; transition:background .18s ease,border-color .18s ease,color .18s ease,transform .18s ease; }
     .nav-button:hover { color:var(--heading); border-color:var(--line); background:var(--surface-raised); transform:translateY(-1px); }
@@ -157,6 +159,18 @@
     .transfer-progress-meta { display:flex; justify-content:space-between; gap:8px; color:#cfe2f7; font-size:12px; }
     .transfer-progress-meta + .progress-track { margin-top:6px; }
     .transfer-detail { color:#9fb3cc; font-size:11px; line-height:1.45; }
+    .list-pagination { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    .list-pagination label { display:flex; align-items:center; gap:6px; margin:0; color:var(--muted); font-size:12px; font-weight:600; }
+    .list-pagination select { width:auto; min-width:78px; min-height:34px; padding:6px 8px; }
+    .list-pagination .inline { min-height:34px; margin:0; }
+    .model-catalog-table { table-layout:fixed; }
+    .model-catalog-table th:nth-child(1),.model-catalog-table td:nth-child(1) { width:24%; }
+    .model-catalog-table th:nth-child(2),.model-catalog-table td:nth-child(2) { width:13%; }
+    .model-catalog-table th:nth-child(3),.model-catalog-table td:nth-child(3) { width:16%; }
+    .model-catalog-table th:nth-child(4),.model-catalog-table td:nth-child(4) { width:47%; }
+    .model-catalog-table th,.model-catalog-table td { overflow-wrap:anywhere; }
+    .policy-workspace { grid-template-columns:minmax(0,1fr); }
+    .policy-workspace > .card { grid-column:1; }
     .section-note { padding:10px 12px; border-left:3px solid var(--blue); border-radius:7px; background:#0b1b2e; color:#aac0d8; }
     .dataset-origin-real { color:#bfffe5; border-color:#217a5f !important; background:#103529 !important; }
     .dataset-origin-simulation { color:#d9ccff; border-color:#624ca8 !important; background:#261f46 !important; }
@@ -216,6 +230,20 @@
     .analysis-anomaly-legend { display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 2px; color:#b8cbe0; font-size:11px; }
     .training-workspace,.evaluation-workspace { grid-column:span 12; display:grid; grid-template-columns:minmax(0,1.16fr) minmax(360px,.84fr); gap:18px; align-items:start; }
     .training-workspace > .card,.evaluation-workspace > .card { grid-column:auto; }
+    .settings-path-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+    .settings-path-field { min-width:0; }
+    .settings-path-field.wide { grid-column:span 2; }
+    .settings-path-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:7px; align-items:end; }
+    .settings-path-row button { width:auto; min-width:74px; }
+    .settings-browser-toolbar { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.2fr) auto; gap:8px; align-items:end; }
+    .settings-browser-toolbar button { width:auto; }
+    .settings-browser-path { margin:10px 0; padding:9px 11px; overflow-wrap:anywhere; border:1px solid var(--line-soft); border-radius:10px; background:var(--surface-inset); }
+    .settings-directory-list { display:grid; gap:6px; max-height:430px; overflow:auto; }
+    .settings-directory-entry { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:7px; align-items:center; padding:7px 9px; border:1px solid var(--line-soft); border-radius:9px; background:var(--surface-inset); }
+    .settings-directory-entry .name { overflow-wrap:anywhere; }
+    .settings-directory-entry button { width:auto; min-width:58px; min-height:34px; padding:6px 9px; }
+    .settings-readonly { display:grid; gap:7px; margin-top:14px; }
+    .settings-readonly code { display:block; padding:8px 10px; overflow-wrap:anywhere; border:1px solid var(--line-soft); border-radius:9px; background:var(--surface-inset); }
     .training-process-card,.training-output-card,.evaluation-process-card,.evaluation-log-card { min-width:0; }
     .training-process-card { overflow:hidden; }
     .training-output-tabs { display:flex; gap:6px; margin:-2px 0 18px; padding-bottom:10px; border-bottom:1px solid var(--line-soft); }
@@ -272,8 +300,8 @@
     @media(max-width:1280px){.analysis-grid{grid-template-columns:1fr}}
     @media(max-width:1280px){.checkpoint-filter-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
     @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid,.telemetry-latency-grid{grid-template-columns:repeat(2,1fr)}.checkpoint-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-    @media(max-width:900px){.training-workspace,.evaluation-workspace{grid-template-columns:1fr}.eval-settings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-    @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar,.eval-settings-grid{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid,.telemetry-vector-grid,.analysis-grid{grid-template-columns:1fr;grid-auto-flow:row;grid-auto-columns:auto;overflow-x:visible}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
+    @media(max-width:900px){.training-workspace,.evaluation-workspace{grid-template-columns:1fr}.eval-settings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.settings-path-grid{grid-template-columns:1fr}.settings-path-field.wide{grid-column:auto}.settings-browser-toolbar{grid-template-columns:1fr 1fr}.settings-browser-toolbar button{grid-column:span 2}}
+    @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar,.eval-settings-grid,.settings-path-grid,.settings-browser-toolbar{grid-template-columns:1fr}.settings-path-field.wide{grid-column:auto}.settings-browser-toolbar button{grid-column:auto}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid,.telemetry-vector-grid,.analysis-grid{grid-template-columns:1fr;grid-auto-flow:row;grid-auto-columns:auto;overflow-x:visible}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
   </style>
   <script>
     (() => {
@@ -296,8 +324,10 @@
         <div><h1>{{ dashboard_title }} <span class="pill" id="dashboardBuildBadge">build {{ dashboard_build }}</span></h1><div class="muted">{{ "仿真数据上传、4×4090/H100/H200 训练评测与视频查看" if dashboard_profile == "simulation" else "数据集、训练、Policy 与实机遥测统一管理" }}</div></div>
       </div>
       <div class="auth-panel">
-        <div class="toolbar"><input id="token" type="password" placeholder="Dashboard API Token"><button class="inline" onclick="saveToken()">保存 Token</button><button class="inline secondary" onclick="refreshAll()">刷新</button><button id="themeToggle" class="inline secondary theme-toggle" type="button" aria-pressed="false" aria-label="切换主题"><span id="themeToggleIcon" class="theme-toggle-icon" aria-hidden="true">☾</span><span id="themeToggleLabel">亮色</span></button></div>
-        <div class="toolbar"><input id="loginUser" autocomplete="username" placeholder="登录账号"><input id="loginPassword" type="password" autocomplete="current-password" placeholder="登录密码"><button class="inline secondary" onclick="requestToken()">获取 Token</button></div>
+        <div class="toolbar auth-token-toolbar"><input id="token" type="password" placeholder="Dashboard API Token"><button class="inline" onclick="saveToken()">保存 Token</button><button class="inline secondary" onclick="refreshAll()">刷新</button></div>
+        <div class="toolbar auth-login-toolbar"><input id="loginUser" autocomplete="username" placeholder="登录账号"><input id="loginPassword" type="password" autocomplete="current-password" placeholder="登录密码"><button class="inline secondary" onclick="requestToken()">获取 Token</button></div>
+        <div id="authStatus" class="auth-status" hidden><span id="authStatusText"></span><button class="inline secondary" type="button" onclick="refreshAll()">刷新</button><button class="inline secondary" type="button" onclick="logoutDashboard()">退出登录</button></div>
+        <div class="toolbar theme-toolbar"><button id="themeToggle" class="inline secondary theme-toggle" type="button" aria-pressed="false" aria-label="切换主题"><span id="themeToggleIcon" class="theme-toggle-icon" aria-hidden="true">☾</span><span id="themeToggleLabel">亮色</span></button></div>
       </div>
     </header>
     <nav id="moduleNav" class="module-nav" aria-label="Dashboard modules">
@@ -307,6 +337,7 @@
       {% if enable_policy %}<button class="nav-button" data-module="policy">Policy <span id="navPolicyCount" class="nav-count">-</span></button>
       <button class="nav-button" data-module="telemetry">实时遥测 <span id="navTelemetryCount" class="nav-count">-</span></button>{% endif %}
       {% if dashboard_profile == "simulation" %}<button class="nav-button" data-module="eval-videos">评估视频 <span id="navEvalVideoCount" class="nav-count">-</span></button>{% endif %}
+      <button class="nav-button" data-module="settings">设置 <span id="navSettingsCount" class="nav-count">⚙</span></button>
 
     </nav>
   </div>
@@ -339,18 +370,18 @@
       <div class="grid">
         <div class="card half"><h2>上传数据集</h2><p>{{ "仿真数据上传执行：" if dashboard_profile == "simulation" else "真机采集机执行：" }}</p><pre id="uploadCommand">bin/bimanual-vla data-upload LEROBOT_OR_GUI_NPZ_DIR --name my_dataset --dataset-origin {{ upload_default_origin }} --server http://192.168.101.9:{{ server_port }} --token TOKEN --workers 4 --merge</pre><p class="muted">{{ "仿真 Dashboard 默认只接收并显示 --dataset-origin simulation 的数据；正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。" if dashboard_profile == "simulation" else "仿真数据上传时仍使用 --dataset-origin simulation，其暂存目录与真机数据隔离，并且不会出现在实机 Dashboard 列表或训练/Policy 数据集选择器中。正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。" }}</p></div>
         <div class="card half"><h2>格式与媒体说明</h2><div class="section-note">Dashboard 可识别单臂 7D / 10D、双臂 14D / 20D 和其他自定义维度，并显示所有 <code>dtype: video</code> / <code>dtype: image</code> 相机。{{ "这里只呈现仿真数据集；可从本页面统一提交 4×4090 本地训练/评测或 H100/H200 Slurm 训练/评测。" if dashboard_profile == "simulation" else "这里只呈现真机和未分类数据集；将来源标记为仿真后，该数据集会从 Dashboard 隐藏，但数据集 ID 和底层训练加载路径不会改变。" }}</div></div>
-        <div class="card"><h2>{{ "已接收仿真数据集" if dashboard_profile == "simulation" else "已接收真机数据集" }}</h2><div class="toolbar"><label style="margin:0">来源筛选</label><select id="datasetOriginFilter" class="dataset-origin-select"><option value="all">全部</option>{% for origin in visible_dataset_origins %}<option value="{{ origin }}">{{ "真机" if origin == "real" else "仿真" if origin == "simulation" else "未分类" }}</option>{% endfor %}</select><button class="inline secondary" type="button" onclick="loadDatasetLocations(true)">刷新 4×4090/H100/H200 位置</button><span id="datasetOriginSummary" class="muted">等待状态数据。</span></div><div class="table-wrap"><table><thead><tr><th>ID / 来源</th><th>位置 / 同步</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div></div>
+        <div class="card"><h2>{{ "已接收仿真数据集" if dashboard_profile == "simulation" else "已接收真机数据集" }}</h2><div class="toolbar"><label style="margin:0">来源筛选</label><select id="datasetOriginFilter" class="dataset-origin-select"><option value="all">全部</option>{% for origin in visible_dataset_origins %}<option value="{{ origin }}">{{ "真机" if origin == "real" else "仿真" if origin == "simulation" else "未分类" }}</option>{% endfor %}</select><button class="inline secondary" type="button" onclick="loadDatasetLocations(true)">刷新 4×4090/H100/H200 位置</button><span id="datasetOriginSummary" class="muted">等待状态数据。</span></div><div class="table-wrap"><table><thead><tr><th>ID / 来源</th><th>位置 / 同步</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div><div id="datasetsPagination"></div></div>
         <div class="card">
           <h2>数据传输任务</h2>
           <p class="muted">显示数据集、checkpoint 和评估视频 transfer 的实时状态；进度来自传输 runner 的 sidecar，旧任务会用目标目录清单做保守估算。</p>
-          <div class="table-wrap"><table><thead><tr><th>任务</th><th>方向 / 路径</th><th>进度</th><th>状态 / 详情</th><th>操作</th></tr></thead><tbody id="transferJobs"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>任务</th><th>方向 / 路径</th><th>进度</th><th>状态 / 详情</th><th>操作</th></tr></thead><tbody id="transferJobs"></tbody></table></div><div id="transferTasksPagination"></div>
         </div>
         <div class="card">
           <h2>Episode 级数据集编辑与相机预览</h2>
           <p class="muted">参数编辑不修改 state/action/图像帧；合并、删除或编辑会先构造临时数据集并校验，成功后原子替换。已有 norm stats 将失效。</p>
           <div class="row3"><div><label>目标数据集</label><select id="editorDataset"></select></div><div><label>合并来源</label><select id="mergeSourceDataset"></select></div><div><label>&nbsp;</label><button type="button" id="mergeDatasetButton" onclick="mergeDatasetEpisodes()">增量合并到目标</button></div></div>
           <details id="datasetEventSemanticsPanel"><summary><strong>数据集 Event 语义</strong>（每个数据集独立保存）</summary><p class="muted">保存到 <code>meta/event_semantics.json</code>。每行格式为 <code>E编号: 语义</code>；episode 中只标注 event 起始帧。</p><div class="row"><div><label>Event 最大编号</label><input id="datasetEventMaxValue" type="number" min="0" max="99" step="1" value="4"></div><div><label>说明（可选）</label><input id="datasetEventDescription" placeholder="该 event 划分的用途或版本"></div></div><label>Event 定义</label><textarea id="datasetEventLabels" rows="7" placeholder="E0: 未稳定抓住物体&#10;E1: 稳定抓住物体&#10;E2: 稳定抬起物体"></textarea><div class="toolbar"><button class="inline secondary" type="button" onclick="saveDatasetEventSemantics()">保存 Event 语义文件</button><span id="datasetEventSemanticsStatus" class="muted">选择数据集后加载。</span></div></details>
-          <div class="toolbar"><button class="inline secondary" type="button" onclick="loadDatasetEpisodes(0)">刷新 episodes</button><button class="inline danger" type="button" onclick="deleteSelectedEpisodes()">删除选中 episodes</button></div>
+          <div class="toolbar"><button class="inline secondary" type="button" onclick="loadDatasetEpisodes(0)">刷新 episodes</button><button class="inline danger" type="button" onclick="deleteSelectedEpisodes()">删除选中 episodes</button><label style="margin:0">每页<select id="episodePageSize" style="width:auto; min-width:78px" onchange="setEpisodePageSize(this.value)"><option value="25">25</option><option value="50">50</option><option value="100" selected>100</option></select></label></div>
           <div id="episodeEditorSummary" class="muted editor-summary">选择数据集后加载。</div>
           <div class="episode-editor-grid">
             <div class="episode-panel table-wrap"><table><thead><tr><th></th><th>Episode</th><th>帧数</th><th>Instruction</th><th>Task</th><th>Success</th><th>Event</th><th>操作</th></tr></thead><tbody id="episodeRows"></tbody></table><div class="toolbar" style="margin:10px"><button class="inline secondary" type="button" onclick="changeEpisodePage(-1)">上一页</button><span id="episodePage" class="muted">-</span><button class="inline secondary" type="button" onclick="changeEpisodePage(1)">下一页</button></div></div>
@@ -454,7 +485,7 @@
             <span id="trainingTaskFilterSummary" class="muted">-</span>
           </div>
           <div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('training')" disabled data-bulk-delete-scope="training">批量删除已选日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束任务；不会删除 checkpoint、模型或训练输出。</span></div>
-          <div class="table-wrap training-jobs-wrap"><table class="training-jobs-table"><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="training" onchange="toggleTaskSelection('training', this.checked)" aria-label="全选训练历史任务"></th><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div>
+          <div class="table-wrap training-jobs-wrap"><table class="training-jobs-table"><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="training" onchange="toggleTaskSelection('training', this.checked)" aria-label="全选当前页训练历史任务"></th><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div><div id="trainingTasksPagination"></div>
         </section>
         <section id="trainingOutputCard" class="card training-output-card">
           <div class="training-output-tabs" role="tablist" aria-label="训练输出">
@@ -486,7 +517,12 @@
             <div class="checkpoint-step-filter"><label>Step 范围</label><div class="toolbar"><input id="checkpointMinStep" type="number" min="0" placeholder="最小"><span class="muted">至</span><input id="checkpointMaxStep" type="number" min="0" placeholder="最大"></div></div>
           </div>
           <div class="toolbar checkpoint-toolbar"><button class="inline secondary" type="button" onclick="resetCheckpointFilters()">清空筛选</button><button class="inline danger" type="button" onclick="batchDeleteSelectedCheckpoints()" disabled data-bulk-delete-checkpoint-scope="training">批量删除已选 checkpoint（<span data-selected-checkpoint-count>0</span>）</button></div>
-          <div class="table-wrap"><table><thead><tr><th class="checkpoint-selection-cell"><input type="checkbox" class="checkpoint-select-all" data-checkpoint-scope="training" onchange="toggleCheckpointSelection('training', this.checked)" aria-label="全选当前筛选的 checkpoint"></th><th>实验 / step</th><th>数据集</th><th>大小 / 时间</th></tr></thead><tbody id="checkpoints"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th class="checkpoint-selection-cell"><input type="checkbox" class="checkpoint-select-all" data-checkpoint-scope="training" onchange="toggleCheckpointSelection('training', this.checked)" aria-label="全选当前页 checkpoint"></th><th>实验 / step</th><th>数据集</th><th>大小 / 时间</th></tr></thead><tbody id="checkpoints"></tbody></table></div><div id="checkpointsPagination"></div>
+        </section>
+        <section class="card model-catalog-card">
+          <div class="training-output-heading"><div><h2>模型资源列表</h2><p class="muted">基础模型与训练 checkpoint 统一展示；表单中的模型选择器仍按实验和模型系列自动匹配。</p></div><span id="baseModelSummary" class="muted">等待模型数据。</span></div>
+          <div class="checkpoint-filter-grid"><div><label for="baseModelSearch">模型 / 实验 / 路径包含</label><input id="baseModelSearch" type="search" placeholder="搜索名称、实验或 checkpoint 路径"></div><div><label for="baseModelVariantFilter">模型系列</label><select id="baseModelVariantFilter"><option value="all">全部模型</option></select></div><div><label for="baseModelSourceFilter">资源类型</label><select id="baseModelSourceFilter"><option value="all">全部资源</option><option value="foundation">基础模型</option><option value="checkpoint">训练 checkpoint</option></select></div></div>
+          <div class="table-wrap"><table class="model-catalog-table"><thead><tr><th>名称 / 实验</th><th>模型系列</th><th>资源类型 / step</th><th>路径 / 机械臂模式</th></tr></thead><tbody id="baseModels"></tbody></table></div><div id="baseModelsPagination"></div>
         </section>
         <div class="card manual-eval-card" id="manualEvalCard">
           <h2>手动评测</h2>
@@ -514,7 +550,7 @@
             <div class="training-output-heading"><div><h2>评测进程管理</h2><p class="muted">这里只显示 Eval 任务；Norm / Train 任务保留在上方训练进程表。</p></div><span id="evalTaskFilterSummary" class="muted">-</span></div>
             <div class="eval-task-filter-grid"><div><label for="evalExperimentFilter">实验名称包含</label><input id="evalExperimentFilter" type="search" placeholder="筛选 experiment / task name"></div><div><label for="evalTaskStateFilter">状态</label><select id="evalTaskStateFilter"><option value="all">全部状态</option><option value="running">运行中</option><option value="completed">已完成</option><option value="failed">失败</option><option value="skipped">已跳过</option></select></div></div>
             <div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('evaluation')" disabled data-bulk-delete-scope="evaluation">批量删除已选日志（<span data-selected-task-count>0</span>）</button></div>
-            <div class="table-wrap training-jobs-wrap"><table class="training-jobs-table"><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="evaluation" onchange="toggleTaskSelection('evaluation', this.checked)" aria-label="全选评测历史任务"></th><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="evalJobs"></tbody></table></div>
+          <div class="table-wrap training-jobs-wrap"><table class="training-jobs-table"><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="evaluation" onchange="toggleTaskSelection('evaluation', this.checked)" aria-label="全选当前页评测历史任务"></th><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="evalJobs"></tbody></table></div><div id="evaluationTasksPagination"></div>
           </section>
           <section class="card evaluation-log-card" id="evalTaskLogCard">
             <div class="training-output-heading"><div><h2>评测任务日志</h2><p class="muted">从左侧评测进程点击“日志”，或提交手动评测后查看输出。</p></div><span id="evalLogSelection" class="pill">尚未选择评测任务</span></div>
@@ -542,16 +578,80 @@
           <span class="muted">仅本地 4×4090 视频可删除；远端视频只能同步。</span>
         </div>
         <span id="evalVideoSummary" class="muted">尚未加载。</span>
-        <div id="evalVideoList" class="eval-video-list"></div>
+        <div id="evalVideoList" class="eval-video-list"></div><div id="evalVideosPagination"></div>
       </div></div>
     </section>
 {% endif %}
 
+    <section id="module-settings" class="dashboard-module" data-module="settings" hidden>
+      <div class="module-heading"><div><h2>设置</h2><p>配置数据集、模型、基础模型和 Dashboard 运行产物的服务器路径；目录浏览器只显示已授权的服务器目录。</p></div></div>
+      <div class="grid">
+        <section class="card two-third">
+          <h2>路径配置</h2>
+          <p class="muted">模型路径保存后立即用于扫描和新任务。数据集、assets、工作目录和缓存路径保存到配置文件，重启 Dashboard 后完全生效。</p>
+          <form id="settingsForm">
+            <div class="settings-path-grid">
+              <div class="settings-path-field">
+                <label for="settingsDatasetRoot">数据集读取 / 存储目录</label>
+                <div class="settings-path-row"><input id="settingsDatasetRoot" name="dataset_root" autocomplete="off"><button type="button" class="inline secondary" data-settings-browse-target="settingsDatasetRoot">浏览</button></div>
+              </div>
+              <div class="settings-path-field">
+                <label for="settingsCheckpointBaseDir">模型 checkpoint 读取 / 存储目录</label>
+                <div class="settings-path-row"><input id="settingsCheckpointBaseDir" name="checkpoint_base_dir" autocomplete="off"><button type="button" class="inline secondary" data-settings-browse-target="settingsCheckpointBaseDir">浏览</button></div>
+              </div>
+              <div class="settings-path-field">
+                <label for="settingsBaseCheckpoint">基础模型 checkpoint</label>
+                <div class="settings-path-row"><input id="settingsBaseCheckpoint" name="base_checkpoint" autocomplete="off"><button type="button" class="inline secondary" data-settings-browse-target="settingsBaseCheckpoint">浏览</button></div>
+              </div>
+              <div class="settings-path-field">
+                <label for="settingsAssetsBaseDir">模型 assets / norm 目录</label>
+                <div class="settings-path-row"><input id="settingsAssetsBaseDir" name="assets_base_dir" autocomplete="off"><button type="button" class="inline secondary" data-settings-browse-target="settingsAssetsBaseDir">浏览</button></div>
+              </div>
+              <div class="settings-path-field">
+                <label for="settingsWorkspaceRoot">日志、任务和上传工作目录</label>
+                <div class="settings-path-row"><input id="settingsWorkspaceRoot" name="workspace_root" autocomplete="off"><button type="button" class="inline secondary" data-settings-browse-target="settingsWorkspaceRoot">浏览</button></div>
+              </div>
+              <div class="settings-path-field">
+                <label for="settingsCacheRoot">缓存目录</label>
+                <div class="settings-path-row"><input id="settingsCacheRoot" name="cache_root" autocomplete="off"><button type="button" class="inline secondary" data-settings-browse-target="settingsCacheRoot">浏览</button></div>
+              </div>
+              <div class="settings-path-field wide">
+                <label for="settingsAllowedRoots">允许扫描 / 读取的 checkpoint 目录（每行一个）</label>
+                <textarea id="settingsAllowedRoots" name="checkpoint_allowed_roots" rows="4" spellcheck="false"></textarea>
+                <p class="muted">基础模型和 checkpoint 必须位于这些目录中；软链接目标目录也应加入这里。</p>
+              </div>
+              <div class="settings-path-field wide">
+                <label for="settingsEvalVideoRoots">评估视频目录（每行一个，可留空）</label>
+                <textarea id="settingsEvalVideoRoots" name="eval_video_roots" rows="3" spellcheck="false"></textarea>
+              </div>
+            </div>
+            <div class="toolbar" style="margin-top:14px"><button type="submit" class="inline">保存路径设置</button><span id="settingsSaveStatus" class="muted">尚未加载设置。</span></div>
+          </form>
+          <div class="settings-readonly">
+            <div class="muted">OpenPI 仓库（只读）</div><code id="settingsOpenpiRepo">-</code>
+            <div class="muted">Python 环境（只读）</div><code id="settingsOpenpiPython">-</code>
+            <div class="muted">配置文件（只读）</div><code id="settingsConfigFile">-</code>
+          </div>
+        </section>
+        <section class="card third">
+          <h2>服务器目录浏览</h2>
+          <p class="muted">选择字段后点击“浏览”。可进入目录、返回上级，或把当前目录填入选中的路径字段。</p>
+          <div class="settings-browser-toolbar">
+            <div><label for="settingsBrowseTarget">填入字段</label><select id="settingsBrowseTarget"><option value="settingsDatasetRoot">数据集目录</option><option value="settingsCheckpointBaseDir">模型目录</option><option value="settingsBaseCheckpoint">基础模型</option><option value="settingsAssetsBaseDir">assets / norm</option><option value="settingsWorkspaceRoot">日志 / 任务目录</option><option value="settingsCacheRoot">缓存目录</option></select></div>
+            <div><label for="settingsBrowseRoot">浏览起点</label><select id="settingsBrowseRoot"></select></div>
+            <button type="button" class="inline secondary" id="settingsBrowseRefresh">刷新</button>
+          </div>
+          <div id="settingsBrowsePath" class="settings-browser-path"><code>-</code></div>
+          <div id="settingsDirectoryList" class="settings-directory-list"><span class="muted">打开设置后加载目录。</span></div><div id="settingsDirectoryPagination"></div>
+        </section>
+      </div>
+    </section>
+
     <section id="module-policy" class="dashboard-module" data-module="policy" hidden>
       <div class="module-heading"><div><h2>Policy 管理</h2><p>从 checkpoint 启动、切换、健康检测和实机执行授权。</p></div></div>
-      <div class="grid">
+      <div class="grid policy-workspace">
         <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><input type="hidden" name="model_variant" id="policyModelVariant" value="pi05"><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div></div><p class="muted">Prompt 与 RTC 运行参数由机械臂客户端配置；Policy 仅提供服务器能力上限。客户端改动后无需重启 Policy。</p><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
-        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code>、<code>action_horizon &gt;= 16</code> 和本地逐 20 Hz command 安全检查。异步客户端默认 4 Hz 启动推理（推理+传输通常约 200 ms），旧 chunk 在推理期间持续执行；新 chunk 到达后按实时 arrival 延迟动态过期 prefix，融合 2~4 步后切换 generation。已结束的历史进程可删除记录和日志。</p><div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('policy')" disabled data-bulk-delete-scope="policy">批量删除已选日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束 Policy；不会删除模型或其他输出。</span></div><div class="table-wrap"><table><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="policy" onchange="toggleTaskSelection('policy', this.checked)" aria-label="全选 Policy 历史任务"></th><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端状态 / 延迟摘要</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div></div>
+        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code>、<code>action_horizon &gt;= 16</code> 和本地逐 20 Hz command 安全检查。异步客户端默认 4 Hz 启动推理（推理+传输通常约 200 ms），旧 chunk 在推理期间持续执行；新 chunk 到达后按实时 arrival 延迟动态过期 prefix，融合 2~4 步后切换 generation。已结束的历史进程可删除记录和日志。</p><div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('policy')" disabled data-bulk-delete-scope="policy">批量删除已选日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束 Policy；不会删除模型或其他输出。</span></div><div class="table-wrap"><table><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="policy" onchange="toggleTaskSelection('policy', this.checked)" aria-label="全选当前页 Policy 历史任务"></th><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端状态 / 延迟摘要</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div><div id="policyTasksPagination"></div></div>
         <div class="card" id="policyTaskLogCard"><h2>Policy 进程日志</h2><p class="muted">从 Policy 进程表点击“日志”查看最近输出。</p><pre id="policyTaskLog">尚未选择 Policy 进程。</pre></div>
         <div class="card"><h2>机械臂客户端命令</h2><p class="muted">以下只生成连接/设备示例；prompt 和 RTC 运行参数属于客户端。连接后以 telemetry 中的 client prompt/RTC 为准。</p><pre id="policyClientCommand">bin/bimanual-vla rtc-client --host 192.168.101.9 --port 8000 --hz 4 --arm-mode single --arm-side right --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16</pre></div>
       </div>
@@ -580,6 +680,32 @@ const loginPasswordInput = document.getElementById('loginPassword');
 tokenInput.value = localStorage.getItem('bimanualVlaToken') || '';
 loginUserInput.value = localStorage.getItem('bimanualVlaLoginUser') || '';
 
+function setAuthState(authenticated, username = '') {
+  const tokenToolbar = document.querySelector('.auth-token-toolbar');
+  const loginToolbar = document.querySelector('.auth-login-toolbar');
+  const status = document.getElementById('authStatus');
+  const statusText = document.getElementById('authStatusText');
+  const loggedIn = Boolean(authenticated && tokenInput.value);
+  if (tokenToolbar) tokenToolbar.hidden = loggedIn;
+  if (loginToolbar) loginToolbar.hidden = loggedIn;
+  if (status) status.hidden = !loggedIn;
+  if (statusText) statusText.innerHTML = loggedIn
+    ? `<strong>已登录</strong> · 用户 ${esc(username || 'Token')}`
+    : '';
+}
+
+function logoutDashboard() {
+  tokenInput.value = '';
+  loginPasswordInput.value = '';
+  localStorage.removeItem('bimanualVlaToken');
+  localStorage.removeItem('bimanualVlaLoginUser');
+  latestStatus = null;
+  setAuthState(false);
+  show('已退出 Dashboard 登录。', false);
+}
+
+setAuthState(Boolean(tokenInput.value), loginUserInput.value || 'Token');
+
 const ACTIVE_STATES = new Set(['starting', 'running', 'stopping', 'waiting_norm', 'waiting_gpu']);
 const TERMINAL_STATES = new Set(['completed', 'failed', 'lost', 'stopped', 'skipped']);
 const TRAINING_TASK_TYPES = new Set(['norm', 'train']);
@@ -592,9 +718,14 @@ const ENABLE_EVAL_VIDEOS = DASHBOARD_PROFILE === 'simulation';
 const MODULE_LIST = ['overview', 'datasets', 'training'];
 if (ENABLE_POLICY) MODULE_LIST.push('policy', 'telemetry');
 if (ENABLE_EVAL_VIDEOS) MODULE_LIST.push('eval-videos');
+MODULE_LIST.push('settings');
 const MODULES = new Set(MODULE_LIST);
 const METRIC_COLORS = ['#42c7ff', '#3ee6a8', '#ffd166', '#ff6f91', '#a78bfa', '#fb923c', '#67e8f9'];
 let latestStatus = null;
+let latestSettings = null;
+let settingsDirty = false;
+let settingsBrowsePath = '';
+let settingsBrowseData = null;
 let latestDatasetLocations = null;
 let latestTelemetryKey = null;
 let previewUrls = new Map();
@@ -627,7 +758,83 @@ const selectedEvalVideoIds = new Set();
 const expandedEvalVideoIds = new Set();
 let evalVideoDataById = new Map();
 const selectedCheckpointPaths = new Set();
-const episodeLimit = 100;
+let episodeLimit = 100;
+const LIST_PAGE_SIZE_OPTIONS = [25, 50, 100];
+const listPageStates = {
+  datasets: {page: 1, pageSize: 25},
+  transferTasks: {page: 1, pageSize: 25},
+  trainingTasks: {page: 1, pageSize: 25},
+  evaluationTasks: {page: 1, pageSize: 25},
+  policyTasks: {page: 1, pageSize: 25},
+  checkpoints: {page: 1, pageSize: 25},
+  baseModels: {page: 1, pageSize: 25},
+  evalVideos: {page: 1, pageSize: 25},
+  settingsDirectories: {page: 1, pageSize: 25},
+};
+let evalVideoIncludeRemote = false;
+let evalVideoFilterTimer = null;
+
+function listPageState(key, total = 0) {
+  const state = listPageStates[key] || (listPageStates[key] = {page: 1, pageSize: 25});
+  const pageCount = Math.max(1, Math.ceil(Math.max(0, total) / state.pageSize));
+  state.page = Math.min(Math.max(1, state.page), pageCount);
+  return {...state, pageCount};
+}
+
+function paginateList(key, items) {
+  const state = listPageState(key, items.length);
+  const start = (state.page - 1) * state.pageSize;
+  return items.slice(start, start + state.pageSize);
+}
+
+function renderListPagination(key, total) {
+  const state = listPageState(key, total);
+  const start = total ? (state.page - 1) * state.pageSize + 1 : 0;
+  const end = total ? Math.min(total, state.page * state.pageSize) : 0;
+  const options = LIST_PAGE_SIZE_OPTIONS.map(size => `<option value="${size}"${size === state.pageSize ? ' selected' : ''}>${size}</option>`).join('');
+  return `<div class="list-pagination" data-list-pagination="${esc(key)}"><label>每页<select onchange="setListPageSize('${esc(key)}', this.value)">${options}</select></label><span class="muted">${start}-${end} / ${total}</span><button class="inline secondary" type="button" onclick="changeListPage('${esc(key)}', -1)" ${state.page <= 1 ? 'disabled' : ''}>上一页</button><span class="muted">第 ${state.page} / ${state.pageCount} 页</span><button class="inline secondary" type="button" onclick="changeListPage('${esc(key)}', 1)" ${state.page >= state.pageCount ? 'disabled' : ''}>下一页</button></div>`;
+}
+
+function resetListPage(key) {
+  if (listPageStates[key]) listPageStates[key].page = 1;
+}
+
+function rerenderPaginatedList(key) {
+  const items = (latestStatus && latestStatus.tasks) || [];
+  if (key === 'datasets') fillDatasets((latestStatus && latestStatus.datasets) || []);
+  else if (key === 'transferTasks') fillTransferTasks(items);
+  else if (key === 'trainingTasks' || key === 'policyTasks' || key === 'evaluationTasks') fillTasks(items);
+  else if (key === 'checkpoints') fillCheckpoints((latestStatus && latestStatus.checkpoints) || []);
+  else if (key === 'baseModels') fillBaseModels((latestStatus && latestStatus.base_models) || []);
+  else if (key === 'evalVideos') loadEvalVideos(evalVideoIncludeRemote);
+  else if (key === 'settingsDirectories') renderSettingsDirectory(settingsBrowseData);
+}
+
+function changeListPage(key, direction) {
+  const state = listPageStates[key];
+  if (!state) return;
+  state.page += Number(direction) || 0;
+  rerenderPaginatedList(key);
+}
+
+function setListPageSize(key, value) {
+  const state = listPageStates[key];
+  if (!state) return;
+  const pageSize = Number(value);
+  if (!LIST_PAGE_SIZE_OPTIONS.includes(pageSize)) return;
+  state.pageSize = pageSize;
+  state.page = 1;
+  rerenderPaginatedList(key);
+}
+
+function scheduleEvalVideoRefresh() {
+  if (evalVideoFilterTimer) clearTimeout(evalVideoFilterTimer);
+  evalVideoFilterTimer = setTimeout(() => {
+    resetListPage('evalVideos');
+    loadEvalVideos(evalVideoIncludeRemote);
+  }, 250);
+}
+
 const HANDOVER_MIC_EVENT_LABELS = {
   0: 'E0 未稳定抓住 mic',
   1: 'E1 donor 稳定抓住 mic',
@@ -637,7 +844,12 @@ const HANDOVER_MIC_EVENT_LABELS = {
 };
 
 function saveToken() {
+  if (!tokenInput.value.trim()) {
+    logoutDashboard();
+    return;
+  }
   localStorage.setItem('bimanualVlaToken', tokenInput.value);
+  setAuthState(true, loginUserInput.value || 'Token');
   show('Token 已保存。', false);
   refreshAll();
   refreshObservation();
@@ -670,6 +882,7 @@ async function requestToken() {
     localStorage.setItem('bimanualVlaToken', tokenInput.value);
     localStorage.setItem('bimanualVlaLoginUser', username);
     loginPasswordInput.value = '';
+    setAuthState(true, username);
     show('账号密码验证成功，Token 已获取并保存。', false);
     await refreshAll();
     await refreshObservation();
@@ -683,7 +896,10 @@ async function api(path, options = {}) {
   options.headers.Authorization = 'Bearer ' + tokenInput.value;
   const response = await fetch(path, options);
   const body = await response.json().catch(() => ({error: 'invalid JSON response'}));
-  if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) setAuthState(false);
+    throw new Error(body.error || `HTTP ${response.status}`);
+  }
   return body;
 }
 
@@ -699,19 +915,141 @@ async function apiBlob(path) {
   return response.blob();
 }
 
+const SETTINGS_PATH_FIELDS = [
+  ['dataset_root', 'settingsDatasetRoot'],
+  ['checkpoint_base_dir', 'settingsCheckpointBaseDir'],
+  ['base_checkpoint', 'settingsBaseCheckpoint'],
+  ['assets_base_dir', 'settingsAssetsBaseDir'],
+  ['workspace_root', 'settingsWorkspaceRoot'],
+  ['cache_root', 'settingsCacheRoot'],
+];
+
+function markSettingsDirty() {
+  settingsDirty = true;
+  const status = document.getElementById('settingsSaveStatus');
+  if (status) status.textContent = '有未保存的修改。';
+}
+
+function settingsLines(value) {
+  return Array.isArray(value) ? value.join('\n') : String(value || '');
+}
+
+function fillSettings(data) {
+  latestSettings = data || null;
+  const paths = (data && data.paths) || {};
+  SETTINGS_PATH_FIELDS.forEach(([key, id]) => {
+    const input = document.getElementById(id);
+    if (input) input.value = paths[key] || '';
+  });
+  const roots = document.getElementById('settingsAllowedRoots');
+  if (roots) roots.value = settingsLines(paths.checkpoint_allowed_roots);
+  const videos = document.getElementById('settingsEvalVideoRoots');
+  if (videos) videos.value = settingsLines(paths.eval_video_roots);
+  const readonly = (data && data.readonly) || {};
+  document.getElementById('settingsOpenpiRepo').textContent = readonly.openpi_repo || '-';
+  document.getElementById('settingsOpenpiPython').textContent = readonly.openpi_python || '-';
+  document.getElementById('settingsConfigFile').textContent = readonly.config_file || '-';
+  const browserRoots = (data && data.browser_roots) || [];
+  const rootSelect = document.getElementById('settingsBrowseRoot');
+  if (rootSelect) {
+    const old = rootSelect.value;
+    rootSelect.innerHTML = browserRoots.map(root => `<option value="${esc(root.path)}">${esc(root.label || root.path)}</option>`).join('');
+    if (browserRoots.some(root => root.path === old)) rootSelect.value = old;
+  }
+  settingsDirty = false;
+  const status = document.getElementById('settingsSaveStatus');
+  if (status) status.textContent = '设置已加载。';
+}
+
+function renderSettingsDirectory(data) {
+  settingsBrowseData = data || null;
+  settingsBrowsePath = data && data.path ? data.path : '';
+  const pathBox = document.getElementById('settingsBrowsePath');
+  if (pathBox) {
+    pathBox.innerHTML = `<code>${esc(settingsBrowsePath || '-')}</code><button type="button" class="inline secondary" id="settingsChooseCurrent">选择当前目录</button>`;
+    document.getElementById('settingsChooseCurrent')?.addEventListener('click', () => chooseSettingsDirectory(settingsBrowsePath));
+  }
+  const rootSelect = document.getElementById('settingsBrowseRoot');
+  const roots = (data && data.roots) || [];
+  if (rootSelect) {
+    const old = rootSelect.value;
+    rootSelect.innerHTML = roots.map(root => `<option value="${esc(root.path)}">${esc(root.label || root.path)}</option>`).join('');
+    const matching = roots.find(root => settingsBrowsePath === root.path || settingsBrowsePath.startsWith(root.path + '/'));
+    if (matching) rootSelect.value = matching.path;
+    else if (roots.some(root => root.path === old)) rootSelect.value = old;
+  }
+  const list = document.getElementById('settingsDirectoryList');
+  if (!list) return;
+  const entries = (data && data.entries) || [];
+  const pageEntries = paginateList('settingsDirectories', entries);
+  const parent = data && data.parent ? `<div class="settings-directory-entry"><span class="name">上级目录</span><span class="muted">..</span><button type="button" class="inline secondary" data-settings-enter="${esc(data.parent)}">进入</button></div>` : '';
+  const rows = pageEntries.map(entry => `<div class="settings-directory-entry"><span class="name" title="${esc(entry.path)}">📁 ${esc(entry.name)}${entry.symlink ? ' ↗' : ''}</span><button type="button" class="inline secondary" data-settings-enter="${esc(entry.path)}">进入</button><button type="button" class="inline secondary" data-settings-choose="${esc(entry.path)}">选择</button></div>`).join('');
+  list.innerHTML = parent + rows || '<span class="muted">当前目录没有可进入的子目录。</span>';
+  const pagination = document.getElementById('settingsDirectoryPagination');
+  if (pagination) pagination.innerHTML = renderListPagination('settingsDirectories', entries.length);
+  list.querySelectorAll('[data-settings-enter]').forEach(button => {
+    button.addEventListener('click', () => browseSettingsDirectory(button.dataset.settingsEnter));
+  });
+  list.querySelectorAll('[data-settings-choose]').forEach(button => {
+    button.addEventListener('click', () => chooseSettingsDirectory(button.dataset.settingsChoose));
+  });
+}
+
+async function browseSettingsDirectory(path = '', quiet = false) {
+  if (!tokenInput.value) return;
+  try {
+    resetListPage('settingsDirectories');
+    const requested = path || document.getElementById('settingsBrowseRoot')?.value || settingsBrowsePath;
+    const query = requested ? `?path=${encodeURIComponent(requested)}` : '';
+    const data = await api(`/api/fs/directories${query}`);
+    renderSettingsDirectory(data);
+  } catch (error) {
+    if (!quiet) show(error.message);
+  }
+}
+
+function chooseSettingsDirectory(path) {
+  const target = document.getElementById('settingsBrowseTarget')?.value;
+  const input = target ? document.getElementById(target) : null;
+  if (!input || !path) return;
+  input.value = path;
+  markSettingsDirty();
+  show(`已将目录填入 ${input.previousElementSibling?.textContent || '路径字段'}。`, false);
+}
+
+function openSettingsBrowser(target) {
+  showModule('settings');
+  const targetSelect = document.getElementById('settingsBrowseTarget');
+  if (targetSelect && target) targetSelect.value = target;
+  if (settingsBrowseData) browseSettingsDirectory(settingsBrowsePath, true);
+  else browseSettingsDirectory('', true);
+}
+
+async function loadSettings(options = {}) {
+  if (!tokenInput.value || (settingsDirty && !options.force)) return;
+  try {
+    const data = await api('/api/settings');
+    fillSettings(data);
+    await browseSettingsDirectory('', true);
+  } catch (error) {
+    if (!options.quiet) show(error.message);
+  }
+}
+
 function updateEvalVideoBulkControls() {
   const header = document.getElementById('evalVideoSelectAll');
   const boxes = [...document.querySelectorAll('.eval-video-select')].filter(input => !input.disabled);
   const checked = boxes.filter(input => input.checked);
+  const selectedCount = [...selectedEvalVideoIds].filter(videoId => evalVideoDataById.has(videoId)).length;
   if (header) {
     header.disabled = boxes.length === 0;
     header.checked = boxes.length > 0 && checked.length === boxes.length;
     header.indeterminate = checked.length > 0 && checked.length < boxes.length;
   }
   document.querySelectorAll('[data-bulk-delete-eval-scope="videos"]').forEach(button => {
-    button.disabled = checked.length === 0;
+    button.disabled = selectedCount === 0;
     const count = button.querySelector('[data-selected-eval-video-count]');
-    if (count) count.textContent = String(checked.length);
+    if (count) count.textContent = String(selectedCount);
   });
 }
 
@@ -772,14 +1110,17 @@ ${preview}${suffix}
 }
 
 async function batchDeleteSelectedEvalVideos() {
-  const selectedInputs = [...document.querySelectorAll('.eval-video-select:checked')];
-  if (!selectedInputs.length) {
+  const selectedIds = [...selectedEvalVideoIds].filter(videoId => evalVideoDataById.has(videoId));
+  if (!selectedIds.length) {
     show('请先选择要删除的评估视频。');
     return;
   }
   await deleteEvalVideos(
-    selectedInputs.map(input => input.dataset.videoId || ''),
-    selectedInputs.map(input => input.dataset.videoLabel || input.dataset.videoPath || input.dataset.videoId || ''),
+    selectedIds,
+    selectedIds.map(videoId => {
+      const video = evalVideoDataById.get(videoId) || {};
+      return video.display_name || video.relative_path || videoId;
+    }),
   );
 }
 
@@ -790,11 +1131,12 @@ async function deleteEvalVideo(videoId, label = '') {
 
 async function loadEvalVideos(includeRemote = false) {
   if (!tokenInput.value) return;
+  evalVideoIncludeRemote = Boolean(includeRemote);
   const summary = document.getElementById('evalVideoSummary');
   const list = document.getElementById('evalVideoList');
   if (!summary || !list) return;
   let detachedPlayers = null;
-  const params = new URLSearchParams({limit: '300'});
+  const params = new URLSearchParams({limit: '1000'});
   if (includeRemote) params.set('include_remote', 'true');
   const taskFilter = document.getElementById('evalVideoTaskFilter')?.value.trim();
   const experimentFilter = document.getElementById('evalVideoExperimentFilter')?.value.trim();
@@ -818,11 +1160,14 @@ async function loadEvalVideos(includeRemote = false) {
     }
     const navCount = document.getElementById('navEvalVideoCount');
     if (navCount) navCount.textContent = String(data.total ?? videos.length);
+    const pageVideos = paginateList('evalVideos', videos);
     const success = (data.facets && data.facets.success) || {};
     const remoteErrors = Object.entries(data.remote_errors || {}).map(([k, v]) => `${k}: ${String(v).slice(0, 160)}`);
     summary.textContent = `${videos.length}/${data.total ?? videos.length} 个视频 · 成功 ${success.success || 0} · 失败 ${success.failed || 0} · 未知 ${success.unknown || 0}${remoteErrors.length ? ' · 远端提示: ' + remoteErrors.join(' ; ') : ''}`;
     detachedPlayers = detachEvalVideoPlayers();
-    list.innerHTML = videos.map(video => renderEvalVideoRow(video)).join('') || '<div class="muted">没有找到符合筛选条件的 mp4/webm/mov/mkv/avi/gif 文件。</div>';
+    list.innerHTML = pageVideos.map(video => renderEvalVideoRow(video)).join('') || '<div class="muted">没有找到符合筛选条件的 mp4/webm/mov/mkv/avi/gif 文件。</div>';
+    const pagination = document.getElementById('evalVideosPagination');
+    if (pagination) pagination.innerHTML = renderListPagination('evalVideos', videos.length);
     restoreEvalVideoPlayers(detachedPlayers);
     updateEvalVideoBulkControls();
   } catch (error) {
@@ -1295,9 +1640,10 @@ function fillDatasets(items) {
     DASHBOARD_PROFILE === 'simulation' ? `仿真 ${counts.simulation}` : `真机 ${counts.real} · 未分类 ${counts.unknown} · 仿真数据集已隐藏`;
 
   const visible = filter === 'all' ? items : items.filter(item => (item.dataset_origin || 'unknown') === filter);
+  const pageItems = paginateList('datasets', visible);
   const rows = [];
   for (const origin of ['real', 'simulation', 'unknown'].filter(origin => VISIBLE_DATASET_ORIGINS.has(origin))) {
-    const grouped = visible.filter(item => (item.dataset_origin || 'unknown') === origin);
+    const grouped = pageItems.filter(item => (item.dataset_origin || 'unknown') === origin);
     if (!grouped.length) continue;
     rows.push(`<tr class="dataset-group-row"><td colspan="6">${datasetOriginBadge(origin)} ${grouped.length} 个数据集</td></tr>`);
     for (const d of grouped) {
@@ -1313,6 +1659,8 @@ function fillDatasets(items) {
     }
   }
   document.getElementById('datasets').innerHTML = rows.join('') || '<tr><td colspan="6" class="muted">当前筛选下暂无数据集</td></tr>';
+  const pagination = document.getElementById('datasetsPagination');
+  if (pagination) pagination.innerHTML = renderListPagination('datasets', visible.length);
 
   const trainable = items.filter(d => d.training_supported);
   document.querySelectorAll('.dataset-select').forEach(select => {
@@ -1561,6 +1909,13 @@ function changeEpisodePage(direction) {
   const next = episodeOffset + direction * episodeLimit;
   if (next < 0 || next >= episodeDatasetData.total) return;
   loadDatasetEpisodes(next);
+}
+
+function setEpisodePageSize(value) {
+  const pageSize = Number(value);
+  if (!LIST_PAGE_SIZE_OPTIONS.includes(pageSize)) return;
+  episodeLimit = pageSize;
+  loadDatasetEpisodes(0);
 }
 
 function setEpisodeEditorTab(tabName) {
@@ -3024,7 +3379,45 @@ function resetCheckpointFilters() {
   fillCheckpoints((latestStatus && latestStatus.checkpoints) || []);
 }
 
+function fillBaseModelCatalog(items) {
+  const target = document.getElementById('baseModels');
+  if (!target) return;
+  const search = document.getElementById('baseModelSearch')?.value.trim().toLowerCase() || '';
+  const variantSelect = document.getElementById('baseModelVariantFilter');
+  const oldVariant = variantSelect?.value || 'all';
+  const variants = [...new Set(items.map(model => String(model.model_variant || '')).filter(Boolean))].sort();
+  if (variantSelect) {
+    variantSelect.innerHTML = '<option value="all">全部模型</option>' + variants.map(value => `<option value="${esc(value)}">${esc(modelVariantLabel(value))}</option>`).join('');
+    variantSelect.value = variants.includes(oldVariant) ? oldVariant : 'all';
+  }
+  const sourceFilter = document.getElementById('baseModelSourceFilter')?.value || 'all';
+  const variant = variantSelect?.value || 'all';
+  const filtered = items.filter(model => {
+    const foundation = isFoundationModel(model);
+    if (sourceFilter === 'foundation' && !foundation) return false;
+    if (sourceFilter === 'checkpoint' && foundation) return false;
+    if (variant !== 'all' && String(model.model_variant || '') !== variant) return false;
+    if (!search) return true;
+    return [model.name, model.experiment, model.path, model.arm_mode, model.checkpoint_step]
+      .filter(value => value != null).join(' ').toLowerCase().includes(search);
+  });
+  const pageModels = paginateList('baseModels', filtered);
+  target.innerHTML = pageModels.map(model => {
+    const foundation = isFoundationModel(model);
+    const type = foundation ? '基础模型' : '训练 checkpoint';
+    const step = model.checkpoint_step == null ? '-' : `step ${model.checkpoint_step}`;
+    const name = foundation ? (model.name || 'pretrained') : (model.experiment || model.name || '-');
+    return `<tr><td><strong>${esc(name)}</strong>${model.default ? '<br><span class="pill">默认</span>' : ''}</td><td><span class="pill">${esc(modelVariantLabel(model.model_variant))}</span></td><td>${esc(type)}<br><span class="muted">${esc(step)}</span></td><td><code class="path" title="${esc(model.path)}">${esc(model.path || '-')}</code><br><span class="muted">arm=${esc(model.arm_mode || '-')}</span></td></tr>`;
+  }).join('') || '<tr><td colspan="4" class="muted">当前筛选下暂无模型资源</td></tr>';
+  const summary = document.getElementById('baseModelSummary');
+  if (summary) summary.textContent = `显示 ${filtered.length} / ${items.length} 个模型资源`;
+  const pagination = document.getElementById('baseModelsPagination');
+  if (pagination) pagination.innerHTML = renderListPagination('baseModels', filtered.length);
+}
+
 function updateCheckpointBulkControls() {
+  const availablePaths = new Set(((latestStatus && latestStatus.checkpoints) || []).map(item => item.path));
+  const selectedCount = [...selectedCheckpointPaths].filter(path => availablePaths.has(path)).length;
   document.querySelectorAll('.checkpoint-select-all').forEach(header => {
     const scope = header.dataset.checkpointScope;
     const boxes = [...document.querySelectorAll(`.checkpoint-select[data-checkpoint-scope="${scope}"]`)]
@@ -3035,9 +3428,9 @@ function updateCheckpointBulkControls() {
     header.indeterminate = checked.length > 0 && checked.length < boxes.length;
 
     document.querySelectorAll(`[data-bulk-delete-checkpoint-scope="${scope}"]`).forEach(button => {
-      button.disabled = checked.length === 0;
+      button.disabled = selectedCount === 0;
       const count = button.querySelector('[data-selected-checkpoint-count]');
-      if (count) count.textContent = String(checked.length);
+      if (count) count.textContent = String(selectedCount);
     });
   });
 }
@@ -3060,9 +3453,8 @@ function toggleCheckpointSelection(scope, checked) {
 }
 
 async function batchDeleteSelectedCheckpoints() {
-  const checkpointPaths = [...document.querySelectorAll('.checkpoint-select[data-checkpoint-scope="training"]:checked')]
-    .map(input => input.dataset.checkpointPath)
-    .filter(Boolean);
+  const availablePaths = new Set(((latestStatus && latestStatus.checkpoints) || []).map(item => item.path));
+  const checkpointPaths = [...selectedCheckpointPaths].filter(path => availablePaths.has(path));
   if (!checkpointPaths.length) {
     show('请先选择要删除的 checkpoint。');
     return;
@@ -3088,6 +3480,7 @@ async function batchDeleteSelectedCheckpoints() {
 }
 
 function fillBaseModels(items) {
+  fillBaseModelCatalog(items);
   document.querySelectorAll('.base-model-select').forEach(select => {
     const form = select.closest('form');
     const variantSelect = form && form.querySelector('.model-variant-select');
@@ -3160,21 +3553,24 @@ function fillCheckpoints(items) {
     if (filters.maxStep != null && Number.isFinite(filters.maxStep) && step > filters.maxStep) return false;
     return true;
   }).sort((left, right) => Number(right.step || 0) - Number(left.step || 0) || Number(right.mtime || 0) - Number(left.mtime || 0));
-  const visiblePaths = new Set(filtered.map(c => c.path));
+  const visiblePaths = new Set(items.map(c => c.path));
   for (const checkpointPath of [...selectedCheckpointPaths]) {
     if (!visiblePaths.has(checkpointPath)) selectedCheckpointPaths.delete(checkpointPath);
   }
+  const pageFiltered = paginateList('checkpoints', filtered);
 
   const checkpointRows = document.getElementById('checkpoints');
   if (checkpointRows) {
     const emptyRow = filterValue === 'all'
       ? '<tr><td colspan="4" class="muted">暂无完整 checkpoint</td></tr>'
       : `<tr><td colspan="4" class="muted">实验 ${esc(filterValue)} 暂无匹配 checkpoint</td></tr>`;
-    checkpointRows.innerHTML = filtered.map(c => {
+    checkpointRows.innerHTML = pageFiltered.map(c => {
       const checkbox = `<input type="checkbox" class="checkpoint-select" data-checkpoint-scope="training" data-checkpoint-path="${esc(c.path)}" onchange="onCheckpointSelectionChange(this)" ${selectedCheckpointPaths.has(c.path) ? 'checked' : ''} aria-label="选择 checkpoint ${esc(c.experiment)} step ${esc(c.step)}">`;
       return `<tr data-checkpoint-path="${esc(c.path)}"><td class="checkpoint-selection-cell">${checkbox}</td><td><strong>${esc(c.experiment)}</strong><br>step ${esc(c.step)} · <span class="pill">${esc(modelVariantLabel(c.model_variant))}</span> <span class="pill">${esc(c.arm_mode || '-')}</span><br><span class="muted">contract v${esc(c.contract_version || '?')} · raw/model ${esc(c.raw_action_dim || '?')}D/${esc(c.model_action_dim || '?')}D · ${esc(c.model_action_convention || 'unmarked')} · ${esc(c.gripper_semantics || '-')}</span></td><td>${(c.dataset_ids || []).map(id => `<span class="pill">${esc(id)}</span>`).join('') || '<span class="muted">-</span>'}<br><span class="muted">${esc(c.config_name || '-')}</span></td><td>${c.size_gib == null ? '-' : `${Number(c.size_gib).toFixed(1)} GiB`}<br><span class="muted">${esc(c.updated_at || '-')}</span></td></tr>`;
     }).join('') || emptyRow;
   }
+  const pagination = document.getElementById('checkpointsPagination');
+  if (pagination) pagination.innerHTML = renderListPagination('checkpoints', filtered.length);
 
   const summary = document.getElementById('checkpointSummary');
   if (summary) {
@@ -4195,7 +4591,8 @@ function fillTransferTasks(items) {
   const target = document.getElementById('transferJobs');
   if (!target) return;
   const transfers = items.filter(task => task.type === 'transfer');
-  target.innerHTML = transfers.map(task => {
+  const pageTransfers = paginateList('transferTasks', transfers);
+  target.innerHTML = pageTransfers.map(task => {
     const metadata = task.metadata || {};
     const progress = task.progress || {};
     const fraction = transferProgressValue(task);
@@ -4220,6 +4617,8 @@ function fillTransferTasks(items) {
       + `<td class="${stateClass(task.state)}">${esc(task.state)}${progress.updated_at ? `<br><span class="muted">${esc(progress.updated_at)}</span>` : ''}${error ? `<br><span class="bad">${esc(error)}</span>` : ''}</td>`
       + `<td><button class="inline secondary" onclick="loadLog('${esc(task.id)}','training')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(task.id)}',false)">停止</button>` : ''}${terminal ? `<button class="inline danger" onclick="deleteTask('${esc(task.id)}','training')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="5" class="muted">暂无 transfer 任务</td></tr>';
+  const pagination = document.getElementById('transferTasksPagination');
+  if (pagination) pagination.innerHTML = renderListPagination('transferTasks', transfers.length);
 }
 
 function filteredEvaluationTasks(items) {
@@ -4244,9 +4643,10 @@ function fillEvaluationTasks(items) {
   if (!target) return;
   const allTasks = items.filter(task => task.type === 'eval');
   const tasks = filteredEvaluationTasks(items);
+  const pageTasks = paginateList('evaluationTasks', tasks);
   const summary = document.getElementById('evalTaskFilterSummary');
   if (summary) summary.textContent = `显示 ${tasks.length}/${allTasks.length} 个评测任务`;
-  target.innerHTML = tasks.map(task => {
+  target.innerHTML = pageTasks.map(task => {
     const metadata = task.metadata || {};
     const result = task.result || {};
     const active = ACTIVE_STATES.has(task.state);
@@ -4264,6 +4664,8 @@ function fillEvaluationTasks(items) {
     const stateDetails = `${task.start_error ? `<br><span class="bad">${esc(task.start_error)}</span>` : ''}${task.waiting_reason ? `<br><span class="warn">${esc(task.waiting_reason)}</span>` : ''}`;
     return `<tr><td class="task-selection-cell">${checkbox}</td><td><code class="task-ref" title="${esc(task.id)}">${esc(shortTaskId(task.id))}</code><br>eval · PID ${esc(task.pid || '-')}</td><td class="${stateClass(task.state)}">${esc(task.state)}${stateDetails}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(task.id)}','eval')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(task.id)}',false)">${task.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${task.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(task.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(task.id)}','eval')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="5" class="muted">暂无匹配评测任务</td></tr>';
+  const pagination = document.getElementById('evaluationTasksPagination');
+  if (pagination) pagination.innerHTML = renderListPagination('evaluationTasks', tasks.length);
   updateTaskBulkControls();
 }
 
@@ -4274,7 +4676,8 @@ function fillTasks(items) {
   }
 
   const policies = items.filter(t => t.type === 'policy');
-  document.getElementById('policies').innerHTML = policies.map(t => {
+  const pagePolicies = paginateList('policyTasks', policies);
+  document.getElementById('policies').innerHTML = pagePolicies.map(t => {
     const m = t.metadata || {};
     const active = ['starting', 'running', 'stopping'].includes(t.state);
     const health = t.policy_healthy === true ? '<span class="ok">/healthz OK</span>' : t.state === 'running' ? '<span class="bad">/healthz FAIL</span>' : '<span class="muted">未运行</span>';
@@ -4283,11 +4686,14 @@ function fillTasks(items) {
     const checkbox = `<input type="checkbox" class="task-select" data-task-scope="policy" data-task-id="${esc(t.id)}" onchange="onTaskSelectionChange(this)" ${deletable ? '' : 'disabled title="运行中的 Policy 不能批量删除"'} ${selectedTaskIds.has(t.id) ? 'checked' : ''} aria-label="选择任务 ${esc(t.id)}">`;
     return `<tr><td class="task-selection-cell">${checkbox}</td><td><code>${esc(t.id)}</code><br>PID ${esc(t.pid || '-')}${badge}</td><td class="${stateClass(t.state)}">${esc(t.state)}<br>${health}${t.stop_signal ? `<br>${esc(t.stop_signal)}` : ''}</td><td>GPU ${esc((m.gpu_ids || []).join(','))}<br>port ${esc(m.port)}<br><span class="pill">${esc(m.arm_mode || '-')}</span> <span class="pill">${esc(m.schema || '-')}</span></td><td>dataset=${esc(m.dataset_id)} · <span class="pill">${esc(modelVariantLabel(m.model_variant))}</span><br>contract v${esc(m.contract_version || '?')} · raw/model ${esc(m.raw_action_dim || '?')}D/${esc(m.model_action_dim || '?')}D · offset ${esc(m.action_offset ?? '-')}/+${esc(m.model_action_start_offset ?? 1)}<br>${esc(m.model_action_convention || '-')} · gripper ${esc(m.raw_gripper_semantics || '-')} → ${esc(m.gripper_semantics || m.wire_gripper_semantics || '-')}<br><code class="path" title="${esc(m.checkpoint)}">${esc(shortPath(m.checkpoint))}</code></td><td>${telemetrySummary(t.telemetry)}</td><td>${policyControlButtons(t)}<br><button class="inline secondary" onclick="loadLog('${esc(t.id)}','policy')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">停止</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','policy')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="7" class="muted">暂无 Policy 进程；可在上方创建。</td></tr>';
+  const policyPagination = document.getElementById('policyTasksPagination');
+  if (policyPagination) policyPagination.innerHTML = renderListPagination('policyTasks', policies.length);
 
   const allJobs = items.filter(t => TRAINING_TASK_TYPES.has(t.type));
   const jobs = filteredTrainingJobs(items);
+  const pageJobs = paginateList('trainingTasks', jobs);
   updateTrainingTaskFilterSummary(allJobs, jobs);
-  document.getElementById('jobs').innerHTML = jobs.map(t => {
+  document.getElementById('jobs').innerHTML = pageJobs.map(t => {
     const m = t.metadata || {};
     const active = ACTIVE_STATES.has(t.state);
     const deletable = TERMINAL_STATES.has(t.state);
@@ -4315,6 +4721,8 @@ function fillTasks(items) {
     const metricButton = t.type === 'train' ? `<button class="inline secondary" onclick="openTrainingView('metrics','${esc(t.id)}')">曲线</button>` : '';
     return `<tr><td class="task-selection-cell">${checkbox}</td><td><code class="task-ref" title="${esc(t.id)}">${esc(shortTaskId(t.id))}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${stateDetails}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}','${logModule}')">${logLabel}</button>${metricButton}${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','${logModule}')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="5" class="muted">暂无 Norm / Train 任务</td></tr>';
+  const trainingPagination = document.getElementById('trainingTasksPagination');
+  if (trainingPagination) trainingPagination.innerHTML = renderListPagination('trainingTasks', jobs.length);
   updateTaskBulkControls();
   fillEvaluationTasks(items);
   fillTransferTasks(items);
@@ -4759,7 +5167,7 @@ async function refreshAll() {
     document.getElementById('serverInfo').innerHTML = `管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>真机上传暂存: <code>${esc((data.config.upload_roots || {}).real || '-')}</code><br>仿真上传暂存: <code>${esc((data.config.upload_roots || {}).simulation || '-')}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>默认基础模型: <code>${esc(data.config.base_checkpoint)}</code><br>可选基础权重: ${esc((data.base_models || []).length)}<br>已有训练实验: ${esc((data.experiments || []).length)}`;
     if (!episodeDatasetData && document.getElementById('editorDataset').value) loadDatasetEpisodes(0);
     const evalVideoModule = document.getElementById('module-eval-videos');
-    if (evalVideoModule && !evalVideoModule.hidden) loadEvalVideos();
+    if (evalVideoModule && !evalVideoModule.hidden) loadEvalVideos(evalVideoIncludeRemote);
     const trainingVisible = !document.getElementById('module-training').hidden;
     if (trainingVisible && document.getElementById('trainMetricsTask').value) loadTrainingMetrics({quiet: true});
   } catch (error) {
@@ -4872,20 +5280,35 @@ async function refreshSelectedLogs() {
   }
 }
 
+function taskMatchesScope(task, scope) {
+  if (!task) return false;
+  if (scope === 'training') return TRAINING_TASK_TYPES.has(task.type);
+  if (scope === 'evaluation') return task.type === 'eval';
+  if (scope === 'policy') return task.type === 'policy';
+  return false;
+}
+
+function selectedTaskIdsForScope(scope) {
+  const tasks = ((latestStatus && latestStatus.tasks) || []).filter(task => taskMatchesScope(task, scope) && TERMINAL_STATES.has(task.state));
+  const eligible = new Set(tasks.map(task => task.id));
+  return [...selectedTaskIds].filter(taskId => eligible.has(taskId));
+}
+
 function updateTaskBulkControls() {
   document.querySelectorAll('.task-select-all').forEach(header => {
     const scope = header.dataset.taskScope;
     const boxes = [...document.querySelectorAll(`.task-select[data-task-scope="${scope}"]`)]
       .filter(input => !input.disabled);
     const checked = boxes.filter(input => input.checked);
+    const selectedCount = selectedTaskIdsForScope(scope).length;
     header.disabled = boxes.length === 0;
     header.checked = boxes.length > 0 && checked.length === boxes.length;
     header.indeterminate = checked.length > 0 && checked.length < boxes.length;
 
     document.querySelectorAll(`[data-bulk-delete-scope="${scope}"]`).forEach(button => {
-      button.disabled = checked.length === 0;
+      button.disabled = selectedCount === 0;
       const count = button.querySelector('[data-selected-task-count]');
-      if (count) count.textContent = String(checked.length);
+      if (count) count.textContent = String(selectedCount);
     });
   });
 }
@@ -4908,9 +5331,7 @@ function toggleTaskSelection(scope, checked) {
 }
 
 async function batchDeleteSelectedTasks(scope) {
-  const taskIds = [...document.querySelectorAll(`.task-select[data-task-scope="${scope}"]:checked`)]
-    .map(input => input.dataset.taskId)
-    .filter(Boolean);
+  const taskIds = selectedTaskIdsForScope(scope);
   if (!taskIds.length) {
     show('请先选择要删除的历史日志。');
     return;
@@ -5027,6 +5448,7 @@ window.addEventListener('beforeunload', () => {
 });
 
 document.getElementById('datasetOriginFilter').addEventListener('change', () => {
+  resetListPage('datasets');
   fillDatasets((latestStatus && latestStatus.datasets) || []);
 });
 document.querySelectorAll('.dataset-select').forEach(select => select.addEventListener('change', () => {
@@ -5049,13 +5471,18 @@ const trainExperimentInput = document.getElementById('trainExperimentName');
 }));
 document.getElementById('replacePolicy').addEventListener('change', () => updatePolicyOperation(true));
 document.getElementById('checkpointSelect').addEventListener('change', syncPolicyCheckpointVariant);
-document.getElementById('checkpointExperimentFilter').addEventListener('change', () => fillCheckpoints((latestStatus && latestStatus.checkpoints) || []));
-['checkpointModelFilter', 'checkpointArmFilter'].forEach(id => document.getElementById(id)?.addEventListener('change', () => fillCheckpoints((latestStatus && latestStatus.checkpoints) || [])));
-['checkpointExperimentSearch', 'checkpointDatasetFilter', 'checkpointMinStep', 'checkpointMaxStep'].forEach(id => document.getElementById(id)?.addEventListener('input', () => fillCheckpoints((latestStatus && latestStatus.checkpoints) || [])));
-document.getElementById('trainingTaskTypeFilter').addEventListener('change', () => fillTasks((latestStatus && latestStatus.tasks) || []));
-document.getElementById('trainingMetricFilter').addEventListener('change', () => fillTasks((latestStatus && latestStatus.tasks) || []));
-document.getElementById('evalExperimentFilter')?.addEventListener('input', () => fillEvaluationTasks((latestStatus && latestStatus.tasks) || []));
-document.getElementById('evalTaskStateFilter')?.addEventListener('change', () => fillEvaluationTasks((latestStatus && latestStatus.tasks) || []));
+document.getElementById('checkpointExperimentFilter').addEventListener('change', () => { resetListPage('checkpoints'); fillCheckpoints((latestStatus && latestStatus.checkpoints) || []); });
+['checkpointModelFilter', 'checkpointArmFilter'].forEach(id => document.getElementById(id)?.addEventListener('change', () => { resetListPage('checkpoints'); fillCheckpoints((latestStatus && latestStatus.checkpoints) || []); }));
+['checkpointExperimentSearch', 'checkpointDatasetFilter', 'checkpointMinStep', 'checkpointMaxStep'].forEach(id => document.getElementById(id)?.addEventListener('input', () => { resetListPage('checkpoints'); fillCheckpoints((latestStatus && latestStatus.checkpoints) || []); }));
+document.getElementById('trainingTaskTypeFilter').addEventListener('change', () => { resetListPage('trainingTasks'); fillTasks((latestStatus && latestStatus.tasks) || []); });
+document.getElementById('trainingMetricFilter').addEventListener('change', () => { resetListPage('trainingTasks'); fillTasks((latestStatus && latestStatus.tasks) || []); });
+document.getElementById('evalExperimentFilter')?.addEventListener('input', () => { resetListPage('evaluationTasks'); fillEvaluationTasks((latestStatus && latestStatus.tasks) || []); });
+document.getElementById('evalTaskStateFilter')?.addEventListener('change', () => { resetListPage('evaluationTasks'); fillEvaluationTasks((latestStatus && latestStatus.tasks) || []); });
+document.getElementById('baseModelSearch')?.addEventListener('input', () => { resetListPage('baseModels'); fillBaseModels((latestStatus && latestStatus.base_models) || []); });
+document.getElementById('baseModelVariantFilter')?.addEventListener('change', () => { resetListPage('baseModels'); fillBaseModels((latestStatus && latestStatus.base_models) || []); });
+document.getElementById('baseModelSourceFilter')?.addEventListener('change', () => { resetListPage('baseModels'); fillBaseModels((latestStatus && latestStatus.base_models) || []); });
+['evalVideoTaskFilter', 'evalVideoExperimentFilter', 'evalVideoQueryFilter'].forEach(id => document.getElementById(id)?.addEventListener('input', scheduleEvalVideoRefresh));
+document.getElementById('evalVideoSuccessFilter')?.addEventListener('change', scheduleEvalVideoRefresh);
 document.getElementById('policyPort').addEventListener('input', updateClientCommand);
 document.getElementById('editorDataset').addEventListener('change', () => {
   episodeDatasetData = null;
