@@ -10,7 +10,7 @@ import numpy as np
 
 ARM_BASE_OFFSET_KEY = "arm_base_offset"
 ARM_BASE_ROTATIONS_KEY = "arm_base_rotations"
-ARM_BASE_AXIS_CONVENTION = "per_arm_base_frame_explicit_rotations"
+ARM_BASE_AXIS_CONVENTION = "per_arm_base_frame_explicit_axis_signs"
 ARM_AXIS_SIGNS = {
     "left": (1, 1, 1),
     "right": (1, 1, 1),
@@ -21,10 +21,7 @@ ROBOTWIN_EMBODIMENTS = frozenset(
 )
 
 
-REAL_PIPER_RIGHT_BASE_ROTATION = np.asarray(
-    [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
-    dtype=np.float64,
-)
+REAL_PIPER_RIGHT_AXIS_SIGNS = (1, -1, 1)
 
 
 def normalize_robot_type(value: Any) -> str | None:
@@ -136,10 +133,20 @@ def arm_base_origins(value: Any) -> dict[str, list[float]]:
     return {"left": [0.0, 0.0, 0.0], "right": list(offset)}
 
 
-def arm_base_axis_signs(value: Any, *, bimanual: bool = False) -> dict[str, list[int]]:
+def arm_base_axis_signs(
+    value: Any,
+    *,
+    bimanual: bool = False,
+    robot_type: Any = None,
+    dataset_origin: Any = None,
+) -> dict[str, list[int]]:
     if normalize_arm_base_offset(value) is None and not bimanual:
         return {}
-    return {side: list(signs) for side, signs in ARM_AXIS_SIGNS.items()}
+    signs = {side: list(axis_signs) for side, axis_signs in ARM_AXIS_SIGNS.items()}
+    is_real = str(dataset_origin or "").strip().lower() in {"real", "hardware", "physical"}
+    if is_real and normalize_robot_type(robot_type) == "piper" and bimanual:
+        signs["right"] = list(REAL_PIPER_RIGHT_AXIS_SIGNS)
+    return signs
 
 
 __all__ = [
@@ -147,7 +154,7 @@ __all__ = [
     "ARM_BASE_ROTATIONS_KEY",
     "ARM_BASE_AXIS_CONVENTION",
     "ARM_AXIS_SIGNS",
-    "REAL_PIPER_RIGHT_BASE_ROTATION",
+    "REAL_PIPER_RIGHT_AXIS_SIGNS",
     "ROBOTWIN_EMBODIMENTS",
     "arm_base_axis_signs",
     "arm_base_offset_metadata",

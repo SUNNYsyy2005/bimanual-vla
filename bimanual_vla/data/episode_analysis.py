@@ -25,7 +25,6 @@ from bimanual_vla.data.arm_geometry import (
     normalize_arm_base_offset,
     normalize_arm_base_rotations,
     normalize_robot_type,
-    REAL_PIPER_RIGHT_BASE_ROTATION,
 )
 
 
@@ -76,6 +75,7 @@ class EpisodeAnalysis:
     arm_base_offset: tuple[float, float, float] | None
     arm_base_rotations: dict[str, np.ndarray] | None
     robot_type: str | None
+    arm_axis_signs: dict[str, list[int]]
 
     @property
     def frame_count(self) -> int:
@@ -559,36 +559,30 @@ def _resolve_arm_geometry(
             merged_rotations = dict(default_rotations)
             merged_rotations.update(rotations or {})
             rotations = merged_rotations
-    elif (
-        str(dataset_origin or "").strip().lower() in {"real", "hardware", "physical"}
-        and normalize_robot_type(robot_type) == "piper"
-        and bimanual
-    ):
-        merged_rotations = {
-            "left": np.eye(3, dtype=np.float64),
-            "right": REAL_PIPER_RIGHT_BASE_ROTATION.copy(),
-        }
-        merged_rotations.update(rotations or {})
-        rotations = merged_rotations
     return offset, rotations
 
 
-def _transform_eef_orientation(values: np.ndarray, base_rotation: np.ndarray) -> np.ndarray:
+def _transform_eef_orientation(
+    values: np.ndarray,
+    base_rotation: np.ndarray,
+    axis_signs: np.ndarray,
+) -> np.ndarray:
     if values.ndim != 2 or values.shape[1] not in {3, 6}:
         return values
     transformed = values.copy()
+    axis_matrix = np.diag(axis_signs)
     for index, row in enumerate(values):
         if not np.isfinite(row).all():
             continue
         if values.shape[1] == 3:
             local_rotation = _rotation_from_rpy(row)
-            transformed[index] = _rotation_to_rpy(base_rotation @ local_rotation)
+            transformed[index] = _rotation_to_rpy(base_rotation @ axis_matrix @ local_rotation @ axis_matrix)
         else:
             try:
                 local_rotation = rotation6d_to_matrix(row)
             except ValueError:
                 continue
-            transformed[index] = matrix_to_rotation6d(base_rotation @ local_rotation)
+            transformed[index] = matrix_to_rotation6d(base_rotation @ axis_matrix @ local_rotation @ axis_matrix)
     return transformed
 
 
@@ -613,16 +607,23 @@ def _apply_arm_base_offset(
         if bimanual
         else {side: (0.0, 0.0, 0.0) for side in eef}
     )
+    effective_axis_signs = arm_base_axis_signs(
+        offset,
+        bimanual=bimanual,
+        robot_type=robot_type,
+        dataset_origin=dataset_origin,
+    )
     for side, origin in origins.items():
         base_rotation = np.asarray(
             (rotations or {}).get(side, np.eye(3, dtype=np.float64)),
             dtype=np.float64,
         )
+        axis_signs = np.asarray(effective_axis_signs.get(side, [1, 1, 1]), dtype=np.float64)
         positions = np.asarray(eef[side].get("position", []), dtype=np.float64)
         if positions.ndim == 2 and positions.shape[1] == 3:
-            eef[side]["position"] = positions @ base_rotation.T + np.asarray(origin, dtype=np.float64)
+            eef[side]["position"] = positions * axis_signs @ base_rotation.T + np.asarray(origin, dtype=np.float64)
         orientations = np.asarray(eef[side].get("orientation", []), dtype=np.float64)
-        eef[side]["orientation"] = _transform_eef_orientation(orientations, base_rotation)
+        eef[side]["orientation"] = _transform_eef_orientation(orientations, base_rotation, axis_signs)
     return eef, offset, rotations
 
 
@@ -783,6 +784,12 @@ def analyze_episode(
         bimanual=measured.shape[1] in {14, 16, 20},
         dataset_origin=dataset_origin,
     )
+    effective_axis_signs = arm_base_axis_signs(
+        effective_offset,
+        bimanual=measured.shape[1] in {14, 16, 20},
+        robot_type=robot_type,
+        dataset_origin=dataset_origin,
+    )
     eef, eef_method = compute_eef_trajectory(
         measured,
         names=state_names,
@@ -818,6 +825,7 @@ def analyze_episode(
         arm_base_offset=effective_offset,
         arm_base_rotations=effective_rotations,
         robot_type=normalize_robot_type(robot_type),
+        arm_axis_signs=effective_axis_signs,
     )
 
 
@@ -896,10 +904,7 @@ def frame_payload(analysis: EpisodeAnalysis, frame_index: int) -> dict[str, Any]
             if analysis.arm_base_offset is not None or {"left", "right"}.issubset(analysis.eef)
             else None
         ),
-        "arm_axis_signs": arm_base_axis_signs(
-            analysis.arm_base_offset,
-            bimanual={"left", "right"}.issubset(analysis.eef),
-        ),
+        "arm_axis_signs": analysis.arm_axis_signs,
         "arm_origins": arm_base_origins(analysis.arm_base_offset),
     }
 
@@ -922,10 +927,7 @@ def analysis_payload(analysis: EpisodeAnalysis, *, max_points: int = 1200) -> di
                 if analysis.arm_base_offset is not None or {"left", "right"}.issubset(analysis.eef)
                 else None
             ),
-            "arm_axis_signs": arm_base_axis_signs(
-                analysis.arm_base_offset,
-                bimanual={"left", "right"}.issubset(analysis.eef),
-            ),
+            "arm_axis_signs": analysis.arm_axis_signs,
             "arm_origins": arm_base_origins(analysis.arm_base_offset),
         }
     stride = max(1, int(np.ceil(count / max(1, int(max_points)))))
@@ -953,10 +955,7 @@ def analysis_payload(analysis: EpisodeAnalysis, *, max_points: int = 1200) -> di
             if analysis.arm_base_offset is not None or {"left", "right"}.issubset(analysis.eef)
             else None
         ),
-        "arm_axis_signs": arm_base_axis_signs(
-            analysis.arm_base_offset,
-            bimanual={"left", "right"}.issubset(analysis.eef),
-        ),
+        "arm_axis_signs": analysis.arm_axis_signs,
         "arm_origins": arm_base_origins(analysis.arm_base_offset),
         "idle_frames": int(np.count_nonzero(analysis.idle)),
         "idle_fraction": float(np.mean(analysis.idle)),
