@@ -38,7 +38,8 @@
     .brand-mark { width:46px; height:46px; flex:0 0 auto; display:grid; place-items:center; border:1px solid rgba(255,255,255,.34); border-radius:15px; color:#07101d; font-size:21px; font-weight:900; background:linear-gradient(135deg,var(--blue),var(--green)); box-shadow:0 0 28px rgba(66,199,255,.28); }
     .brand h1 { margin:0; font-size:22px; letter-spacing:.01em; color:var(--heading); }
     h2 { margin:0 0 14px; font-size:17px; color:var(--heading); } h3 { margin:14px 0 8px; color:var(--heading); font-size:14px; }
-    .auth-panel { display:flex; flex-direction:column; align-items:flex-end; gap:8px; max-width:760px; }
+    .auth-panel { display:flex; flex-direction:row; align-items:center; justify-content:flex-end; gap:8px; max-width:760px; flex-wrap:wrap; }
+    .auth-panel > .toolbar,.auth-panel > .auth-status { flex:0 0 auto; }
     .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
     .auth-panel input { width:190px; }
     .auth-status { display:flex; align-items:center; gap:8px; color:var(--muted); }
@@ -49,7 +50,7 @@
     .nav-button.active { color:var(--heading); border-color:rgba(66,199,255,.65); background:linear-gradient(180deg,rgba(18,53,84,.98),rgba(16,40,62,.98)); box-shadow:inset 0 0 0 1px rgba(66,199,255,.08),0 6px 16px rgba(14,165,233,.12); }
     .nav-count { min-width:21px; padding:1px 6px; border-radius:999px; color:#bfeaff; background:#153f5d; font-size:11px; text-align:center; }
     main { max-width:1640px; margin:auto; padding:28px 28px 48px; }
-    .dashboard-module[hidden] { display:none !important; }
+    .dashboard-module[hidden],.toolbar[hidden],.auth-status[hidden] { display:none !important; }
     .module-heading { display:flex; justify-content:space-between; gap:16px; align-items:flex-end; margin:2px 0 20px; }
     .module-heading h2 { margin:0; font-size:24px; letter-spacing:-.015em; }
     .module-heading p { margin:3px 0 0; color:var(--muted); }
@@ -66,7 +67,7 @@
     .stat-value { margin-top:5px; font-size:27px; font-weight:800; color:var(--heading); letter-spacing:-.02em; }
     .stat-detail { margin-top:3px; color:var(--muted); font-size:12px; }
     .muted { color:var(--muted); } .ok { color:var(--green); } .bad { color:var(--red); } .warn { color:var(--yellow); }
-    label { display:block; margin:10px 0 5px; color:var(--text); font-weight:650; }
+    label { display:block; margin:6px 0 3px; color:var(--text); font-weight:650; }
     input,select,textarea,button { width:100%; min-height:40px; padding:9px 11px; border:1px solid var(--line); border-radius:10px; color:var(--control-text); background:var(--control); transition:border-color .18s ease,box-shadow .18s ease,background .18s ease; }
     input::placeholder,textarea::placeholder { color:var(--muted); }
     input:focus,select:focus,textarea:focus { outline:2px solid rgba(66,199,255,.22); border-color:var(--blue-strong); box-shadow:0 0 0 4px rgba(66,199,255,.08); }
@@ -76,6 +77,17 @@
     .theme-toggle { display:inline-flex; align-items:center; justify-content:center; gap:7px; min-width:98px; }
     .theme-toggle-icon { font-size:15px; line-height:1; }
     .row { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; } .row3 { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
+    form.compact-submission { display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:8px 10px; align-items:end; }
+    form.compact-submission > label { grid-column:span 2; align-self:center; margin:0; }
+    form.compact-submission > label + input,form.compact-submission > label + select { grid-column:span 4; min-width:0; }
+    form.compact-submission > label + textarea,form.compact-submission > textarea { grid-column:1/-1; min-width:0; }
+    form.compact-submission > .row,form.compact-submission > .row3,form.compact-submission > .eval-settings-grid,form.compact-submission > .settings-path-grid,form.compact-submission > p,form.compact-submission > .muted { grid-column:1/-1; margin-top:0; margin-bottom:0; }
+    form.compact-submission > p:has(> button) { display:flex; align-items:center; gap:8px; }
+    form.compact-submission > p:has(> button) button { width:auto; }
+    form.compact-submission input,form.compact-submission select,form.compact-submission textarea { min-height:36px; padding:7px 9px; }
+    form.compact-submission > p.muted,form.compact-submission > p.warn { max-height:0; margin-top:0; margin-bottom:0; overflow:hidden; opacity:0; transition:max-height .18s ease,margin .18s ease,opacity .18s ease; }
+    form.compact-submission.context-help-visible > p.muted,form.compact-submission.context-help-visible > p.warn { max-height:180px; margin-top:2px; margin-bottom:2px; opacity:1; }
+    .toolbar:not(.auth-token-toolbar):not(.auth-login-toolbar) > input:not([type=checkbox]),.toolbar:not(.auth-token-toolbar):not(.auth-login-toolbar) > select { width:auto; min-width:110px; max-width:280px; }
     .table-wrap { overflow:auto; border:1px solid var(--line-soft); border-radius:12px; background:var(--surface-inset); }
     table { width:100%; border-collapse:collapse; font-size:13px; } th,td { padding:10px; border-bottom:1px solid var(--line-soft); text-align:left; vertical-align:top; } th { position:sticky; top:0; z-index:1; color:#9edcff; background:var(--table-head); } tbody tr { transition:background .16s ease; } tbody tr:hover { background:rgba(66,199,255,.055); } tr:last-child td { border-bottom:0; }
     /* Keep training task management readable without making the status cell
@@ -244,6 +256,10 @@
     .settings-directory-entry button { width:auto; min-width:58px; min-height:34px; padding:6px 9px; }
     .settings-readonly { display:grid; gap:7px; margin-top:14px; }
     .settings-readonly code { display:block; padding:8px 10px; overflow-wrap:anywhere; border:1px solid var(--line-soft); border-radius:9px; background:var(--surface-inset); }
+    .settings-directory-modal { position:fixed; inset:0; z-index:1000; display:flex; align-items:center; justify-content:center; padding:20px; background:rgba(0,0,0,.68); }
+    .settings-directory-modal[hidden] { display:none; }
+    .settings-directory-dialog { width:min(760px,100%); max-height:min(780px,calc(100vh - 40px)); overflow:auto; padding:18px; border:1px solid var(--line); border-radius:14px; background:var(--surface-raised); box-shadow:0 24px 70px rgba(0,0,0,.45); }
+    .settings-directory-dialog .settings-browser-toolbar { grid-template-columns:minmax(0,1fr) auto; }
     .training-process-card,.training-output-card,.evaluation-process-card,.evaluation-log-card { min-width:0; }
     .training-process-card { overflow:hidden; }
     .training-output-tabs { display:flex; gap:6px; margin:-2px 0 18px; padding-bottom:10px; border-bottom:1px solid var(--line-soft); }
@@ -300,8 +316,9 @@
     @media(max-width:1280px){.analysis-grid{grid-template-columns:1fr}}
     @media(max-width:1280px){.checkpoint-filter-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
     @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid,.telemetry-latency-grid{grid-template-columns:repeat(2,1fr)}.checkpoint-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-    @media(max-width:900px){.training-workspace,.evaluation-workspace{grid-template-columns:1fr}.eval-settings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.settings-path-grid{grid-template-columns:1fr}.settings-path-field.wide{grid-column:auto}.settings-browser-toolbar{grid-template-columns:1fr 1fr}.settings-browser-toolbar button{grid-column:span 2}}
-    @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar,.eval-settings-grid,.settings-path-grid,.settings-browser-toolbar{grid-template-columns:1fr}.settings-path-field.wide{grid-column:auto}.settings-browser-toolbar button{grid-column:auto}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid,.telemetry-vector-grid,.analysis-grid{grid-template-columns:1fr;grid-auto-flow:row;grid-auto-columns:auto;overflow-x:visible}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
+    @media(max-width:900px){.training-workspace,.evaluation-workspace{grid-template-columns:1fr}.eval-settings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.settings-path-grid{grid-template-columns:1fr}.settings-path-field.wide{grid-column:auto}.settings-browser-toolbar{grid-template-columns:1fr 1fr}.settings-browser-toolbar button{grid-column:span 2}.compact-submission{grid-template-columns:repeat(2,minmax(0,1fr)) !important}.compact-submission > label{grid-column:span 1 !important}.compact-submission > label + input,.compact-submission > label + select{grid-column:span 1 !important}.compact-submission > label + textarea,.compact-submission > textarea{grid-column:1/-1 !important}}
+    @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch;flex-direction:column}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar,.eval-settings-grid,.settings-path-grid,.settings-browser-toolbar{grid-template-columns:1fr}.settings-path-field.wide{grid-column:auto}.settings-browser-toolbar button{grid-column:auto}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid,.telemetry-vector-grid,.analysis-grid{grid-template-columns:1fr;grid-auto-flow:row;grid-auto-columns:auto;overflow-x:visible}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
+    @media(max-width:520px){.compact-submission{grid-template-columns:1fr !important}.compact-submission > label,.compact-submission > label + input,.compact-submission > label + select,.compact-submission > label + textarea,.compact-submission > textarea{grid-column:1/-1 !important}.compact-submission > label{align-self:auto;margin-top:2px}}
   </style>
   <script>
     (() => {
@@ -393,7 +410,7 @@
                 <button type="button" data-episode-editor-tab="params" role="tab" aria-selected="false" aria-controls="episodeEditorTabParams" onclick="setEpisodeEditorTab('params')">Episode 参数</button>
               </div>
               <section id="episodeEditorTabParams" class="episode-editor-tab-panel" data-episode-editor-panel="params" role="tabpanel" hidden>
-                <form id="episodeForm"><input id="episodeIndex" type="hidden"><label>Episode</label><input id="episodeIndexDisplay" disabled><label>Instruction</label><textarea id="episodeInstruction" rows="3" required></textarea><label>Task name（可选）</label><input id="episodeTaskName" placeholder="未设置"><label>Success（可选）</label><select id="episodeSuccess"><option value="">未设置</option><option value="true">true</option><option value="false">false</option></select><label>附加 metadata（JSON object）</label><textarea id="episodeMetadata" rows="7">{}</textarea><label>删除 metadata 字段（逗号分隔）</label><input id="episodeRemoveMetadata" placeholder="operator_note, bad_reason"><p><button type="submit">保存 Episode 参数</button></p></form>
+                <form id="episodeForm" class="compact-submission"><input id="episodeIndex" type="hidden"><label>Episode</label><input id="episodeIndexDisplay" disabled><label>Instruction</label><textarea id="episodeInstruction" rows="3" required></textarea><label>Task name（可选）</label><input id="episodeTaskName" placeholder="未设置"><label>Success（可选）</label><select id="episodeSuccess"><option value="">未设置</option><option value="true">true</option><option value="false">false</option></select><label>附加 metadata（JSON object）</label><textarea id="episodeMetadata" rows="7">{}</textarea><label>删除 metadata 字段（逗号分隔）</label><input id="episodeRemoveMetadata" placeholder="operator_note, bad_reason"><p><button type="submit">保存 Episode 参数</button></p></form>
               </section>
               <section id="episodeEditorTabEvents" class="episode-editor-tab-panel" data-episode-editor-panel="events" role="tabpanel" hidden>
                 <div id="episodeCameraSlotEvents" class="episode-camera-slot"></div>
@@ -437,7 +454,7 @@
       <div class="grid">
         <div class="card third">
           <h2>1. 数据集归一化</h2><p class="muted">只统计数据集训练 split 的 state/actions；不读取模型权重数值。模型系列仅用于匹配动作序列与数据合同。</p>
-          <form id="normForm">
+          <form id="normForm" class="compact-submission">
             <label>数据集</label><select name="dataset_id" class="dataset-select"></select>
             <div class="row"><div><label>模型系列</label><select name="model_variant" class="model-variant-select"><option value="pi05">π0.5</option><option value="pi0">π0</option></select></div><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div></div>
             <div class="row"><div><label>Norm batch size</label><input name="batch_size" type="number" value="16" min="1"></div><div><label>Workers</label><input name="num_workers" type="number" value="2" min="1"></div></div><p class="muted">Norm batch size 只影响统计计算吞吐和显存/内存占用，不需要与训练 batch size 一致。</p>
@@ -447,7 +464,7 @@
         </div>
         <div class="card two-third">
           <h2>2. 提交 LoRA 微调</h2>
-          <form id="trainForm">
+          <form id="trainForm" class="compact-submission">
             <div class="row"><div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div><div><label>实验名</label><input id="trainExperimentName" name="exp_name" list="trainExperimentOptions" required autocomplete="off" placeholder="选择已有实验或输入新名称"><datalist id="trainExperimentOptions"></datalist></div></div>
             <p id="trainExperimentInfo" class="muted">选择已有实验可继续该实验下的 checkpoint；直接输入新名称时只提供基础模型。</p>
             <div class="row"><div><label>模型系列</label><select name="model_variant" class="model-variant-select"><option value="pi05">π0.5</option><option value="pi0">π0</option></select></div><div><label>基础模型 / 初始化 checkpoint</label><select name="base_checkpoint" class="base-model-select" required></select></div></div>
@@ -462,6 +479,7 @@
             <label>启动方式</label><select name="mode"><option value="auto">auto（推荐）</option><option value="new">new</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select>
             <p class="muted">2×24 GiB RTX 4090 上 π0.5 LoRA 建议使用全局 batch 2、FSDP 2、显存比例 0.90。自动评测在每个持久化的 5000-step checkpoint 上使用 held-out episodes；只占用完全空闲的单卡，没有空闲卡就记录 skipped，不排队也不阻塞训练。</p><p><button type="submit">提交训练</button></p>
           </form>
+          <p class="muted">Checkpoint 存储目录为单一写入位置；“允许扫描 / 读取的 checkpoint 目录”支持多个只读来源，存储目录会自动包含在其中。</p>
         </div>
         <div class="training-workspace">
         <section class="card training-process-card">
@@ -527,7 +545,7 @@
         <div class="card manual-eval-card" id="manualEvalCard">
           <h2>手动评测</h2>
           <p class="muted">用于仿真模型 held-out loss / 安全阈值评测；可选择 4×4090 本地或 H100/H200 Slurm 目标。H100/H200 通过 SSH 提交 sbatch，实际 GPU 工作在 Slurm 节点执行。</p>
-          <form id="evalForm" class="manual-eval-form">
+          <form id="evalForm" class="manual-eval-form compact-submission">
             <div class="eval-settings-grid">
               <div><label>执行目标</label><select name="execution_target" class="execution-target-select"><option value="local_4090">4×4090 本地</option></select></div>
               <div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div>
@@ -589,14 +607,19 @@
         <section class="card two-third">
           <h2>路径配置</h2>
           <p class="muted">模型路径保存后立即用于扫描和新任务。数据集、assets、工作目录和缓存路径保存到配置文件，重启 Dashboard 后完全生效。</p>
-          <form id="settingsForm">
+          <form id="settingsForm" class="compact-submission">
             <div class="settings-path-grid">
+              <div class="settings-path-field">
+                <label for="settingsDatasetReadRoots">Dataset read directories (multiple, one per line)</label>
+                <div class="settings-path-row"><textarea id="settingsDatasetReadRoots" name="dataset_read_roots" rows="3" spellcheck="false"></textarea><button type="button" class="inline secondary" data-settings-browse-target="settingsDatasetReadRoots" data-settings-browse-mode="append">Browse</button></div>
+                <p class="muted">Read-only sources are scanned, previewed, trained and evaluated; the storage directory wins on duplicate dataset IDs.</p>
+              </div>
               <div class="settings-path-field">
                 <label for="settingsDatasetRoot">数据集读取 / 存储目录</label>
                 <div class="settings-path-row"><input id="settingsDatasetRoot" name="dataset_root" autocomplete="off"><button type="button" class="inline secondary" data-settings-browse-target="settingsDatasetRoot">浏览</button></div>
               </div>
               <div class="settings-path-field">
-                <label for="settingsCheckpointBaseDir">模型 checkpoint 读取 / 存储目录</label>
+                <label for="settingsCheckpointBaseDir">模型 checkpoint 存储目录（单一）</label>
                 <div class="settings-path-row"><input id="settingsCheckpointBaseDir" name="checkpoint_base_dir" autocomplete="off"><button type="button" class="inline secondary" data-settings-browse-target="settingsCheckpointBaseDir">浏览</button></div>
               </div>
               <div class="settings-path-field">
@@ -616,7 +639,7 @@
                 <div class="settings-path-row"><input id="settingsCacheRoot" name="cache_root" autocomplete="off"><button type="button" class="inline secondary" data-settings-browse-target="settingsCacheRoot">浏览</button></div>
               </div>
               <div class="settings-path-field wide">
-                <label for="settingsAllowedRoots">允许扫描 / 读取的 checkpoint 目录（每行一个）</label>
+                <label for="settingsAllowedRoots">模型 checkpoint 读取目录（多个，每行一个）</label>
                 <textarea id="settingsAllowedRoots" name="checkpoint_allowed_roots" rows="4" spellcheck="false"></textarea>
                 <p class="muted">基础模型和 checkpoint 必须位于这些目录中；软链接目标目录也应加入这里。</p>
               </div>
@@ -633,24 +656,13 @@
             <div class="muted">配置文件（只读）</div><code id="settingsConfigFile">-</code>
           </div>
         </section>
-        <section class="card third">
-          <h2>服务器目录浏览</h2>
-          <p class="muted">选择字段后点击“浏览”。可进入目录、返回上级，或把当前目录填入选中的路径字段。</p>
-          <div class="settings-browser-toolbar">
-            <div><label for="settingsBrowseTarget">填入字段</label><select id="settingsBrowseTarget"><option value="settingsDatasetRoot">数据集目录</option><option value="settingsCheckpointBaseDir">模型目录</option><option value="settingsBaseCheckpoint">基础模型</option><option value="settingsAssetsBaseDir">assets / norm</option><option value="settingsWorkspaceRoot">日志 / 任务目录</option><option value="settingsCacheRoot">缓存目录</option></select></div>
-            <div><label for="settingsBrowseRoot">浏览起点</label><select id="settingsBrowseRoot"></select></div>
-            <button type="button" class="inline secondary" id="settingsBrowseRefresh">刷新</button>
-          </div>
-          <div id="settingsBrowsePath" class="settings-browser-path"><code>-</code></div>
-          <div id="settingsDirectoryList" class="settings-directory-list"><span class="muted">打开设置后加载目录。</span></div><div id="settingsDirectoryPagination"></div>
-        </section>
       </div>
     </section>
 
     <section id="module-policy" class="dashboard-module" data-module="policy" hidden>
       <div class="module-heading"><div><h2>Policy 管理</h2><p>从 checkpoint 启动、切换、健康检测和实机执行授权。</p></div></div>
       <div class="grid policy-workspace">
-        <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><input type="hidden" name="model_variant" id="policyModelVariant" value="pi05"><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div></div><p class="muted">Prompt 与 RTC 运行参数由机械臂客户端配置；Policy 仅提供服务器能力上限。客户端改动后无需重启 Policy。</p><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
+        <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm" class="compact-submission"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><input type="hidden" name="model_variant" id="policyModelVariant" value="pi05"><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div></div><p class="muted">Prompt 与 RTC 运行参数由机械臂客户端配置；Policy 仅提供服务器能力上限。客户端改动后无需重启 Policy。</p><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
         <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code>、<code>action_horizon &gt;= 16</code> 和本地逐 20 Hz command 安全检查。异步客户端默认 4 Hz 启动推理（推理+传输通常约 200 ms），旧 chunk 在推理期间持续执行；新 chunk 到达后按实时 arrival 延迟动态过期 prefix，融合 2~4 步后切换 generation。已结束的历史进程可删除记录和日志。</p><div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('policy')" disabled data-bulk-delete-scope="policy">批量删除已选日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束 Policy；不会删除模型或其他输出。</span></div><div class="table-wrap"><table><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="policy" onchange="toggleTaskSelection('policy', this.checked)" aria-label="全选当前页 Policy 历史任务"></th><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端状态 / 延迟摘要</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div><div id="policyTasksPagination"></div></div>
         <div class="card" id="policyTaskLogCard"><h2>Policy 进程日志</h2><p class="muted">从 Policy 进程表点击“日志”查看最近输出。</p><pre id="policyTaskLog">尚未选择 Policy 进程。</pre></div>
         <div class="card"><h2>机械臂客户端命令</h2><p class="muted">以下只生成连接/设备示例；prompt 和 RTC 运行参数属于客户端。连接后以 telemetry 中的 client prompt/RTC 为准。</p><pre id="policyClientCommand">bin/bimanual-vla rtc-client --host 192.168.101.9 --port 8000 --hz 4 --arm-mode single --arm-side right --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16</pre></div>
@@ -673,6 +685,19 @@
       </div>
     </section>
   </main>
+  <div id="settingsDirectoryModal" class="settings-directory-modal" hidden>
+    <div class="settings-directory-dialog" role="dialog" aria-modal="true" aria-labelledby="settingsDirectoryModalTitle">
+      <div class="toolbar" style="margin-top:0"><h2 id="settingsDirectoryModalTitle" style="margin:0">选择服务器目录</h2><button type="button" class="inline secondary" id="settingsBrowseClose">关闭</button></div>
+      <p id="settingsDirectoryModalTarget" class="muted">-</p>
+      <div class="settings-browser-toolbar">
+        <div><label for="settingsBrowseRoot">浏览起点</label><select id="settingsBrowseRoot"></select></div>
+        <button type="button" class="inline secondary" id="settingsBrowseRefresh">刷新</button>
+      </div>
+      <div id="settingsBrowsePath" class="settings-browser-path"><code>-</code></div>
+      <div id="settingsDirectoryList" class="settings-directory-list"><span class="muted">加载目录中…</span></div>
+      <div id="settingsDirectoryPagination"></div>
+    </div>
+  </div>
 <script>
 const tokenInput = document.getElementById('token');
 const loginUserInput = document.getElementById('loginUser');
@@ -924,6 +949,12 @@ const SETTINGS_PATH_FIELDS = [
   ['cache_root', 'settingsCacheRoot'],
 ];
 
+const SETTINGS_MULTI_PATH_FIELDS = [
+  ['dataset_read_roots', 'settingsDatasetReadRoots'],
+  ['checkpoint_allowed_roots', 'settingsAllowedRoots'],
+  ['eval_video_roots', 'settingsEvalVideoRoots'],
+];
+
 function markSettingsDirty() {
   settingsDirty = true;
   const status = document.getElementById('settingsSaveStatus');
@@ -941,10 +972,10 @@ function fillSettings(data) {
     const input = document.getElementById(id);
     if (input) input.value = paths[key] || '';
   });
-  const roots = document.getElementById('settingsAllowedRoots');
-  if (roots) roots.value = settingsLines(paths.checkpoint_allowed_roots);
-  const videos = document.getElementById('settingsEvalVideoRoots');
-  if (videos) videos.value = settingsLines(paths.eval_video_roots);
+  SETTINGS_MULTI_PATH_FIELDS.forEach(([key, id]) => {
+    const input = document.getElementById(id);
+    if (input) input.value = settingsLines(paths[key]);
+  });
   const readonly = (data && data.readonly) || {};
   document.getElementById('settingsOpenpiRepo').textContent = readonly.openpi_repo || '-';
   document.getElementById('settingsOpenpiPython').textContent = readonly.openpi_python || '-';
@@ -1012,7 +1043,14 @@ function chooseSettingsDirectory(path) {
   const target = document.getElementById('settingsBrowseTarget')?.value;
   const input = target ? document.getElementById(target) : null;
   if (!input || !path) return;
-  input.value = path;
+  const append = input.tagName === 'TEXTAREA' || input.dataset.settingsBrowseMode === 'append';
+  if (append) {
+    const values = String(input.value || '').split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+    if (!values.includes(path)) values.push(path);
+    input.value = values.join('\n');
+  } else {
+    input.value = path;
+  }
   markSettingsDirty();
   show(`已将目录填入 ${input.previousElementSibling?.textContent || '路径字段'}。`, false);
 }
@@ -5629,6 +5667,21 @@ document.getElementById('policyForm').onsubmit = async event => {
   }
 };
 
+function setupContextualFormHelp() {
+  document.querySelectorAll('form.compact-submission').forEach(form => {
+    const controls = Array.from(form.querySelectorAll('input:not([type="hidden"]),select,textarea'));
+    controls.forEach(control => {
+      control.addEventListener('focus', () => form.classList.add('context-help-visible'));
+      control.addEventListener('blur', () => {
+        setTimeout(() => {
+          if (!controls.some(item => item.matches(':focus'))) form.classList.remove('context-help-visible');
+        }, 0);
+      });
+    });
+  });
+}
+
+setupContextualFormHelp();
 showModule(location.hash.slice(1), false);
 if (tokenInput.value) {
   refreshAll();

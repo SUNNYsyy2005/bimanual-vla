@@ -4844,34 +4844,43 @@ def create_app(config_path: Path) -> Flask:
 
     def list_checkpoints() -> list[dict[str, Any]]:
         checkpoints = []
+        storage_root = Path(config["checkpoint_base_dir"]).expanduser().resolve()
+        roots = [Path(item).expanduser().resolve() for item in config.get("checkpoint_allowed_roots", [])]
+        if storage_root not in roots:
+            roots.insert(0, storage_root)
+        seen_paths: set[str] = set()
         for model_variant in ("pi05", "pi0"):
             for arm_mode in ("single", "bimanual"):
                 config_name = policy_config_name(arm_mode, model_variant)
-                config_root = Path(config["checkpoint_base_dir"]) / config_name
-                if not config_root.exists():
-                    continue
-                for exp_dir in config_root.iterdir():
-                    if not exp_dir.is_dir() or exp_dir.name.startswith("."):
+                for root in roots:
+                    config_root = root / config_name
+                    if not config_root.exists():
                         continue
-                    for step_dir in exp_dir.iterdir():
-                        if not step_dir.is_dir() or not step_dir.name.isdigit():
+                    for exp_dir in config_root.iterdir():
+                        if not exp_dir.is_dir() or exp_dir.name.startswith("."):
                             continue
-                        if not (step_dir / "params").is_dir() or not (step_dir / "_CHECKPOINT_METADATA").is_file():
-                            continue
-                        visible_checkpoint, dataset_ids, dataset_origins = checkpoint_matches_visible_datasets(step_dir)
-                        if not visible_checkpoint:
-                            continue
-                        mtime = step_dir.stat().st_mtime
-                        cache_key = str(step_dir.resolve())
-                        cached = checkpoint_size_cache.get(cache_key)
-                        if cached is None or cached[0] != mtime:
-                            size_bytes = sum(path.stat().st_size for path in step_dir.rglob("*") if path.is_file())
-                            checkpoint_size_cache[cache_key] = (mtime, size_bytes)
-                        else:
-                            size_bytes = cached[1]
-                        action_contract = checkpoint_action_contract(step_dir)
-                        checkpoints.append(
-                            {
+                        for step_dir in exp_dir.iterdir():
+                            if not step_dir.is_dir() or not step_dir.name.isdigit():
+                                continue
+                            if not (step_dir / "params").is_dir() or not (step_dir / "_CHECKPOINT_METADATA").is_file():
+                                continue
+                            visible_checkpoint, dataset_ids, dataset_origins = checkpoint_matches_visible_datasets(step_dir)
+                            if not visible_checkpoint:
+                                continue
+                            mtime = step_dir.stat().st_mtime
+                            cache_key = str(step_dir.resolve())
+                            if cache_key in seen_paths:
+                                continue
+                            seen_paths.add(cache_key)
+                            cached = checkpoint_size_cache.get(cache_key)
+                            if cached is None or cached[0] != mtime:
+                                size_bytes = sum(path.stat().st_size for path in step_dir.rglob("*") if path.is_file())
+                                checkpoint_size_cache[cache_key] = (mtime, size_bytes)
+                            else:
+                                size_bytes = cached[1]
+                            action_contract = checkpoint_action_contract(step_dir)
+                            checkpoints.append(
+                                {
                                 "path": cache_key,
                                 "action_contract": action_contract,
                                 "contract_version": action_contract.get("contract_version") if action_contract else None,
@@ -4892,11 +4901,14 @@ def create_app(config_path: Path) -> Flask:
                                 "restore_capabilities": (["full_state"] if is_full_state_checkpoint(step_dir) else ["weights_only"]),
                                 "dataset_ids": dataset_ids,
                                 "dataset_origins": dataset_origins,
+                                "root": str(root),
+                                "storage": root == storage_root,
+                                "read_only": root != storage_root,
                                 "mtime": mtime,
                                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)),
                                 "size_gib": round(size_bytes / (1024**3), 3),
-                            }
-                        )
+                                }
+                            )
         return sorted(checkpoints, key=lambda item: (item["mtime"], item["step"]), reverse=True)
 
     def checkpoint_active_references(path: Path) -> list[dict[str, Any]]:
@@ -4984,10 +4996,26 @@ def create_app(config_path: Path) -> Flask:
         checkpoints = list_checkpoints()
         base_models = list_base_models(checkpoints)
         visible_experiments = {item.get("experiment") for item in checkpoints if item.get("experiment")}
-        experiments = [
-            item for item in training_experiment_catalog(Path(config["checkpoint_base_dir"]))
-            if item.get("name") in visible_experiments
+        experiment_rows: dict[str, dict[str, Any]] = {}
+        experiment_roots = [Path(config["checkpoint_base_dir"])] + [
+            Path(item) for item in config.get("checkpoint_allowed_roots", [])
+            if Path(item) != Path(config["checkpoint_base_dir"])
         ]
+        for experiment_root in experiment_roots:
+            for item in training_experiment_catalog(experiment_root):
+                if item.get("name") not in visible_experiments:
+                    continue
+                current = experiment_rows.get(item["name"])
+                if current is None:
+                    experiment_rows[item["name"]] = dict(item)
+                    continue
+                for key in ("model_variants", "arm_modes", "config_names"):
+                    current[key] = sorted(set(current.get(key, [])) | set(item.get(key, [])))
+                current["checkpoint_count"] = int(current.get("checkpoint_count", 0)) + int(item.get("checkpoint_count", 0))
+                current["latest_step"] = max(current.get("latest_step") or 0, item.get("latest_step") or 0) or None
+                current["mtime"] = max(float(current.get("mtime", 0)), float(item.get("mtime", 0)))
+                current["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(current["mtime"]))
+        experiments = sorted(experiment_rows.values(), key=lambda item: (-float(item.get("mtime", 0)), item["name"]))
         return jsonify(
             {
                 "datasets": list_datasets(),
@@ -8026,9 +8054,12 @@ print(json.dumps(rows, ensure_ascii=False))
                 gpu_ids,
                 xla_memory_fraction=policy_xla_memory_fraction,
                 xla_preallocate=policy_xla_preallocate,
+                **dataset_env_kwargs(dataset_id),
             ),
             metadata={
                 "dataset_id": dataset_id,
+                "dataset_root_path": str(dataset_root_for_id(dataset_id)[0].parent),
+                "dataset_read_only": not dataset_root_for_id(dataset_id)[1],
                 "arm_mode": arm_mode,
                 "arm_side": arm_side,
                 "schema": schema,

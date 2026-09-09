@@ -1738,6 +1738,7 @@ def _resolve_training_split(
                 else persisted.seed if persisted is not None else DEFAULT_SPLIT_SEED
             ),
             contract=contract,
+            persist=os.environ.get("BIMANUAL_VLA_DATASET_READ_ONLY") != "1",
         )
         source = "requested split" if requested_ratio is not None or requested_seed is not None else "default split"
     print(
