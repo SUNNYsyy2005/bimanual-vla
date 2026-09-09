@@ -102,6 +102,7 @@
     #message { position:sticky; top:calc(var(--nav-height) + 8px); z-index:40; display:none; margin-bottom:16px; padding:11px 15px; border:1px solid #3b82f6; border-radius:11px; background:#172554; box-shadow:var(--shadow-soft); }
     .episode-editor-grid { display:grid; grid-template-columns:minmax(0,1fr); gap:14px; margin-top:14px; }
     .episode-panel { padding:12px; border:1px solid #334c69; border-radius:11px; background:#091727; }
+    #episodeEditorPanel { scroll-margin-top:calc(var(--nav-height) + 18px); }
     .episode-panel.table-wrap { max-height:430px; overflow:auto; }
     .episode-panel.table-wrap thead th { position:sticky; top:0; z-index:2; background:#0b1d31; }
     .episode-detail-toolbar { display:flex; flex-wrap:wrap; align-items:end; gap:8px; margin-bottom:10px; }
@@ -214,6 +215,7 @@
     .anomaly-abrupt { color:#ff5f6d; }
     .analysis-anomaly-legend { display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 2px; color:#b8cbe0; font-size:11px; }
     .training-workspace,.evaluation-workspace { grid-column:span 12; display:grid; grid-template-columns:minmax(0,1.16fr) minmax(360px,.84fr); gap:18px; align-items:start; }
+    .training-workspace > .card,.evaluation-workspace > .card { grid-column:auto; }
     .training-process-card,.training-output-card,.evaluation-process-card,.evaluation-log-card { min-width:0; }
     .training-process-card { overflow:hidden; }
     .training-output-tabs { display:flex; gap:6px; margin:-2px 0 18px; padding-bottom:10px; border-bottom:1px solid var(--line-soft); }
@@ -224,12 +226,13 @@
     .training-output-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; margin-bottom:12px; }
     .training-output-heading h2 { margin:0; }
     .training-output-heading p { margin:3px 0 0; }
-    .checkpoint-card { grid-column:span 12; }
+    .checkpoint-card,.manual-eval-card { grid-column:span 12; }
     .checkpoint-filter-grid { display:grid; grid-template-columns:1.2fr 1.2fr .85fr .85fr 1.1fr 1.25fr; gap:10px; align-items:end; margin:4px 0 12px; }
     .checkpoint-filter-grid label,.eval-task-filter-grid label { margin-top:0; }
     .checkpoint-step-filter .toolbar { flex-wrap:nowrap; }
     .checkpoint-step-filter input { min-width:0; }
     .eval-task-filter-grid { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(150px,.7fr); gap:10px; align-items:end; margin-bottom:12px; }
+    .eval-settings-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; align-items:end; }
     .evaluation-workspace .training-jobs-table th:nth-child(2),.evaluation-workspace .training-jobs-table td:nth-child(2) { width:17%; }
     .evaluation-workspace .training-jobs-table th:nth-child(3),.evaluation-workspace .training-jobs-table td:nth-child(3) { width:17%; }
     .evaluation-workspace .training-jobs-table th:nth-child(4),.evaluation-workspace .training-jobs-table td:nth-child(4) { width:45%; }
@@ -268,8 +271,9 @@
     @keyframes module-in { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
     @media(max-width:1280px){.analysis-grid{grid-template-columns:1fr}}
     @media(max-width:1280px){.checkpoint-filter-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
-    @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid,.telemetry-latency-grid{grid-template-columns:repeat(2,1fr)}.training-workspace,.evaluation-workspace{grid-template-columns:1fr}.checkpoint-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-    @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid,.telemetry-vector-grid,.analysis-grid{grid-template-columns:1fr;grid-auto-flow:row;grid-auto-columns:auto;overflow-x:visible}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
+    @media(max-width:1100px){.half,.third,.two-third,.quarter{grid-column:span 12}.stat-grid,.telemetry-latency-grid{grid-template-columns:repeat(2,1fr)}.checkpoint-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media(max-width:900px){.training-workspace,.evaluation-workspace{grid-template-columns:1fr}.eval-settings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar,.eval-settings-grid{grid-template-columns:1fr}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid,.telemetry-vector-grid,.analysis-grid{grid-template-columns:1fr;grid-auto-flow:row;grid-auto-columns:auto;overflow-x:visible}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
   </style>
   <script>
     (() => {
@@ -350,7 +354,7 @@
           <div id="episodeEditorSummary" class="muted editor-summary">选择数据集后加载。</div>
           <div class="episode-editor-grid">
             <div class="episode-panel table-wrap"><table><thead><tr><th></th><th>Episode</th><th>帧数</th><th>Instruction</th><th>Task</th><th>Success</th><th>Event</th><th>操作</th></tr></thead><tbody id="episodeRows"></tbody></table><div class="toolbar" style="margin:10px"><button class="inline secondary" type="button" onclick="changeEpisodePage(-1)">上一页</button><span id="episodePage" class="muted">-</span><button class="inline secondary" type="button" onclick="changeEpisodePage(1)">下一页</button></div></div>
-            <div class="episode-panel">
+            <div id="episodeEditorPanel" class="episode-panel">
               <div class="episode-detail-toolbar"><div><label for="episodeEditorSelector">当前编辑 Episode</label><select id="episodeEditorSelector" disabled><option value="">请先从上方列表选择</option></select></div><span id="episodeEditorSelectionStatus" class="muted">编辑区位于列表下方；可在这里切换当前页 Episode。</span></div>
               <div class="episode-editor-tabs" role="tablist" aria-label="Episode 编辑模块">
                 <button type="button" class="active" data-episode-editor-tab="analysis" role="tab" aria-selected="true" aria-controls="episodeEditorTabAnalysis" onclick="setEpisodeEditorTab('analysis')">帧分析 + 相机帧</button>
@@ -401,11 +405,10 @@
       <div class="module-heading"><div><h2>训练中心</h2><p>归一化、LoRA 微调、训练进度和 loss 曲线。</p></div></div>
       <div class="grid">
         <div class="card third">
-          <h2>1. 归一化统计</h2><p class="muted">训练提交时若缺失或数据划分不匹配会自动串联执行。</p>
+          <h2>1. 数据集归一化</h2><p class="muted">只统计数据集训练 split 的 state/actions；不读取模型权重数值。模型系列仅用于匹配动作序列与数据合同。</p>
           <form id="normForm">
             <label>数据集</label><select name="dataset_id" class="dataset-select"></select>
             <div class="row"><div><label>模型系列</label><select name="model_variant" class="model-variant-select"><option value="pi05">π0.5</option><option value="pi0">π0</option></select></div><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div></div>
-            <label>基础模型 / 初始化 checkpoint</label><select name="base_checkpoint" class="base-model-select" required></select><p class="muted base-model-info">从允许目录自动扫描可用权重。</p>
             <div class="row"><div><label>Norm batch size</label><input name="batch_size" type="number" value="16" min="1"></div><div><label>Workers</label><input name="num_workers" type="number" value="2" min="1"></div></div><p class="muted">Norm batch size 只影响统计计算吞吐和显存/内存占用，不需要与训练 batch size 一致。</p>
             <div class="row"><div><label>测试集比例</label><input name="test_ratio" type="number" value="0.1" min="0" max="0.9" step="0.01"></div><div><label>划分种子</label><input name="split_seed" type="number" value="42" min="0"></div></div>
             <label>最多帧数（留空=全部训练集帧）</label><input name="max_frames" type="number" min="1"><p><button type="submit">提交 norm stats</button></p>
@@ -485,15 +488,24 @@
           <div class="toolbar checkpoint-toolbar"><button class="inline secondary" type="button" onclick="resetCheckpointFilters()">清空筛选</button><button class="inline danger" type="button" onclick="batchDeleteSelectedCheckpoints()" disabled data-bulk-delete-checkpoint-scope="training">批量删除已选 checkpoint（<span data-selected-checkpoint-count>0</span>）</button></div>
           <div class="table-wrap"><table><thead><tr><th class="checkpoint-selection-cell"><input type="checkbox" class="checkpoint-select-all" data-checkpoint-scope="training" onchange="toggleCheckpointSelection('training', this.checked)" aria-label="全选当前筛选的 checkpoint"></th><th>实验 / step</th><th>数据集</th><th>大小 / 时间</th></tr></thead><tbody id="checkpoints"></tbody></table></div>
         </section>
-        <div class="card two-third" id="manualEvalCard">
+        <div class="card manual-eval-card" id="manualEvalCard">
           <h2>手动评测</h2>
           <p class="muted">用于仿真模型 held-out loss / 安全阈值评测；可选择 4×4090 本地或 H100/H200 Slurm 目标。H100/H200 通过 SSH 提交 sbatch，实际 GPU 工作在 Slurm 节点执行。</p>
-          <form id="evalForm">
-            <div class="row3"><div><label>执行目标</label><select name="execution_target" class="execution-target-select"><option value="local_4090">4×4090 本地</option></select></div><div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div><div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div></div>
-            <div class="row"><div><label>Checkpoint</label><select name="checkpoint" class="eval-checkpoint-select" required></select></div><div><label>模型系列</label><select name="model_variant" class="model-variant-select"><option value="pi05">π0.5</option><option value="pi0">π0</option></select></div></div>
-            <label>基础模型 / 初始化 checkpoint</label><select name="base_checkpoint" class="base-model-select" required></select>
-            <div class="row3"><div><label>GPU ID / 集群卡数</label><input name="gpu_ids" value="2" placeholder="本地单卡 ID；集群填卡数"></div><div><label>Eval batch</label><input name="batch_size" type="number" value="1" min="1"></div><div><label>最多 batches</label><input name="max_batches" type="number" value="50" min="1"></div></div>
-            <div class="row3"><div><label>Workers</label><input name="num_workers" type="number" value="2" min="0"></div><div><label>JAX 显存比例</label><input name="xla_memory_fraction" type="number" value="0.85" min="0.50" max="0.95" step="0.01"></div><div><label>Slurm GPU count（可选）</label><input name="cluster_gpus" type="number" min="1" max="8"></div></div>
+          <form id="evalForm" class="manual-eval-form">
+            <div class="eval-settings-grid">
+              <div><label>执行目标</label><select name="execution_target" class="execution-target-select"><option value="local_4090">4×4090 本地</option></select></div>
+              <div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div>
+              <div><label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div>
+              <div><label>Checkpoint</label><select name="checkpoint" class="eval-checkpoint-select" required></select></div>
+              <div><label>模型系列</label><select name="model_variant" class="model-variant-select"><option value="pi05">π0.5</option><option value="pi0">π0</option></select></div>
+              <div><label>基础模型 / 初始化 checkpoint</label><select name="base_checkpoint" class="base-model-select" required></select></div>
+              <div><label>GPU ID / 集群卡数</label><input name="gpu_ids" value="2" placeholder="本地单卡 ID；集群填卡数"></div>
+              <div><label>Eval batch</label><input name="batch_size" type="number" value="1" min="1"></div>
+              <div><label>最多 batches</label><input name="max_batches" type="number" value="50" min="1"></div>
+              <div><label>Workers</label><input name="num_workers" type="number" value="2" min="0"></div>
+              <div><label>JAX 显存比例</label><input name="xla_memory_fraction" type="number" value="0.85" min="0.50" max="0.95" step="0.01"></div>
+              <div><label>Slurm GPU count（可选）</label><input name="cluster_gpus" type="number" min="1" max="8"></div>
+            </div>
             <p><button type="submit">提交评测</button></p>
           </form>
         </div>
@@ -2805,6 +2817,7 @@ async function createVideoPlayer(container, datasetId, episode, media) {
 }
 
 async function editEpisode(index) {
+  showModule('datasets');
   const episode = ((episodeDatasetData && episodeDatasetData.episodes) || [])
     .find(item => Number(item.episode_index) === Number(index));
   if (!episode) return;
@@ -2834,6 +2847,7 @@ async function editEpisode(index) {
   ];
   if (!media.length) {
     container.innerHTML = '<span class="muted">该 episode 未发现 video 或 image 相机媒体。</span>';
+    focusEpisodeEditor();
     return;
   }
   const datasetId = document.getElementById('editorDataset').value;
@@ -2849,6 +2863,13 @@ async function editEpisode(index) {
     seekEpisodeImagePlayers(imagePlayers[0], 0);
     setEpisodeImagePlaying(true, imagePlayers[0]);
   }
+  focusEpisodeEditor();
+}
+
+function focusEpisodeEditor() {
+  const editor = document.getElementById('episodeEditorPanel');
+  if (!editor) return;
+  editor.scrollIntoView({behavior: 'smooth', block: 'start'});
 }
 
 async function deleteSelectedEpisodes() {
@@ -4909,6 +4930,8 @@ async function batchDeleteSelectedTasks(scope) {
         const target = taskLogTarget(moduleName);
         document.getElementById(target.logId).textContent = target.empty;
         selectedTaskLogs[moduleName] = null;
+        if (moduleName === 'training') setTrainingLogSelection(null);
+        if (moduleName === 'eval') setEvaluationLogSelection(null);
       }
     }
     updateTaskBulkControls();
@@ -4928,6 +4951,8 @@ async function deleteTask(id, moduleName = 'training') {
     if (selectedTaskLogs[target.module] === id) {
       document.getElementById(target.logId).textContent = target.empty;
       selectedTaskLogs[target.module] = null;
+      if (target.module === 'training') setTrainingLogSelection(null);
+      if (target.module === 'eval') setEvaluationLogSelection(null);
     }
     updateTaskBulkControls();
     show(`历史任务 ${id} 已删除。`, false);
@@ -5152,6 +5177,7 @@ document.getElementById('evalForm').onsubmit = async event => {
     show(`评测任务已启动：${task.id}`, false);
     selectedTaskLogs.eval = task.id;
     document.getElementById('evalTaskLog').textContent = `评测任务已启动：${task.id}\n等待日志输出...`;
+    setEvaluationLogSelection(task.id);
     showModule('training');
     document.getElementById('evalTaskLogCard').scrollIntoView({behavior: 'smooth', block: 'center'});
     refreshAll();

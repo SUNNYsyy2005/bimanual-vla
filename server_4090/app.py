@@ -4450,6 +4450,13 @@ def create_app(config_path: Path) -> Flask:
                 )
         return path, model_variant
 
+    def resolve_norm_model(payload: dict[str, Any]) -> tuple[Path, str]:
+        """Resolve norm's data contract without requiring a weight selection."""
+        model_variant = str(payload.get("model_variant") or "pi05")
+        if model_variant not in MODEL_VARIANTS:
+            raise ValueError(f"model_variant must be one of {sorted(MODEL_VARIANTS)}")
+        return Path(config["base_checkpoint"]).expanduser().resolve(), model_variant
+
     def resolve_complete_resume_checkpoint(value: Any) -> Path:
         """Resolve an exact checkpoint step or the latest complete step in an experiment."""
         path = resolve_under(value, checkpoint_roots)
@@ -6692,7 +6699,7 @@ print(json.dumps(rows, ensure_ascii=False))
         payload = request.get_json(force=True)
         dataset_id, arm_mode, arm_side, schema, dataset_contract = parse_dataset(payload)
         model_contract = action_contract_for_model(dataset_contract)
-        base_checkpoint, model_variant = resolve_base_model(payload)
+        base_checkpoint, model_variant = resolve_norm_model(payload)
         split = parse_episode_split(payload, dataset_id, dataset_contract)
         batch_size = safe_int(payload.get("batch_size", 16), "batch_size", 1, 1024)
         num_workers = safe_int(payload.get("num_workers", 2), "num_workers", 1, 64)
