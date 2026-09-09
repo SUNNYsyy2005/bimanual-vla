@@ -4,6 +4,9 @@
   "openpi_repo": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05",
   "openpi_python": "/home/sunny/miniconda3/envs/openpi/bin/python",
   "dataset_root": "/home/sunny/.cache/huggingface/lerobot",
+  "dataset_read_roots": [
+    "/home/sunny/.cache/huggingface/lerobot"
+  ],
   "workspace_root": "/home/sunny/.local/share/bimanual-vla-server",
   "assets_base_dir": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/assets",
   "checkpoint_base_dir": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints",

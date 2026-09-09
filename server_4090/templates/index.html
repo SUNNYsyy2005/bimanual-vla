@@ -14,7 +14,7 @@
       --line:#263a55; --line-soft:#1d3049; --line-hover:#3e668d; --muted:#91a4bd; --text:#edf4ff;
       --heading:#f7fbff; --control-text:#edf4ff; --code:#bfeaff;
       --blue:#42c7ff; --blue-strong:#0ea5e9; --green:#3ee6a8; --yellow:#ffd166;
-      --red:#ff6f91; --purple:#a78bfa; --nav-height:132px;
+      --red:#ff6f91; --purple:#a78bfa; --nav-height:112px;
       --shadow:0 18px 50px rgba(0,0,0,.2); --shadow-soft:0 8px 24px rgba(0,0,0,.14);
     }
     html[data-theme="light"] {
@@ -33,10 +33,11 @@
     button,input,select,textarea { font:inherit; }
     button { cursor:pointer; }
     .top-shell { position:sticky; top:0; z-index:50; border-bottom:1px solid rgba(66,199,255,.22); background:var(--topbar-bg); backdrop-filter:blur(20px); box-shadow:var(--shadow-soft); }
-    .topbar { max-width:1640px; margin:auto; padding:18px 28px 14px; display:flex; align-items:center; justify-content:space-between; gap:28px; }
-    .brand { display:flex; align-items:center; gap:14px; min-width:0; flex:1; }
-    .brand-mark { width:46px; height:46px; flex:0 0 auto; display:grid; place-items:center; border:1px solid rgba(255,255,255,.34); border-radius:15px; color:#07101d; font-size:21px; font-weight:900; background:linear-gradient(135deg,var(--blue),var(--green)); box-shadow:0 0 28px rgba(66,199,255,.28); }
-    .brand h1 { margin:0; font-size:22px; letter-spacing:.01em; color:var(--heading); }
+    .topbar { max-width:1640px; margin:auto; padding:10px 28px 8px; display:flex; align-items:center; justify-content:space-between; gap:16px; }
+    .brand { display:flex; align-items:center; gap:10px; min-width:0; flex:1; }
+    .brand-mark { width:38px; height:38px; flex:0 0 auto; display:grid; place-items:center; border:1px solid rgba(255,255,255,.34); border-radius:12px; color:#07101d; font-size:18px; font-weight:900; background:linear-gradient(135deg,var(--blue),var(--green)); box-shadow:0 0 22px rgba(66,199,255,.24); }
+    .brand h1 { margin:0; font-size:20px; letter-spacing:.01em; color:var(--heading); }
+    .brand .pill,.brand > div > .muted { display:none; }
     h2 { margin:0 0 14px; font-size:17px; color:var(--heading); } h3 { margin:14px 0 8px; color:var(--heading); font-size:14px; }
     .auth-panel { display:flex; flex-direction:row; align-items:center; justify-content:flex-end; gap:8px; max-width:760px; flex-wrap:wrap; }
     .auth-panel > .toolbar,.auth-panel > .auth-status { flex:0 0 auto; }
@@ -44,7 +45,7 @@
     .auth-panel input { width:190px; }
     .auth-status { display:flex; align-items:center; gap:8px; color:var(--muted); }
     .auth-status strong { color:var(--heading); }
-    .module-nav { max-width:1640px; margin:auto; padding:0 28px 14px; display:flex; gap:7px; overflow-x:auto; scrollbar-width:thin; }
+    .module-nav { max-width:1640px; margin:auto; padding:0 28px 8px; display:flex; gap:7px; overflow-x:auto; scrollbar-width:thin; }
     .nav-button { width:auto; flex:0 0 auto; display:flex; align-items:center; gap:8px; padding:9px 14px; border:1px solid transparent; border-radius:11px; color:var(--muted); background:transparent; font-weight:750; transition:background .18s ease,border-color .18s ease,color .18s ease,transform .18s ease; }
     .nav-button:hover { color:var(--heading); border-color:var(--line); background:var(--surface-raised); transform:translateY(-1px); }
     .nav-button.active { color:var(--heading); border-color:rgba(66,199,255,.65); background:linear-gradient(180deg,rgba(18,53,84,.98),rgba(16,40,62,.98)); box-shadow:inset 0 0 0 1px rgba(66,199,255,.08),0 6px 16px rgba(14,165,233,.12); }
@@ -256,6 +257,10 @@
     .settings-directory-entry button { width:auto; min-width:58px; min-height:34px; padding:6px 9px; }
     .settings-readonly { display:grid; gap:7px; margin-top:14px; }
     .settings-readonly code { display:block; padding:8px 10px; overflow-wrap:anywhere; border:1px solid var(--line-soft); border-radius:9px; background:var(--surface-inset); }
+    .settings-multi-list { display:grid; gap:6px; margin-bottom:7px; }
+    .settings-multi-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:7px; align-items:center; }
+    .settings-multi-row input { min-width:0; }
+    .settings-multi-row button { width:auto; min-width:58px; padding:6px 9px; }
     .settings-directory-modal { position:fixed; inset:0; z-index:1000; display:flex; align-items:center; justify-content:center; padding:20px; background:rgba(0,0,0,.68); }
     .settings-directory-modal[hidden] { display:none; }
     .settings-directory-dialog { width:min(760px,100%); max-height:min(780px,calc(100vh - 40px)); overflow:auto; padding:18px; border:1px solid var(--line); border-radius:14px; background:var(--surface-raised); box-shadow:0 24px 70px rgba(0,0,0,.45); }
@@ -319,6 +324,7 @@
     @media(max-width:900px){.training-workspace,.evaluation-workspace{grid-template-columns:1fr}.eval-settings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.settings-path-grid{grid-template-columns:1fr}.settings-path-field.wide{grid-column:auto}.settings-browser-toolbar{grid-template-columns:1fr 1fr}.settings-browser-toolbar button{grid-column:span 2}.compact-submission{grid-template-columns:repeat(2,minmax(0,1fr)) !important}.compact-submission > label{grid-column:span 1 !important}.compact-submission > label + input,.compact-submission > label + select{grid-column:span 1 !important}.compact-submission > label + textarea,.compact-submission > textarea{grid-column:1/-1 !important}}
     @media(max-width:760px){:root{--nav-height:190px}.topbar{align-items:flex-start;flex-direction:column}.auth-panel{width:100%;align-items:stretch;flex-direction:column}.auth-panel input{width:100%}.module-nav{padding-bottom:8px}.row,.row3,.chart-toolbar,.eval-settings-grid,.settings-path-grid,.settings-browser-toolbar{grid-template-columns:1fr}.settings-path-field.wide{grid-column:auto}.settings-browser-toolbar button{grid-column:auto}.stat-grid{grid-template-columns:1fr 1fr}.architecture{grid-template-columns:1fr}.architecture .arrow{display:none}.episode-videos,.preview-grid,.telemetry-vector-grid,.analysis-grid{grid-template-columns:1fr;grid-auto-flow:row;grid-auto-columns:auto;overflow-x:visible}main{padding:15px 12px 32px}.topbar,.module-nav{padding-left:12px;padding-right:12px}}
     @media(max-width:520px){.compact-submission{grid-template-columns:1fr !important}.compact-submission > label,.compact-submission > label + input,.compact-submission > label + select,.compact-submission > label + textarea,.compact-submission > textarea{grid-column:1/-1 !important}.compact-submission > label{align-self:auto;margin-top:2px}}
+    @media(max-width:760px){:root{--nav-height:160px}}
   </style>
   <script>
     (() => {
@@ -371,12 +377,6 @@
         <div class="stat-card"><div class="stat-label">Policy</div><div id="summaryPolicies" class="stat-value">-</div><div id="summaryPolicyDetail" class="stat-detail">-</div></div>
       </div>
       <div class="grid">
-        <div class="card half">
-          <h2>链路与服务器</h2>
-          <div class="architecture"><span>机械臂控制电脑<br><small class="muted">Piper + 单臂两路 / 双臂三路相机</small></span><b class="arrow">→</b><span>OpenPI WebSocket<br><small class="muted">真实数据面</small></span><b class="arrow">→</b><span>4×4090 Policy<br><small class="muted">推理 + telemetry</small></span></div>
-          <p class="muted">Dashboard 仅管理进程、GPU、checkpoint、训练和短时执行授权。真实 state / 图像不经 Dashboard HTTP 转发。</p>
-          <div id="serverInfo" class="muted">输入 Token 后刷新。</div>
-        </div>
         <div class="card half"><h2>4×4090 GPU 资源</h2><div id="gpuList"><span class="muted">等待状态数据。</span></div></div>
         {% if dashboard_profile == "simulation" %}<div class="card"><h2>H100 / H200 Slurm 资源</h2><p class="muted">只通过 SSH + Slurm 只读查询，不在 H100/H200 上开启 Dashboard 端口。</p><pre id="clusterResources">等待状态数据。</pre></div>{% endif %}
       </div>
@@ -391,7 +391,7 @@
         <div class="card">
           <h2>数据传输任务</h2>
           <p class="muted">显示数据集、checkpoint 和评估视频 transfer 的实时状态；进度来自传输 runner 的 sidecar，旧任务会用目标目录清单做保守估算。</p>
-          <div class="table-wrap"><table><thead><tr><th>任务</th><th>方向 / 路径</th><th>进度</th><th>状态 / 详情</th><th>操作</th></tr></thead><tbody id="transferJobs"></tbody></table></div><div id="transferTasksPagination"></div>
+          <div class="toolbar task-bulk-toolbar"><label style="margin:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" class="task-select-all" data-task-scope="transfer" onchange="toggleTaskSelection('transfer', this.checked)" aria-label="全选当前页数据传输任务">全选本页</label><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('transfer')" disabled data-bulk-delete-scope="transfer">批量删除已选任务（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束传输任务；不会删除数据集、checkpoint 或评估视频。</span></div><div class="table-wrap"><table><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="transfer" onchange="toggleTaskSelection('transfer', this.checked)" aria-label="全选当前页数据传输任务"></th><th>任务</th><th>方向 / 路径</th><th>进度</th><th>状态 / 详情</th><th>操作</th></tr></thead><tbody id="transferJobs"></tbody></table></div><div id="transferTasksPagination"></div>
         </div>
         <div class="card">
           <h2>Episode 级数据集编辑与相机预览</h2>
@@ -610,12 +610,13 @@
           <form id="settingsForm" class="compact-submission">
             <div class="settings-path-grid">
               <div class="settings-path-field">
-                <label for="settingsDatasetReadRoots">Dataset read directories (multiple, one per line)</label>
-                <div class="settings-path-row"><textarea id="settingsDatasetReadRoots" name="dataset_read_roots" rows="3" spellcheck="false"></textarea><button type="button" class="inline secondary" data-settings-browse-target="settingsDatasetReadRoots" data-settings-browse-mode="append">Browse</button></div>
-                <p class="muted">Read-only sources are scanned, previewed, trained and evaluated; the storage directory wins on duplicate dataset IDs.</p>
+                <label for="settingsDatasetReadRoots">数据集读取目录（多个）</label>
+                <div id="settingsDatasetReadRoots" class="settings-multi-list" data-settings-multi-key="dataset_read_roots"></div>
+                <button type="button" class="inline secondary" data-settings-add-path="dataset_read_roots">添加读取目录</button>
+                <p class="muted">每行一个目录；只用于扫描、预览、训练和评估。同名数据集优先使用存储目录。</p>
               </div>
               <div class="settings-path-field">
-                <label for="settingsDatasetRoot">数据集读取 / 存储目录</label>
+                <label for="settingsDatasetRoot">数据集存储目录（单一）</label>
                 <div class="settings-path-row"><input id="settingsDatasetRoot" name="dataset_root" autocomplete="off"><button type="button" class="inline secondary" data-settings-browse-target="settingsDatasetRoot">浏览</button></div>
               </div>
               <div class="settings-path-field">
@@ -640,12 +641,14 @@
               </div>
               <div class="settings-path-field wide">
                 <label for="settingsAllowedRoots">模型 checkpoint 读取目录（多个，每行一个）</label>
-                <textarea id="settingsAllowedRoots" name="checkpoint_allowed_roots" rows="4" spellcheck="false"></textarea>
+                <div id="settingsAllowedRoots" class="settings-multi-list" data-settings-multi-key="checkpoint_allowed_roots"></div>
+                <button type="button" class="inline secondary" data-settings-add-path="checkpoint_allowed_roots">添加读取目录</button>
                 <p class="muted">基础模型和 checkpoint 必须位于这些目录中；软链接目标目录也应加入这里。</p>
               </div>
               <div class="settings-path-field wide">
                 <label for="settingsEvalVideoRoots">评估视频目录（每行一个，可留空）</label>
-                <textarea id="settingsEvalVideoRoots" name="eval_video_roots" rows="3" spellcheck="false"></textarea>
+                <div id="settingsEvalVideoRoots" class="settings-multi-list" data-settings-multi-key="eval_video_roots"></div>
+                <button type="button" class="inline secondary" data-settings-add-path="eval_video_roots">添加评估视频目录</button>
               </div>
             </div>
             <div class="toolbar" style="margin-top:14px"><button type="submit" class="inline">保存路径设置</button><span id="settingsSaveStatus" class="muted">尚未加载设置。</span></div>
@@ -655,6 +658,27 @@
             <div class="muted">Python 环境（只读）</div><code id="settingsOpenpiPython">-</code>
             <div class="muted">配置文件（只读）</div><code id="settingsConfigFile">-</code>
           </div>
+          <section class="settings-auth-panel">
+            <h3>Dashboard 账户与 Token</h3>
+            <p class="muted">Token 轮换和账户变更会在重启后完全生效；请在重启前记下新 Token，浏览器会自动清除旧登录状态。</p>
+            <div class="toolbar"><button type="button" class="inline secondary" id="settingsRotateToken">生成新 Token</button><span id="settingsTokenHint" class="muted">Token 已配置</span></div>
+            <div class="row">
+              <div><label for="settingsNewUsername">新增用户名</label><input id="settingsNewUsername" autocomplete="off" placeholder="operator"></div>
+              <div><label for="settingsNewUserPassword">新增用户密码</label><input id="settingsNewUserPassword" type="password" autocomplete="new-password" placeholder="至少 8 位"></div>
+            </div>
+            <button type="button" class="inline secondary" id="settingsAddUser">增加用户</button>
+            <div id="settingsUsers" class="muted" style="margin-top:10px">-</div>
+            <div class="row">
+              <div><label for="settingsPasswordUsername">修改密码的用户名</label><input id="settingsPasswordUsername" autocomplete="off"></div>
+              <div><label for="settingsPasswordValue">新密码</label><input id="settingsPasswordValue" type="password" autocomplete="new-password" placeholder="至少 8 位"></div>
+            </div>
+            <button type="button" class="inline secondary" id="settingsChangePassword">修改密码</button>
+          </section>
+          <section class="settings-restart-panel">
+            <h3>应用设置</h3>
+            <p class="muted">修改数据集、assets、工作目录、缓存或读取目录后，点击此按钮重启 Dashboard。训练、评估和 Policy 任务会由任务记录自动重新接管。</p>
+            <button type="button" class="inline" id="settingsRestartDashboard">重启 Dashboard</button>
+          </section>
         </section>
       </div>
     </section>
@@ -689,6 +713,17 @@
     <div class="settings-directory-dialog" role="dialog" aria-modal="true" aria-labelledby="settingsDirectoryModalTitle">
       <div class="toolbar" style="margin-top:0"><h2 id="settingsDirectoryModalTitle" style="margin:0">选择服务器目录</h2><button type="button" class="inline secondary" id="settingsBrowseClose">关闭</button></div>
       <p id="settingsDirectoryModalTarget" class="muted">-</p>
+      <select id="settingsBrowseTarget" hidden>
+        <option value="settingsDatasetRoot">数据集存储目录</option>
+        <option value="settingsDatasetReadRoots">数据集读取目录</option>
+        <option value="settingsCheckpointBaseDir">模型存储目录</option>
+        <option value="settingsAllowedRoots">模型读取目录</option>
+        <option value="settingsBaseCheckpoint">基础模型</option>
+        <option value="settingsAssetsBaseDir">assets / norm</option>
+        <option value="settingsWorkspaceRoot">日志 / 任务目录</option>
+        <option value="settingsCacheRoot">缓存目录</option>
+        <option value="settingsEvalVideoRoots">评估视频读取目录</option>
+      </select>
       <div class="settings-browser-toolbar">
         <div><label for="settingsBrowseRoot">浏览起点</label><select id="settingsBrowseRoot"></select></div>
         <button type="button" class="inline secondary" id="settingsBrowseRefresh">刷新</button>
@@ -751,6 +786,7 @@ let latestSettings = null;
 let settingsDirty = false;
 let settingsBrowsePath = '';
 let settingsBrowseData = null;
+let settingsBrowseEditIndex = null;
 let latestDatasetLocations = null;
 let latestTelemetryKey = null;
 let previewUrls = new Map();
@@ -965,6 +1001,43 @@ function settingsLines(value) {
   return Array.isArray(value) ? value.join('\n') : String(value || '');
 }
 
+function settingsMultiFieldId(key) {
+  const item = SETTINGS_MULTI_PATH_FIELDS.find(([name]) => name === key);
+  return item ? item[1] : null;
+}
+
+function settingsMultiValues(key) {
+  const id = settingsMultiFieldId(key);
+  const container = id ? document.getElementById(id) : null;
+  return container
+    ? [...container.querySelectorAll('input[data-settings-path]')].map(input => input.value.trim()).filter(Boolean)
+    : [];
+}
+
+function renderSettingsMultiField(key, values) {
+  const id = settingsMultiFieldId(key);
+  const container = id ? document.getElementById(id) : null;
+  if (!container) return;
+  const paths = Array.isArray(values) ? values : [];
+  container.innerHTML = paths.map((value, index) => `
+    <div class="settings-multi-row">
+      <input data-settings-path="${esc(key)}" data-settings-path-index="${index}" value="${esc(value)}" autocomplete="off">
+      <button type="button" class="inline secondary" data-settings-edit-path="${esc(key)}" data-settings-path-index="${index}">浏览</button>
+      <button type="button" class="inline danger" data-settings-remove-path="${esc(key)}" data-settings-path-index="${index}">删除</button>
+    </div>`).join('');
+  container.querySelectorAll('input[data-settings-path]').forEach(input => input.addEventListener('input', markSettingsDirty));
+  container.querySelectorAll('[data-settings-edit-path]').forEach(button => button.addEventListener('click', () => {
+    settingsBrowseEditIndex = Number(button.dataset.settingsPathIndex);
+    openSettingsBrowser(container.id);
+  }));
+  container.querySelectorAll('[data-settings-remove-path]').forEach(button => button.addEventListener('click', () => {
+    const index = Number(button.dataset.settingsPathIndex);
+    const next = settingsMultiValues(key).filter((_, itemIndex) => itemIndex !== index);
+    renderSettingsMultiField(key, next);
+    markSettingsDirty();
+  }));
+}
+
 function fillSettings(data) {
   latestSettings = data || null;
   const paths = (data && data.paths) || {};
@@ -973,13 +1046,25 @@ function fillSettings(data) {
     if (input) input.value = paths[key] || '';
   });
   SETTINGS_MULTI_PATH_FIELDS.forEach(([key, id]) => {
-    const input = document.getElementById(id);
-    if (input) input.value = settingsLines(paths[key]);
+    renderSettingsMultiField(key, paths[key]);
   });
   const readonly = (data && data.readonly) || {};
   document.getElementById('settingsOpenpiRepo').textContent = readonly.openpi_repo || '-';
   document.getElementById('settingsOpenpiPython').textContent = readonly.openpi_python || '-';
   document.getElementById('settingsConfigFile').textContent = readonly.config_file || '-';
+  const auth = (data && data.auth) || {};
+  const tokenHint = document.getElementById('settingsTokenHint');
+  if (tokenHint) tokenHint.textContent = auth.token_hint ? `当前 Token：${auth.token_hint}` : 'Token 未配置';
+  const users = document.getElementById('settingsUsers');
+  if (users) {
+    const names = Array.isArray(auth.users) ? auth.users : [];
+    users.innerHTML = names.length
+      ? `现有用户：${names.map(name => `<span class="pill">${esc(name)} <button type="button" class="inline danger" style="min-width:auto;padding:2px 6px" data-settings-delete-user="${esc(name)}">删除</button></span>`).join(' ')}`
+      : '尚未配置用户（将使用启动环境中的默认账号）。';
+    users.querySelectorAll('[data-settings-delete-user]').forEach(button => {
+      button.addEventListener('click', () => deleteSettingsUser(button.dataset.settingsDeleteUser));
+    });
+  }
   const browserRoots = (data && data.browser_roots) || [];
   const rootSelect = document.getElementById('settingsBrowseRoot');
   if (rootSelect) {
@@ -1043,24 +1128,53 @@ function chooseSettingsDirectory(path) {
   const target = document.getElementById('settingsBrowseTarget')?.value;
   const input = target ? document.getElementById(target) : null;
   if (!input || !path) return;
-  const append = input.tagName === 'TEXTAREA' || input.dataset.settingsBrowseMode === 'append';
-  if (append) {
-    const values = String(input.value || '').split(/\r?\n/).map(value => value.trim()).filter(Boolean);
-    if (!values.includes(path)) values.push(path);
-    input.value = values.join('\n');
+  const multiKey = input.dataset.settingsMultiKey;
+  if (multiKey) {
+    const values = settingsMultiValues(multiKey);
+    if (settingsBrowseEditIndex == null) {
+      if (!values.includes(path)) values.push(path);
+    } else if (settingsBrowseEditIndex >= 0 && settingsBrowseEditIndex < values.length) {
+      values[settingsBrowseEditIndex] = path;
+    }
+    renderSettingsMultiField(multiKey, values);
+    settingsBrowseEditIndex = null;
   } else {
     input.value = path;
+    settingsBrowseEditIndex = null;
   }
   markSettingsDirty();
   show(`已将目录填入 ${input.previousElementSibling?.textContent || '路径字段'}。`, false);
+  closeSettingsBrowser();
 }
 
 function openSettingsBrowser(target) {
   showModule('settings');
   const targetSelect = document.getElementById('settingsBrowseTarget');
   if (targetSelect && target) targetSelect.value = target;
-  if (settingsBrowseData) browseSettingsDirectory(settingsBrowsePath, true);
-  else browseSettingsDirectory('', true);
+  const input = target ? document.getElementById(target) : null;
+  if (input && !input.dataset.settingsMultiKey) settingsBrowseEditIndex = null;
+  const modal = document.getElementById('settingsDirectoryModal');
+  if (modal) modal.hidden = false;
+  const targetLabel = document.getElementById('settingsDirectoryModalTarget');
+  if (targetLabel) targetLabel.textContent = `选择后将填入：${targetSelect?.selectedOptions?.[0]?.textContent || target || '路径字段'}`;
+  let initialPath = '';
+  if (input?.dataset.settingsMultiKey && settingsBrowseEditIndex != null) {
+    initialPath = settingsMultiValues(input.dataset.settingsMultiKey)[settingsBrowseEditIndex] || '';
+  } else if (input && !input.dataset.settingsMultiKey) {
+    initialPath = input.value.trim();
+  }
+  if (!initialPath && settingsBrowseData) initialPath = settingsBrowsePath;
+  browseSettingsDirectory(initialPath, true);
+}
+
+function addSettingsPath(key) {
+  settingsBrowseEditIndex = null;
+  openSettingsBrowser(settingsMultiFieldId(key));
+}
+
+function closeSettingsBrowser() {
+  const modal = document.getElementById('settingsDirectoryModal');
+  if (modal) modal.hidden = true;
 }
 
 async function loadSettings(options = {}) {
@@ -1072,6 +1186,64 @@ async function loadSettings(options = {}) {
   } catch (error) {
     if (!options.quiet) show(error.message);
   }
+}
+
+async function deleteSettingsUser(username) {
+  if (!confirm(`确认删除 Dashboard 用户 ${username}？`)) return;
+  try {
+    const data = await api(`/api/auth/users/${encodeURIComponent(username)}`, {method: 'DELETE'});
+    if (latestSettings) latestSettings.auth = {...(latestSettings.auth || {}), users: data.users || []};
+    fillSettings(latestSettings);
+    show(`用户 ${username} 已删除。`, false);
+  } catch (error) { show(error.message); }
+}
+
+async function addSettingsUser() {
+  const username = document.getElementById('settingsNewUsername')?.value.trim();
+  const password = document.getElementById('settingsNewUserPassword')?.value || '';
+  try {
+    const data = await api('/api/auth/users', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({username, password}),
+    });
+    document.getElementById('settingsNewUsername').value = '';
+    document.getElementById('settingsNewUserPassword').value = '';
+    await loadSettings({force: true, quiet: true});
+    show(`用户 ${data.username} 已增加。`, false);
+  } catch (error) { show(error.message); }
+}
+
+async function changeSettingsPassword() {
+  const username = document.getElementById('settingsPasswordUsername')?.value.trim();
+  const password = document.getElementById('settingsPasswordValue')?.value || '';
+  try {
+    await api(`/api/auth/users/${encodeURIComponent(username)}`, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({password}),
+    });
+    document.getElementById('settingsPasswordValue').value = '';
+    show(`用户 ${username} 的密码已修改。`, false);
+  } catch (error) { show(error.message); }
+}
+
+async function rotateSettingsToken() {
+  if (!confirm('生成新 Token 后旧 Token 会在 Dashboard 重启后失效，是否继续？')) return;
+  try {
+    const data = await api('/api/auth/token/rotate', {method: 'POST'});
+    if (data.token) {
+      tokenInput.value = data.token;
+      localStorage.setItem('bimanualVlaToken', data.token);
+    }
+    show('新 Token 已生成并保存；请立即点击“重启 Dashboard”，重启后使用新 Token 登录。', false);
+    await loadSettings({force: true, quiet: true});
+  } catch (error) { show(error.message); }
+}
+
+async function restartDashboardFromSettings() {
+  if (!confirm('确认重启 Dashboard？正在运行的训练、评估和 Policy 会由任务记录重新接管。')) return;
+  try {
+    await api('/api/dashboard/restart', {method: 'POST'});
+    show('Dashboard 重启请求已发送，页面将在几秒后恢复。', false);
+    setTimeout(() => { tokenInput.value = ''; setAuthState(false); }, 1200);
+  } catch (error) { show(error.message); }
 }
 
 function updateEvalVideoBulkControls() {
@@ -1692,7 +1864,7 @@ function fillDatasets(items) {
           <td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps<br>${d.train_episodes == null ? '<span class="muted">尚未生成 train/test 划分</span>' : `<span class="pill">${esc(d.train_episodes)} train</span> <span class="pill">${esc(d.test_episodes)} test</span>`}<br>${(d.norm_model_variants || []).length ? `<span class="ok">norm ready: ${esc((d.norm_model_variants || []).map(modelVariantLabel).join(', '))}</span>` : '<span class="warn">norm 需计算或划分已变化</span>'}</td>
           <td><span class="pill">${esc(d.schema_label || d.schema)}</span> <span class="pill">${esc(d.arm_mode || '-')}</span> <span class="pill">${esc(d.dataset_layout || '-')}</span> <span class="pill">contract v${esc(d.contract_version || '?')}</span> ${d.training_supported ? '<span class="ok">训练兼容</span>' : '<span class="warn">仅管理 / 预览</span>'}<br><code>${esc(d.state_key || 'state?')}</code> ${esc(JSON.stringify(d.state_shape))} → <code>${esc(d.action_key || 'action?')}</code> ${esc(JSON.stringify(d.action_shape))}<br>state=${esc(d.state_dim || '?')}D · raw action=${esc(d.raw_action_dim || '?')}D · model/wire=${esc(d.model_action_dim || '?')}D · arm=${esc(d.arm_side || '-')}<br>${d.contract_error ? `<span class="bad">${esc(d.contract_error)}</span><br>` : ''}${d.training_error ? `<span class="warn">${esc(d.training_error)}</span><br>` : ''}${(d.media || []).map(m => `<span class="pill">${esc(m.type)} · ${esc(cameraDisplayName(m.key, d.arm_side))}</span>`).join(' ') || '<span class="muted">无相机媒体</span>'}</td>
           <td><strong>raw</strong> ${esc(d.raw_action_semantics || '-')}<br><span class="muted">convention=${esc(d.raw_action_convention || '-')}</span><br><strong>model</strong> ${esc(d.model_action_semantics || '-')}<br><span class="muted">convention=${esc(d.model_action_convention || '-')}</span><br><strong>gripper</strong> raw=${esc(d.raw_gripper_semantics || '-')} → wire=${esc(d.wire_gripper_semantics || '-')}<br><span class="muted">raw offset=${d.action_offset == null ? '-' : esc(d.action_offset)} · model start=+${esc(d.model_action_start_offset ?? 1)} step</span></td>
-          <td>${d.remote_only ? '<span class="muted">远端数据集：先同步到 4×4090 后可编辑/重命名/删除。</span>' : `<select class="dataset-origin-select" onchange="setDatasetOrigin('${esc(d.id)}', this.value)">${datasetOriginOptions(d.dataset_origin)}</select><br><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button><button class="inline secondary" onclick="renameDataset('${esc(d.id)}')">重命名</button><button class="inline danger" onclick="deleteDataset('${esc(d.id)}')">删除数据集</button>`}</td>
+          <td>${(d.remote_only || d.read_only) ? `<span class="muted">${d.remote_only ? '远端数据集：先同步到 4×4090 后可编辑。' : '外部读取目录数据集：只读；如需编辑请先同步到存储目录。'}</span>` : `<select class="dataset-origin-select" onchange="setDatasetOrigin('${esc(d.id)}', this.value)">${datasetOriginOptions(d.dataset_origin)}</select><br><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button><button class="inline secondary" onclick="renameDataset('${esc(d.id)}')">重命名</button><button class="inline danger" onclick="deleteDataset('${esc(d.id)}')">删除数据集</button>`}</td>
         </tr>`);
     }
   }
@@ -1930,6 +2102,7 @@ function renderEpisodeEditorSelector(episodes) {
       ? `当前正在编辑 Episode ${selector.value}；相机帧与逐帧分析同步更新。`
       : '编辑区位于列表下方；可在这里切换当前页 Episode。';
   }
+  if (moduleName === 'settings') loadSettings({quiet: true});
 }
 
 function renderEpisodeEventCell(episode) {
@@ -4641,6 +4814,7 @@ function fillTransferTasks(items) {
     const eta = formatDuration(progress.eta_seconds);
     const active = ACTIVE_STATES.has(task.state);
     const terminal = TERMINAL_STATES.has(task.state);
+    const checkbox = `<input type="checkbox" class="task-select" data-task-scope="transfer" data-task-id="${esc(task.id)}" onchange="onTaskSelectionChange(this)" ${terminal ? '' : 'disabled title="运行中的传输任务不能批量删除"'} ${selectedTaskIds.has(task.id) ? 'checked' : ''} aria-label="选择数据传输任务 ${esc(task.id)}">`;
     const kind = metadata.transfer_kind || 'dataset';
     const source = metadata.source || progress.source || '-';
     const targetName = metadata.target || progress.target || '-';
@@ -4649,14 +4823,15 @@ function fillTransferTasks(items) {
     const files = progress.total_files ? `${progress.completed_files || 0}/${progress.total_files} files` : 'files -';
     const shards = progress.total_shards ? `${progress.completed_shards || 0}/${progress.total_shards} lanes` : 'lanes -';
     const error = progress.error || progress.scan_error || task.start_error || '';
-    return `<tr><td><code class="task-ref" title="${esc(task.id)}">${esc(shortTaskId(task.id))}</code><br><span class="pill">${esc(kind)}</span><br><span class="muted">${esc(path)}</span></td>`
+    return `<tr><td class="task-selection-cell">${checkbox}</td><td><code class="task-ref" title="${esc(task.id)}">${esc(shortTaskId(task.id))}</code><br><span class="pill">${esc(kind)}</span><br><span class="muted">${esc(path)}</span></td>`
       + `<td><strong>${esc(source)} → ${esc(targetName)}</strong><br><code class="path" title="${esc(metadata.target_path || progress.target_path || '')}">${esc(shortPath(metadata.target_path || progress.target_path || '-'))}</code></td>`
       + `<td class="transfer-progress-cell"><div class="transfer-progress-meta"><span>${esc(percent)}</span><span>${esc(done)} / ${esc(total)}</span></div><div class="progress-track"><div class="progress-bar" style="width:${width.toFixed(3)}%"></div></div><div class="transfer-detail">${esc(files)} · ${esc(shards)} · ${esc(speed)} · ETA ${esc(eta)}</div></td>`
       + `<td class="${stateClass(task.state)}">${esc(task.state)}${progress.updated_at ? `<br><span class="muted">${esc(progress.updated_at)}</span>` : ''}${error ? `<br><span class="bad">${esc(error)}</span>` : ''}</td>`
       + `<td><button class="inline secondary" onclick="loadLog('${esc(task.id)}','training')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(task.id)}',false)">停止</button>` : ''}${terminal ? `<button class="inline danger" onclick="deleteTask('${esc(task.id)}','training')">删除记录</button>` : ''}</td></tr>`;
-  }).join('') || '<tr><td colspan="5" class="muted">暂无 transfer 任务</td></tr>';
+  }).join('') || '<tr><td colspan="6" class="muted">暂无 transfer 任务</td></tr>';
   const pagination = document.getElementById('transferTasksPagination');
   if (pagination) pagination.innerHTML = renderListPagination('transferTasks', transfers.length);
+  updateTaskBulkControls();
 }
 
 function filteredEvaluationTasks(items) {
@@ -5202,7 +5377,6 @@ async function refreshAll() {
     refreshSelectedLogs();
     fillObservation(data.robot_observation);
     updateSummaries(data);
-    document.getElementById('serverInfo').innerHTML = `管理面：Dashboard HTTP <span class="ok">online</span><br>数据面：<code>openpi_websocket_v1</code><br>Dataset root: <code>${esc(data.config.dataset_root)}</code><br>真机上传暂存: <code>${esc((data.config.upload_roots || {}).real || '-')}</code><br>仿真上传暂存: <code>${esc((data.config.upload_roots || {}).simulation || '-')}</code><br>Checkpoint root: <code>${esc(data.config.checkpoint_base_dir)}</code><br>默认基础模型: <code>${esc(data.config.base_checkpoint)}</code><br>可选基础权重: ${esc((data.base_models || []).length)}<br>已有训练实验: ${esc((data.experiments || []).length)}`;
     if (!episodeDatasetData && document.getElementById('editorDataset').value) loadDatasetEpisodes(0);
     const evalVideoModule = document.getElementById('module-eval-videos');
     if (evalVideoModule && !evalVideoModule.hidden) loadEvalVideos(evalVideoIncludeRemote);
@@ -5323,6 +5497,7 @@ function taskMatchesScope(task, scope) {
   if (scope === 'training') return TRAINING_TASK_TYPES.has(task.type);
   if (scope === 'evaluation') return task.type === 'eval';
   if (scope === 'policy') return task.type === 'policy';
+  if (scope === 'transfer') return task.type === 'transfer';
   return false;
 }
 
@@ -5475,6 +5650,22 @@ document.getElementById('themeToggle')?.addEventListener('click', toggleTheme);
 document.querySelectorAll('.nav-button').forEach(button => {
   button.addEventListener('click', () => showModule(button.dataset.module));
 });
+document.querySelectorAll('[data-settings-browse-target]').forEach(button => {
+  button.addEventListener('click', () => openSettingsBrowser(button.dataset.settingsBrowseTarget));
+});
+document.querySelectorAll('[data-settings-add-path]').forEach(button => {
+  button.addEventListener('click', () => addSettingsPath(button.dataset.settingsAddPath));
+});
+document.getElementById('settingsBrowseRefresh')?.addEventListener('click', () => browseSettingsDirectory(settingsBrowsePath));
+document.getElementById('settingsBrowseRoot')?.addEventListener('change', event => browseSettingsDirectory(event.target.value));
+document.getElementById('settingsBrowseClose')?.addEventListener('click', closeSettingsBrowser);
+document.getElementById('settingsDirectoryModal')?.addEventListener('click', event => {
+  if (event.target.id === 'settingsDirectoryModal') closeSettingsBrowser();
+});
+document.getElementById('settingsAddUser')?.addEventListener('click', addSettingsUser);
+document.getElementById('settingsChangePassword')?.addEventListener('click', changeSettingsPassword);
+document.getElementById('settingsRotateToken')?.addEventListener('click', rotateSettingsToken);
+document.getElementById('settingsRestartDashboard')?.addEventListener('click', restartDashboardFromSettings);
 window.addEventListener('hashchange', () => showModule(location.hash.slice(1), false));
 window.addEventListener('resize', () => {
   requestAnimationFrame(drawTrainingMetrics);
@@ -5593,6 +5784,29 @@ document.getElementById('episodeForm').onsubmit = async event => {
     await refreshAll();
     await loadDatasetEpisodes(episodeOffset);
     editEpisode(Number(episodeIndex));
+  } catch (error) {
+    show(error.message);
+  }
+};
+
+document.getElementById('settingsForm').onsubmit = async event => {
+  event.preventDefault();
+  const paths = formJSON(event.target);
+  SETTINGS_MULTI_PATH_FIELDS.forEach(([key]) => { paths[key] = settingsMultiValues(key); });
+  try {
+    const result = await api('/api/settings', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({paths}),
+    });
+    fillSettings(result.settings);
+    const restart = result.restart_required_for || [];
+    show(
+      restart.length
+        ? `设置已保存；以下路径需要重启 Dashboard 后生效：${restart.join(', ')}`
+        : '设置已保存并立即生效。',
+      false,
+    );
   } catch (error) {
     show(error.message);
   }

@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -1481,9 +1482,12 @@ def load_config(path: Path) -> dict[str, Any]:
         "base_checkpoint",
     ):
         defaults[key] = str(Path(defaults[key]).expanduser().resolve())
+    raw_dataset_read_roots = defaults.get("dataset_read_roots", [])
+    if isinstance(raw_dataset_read_roots, str):
+        raw_dataset_read_roots = [raw_dataset_read_roots]
     dataset_read_roots = [
         str(Path(item).expanduser().resolve())
-        for item in defaults.get("dataset_read_roots", [])
+        for item in raw_dataset_read_roots
         if str(item).strip()
     ]
     if defaults["dataset_root"] not in dataset_read_roots:
@@ -4158,6 +4162,83 @@ def create_app(config_path: Path) -> Flask:
     openpi_helper = str(APP_DIR / "openpi_single_arm.py")
     checkpoint_size_cache: dict[str, tuple[float, int]] = {}
     settings_lock = threading.RLock()
+    auth_users_file = Path(
+        os.environ.get(
+            "BIMANUAL_VLA_AUTH_USERS_FILE",
+            str(Path.home() / ".config" / "bimanual-vla" / "users.json"),
+        )
+    ).expanduser().resolve()
+
+    def _password_digest(password: str, salt: bytes | None = None) -> tuple[str, str]:
+        salt = salt or secrets.token_bytes(16)
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 240_000)
+        return salt.hex(), digest.hex()
+
+    def _load_auth_users() -> list[dict[str, str]]:
+        raw = read_json(auth_users_file)
+        users = raw.get("users") if isinstance(raw, dict) else raw
+        if not isinstance(users, list):
+            return []
+        result: list[dict[str, str]] = []
+        for item in users:
+            if not isinstance(item, dict):
+                continue
+            username = str(item.get("username", "")).strip()
+            salt = str(item.get("salt", "")).strip()
+            digest = str(item.get("password_hash", "")).strip()
+            if username and salt and digest:
+                result.append({"username": username, "salt": salt, "password_hash": digest})
+        return result
+
+    auth_users = _load_auth_users()
+    if not auth_users and login_user and login_password:
+        salt, digest = _password_digest(login_password)
+        auth_users = [{"username": login_user, "salt": salt, "password_hash": digest}]
+
+    def _persist_auth_users() -> None:
+        auth_users_file.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json(auth_users_file, {"version": 1, "users": auth_users})
+
+    def _verify_auth_password(username: str, password: str) -> bool:
+        for user in auth_users:
+            if user["username"] != username:
+                continue
+            try:
+                digest = hashlib.pbkdf2_hmac(
+                    "sha256", password.encode("utf-8"), bytes.fromhex(user["salt"]), 240_000
+                ).hex()
+            except ValueError:
+                return False
+            return hmac.compare_digest(digest, user["password_hash"])
+        return False
+
+    def _auth_usernames() -> list[str]:
+        names = [user["username"] for user in auth_users]
+        if not names and login_user:
+            names.append(login_user)
+        return sorted(set(names), key=str.casefold)
+
+    def _token_file_path() -> Path:
+        return Path(
+            os.environ.get(
+                "BIMANUAL_VLA_TOKEN_FILE",
+                str(Path.home() / ".config" / "bimanual-vla" / "server.env"),
+            )
+        ).expanduser().resolve()
+
+    def _write_server_env(*, token: str) -> None:
+        path = _token_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        current_user = login_user or (auth_users[0]["username"] if auth_users else "dashboard")
+        lines = [
+            f"export BIMANUAL_VLA_SERVER_TOKEN={shlex.quote(token)}",
+            f"export BIMANUAL_VLA_LOGIN_USER={shlex.quote(current_user)}",
+            f"export BIMANUAL_VLA_LOGIN_PASSWORD={shlex.quote(login_password or secrets.token_urlsafe(24))}",
+        ]
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
 
     settings_path_keys = (
         "dataset_root",
@@ -4207,6 +4288,15 @@ def create_app(config_path: Path) -> Flask:
             if value:
                 path = Path(str(value)).expanduser()
                 candidates.extend((path, path.parent))
+        for key in ("dataset_read_roots", "checkpoint_allowed_roots", "eval_video_roots"):
+            values = config.get(key, [])
+            if isinstance(values, str):
+                values = [values]
+            if isinstance(values, list):
+                for value in values:
+                    if str(value).strip():
+                        path = Path(str(value)).expanduser()
+                        candidates.extend((path, path.parent))
         candidates.append(Path.home())
         for anchor in (Path("/mnt"), Path("/DATA")):
             if anchor.exists():
@@ -4249,6 +4339,12 @@ def create_app(config_path: Path) -> Flask:
         return {
             "paths": paths,
             "readonly": readonly,
+            "auth": {
+                "users": _auth_usernames(),
+                "token_configured": bool(token),
+                "token_hint": (token[:4] + "…" + token[-4:]) if len(token) >= 10 else "configured",
+                "users_file": str(auth_users_file),
+            },
             "browser_roots": browser_roots,
             "restart_required_for": [
                 "dataset_root",
@@ -4475,7 +4571,7 @@ def create_app(config_path: Path) -> Flask:
     def handle_error(exc: Exception):
         if isinstance(exc, HTTPException):
             return jsonify({"error": exc.description, "type": type(exc).__name__}), exc.code
-        status = 400 if isinstance(exc, (ValueError, FileExistsError, FileNotFoundError)) else 500
+        status = 400 if isinstance(exc, (ValueError, FileExistsError, FileNotFoundError, PermissionError)) else 500
         if status == 500:
             app.logger.exception("request failed")
         return jsonify({"error": str(exc), "type": type(exc).__name__}), status
@@ -4512,11 +4608,15 @@ def create_app(config_path: Path) -> Flask:
         supplied_password = str(payload.get("password", ""))
         if not login_user or not login_password:
             return jsonify({"error": "Dashboard login credentials are not configured"}), 503
-        valid_user = hmac.compare_digest(supplied_user, login_user)
-        valid_password = hmac.compare_digest(supplied_password, login_password)
+        valid_user = supplied_user in _auth_usernames()
+        valid_password = (
+            _verify_auth_password(supplied_user, supplied_password)
+            if auth_users
+            else hmac.compare_digest(supplied_password, login_password)
+        )
         if not (valid_user and valid_password):
             return jsonify({"error": "invalid username or password"}), 401
-        response = jsonify({"token": token, "token_type": "Bearer", "username": login_user})
+        response = jsonify({"token": token, "token_type": "Bearer", "username": supplied_user})
         response.set_cookie(
             "bimanual_vla_token",
             token,
@@ -4525,6 +4625,83 @@ def create_app(config_path: Path) -> Flask:
             samesite="Lax",
         )
         return response
+
+    @app.get("/api/auth/settings")
+    def get_auth_settings():
+        return jsonify(settings_payload().get("auth", {}))
+
+    @app.post("/api/auth/users")
+    def add_auth_user():
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        username = str(payload.get("username", "")).strip()
+        password = str(payload.get("password", ""))
+        if not SAFE_NAME.fullmatch(username):
+            raise ValueError("username must contain only letters, numbers, dot, underscore or hyphen")
+        if len(password) < 8:
+            raise ValueError("password must contain at least 8 characters")
+        with settings_lock:
+            if any(item["username"] == username for item in auth_users):
+                raise ValueError(f"user already exists: {username}")
+            salt, digest = _password_digest(password)
+            auth_users.append({"username": username, "salt": salt, "password_hash": digest})
+            _persist_auth_users()
+        return jsonify({"ok": True, "username": username, "users": _auth_usernames()}), 201
+
+    @app.put("/api/auth/users/<username>")
+    def update_auth_user(username: str):
+        username = str(username).strip()
+        payload = request.get_json(force=True)
+        password = str(payload.get("password", "")) if isinstance(payload, dict) else ""
+        if len(password) < 8:
+            raise ValueError("password must contain at least 8 characters")
+        with settings_lock:
+            user = next((item for item in auth_users if item["username"] == username), None)
+            if user is None:
+                raise FileNotFoundError(username)
+            salt, digest = _password_digest(password)
+            user.update({"salt": salt, "password_hash": digest})
+            _persist_auth_users()
+        return jsonify({"ok": True, "username": username, "users": _auth_usernames()})
+
+    @app.delete("/api/auth/users/<username>")
+    def delete_auth_user(username: str):
+        username = str(username).strip()
+        with settings_lock:
+            if len(auth_users) <= 1:
+                raise ValueError("cannot delete the last Dashboard user")
+            before = len(auth_users)
+            auth_users[:] = [item for item in auth_users if item["username"] != username]
+            if len(auth_users) == before:
+                raise FileNotFoundError(username)
+            _persist_auth_users()
+        return jsonify({"ok": True, "deleted": username, "users": _auth_usernames()})
+
+    @app.post("/api/auth/token/rotate")
+    def rotate_auth_token():
+        nonlocal token
+        new_token = secrets.token_urlsafe(36)
+        _write_server_env(token=new_token)
+        token = new_token
+        return jsonify({"ok": True, "token": new_token, "restart_required": True})
+
+    @app.post("/api/dashboard/restart")
+    def restart_dashboard():
+        if not shutil.which("systemctl"):
+            raise RuntimeError("systemctl is not available; restart the Dashboard service manually")
+        service = (
+            "bimanual-vla-sim-dashboard.service"
+            if config.get("dashboard_profile") == "simulation"
+            else "bimanual-vla-dashboard.service"
+        )
+        subprocess.Popen(
+            ["systemctl", "--user", "restart", service],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return jsonify({"ok": True, "service": service, "restart_requested": True}), 202
 
     def list_datasets() -> list[dict[str, Any]]:
         datasets = []
