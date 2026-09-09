@@ -24,10 +24,14 @@ import time
 from typing import Any
 
 import numpy as np
-import jax
-import jax.numpy as jnp
-from flax import nnx
-from websockets.exceptions import ConnectionClosedError, InvalidMessage
+try:
+    from websockets.exceptions import ConnectionClosedError, InvalidMessage
+except ImportError:  # lightweight contract/norm helpers do not need websockets
+    class ConnectionClosedError(Exception):
+        pass
+
+    class InvalidMessage(Exception):
+        pass
 
 
 def _install_torchvision_stub_if_broken() -> None:
@@ -2661,12 +2665,26 @@ class PolicyTelemetry:
         self.root.mkdir(parents=True, exist_ok=True)
         self.metadata = metadata
         self.lock = threading.Lock()
+        # Inference lifecycle counters must not contend with the dashboard
+        # publisher's payload-building lock.  The latter may copy several
+        # camera frames and sanitize a large telemetry dictionary.
+        self._inference_state_lock = threading.Lock()
         self.sequence = 0
         self.active_clients = 0
         self.client_addresses: set[str] = set()
         self.active_inferences = 0
         self.last_inference_started_at: float | None = None
         self.last_inference_finished_at: float | None = None
+        self._latest_payload: dict[str, Any] | None = None
+        self._json_queue: queue.Queue[tuple[Path, dict[str, Any]] | None] = queue.Queue(
+            maxsize=32
+        )
+        self._json_writer = threading.Thread(
+            target=self._json_writer_loop,
+            name="policy-telemetry-json",
+            daemon=True,
+        )
+        self._json_writer.start()
         # Dashboard image encoding is observational side work. Keep it off
         # the inference/websocket critical path; metadata remains synchronous
         # and is the source of truth for the latest observation.
@@ -2677,11 +2695,35 @@ class PolicyTelemetry:
             daemon=True,
         )
         self._image_writer.start()
+        # Dashboard telemetry is observational. Build/copy its snapshot on a
+        # bounded worker queue so image copies and JSON shaping never delay the
+        # WebSocket response sent to the robot client.
+        self._publish_queue: queue.Queue[tuple[dict, dict, float] | None] = queue.Queue(
+            maxsize=2
+        )
+        self._publish_thread = threading.Thread(
+            target=self._publish_loop,
+            name="policy-telemetry-publish",
+            daemon=True,
+        )
+        self._publish_thread.start()
+        self._publish_drop_count = 0
+        self._last_publish_drop_log = 0.0
+        self._json_drop_count = 0
+        self._last_json_drop_log = 0.0
+        self._image_drop_count = 0
+        self._last_image_drop_log = 0.0
+        self._execution_control_cache: dict[str, Any] = {}
+        self._execution_control_mtime_ns: int | None = None
+        self._execution_control_checked_at = 0.0
 
     @staticmethod
     def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         temp = path.with_suffix(path.suffix + ".tmp")
-        temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.write_text(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
         os.replace(temp, path)
 
     @staticmethod
@@ -2708,13 +2750,96 @@ class PolicyTelemetry:
             finally:
                 self._image_queue.task_done()
 
+    def _json_writer_loop(self) -> None:
+        while True:
+            item = self._json_queue.get()
+            try:
+                if item is None:
+                    return
+                path, payload = item
+                self._atomic_json(path, payload)
+            except Exception:
+                logging.exception("failed to publish Policy telemetry JSON")
+            finally:
+                self._json_queue.task_done()
+
+    def _enqueue_json(self, path: Path, payload: dict[str, Any]) -> None:
+        try:
+            self._json_queue.put_nowait((path, payload))
+        except queue.Full:
+            # Telemetry is observational; keep the inference path bounded if
+            # the local disk is temporarily slower than the policy server.
+            self._json_drop_count += 1
+            now = time.monotonic()
+            if now - self._last_json_drop_log >= 5.0:
+                self._last_json_drop_log = now
+                logging.warning(
+                    "policy telemetry JSON queue full; dropped=%d",
+                    self._json_drop_count,
+                )
+
+    def _publish_loop(self) -> None:
+        while True:
+            item = self._publish_queue.get()
+            try:
+                if item is None:
+                    return
+                observation, result, elapsed_s = item
+                try:
+                    self.publish(observation, result, elapsed_s)
+                except Exception:
+                    logging.exception("failed to publish policy telemetry")
+            finally:
+                self._publish_queue.task_done()
+
+    def enqueue_publish(self, observation: dict, result: dict, elapsed_s: float) -> bool:
+        """Schedule dashboard telemetry without blocking policy inference."""
+        try:
+            self._publish_queue.put_nowait((observation, result, float(elapsed_s)))
+            return True
+        except queue.Full:
+            self._publish_drop_count += 1
+            now = time.monotonic()
+            if now - self._last_publish_drop_log >= 5.0:
+                self._last_publish_drop_log = now
+                logging.warning(
+                    "policy telemetry publish queue full; dropped=%d",
+                    self._publish_drop_count,
+                )
+            return False
+
+    def close(self) -> None:
+        """Drain telemetry writers during orderly server shutdown."""
+        try:
+            self._publish_queue.join()
+            self._publish_queue.put(None, timeout=2.0)
+            self._publish_thread.join(timeout=5.0)
+        except Exception:
+            logging.exception("failed to stop policy telemetry publisher")
+        for q, thread in (
+            (self._image_queue, self._image_writer),
+            (self._json_queue, self._json_writer),
+        ):
+            try:
+                q.put(None, timeout=2.0)
+                thread.join(timeout=5.0)
+            except Exception:
+                logging.exception("failed to stop policy telemetry writer")
+
     def _enqueue_images(self, images: dict[str, np.ndarray]) -> None:
         try:
             self._image_queue.put_nowait(images)
         except queue.Full:
             # Telemetry is not part of the robot control contract. Dropping a
             # frame is preferable to adding latency to policy inference.
-            logging.warning("Policy telemetry image queue full; dropping one frame")
+            self._image_drop_count += 1
+            now = time.monotonic()
+            if now - self._last_image_drop_log >= 5.0:
+                self._last_image_drop_log = now
+                logging.warning(
+                    "Policy telemetry image queue full; dropped=%d",
+                    self._image_drop_count,
+                )
 
     @staticmethod
     def _client_address(remote_address: Any) -> str:
@@ -2779,10 +2904,10 @@ class PolicyTelemetry:
             "client_connected": self.active_clients > 0,
             "client_addresses": sorted(self.client_addresses),
         }
-        self._atomic_json(self.root / "connections.json", payload)
+        self._enqueue_json(self.root / "connections.json", payload)
 
     def _publish_runtime(self) -> None:
-        self._atomic_json(
+        self._enqueue_json(
             self.root / "runtime.json",
             {
                 "active_inferences": self.active_inferences,
@@ -2794,13 +2919,13 @@ class PolicyTelemetry:
         )
 
     def inference_started(self) -> None:
-        with self.lock:
+        with self._inference_state_lock:
             self.active_inferences += 1
             self.last_inference_started_at = time.time()
             self._publish_runtime()
 
     def inference_finished(self) -> None:
-        with self.lock:
+        with self._inference_state_lock:
             self.active_inferences = max(0, self.active_inferences - 1)
             self.last_inference_finished_at = time.time()
             self._publish_runtime()
@@ -2822,10 +2947,28 @@ class PolicyTelemetry:
     def execution_control(self) -> dict[str, Any]:
         """Read the Dashboard gate; missing, malformed, or expired means shadow."""
         path = self.root / "execution_control.json"
+        now_monotonic = time.monotonic()
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            value = {}
+            mtime_ns = int(path.stat().st_mtime_ns)
+        except OSError:
+            mtime_ns = None
+        # The file changes only on explicit Dashboard actions. Avoid a disk
+        # read on every 250 ms inference while still checking for updates at a
+        # bounded 100 ms cadence and always re-evaluating expiry below.
+        if (
+            now_monotonic - self._execution_control_checked_at >= 0.10
+            or mtime_ns != self._execution_control_mtime_ns
+        ):
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                value = {}
+            if not isinstance(value, dict):
+                value = {}
+            self._execution_control_cache = dict(value)
+            self._execution_control_mtime_ns = mtime_ns
+            self._execution_control_checked_at = now_monotonic
+        value = dict(self._execution_control_cache)
         if not isinstance(value, dict):
             value = {}
         now = time.time()
@@ -2849,211 +2992,222 @@ class PolicyTelemetry:
         }
 
     def publish(self, observation: dict, result: dict, elapsed_s: float) -> int:
+        # Sequence allocation is the only shared state needed before the
+        # payload is built.  Do not hold ``self.lock`` while copying camera
+        # frames, sanitizing client telemetry, or assembling the dashboard
+        # JSON: ``TelemetryPolicy.infer()`` takes the same lock in its
+        # completion path, and that made observational work delay the response
+        # returned to the robot client.
         with self.lock:
             self.sequence += 1
-            client = observation.get("client_metadata")
-            if not isinstance(client, dict):
-                client = {}
-            images = observation.get("images", {})
-            camera_shapes: dict[str, list[int]] = {}
-            image_payload: dict[str, np.ndarray] = {}
-            for camera_key in self.metadata["camera_keys"]:
-                image = np.asarray(images[camera_key], dtype=np.uint8).copy()
-                camera_shapes[camera_key] = list(image.shape)
-                image_payload[camera_key] = image
-            if self.metadata["arm_mode"] == "single":
-                wrist_key = next(key for key in self.metadata["camera_keys"] if "wrist" in key)
-                if wrist_key != "cam_wrist":
-                    image_payload["cam_wrist"] = image_payload[wrist_key].copy()
-            actions = np.asarray(result.get("actions"), dtype=np.float32)
-            state = np.asarray(observation.get("state"), dtype=np.float32)
-            action_horizon = self._positive_int(self.metadata.get("action_horizon"))
-            if action_horizon is None:
-                action_horizon = 0
-            async_client = sanitize_async_client_telemetry(
-                client,
-                action_dim=int(self.metadata["action_dim"]),
-                action_horizon=action_horizon,
+            sequence = self.sequence
+
+        client = observation.get("client_metadata")
+        if not isinstance(client, dict):
+            client = {}
+        images = observation.get("images", {})
+        camera_shapes: dict[str, list[int]] = {}
+        image_payload: dict[str, np.ndarray] = {}
+        for camera_key in self.metadata["camera_keys"]:
+            image = np.asarray(images[camera_key], dtype=np.uint8).copy()
+            camera_shapes[camera_key] = list(image.shape)
+            image_payload[camera_key] = image
+        if self.metadata["arm_mode"] == "single":
+            wrist_key = next(key for key in self.metadata["camera_keys"] if "wrist" in key)
+            if wrist_key != "cam_wrist":
+                # The writer only reads frames; reuse the already copied
+                # wrist buffer for the legacy alias instead of duplicating
+                # a full image per inference.
+                image_payload["cam_wrist"] = image_payload[wrist_key]
+        actions = np.asarray(result.get("actions"), dtype=np.float32)
+        state = np.asarray(observation.get("state"), dtype=np.float32)
+        # The payload-building block intentionally runs without holding
+        # ``self.lock``.
+        action_horizon = self._positive_int(self.metadata.get("action_horizon"))
+        if action_horizon is None:
+            action_horizon = 0
+        async_client = sanitize_async_client_telemetry(
+            client,
+            action_dim=int(self.metadata["action_dim"]),
+            action_horizon=action_horizon,
+        )
+        if actions.ndim >= 2 and int(actions.shape[0]) > 0:
+            # The returned tensor is authoritative for displayed chunk rows;
+            # expected_action_horizon remains the negotiated client contract.
+            async_client["client_chunk_rows"] = int(actions.shape[0])
+        client_policy_action_hz = _telemetry_positive_float(client.get("policy_action_hz"))
+        client_command_hz = async_client["client_control_hz"]
+        client_inference_hz = async_client["client_inference_launch_hz"]
+        if client_inference_hz is None:
+            # Preserve the legacy field as a configured-rate fallback, but
+            # keep the explicit launch/result fields authoritative for
+            # dashboards that distinguish target from observed throughput.
+            client_inference_hz = async_client["client_configured_inference_hz"]
+        client_action_chunk_steps = async_client["client_chunk_rows"]
+        client_last_action_chunk_steps = self._positive_int(
+            client.get("last_action_chunk_steps")
+        )
+        client_last_composed_action = self._finite_vector(
+            client.get("last_composed_action"), int(self.metadata["action_dim"])
+        )
+        client_last_composed_action_at = self._finite_float(
+            client.get("last_composed_action_at")
+        )
+        client_queue_anchor_state = self._finite_vector(
+            client.get("queue_anchor_state"), int(self.metadata["state_dim"])
+        )
+        expected_qpos_dim = 14 if self.metadata["arm_mode"] == "bimanual" else 7
+        client_queue_anchor_qpos = self._finite_vector(
+            client.get("queue_anchor_qpos_m"), expected_qpos_dim
+        )
+        client_last_wire_action = async_client["client_last_wire_action"]
+        now = time.time()
+        captured_at = _telemetry_nonnegative_float(client.get("captured_at"))
+        transport_timing = result.get("transport_timing")
+        transport_timing = transport_timing if isinstance(transport_timing, dict) else {}
+        result_rtc = result.get("rtc")
+        result_rtc = result_rtc if isinstance(result_rtc, dict) else {}
+        client_rtc_config = result_rtc.get("client_config")
+        if not isinstance(client_rtc_config, dict):
+            client_rtc_config = None
+        server_model_inference_ms = _telemetry_nonnegative_float(
+            transport_timing.get("model_inference_ms")
+        )
+        server_observation_upload_ms = _telemetry_nonnegative_float(
+            transport_timing.get(
+                "server_observation_upload_ms",
+                transport_timing.get("observation_upload_ms"),
             )
-            if actions.ndim >= 2 and int(actions.shape[0]) > 0:
-                # The returned tensor is authoritative for displayed chunk rows;
-                # expected_action_horizon remains the negotiated client contract.
-                async_client["client_chunk_rows"] = int(actions.shape[0])
-            client_policy_action_hz = _telemetry_positive_float(client.get("policy_action_hz"))
-            client_command_hz = async_client["client_control_hz"]
-            client_inference_hz = async_client["client_inference_launch_hz"]
-            if client_inference_hz is None:
-                # Preserve the legacy field as a configured-rate fallback, but
-                # keep the explicit launch/result fields authoritative for
-                # dashboards that distinguish target from observed throughput.
-                client_inference_hz = async_client["client_configured_inference_hz"]
-            client_action_chunk_steps = async_client["client_chunk_rows"]
-            client_last_action_chunk_steps = self._positive_int(
-                client.get("last_action_chunk_steps")
-            )
-            client_last_composed_action = self._finite_vector(
-                client.get("last_composed_action"), int(self.metadata["action_dim"])
-            )
-            client_last_composed_action_at = self._finite_float(
-                client.get("last_composed_action_at")
-            )
-            client_queue_anchor_state = self._finite_vector(
-                client.get("queue_anchor_state"), int(self.metadata["state_dim"])
-            )
-            expected_qpos_dim = 14 if self.metadata["arm_mode"] == "bimanual" else 7
-            client_queue_anchor_qpos = self._finite_vector(
-                client.get("queue_anchor_qpos_m"), expected_qpos_dim
-            )
-            client_last_wire_action = async_client["client_last_wire_action"]
-            now = time.time()
-            captured_at = _telemetry_nonnegative_float(client.get("captured_at"))
-            transport_timing = result.get("transport_timing")
-            transport_timing = transport_timing if isinstance(transport_timing, dict) else {}
-            result_rtc = result.get("rtc")
-            result_rtc = result_rtc if isinstance(result_rtc, dict) else {}
-            client_rtc_config = result_rtc.get("client_config")
-            if not isinstance(client_rtc_config, dict):
-                client_rtc_config = None
-            server_model_inference_ms = _telemetry_nonnegative_float(
-                transport_timing.get("model_inference_ms")
-            )
-            server_observation_upload_ms = _telemetry_nonnegative_float(
-                transport_timing.get(
-                    "server_observation_upload_ms",
-                    transport_timing.get("observation_upload_ms"),
-                )
-            )
-            payload = {
-                "sequence": self.sequence,
-                "received_at": now,
-                "captured_at": captured_at if captured_at is not None else now,
-                "source_name": str(client.get("source_name", "official-openpi-client"))[:256],
-                "prompt_revision": self._nonnegative_int(client.get("prompt_revision")),
-                "client_prompt": str(
-                    observation.get("prompt", result.get("prompt", "")) or ""
-                )[:500],
-                "client_rtc": client_rtc_config,
-                "client_rtc_config_revision": self._nonnegative_int(
-                    result_rtc.get("client_config_revision")
-                ),
-                "server_rtc_limits": self._json_object(result_rtc.get("server_limits")),
-                "can_name": str(client.get("can_name", ""))[:256],
-                "cam_high_device": str(client.get("cam_high_device", ""))[:256],
-                "cam_wrist_device": str(client.get("cam_wrist_device", ""))[:256],
-                "client_allow_execution": bool(client.get("allow_execution", False)),
-                "client_execution_state": str(client.get("execution_state", "unknown"))[:64],
-                "client_blocked_reason": str(client.get("blocked_reason", ""))[:500],
-                "client_last_command_at": _telemetry_nonnegative_float(client.get("last_command_at")),
-                "client_control_revision": self._nonnegative_int(client.get("control_revision")),
-                "action_hz": self.metadata.get("action_hz"),
-                "action_horizon": action_horizon or None,
-                "action_offset": self.metadata.get("action_offset"),
-                "model_action_start_offset": self.metadata.get("model_action_start_offset"),
-                "action_time_step_s": self.metadata.get("action_time_step_s"),
-                "action_start_offset_steps": self.metadata.get("action_start_offset_steps"),
-                "minimum_horizon": MIN_EXECUTION_ACTION_HORIZON,
-                "recommended_inference_launch_hz": self.metadata.get(
-                    "recommended_inference_launch_hz", DEFAULT_ASYNC_INFERENCE_LAUNCH_HZ
-                ),
-                "client_policy_action_hz": client_policy_action_hz,
-                "client_command_hz": client_command_hz,
-                "client_inference_hz": client_inference_hz,
-                "client_action_chunk_steps": client_action_chunk_steps,
-                "client_last_action_chunk_steps": client_last_action_chunk_steps,
-                "client_last_composed_action": client_last_composed_action,
-                "client_last_composed_action_at": client_last_composed_action_at,
-                "client_queue_anchor_state": client_queue_anchor_state,
-                "client_queue_anchor_qpos_m": client_queue_anchor_qpos,
-                "client_queue_anchor_at": self._finite_float(client.get("queue_anchor_at")),
-                "client_queue_loaded_at": self._finite_float(client.get("queue_loaded_at")),
-                "client_queued_action_count": self._nonnegative_int(
-                    client.get("queued_action_count")
-                ),
-                "client_queued_action_index": self._nonnegative_int(
-                    client.get("queued_action_index")
-                ),
-                "client_last_queued_action_index": self._nonnegative_int(
-                    client.get("last_queued_action_index")
-                ),
-                "client_last_wire_action": client_last_wire_action,
-                "client_last_decoded_absolute_target": async_client[
-                    "client_last_decoded_target"
-                ],
-                "client_last_feedback_at": self._finite_float(client.get("last_feedback_at")),
-                "client_unqueued_action_count": self._nonnegative_int(
-                    client.get("unqueued_action_count")
-                ),
-                "client_last_queue_drop_reason": async_client["client_drop_reason"],
-                **async_client,
-                "robot_arm_status": client.get("robot_arm_status"),
-                "client_robot_enabled_sides": client.get("robot_enabled_sides"),
-                "client_robot_driver_enable_status": client.get(
-                    "robot_driver_enable_status"
-                ),
-                "client_robot_enable_hold": client.get("robot_enable_hold"),
-                "schema": self.metadata["schema"],
-                "arm_mode": self.metadata["arm_mode"],
-                "arm_side": self.metadata["arm_side"],
-                "contract_version": self.metadata.get("contract_version"),
-                "raw_action_dim": self.metadata.get("raw_action_dim"),
-                "model_action_dim": self.metadata.get("model_action_dim"),
-                "raw_action_semantics": self.metadata.get("raw_action_semantics"),
-                "model_action_semantics": self.metadata.get("model_action_semantics"),
-                "wire_action_semantics": self.metadata.get("wire_action_semantics"),
-                "raw_action_convention": self.metadata.get("raw_action_convention"),
-                "model_action_convention": self.metadata.get("model_action_convention"),
-                "wire_action_convention": self.metadata.get("wire_action_convention"),
-                "raw_gripper_semantics": self.metadata.get("raw_gripper_semantics"),
-                "model_gripper_semantics": self.metadata.get("model_gripper_semantics"),
-                "wire_gripper_semantics": self.metadata.get("wire_gripper_semantics"),
-                "state_gripper_semantics": self.metadata.get("state_gripper_semantics"),
-                "transport": "openpi_websocket_v1",
-                "state": state.tolist(),
-                "state_dim": int(state.shape[-1]),
-                "prompt": str(
-                    observation.get("prompt", result.get("prompt", "")) or ""
-                )[:500],
-                "camera_shapes": camera_shapes,
-                "cam_high_shape": camera_shapes.get("cam_high"),
-                "cam_wrist_shape": next(
-                    (shape for key, shape in camera_shapes.items() if "wrist" in key), None
-                ) if self.metadata["arm_mode"] == "single" else None,
-                "actions_shape": list(actions.shape),
-                "first_action": actions[0].tolist() if actions.ndim > 1 and len(actions) else actions.tolist(),
-                "action_min": float(actions.min()) if actions.size else None,
-                "action_max": float(actions.max()) if actions.size else None,
-                "policy_elapsed_s": elapsed_s,
-                "server_model_inference_ms": server_model_inference_ms,
-                "server_timing_generation": _telemetry_nonnegative_int(
-                    transport_timing.get("inference_generation")
-                ),
-                "server_observation_upload_ms": server_observation_upload_ms,
-                "server_observation_upload_semantics": "client_request_to_policy_infer_entry",
-                "server_request_received_at": _telemetry_nonnegative_float(
-                    transport_timing.get("server_request_received_at")
-                ),
-                "server_model_completed_at": _telemetry_nonnegative_float(
-                    transport_timing.get("server_model_completed_at")
-                ),
-                "transport_timing": _telemetry_json_value(
-                    transport_timing, action_dim=int(self.metadata["action_dim"])
-                ),
-                "server_timing": result.get("server_timing"),
-                "policy_timing": result.get("policy_timing"),
-                "execution_control": result.get("execution_control"),
-            }
-            self._atomic_json(self.root / "latest.json", payload)
-            self._enqueue_images(image_payload)
-            return self.sequence
+        )
+        payload = {
+            "sequence": sequence,
+            "received_at": now,
+            "captured_at": captured_at if captured_at is not None else now,
+            "source_name": str(client.get("source_name", "official-openpi-client"))[:256],
+            "prompt_revision": self._nonnegative_int(client.get("prompt_revision")),
+            "client_prompt": str(
+                observation.get("prompt", result.get("prompt", "")) or ""
+            )[:500],
+            "client_rtc": client_rtc_config,
+            "client_rtc_config_revision": self._nonnegative_int(
+                result_rtc.get("client_config_revision")
+            ),
+            "server_rtc_limits": self._json_object(result_rtc.get("server_limits")),
+            "can_name": str(client.get("can_name", ""))[:256],
+            "cam_high_device": str(client.get("cam_high_device", ""))[:256],
+            "cam_wrist_device": str(client.get("cam_wrist_device", ""))[:256],
+            "client_allow_execution": bool(client.get("allow_execution", False)),
+            "client_execution_state": str(client.get("execution_state", "unknown"))[:64],
+            "client_blocked_reason": str(client.get("blocked_reason", ""))[:500],
+            "client_last_command_at": _telemetry_nonnegative_float(client.get("last_command_at")),
+            "client_control_revision": self._nonnegative_int(client.get("control_revision")),
+            "action_hz": self.metadata.get("action_hz"),
+            "action_horizon": action_horizon or None,
+            "action_offset": self.metadata.get("action_offset"),
+            "model_action_start_offset": self.metadata.get("model_action_start_offset"),
+            "action_time_step_s": self.metadata.get("action_time_step_s"),
+            "action_start_offset_steps": self.metadata.get("action_start_offset_steps"),
+            "minimum_horizon": MIN_EXECUTION_ACTION_HORIZON,
+            "recommended_inference_launch_hz": self.metadata.get(
+                "recommended_inference_launch_hz", DEFAULT_ASYNC_INFERENCE_LAUNCH_HZ
+            ),
+            "client_policy_action_hz": client_policy_action_hz,
+            "client_command_hz": client_command_hz,
+            "client_inference_hz": client_inference_hz,
+            "client_action_chunk_steps": client_action_chunk_steps,
+            "client_last_action_chunk_steps": client_last_action_chunk_steps,
+            "client_last_composed_action": client_last_composed_action,
+            "client_last_composed_action_at": client_last_composed_action_at,
+            "client_queue_anchor_state": client_queue_anchor_state,
+            "client_queue_anchor_qpos_m": client_queue_anchor_qpos,
+            "client_queue_anchor_at": self._finite_float(client.get("queue_anchor_at")),
+            "client_queue_loaded_at": self._finite_float(client.get("queue_loaded_at")),
+            "client_queued_action_count": self._nonnegative_int(
+                client.get("queued_action_count")
+            ),
+            "client_queued_action_index": self._nonnegative_int(
+                client.get("queued_action_index")
+            ),
+            "client_last_queued_action_index": self._nonnegative_int(
+                client.get("last_queued_action_index")
+            ),
+            "client_last_wire_action": client_last_wire_action,
+            "client_last_decoded_absolute_target": async_client[
+                "client_last_decoded_target"
+            ],
+            "client_last_feedback_at": self._finite_float(client.get("last_feedback_at")),
+            "client_unqueued_action_count": self._nonnegative_int(
+                client.get("unqueued_action_count")
+            ),
+            "client_last_queue_drop_reason": async_client["client_drop_reason"],
+            **async_client,
+            "robot_arm_status": client.get("robot_arm_status"),
+            "client_robot_enabled_sides": client.get("robot_enabled_sides"),
+            "client_robot_driver_enable_status": client.get(
+                "robot_driver_enable_status"
+            ),
+            "client_robot_enable_hold": client.get("robot_enable_hold"),
+            "schema": self.metadata["schema"],
+            "arm_mode": self.metadata["arm_mode"],
+            "arm_side": self.metadata["arm_side"],
+            "contract_version": self.metadata.get("contract_version"),
+            "raw_action_dim": self.metadata.get("raw_action_dim"),
+            "model_action_dim": self.metadata.get("model_action_dim"),
+            "raw_action_semantics": self.metadata.get("raw_action_semantics"),
+            "model_action_semantics": self.metadata.get("model_action_semantics"),
+            "wire_action_semantics": self.metadata.get("wire_action_semantics"),
+            "raw_action_convention": self.metadata.get("raw_action_convention"),
+            "model_action_convention": self.metadata.get("model_action_convention"),
+            "wire_action_convention": self.metadata.get("wire_action_convention"),
+            "raw_gripper_semantics": self.metadata.get("raw_gripper_semantics"),
+            "model_gripper_semantics": self.metadata.get("model_gripper_semantics"),
+            "wire_gripper_semantics": self.metadata.get("wire_gripper_semantics"),
+            "state_gripper_semantics": self.metadata.get("state_gripper_semantics"),
+            "transport": "openpi_websocket_v1",
+            "state": state.tolist(),
+            "state_dim": int(state.shape[-1]),
+            "prompt": str(
+                observation.get("prompt", result.get("prompt", "")) or ""
+            )[:500],
+            "camera_shapes": camera_shapes,
+            "cam_high_shape": camera_shapes.get("cam_high"),
+            "cam_wrist_shape": next(
+                (shape for key, shape in camera_shapes.items() if "wrist" in key), None
+            ) if self.metadata["arm_mode"] == "single" else None,
+            "actions_shape": list(actions.shape),
+            "first_action": actions[0].tolist() if actions.ndim > 1 and len(actions) else actions.tolist(),
+            "action_min": float(actions.min()) if actions.size else None,
+            "action_max": float(actions.max()) if actions.size else None,
+            "policy_elapsed_s": elapsed_s,
+            "server_model_inference_ms": server_model_inference_ms,
+            "server_timing_generation": _telemetry_nonnegative_int(
+                transport_timing.get("inference_generation")
+            ),
+            "server_observation_upload_ms": server_observation_upload_ms,
+            "server_observation_upload_semantics": "client_request_to_policy_infer_entry",
+            "server_request_received_at": _telemetry_nonnegative_float(
+                transport_timing.get("server_request_received_at")
+            ),
+            "server_model_completed_at": _telemetry_nonnegative_float(
+                transport_timing.get("server_model_completed_at")
+            ),
+            "transport_timing": _telemetry_json_value(
+                transport_timing, action_dim=int(self.metadata["action_dim"])
+            ),
+            "server_timing": result.get("server_timing"),
+            "policy_timing": result.get("policy_timing"),
+            "execution_control": result.get("execution_control"),
+        }
+        with self.lock:
+            self._latest_payload = payload
+        self._enqueue_json(self.root / "latest.json", payload)
+        self._enqueue_images(image_payload)
+        return sequence
 
     def mark_response_ready(self, sequence: int, response_ready_at: float) -> None:
         """Attach the post-publish response boundary to the same telemetry row."""
         with self.lock:
-            path = self.root / "latest.json"
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (FileNotFoundError, json.JSONDecodeError, OSError):
-                return
+            payload = self._latest_payload
             if not isinstance(payload, dict) or int(payload.get("sequence", -1)) != int(sequence):
                 return
             transport_timing = payload.get("transport_timing")
@@ -3062,7 +3216,7 @@ class PolicyTelemetry:
             transport_timing["server_response_ready_at"] = float(response_ready_at)
             payload["transport_timing"] = transport_timing
             payload["server_response_ready_at"] = float(response_ready_at)
-            self._atomic_json(path, payload)
+        self._enqueue_json(self.root / "latest.json", payload)
 
 
 class TelemetryWebsocketPolicyServer(websocket_policy_server.WebsocketPolicyServer):
@@ -3078,6 +3232,56 @@ class TelemetryWebsocketPolicyServer(websocket_policy_server.WebsocketPolicyServ
             await super()._handler(websocket)
         finally:
             self.telemetry.client_closed(websocket.remote_address)
+
+
+class ImageTransportPolicy:
+    """Decode optional compact image payloads before OpenPI preprocessing.
+
+    The official piper-pi05 client advertises ``jpeg_chw_v1`` in the server
+    metadata and sends each CHW frame as JPEG bytes. Raw numpy/msgpack remains
+    accepted for older clients and for an explicit ``--image-transport raw``
+    deployment.
+    """
+
+    def __init__(self, policy: Any):
+        self.policy = policy
+
+    def infer(self, observation: dict) -> dict:
+        transport = observation.get("_transport")
+        codec = transport.get("image_codec") if isinstance(transport, dict) else None
+        if codec is None or codec == "None":
+            return self.policy.infer(observation)
+        if codec != "jpeg_chw_v1":
+            raise ValueError(f"unsupported image transport: {codec!r}")
+        import cv2
+
+        images = observation.get("images")
+        if not isinstance(images, dict):
+            raise ValueError("JPEG image transport requires an images mapping")
+        decoded_images: dict[str, np.ndarray] = {}
+        for name, encoded in images.items():
+            if not isinstance(encoded, (bytes, bytearray, memoryview)):
+                raise ValueError(f"JPEG image {name!r} is not a byte payload")
+            frame = cv2.imdecode(
+                np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR
+            )
+            if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+                raise ValueError(f"JPEG decode failed for {name!r}")
+            # Encoding treats the CHW values as an opaque three-channel image;
+            # preserving the decoded channel indices reproduces the original
+            # numeric RGB tensor expected by the OpenPI transforms.
+            decoded_images[name] = np.transpose(frame, (2, 0, 1))
+        # The outer TelemetryPolicy also receives this same dictionary. Update
+        # it in place so dashboard snapshots see decoded CHW arrays rather
+        # than the compact byte payload.
+        observation["images"] = decoded_images
+        observation.pop("_transport", None)
+        return self.policy.infer(observation)
+
+    def reset(self) -> None:
+        reset = getattr(self.policy, "reset", None)
+        if reset is not None:
+            reset()
 
 
 class TelemetryPolicy:
@@ -3114,14 +3318,11 @@ class TelemetryPolicy:
             }
             result["transport_timing"] = transport_timing
             result["execution_control"] = self.telemetry.execution_control()
-            try:
-                sequence = self.telemetry.publish(observation, result, model_inference_s)
-                response_ready_at = time.time()
-                transport_timing["server_response_ready_at"] = response_ready_at
-                self.telemetry.mark_response_ready(sequence, response_ready_at)
-            except Exception:
-                logging.exception("failed to publish policy telemetry")
-                transport_timing["server_response_ready_at"] = time.time()
+            # Publish asynchronously. The response boundary is measured before
+            # queueing so dashboard image copies/JSON serialization cannot add
+            # latency or jitter to the robot request.
+            transport_timing["server_response_ready_at"] = time.time()
+            self.telemetry.enqueue_publish(observation, result, model_inference_s)
             return result
         finally:
             self.telemetry.inference_finished()
@@ -3189,6 +3390,19 @@ def run_serve(args: argparse.Namespace) -> None:
             "max_guidance_weight": 0.0,
             "prefix_attention_schedules": [],
         }
+    # On a stable gigabit robot LAN, raw CHW avoids JPEG encode/decode CPU
+    # latency.  JPEG remains available as an explicit option for constrained or
+    # congested links where reducing bytes matters more than local CPU time.
+    image_transport = str(getattr(args, "image_transport", "raw")).strip().lower()
+    if image_transport not in {"raw", "jpeg_chw_v1"}:
+        raise ValueError(f"unsupported image transport: {image_transport!r}")
+    policy_metadata["image_transport"] = image_transport
+    if image_transport == "jpeg_chw_v1":
+        policy_metadata["image_jpeg_quality"] = int(
+            getattr(args, "image_jpeg_quality", 90)
+        )
+        policy = ImageTransportPolicy(policy)
+    telemetry: PolicyTelemetry | None = None
     if args.telemetry_dir:
         telemetry = PolicyTelemetry(Path(args.telemetry_dir).expanduser().resolve(), policy_metadata)
         policy = TelemetryPolicy(policy, telemetry)
@@ -3206,7 +3420,11 @@ def run_serve(args: argparse.Namespace) -> None:
             port=args.port,
             metadata=policy_metadata,
         )
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        if telemetry is not None:
+            telemetry.close()
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:
@@ -3306,6 +3524,18 @@ def parse_args() -> argparse.Namespace:
     serve.add_argument("--default-prompt", default=None)
     serve.add_argument("--telemetry-dir", default=None)
     serve.add_argument(
+        "--image-transport",
+        choices=("jpeg_chw_v1", "raw"),
+        default="raw",
+        help="observation image transport (raw is lower-latency on a stable LAN)",
+    )
+    serve.add_argument(
+        "--image-jpeg-quality",
+        type=int,
+        default=90,
+        help="JPEG quality for jpeg_chw_v1 image transport (1-100)",
+    )
+    serve.add_argument(
         "--rtc-enabled",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -3348,6 +3578,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--rtc-execution-horizon must be positive")
     if hasattr(args, "rtc_max_guidance_weight") and args.rtc_max_guidance_weight <= 0:
         parser.error("--rtc-max-guidance-weight must be positive")
+    if hasattr(args, "image_jpeg_quality") and not 1 <= args.image_jpeg_quality <= 100:
+        parser.error("--image-jpeg-quality must be in [1, 100]")
     return args
 
 
