@@ -367,6 +367,11 @@ class CameraCapture:
         self._last_direct_monotonic_timestamps: dict[str, float] = {}
         self._source_aspects: dict[str, float] = {}
         self._background_error: BaseException | None = None
+        self._preview_enabled = False
+
+    def set_preview_enabled(self, enabled: bool) -> None:
+        """Enable native-aspect preview buffering only when a preview is used."""
+        self._preview_enabled = bool(enabled)
 
     def open(self):
         try:
@@ -463,7 +468,8 @@ class CameraCapture:
             src_h, src_w = rgb.shape[:2]
             with self._latest_condition:
                 self._source_aspects[key] = src_w / src_h
-                self._latest_preview_images[key] = rgb.copy()
+                if self._preview_enabled:
+                    self._latest_preview_images[key] = rgb.copy()
             scale = min(target_w / src_w, target_h / src_h)
             new_w = max(1, round(src_w * scale))
             new_h = max(1, round(src_h * scale))
@@ -502,7 +508,9 @@ class CameraCapture:
         with self._read_lock:
             return self._read_direct()
 
-    def read_nearest(self, target_monotonic: float) -> CameraFrameSet:
+    def read_nearest(
+        self, target_monotonic: float, *, copy: bool = True
+    ) -> CameraFrameSet:
         """Return the buffered complete frame set closest to a robot-state time."""
         target = float(target_monotonic)
         if not np.isfinite(target):
@@ -522,7 +530,7 @@ class CameraCapture:
                 self._frame_history,
                 key=lambda frame_set: abs(frame_set.captured_monotonic - target),
             )
-            return selected.copied()
+            return selected.copied() if copy else selected
 
     def start_background_capture(
         self,
@@ -563,8 +571,17 @@ class CameraCapture:
                     captured_monotonic = float(
                         np.median(list(monotonic_timestamps.values()))
                     )
+                    # ``_read_direct`` allocates a fresh padded array for every
+                    # capture.  No caller can mutate it after this point, so
+                    # mark those arrays read-only instead of copying every
+                    # camera frame once more before publishing the snapshot.
+                    # This removes one full RGB copy per camera per frame from
+                    # the background capture path.
+                    frozen_images = dict(images)
+                    for frame in frozen_images.values():
+                        frame.setflags(write=False)
                     frame_set = CameraFrameSet(
-                        images={key: frame.copy() for key, frame in images.items()},
+                        images=frozen_images,
                         timestamps={key: float(value) for key, value in timestamps.items()},
                         monotonic_timestamps={
                             key: float(value)
@@ -573,9 +590,10 @@ class CameraCapture:
                         captured_monotonic=captured_monotonic,
                     )
                     with self._latest_condition:
-                        self._latest_images = {
-                            key: frame.copy() for key, frame in frame_set.images.items()
-                        }
+                        # Frame sets are immutable after publication, so the
+                        # latest view can share their arrays without another
+                        # full image copy.
+                        self._latest_images = dict(frame_set.images)
                         self._latest_timestamps = dict(frame_set.timestamps)
                         self._latest_monotonic_timestamps = dict(
                             frame_set.monotonic_timestamps

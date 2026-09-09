@@ -79,12 +79,12 @@ class DeploymentRunRecorderTest(unittest.TestCase):
             )
             recorder.stop(reason="test")
 
-            trajectory = np.load(run_dir / "trajectory.npz")
-            self.assertEqual(trajectory["qpos"].shape, (1, 7))
-            self.assertEqual(trajectory["delivery_state"].shape, (1, 10))
-            self.assertEqual(trajectory["command_action"].shape, (1, 7))
-            self.assertTrue(bool(trajectory["command_sent"][0]))
-            self.assertEqual(int(trajectory["command_generation"][0]), 3)
+            with np.load(run_dir / "trajectory.npz") as trajectory:
+                self.assertEqual(trajectory["qpos"].shape, (1, 7))
+                self.assertEqual(trajectory["delivery_state"].shape, (1, 10))
+                self.assertEqual(trajectory["command_action"].shape, (1, 7))
+                self.assertTrue(bool(trajectory["command_sent"][0]))
+                self.assertEqual(int(trajectory["command_generation"][0]), 3)
 
             command_records = [
                 json.loads(line)
@@ -94,8 +94,8 @@ class DeploymentRunRecorderTest(unittest.TestCase):
             self.assertFalse(command_records[0]["accepted"])
             command_file = run_dir / command_records[0]["action_file"]
             self.assertTrue(command_file.exists())
-            command_data = np.load(command_file)
-            self.assertEqual(command_data["raw_actions"].shape, (2, 7))
+            with np.load(command_file) as command_data:
+                self.assertEqual(command_data["raw_actions"].shape, (2, 7))
 
             video_index = (run_dir / "videos" / "timestamps.jsonl").read_text().splitlines()
             self.assertEqual(len(video_index), 1)

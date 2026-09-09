@@ -45,7 +45,6 @@ from typing import Any, Callable, Mapping
 import uuid
 
 import numpy as np
-from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
 from bimanual_vla.collection.camera import CameraCapture, CameraFrameSet, CameraPreview
@@ -192,7 +191,35 @@ class MonitoringRecorder:
     directly by standard analysis tools.
     """
 
-    def __init__(self, root: str | Path, args: argparse.Namespace):
+    def __init__(
+        self,
+        root: str | Path,
+        args: argparse.Namespace,
+        *,
+        enabled: bool = True,
+        periodic_rate_hz: float = 1.0,
+        level: str = "compact",
+    ):
+        self.enabled = bool(enabled)
+        self.periodic_rate_hz = float(periodic_rate_hz)
+        if not math.isfinite(self.periodic_rate_hz) or self.periodic_rate_hz < 0:
+            raise ValueError("periodic_rate_hz must be finite and non-negative")
+        self.level = str(level).strip().lower()
+        if self.level not in {"compact", "full"}:
+            raise ValueError("monitoring level must be compact or full")
+        self._last_periodic_at = 0.0
+        if not self.enabled:
+            self.session_dir = None
+            self.events_path = None
+            self.manifest_path = None
+            self._file = None
+            self._queue = None
+            self._accepting = False
+            self._writer_thread = None
+            self.event_count = 0
+            self.dropped_event_count = 0
+            self._closed = True
+            return
         root_path = Path(root).expanduser()
         root_path.mkdir(parents=True, exist_ok=True)
         session_id = time.strftime("%Y%m%d_%H%M%S", time.localtime()) + "_" + uuid.uuid4().hex[:8]
@@ -200,7 +227,8 @@ class MonitoringRecorder:
         self.session_dir.mkdir(parents=True, exist_ok=False)
         self.events_path = self.session_dir / "events.jsonl"
         self.manifest_path = self.session_dir / "manifest.json"
-        self._file = self.events_path.open("a", encoding="utf-8", buffering=1)
+        self._file = self.events_path.open("a", encoding="utf-8", buffering=64 * 1024)
+        self._flush_counter = 0
         self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=4096)
         self._accepting = True
         self._writer_thread = threading.Thread(
@@ -234,8 +262,22 @@ class MonitoringRecorder:
             try:
                 if row is None:
                     return
-                self._file.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
-                self._file.flush()
+                # JSON normalization is deliberately performed here, not in
+                # ``record()``.  Converting nested numpy arrays/dicts can be
+                # surprisingly expensive and used to run on the 20 Hz
+                # control thread.
+                self._file.write(
+                    json.dumps(
+                        self._json_safe(row),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    )
+                    + "\n"
+                )
+                self._flush_counter += 1
+                if self._flush_counter >= 16:
+                    self._file.flush()
+                    self._flush_counter = 0
             except Exception:
                 logging.exception("Monitoring writer failed")
             finally:
@@ -257,15 +299,20 @@ class MonitoringRecorder:
             return value
         return str(value)
 
-    def record(self, event_type: str, **payload: Any) -> None:
+    def record(self, event_type: str, *, periodic: bool = False, **payload: Any) -> None:
         if self._closed or not self._accepting:
             return
+        if periodic:
+            if not self.periodic_due():
+                return
         row = {
             "event_index": self.event_count,
             "event_type": str(event_type),
             "recorded_at": time.time(),
             "recorded_monotonic": time.monotonic(),
-            **self._json_safe(payload),
+            # Keep the control-thread operation to a shallow dict assembly;
+            # recursive JSON conversion happens in the writer thread.
+            **payload,
         }
         self.event_count += 1
         try:
@@ -280,6 +327,26 @@ class MonitoringRecorder:
         except Exception:
             # Monitoring must not become a new reason to stop or alter control.
             logging.exception("Monitoring recorder failed for event=%s", event_type)
+
+    def periodic_due(self) -> bool:
+        """Claim the next periodic slot without constructing a payload.
+
+        Callers can use this before evaluating expensive arguments.  Python
+        evaluates function arguments before entering ``record()``, so passing
+        ``execution.metadata(...)`` to a throttled ``record(periodic=True)``
+        still used to build that metadata on every 20 Hz control tick.
+        """
+        if self._closed or not self._accepting or self.periodic_rate_hz <= 0:
+            return False
+        now_monotonic = time.monotonic()
+        period = 1.0 / self.periodic_rate_hz
+        if (
+            self._last_periodic_at > 0
+            and now_monotonic - self._last_periodic_at < period
+        ):
+            return False
+        self._last_periodic_at = now_monotonic
+        return True
 
     def close(self, *, reason: str = "stopped") -> None:
         if self._closed:
@@ -334,6 +401,43 @@ class PolicyProtocol:
     def rtc_enabled(self) -> bool:
         """Backward-compatible alias for the server RTC capability flag."""
         return self.rtc_supported
+
+
+@dataclass(frozen=True)
+class ClientRuntimeRates:
+    """Resolved client timing knobs with one source of truth."""
+
+    inference_hz: float
+    control_hz: float
+    action_hz: float
+    min_action_chunk_steps: int
+    blend_steps: int
+
+
+def resolve_client_runtime_rates(
+    args: argparse.Namespace,
+    protocol: PolicyProtocol | None = None,
+) -> ClientRuntimeRates:
+    action_hz = float(
+        getattr(args, "action_hz", None)
+        or (protocol.action_hz if protocol is not None else None)
+        or DEFAULT_ACTION_HZ
+    )
+    control_hz = float(getattr(args, "control_hz", DEFAULT_ACTION_HZ))
+    inference_hz = float(getattr(args, "hz", DEFAULT_INFERENCE_HZ))
+    minimum = int(
+        getattr(args, "min_action_chunk_steps", DEFAULT_MIN_ACTION_CHUNK_STEPS)
+    )
+    legacy_override = getattr(args, "action_chunk_steps", None)
+    if legacy_override is not None:
+        minimum = int(legacy_override)
+    return ClientRuntimeRates(
+        inference_hz=inference_hz,
+        control_hz=control_hz,
+        action_hz=action_hz,
+        min_action_chunk_steps=minimum,
+        blend_steps=int(getattr(args, "blend_steps", DEFAULT_BLEND_STEPS)),
+    )
 
 
 def connect_piper(can_name: str) -> Any:
@@ -464,6 +568,7 @@ class PiperContinuousIK:
         target_xyz_m: np.ndarray,
         target_rpy_deg: np.ndarray,
         *,
+        initial_joints_rad: np.ndarray | None = None,
         max_joint_step_rad: float,
         position_tolerance_m: float,
         rotation_tolerance_rad: float,
@@ -475,6 +580,7 @@ class PiperContinuousIK:
             current_joints_rad,
             target_xyz_m,
             target_rpy_deg,
+            initial_joints_rad=initial_joints_rad,
             max_joint_step_rad=max_joint_step_rad,
             position_tolerance_m=position_tolerance_m,
             rotation_tolerance_rad=rotation_tolerance_rad,
@@ -489,6 +595,7 @@ class PiperContinuousIK:
         target_xyz_m: np.ndarray,
         target_rpy_deg: np.ndarray,
         *,
+        initial_joints_rad: np.ndarray | None = None,
         max_joint_step_rad: float,
         position_tolerance_m: float,
         rotation_tolerance_rad: float,
@@ -536,7 +643,12 @@ class PiperContinuousIK:
         upper = np.minimum(feedback_upper, current + search_radius)
         if np.any(lower >= upper):
             raise ExecutionBlocked("continuous IK has no valid local joint interval")
-        initial = np.clip(current, lower + 1e-8, upper - 1e-8)
+        initial_source = current if initial_joints_rad is None else np.asarray(
+            initial_joints_rad, dtype=np.float64
+        )
+        if initial_source.shape != (6,) or not np.all(np.isfinite(initial_source)):
+            raise ExecutionBlocked("initial IK joints are not finite 6D")
+        initial = np.clip(initial_source, lower + 1e-8, upper - 1e-8)
         target_rotation = Rotation.from_euler("xyz", target_rpy, degrees=True).as_matrix()
 
         def residual(candidate: np.ndarray) -> np.ndarray:
@@ -556,6 +668,10 @@ class PiperContinuousIK:
                 / IK_JOINT_REGULARIZATION_SCALE_RAD
             )
             return np.concatenate((task_error, joint_regularization))
+
+        # Numerical optimization is only needed for delivery control; keep
+        # joint-only deployments from importing scipy.optimize at startup.
+        from scipy.optimize import least_squares
 
         result = least_squares(
             residual,
@@ -679,6 +795,27 @@ def read_output_state(
     )
     rotation = Rotation.from_euler("xyz", rpy_rad).as_matrix()
     return build_delivery_state(xyz_m, rotation, float(qpos[6])), qpos
+
+
+@dataclass(frozen=True)
+class PiperFeedbackSnapshot:
+    """One timestamp-consistent feedback sample shared by the control path."""
+
+    qpos_m: np.ndarray
+    delivery_state: np.ndarray
+    statuses: Mapping[str, dict[str, Any]]
+    driver_statuses: Mapping[str, dict[str, Any]]
+    captured_at: float
+
+    def __post_init__(self) -> None:
+        qpos = np.asarray(self.qpos_m)
+        delivery = np.asarray(self.delivery_state)
+        if qpos.ndim != 1 or not np.all(np.isfinite(qpos)):
+            raise ValueError("feedback qpos must be a finite 1D array")
+        if delivery.ndim != 1 or not np.all(np.isfinite(delivery)):
+            raise ValueError("feedback delivery state must be a finite 1D array")
+        if not math.isfinite(float(self.captured_at)):
+            raise ValueError("feedback timestamp must be finite")
 
 
 def _canonical_gripper_semantics(value: Any) -> str | None:
@@ -1308,6 +1445,7 @@ def connect_policy(
     logging.info("Connecting to official OpenPI policy at ws://%s:%d ...", host, port)
     policy = WebsocketClientPolicy(host=host, port=port)
     try:
+        _tune_policy_socket(policy)
         metadata = policy.get_server_metadata()
         if not isinstance(metadata, dict):
             raise RuntimeError(f"invalid policy metadata: {type(metadata).__name__}")
@@ -1317,6 +1455,26 @@ def connect_policy(
         raise
     logging.info("Policy connected: %s", metadata)
     return policy, protocol
+
+
+def _tune_policy_socket(policy: Any) -> None:
+    """Best-effort low-latency tuning for the official sync WebSocket client."""
+    connection = getattr(policy, "_ws", None)
+    if connection is None:
+        return
+    candidates = [
+        getattr(connection, name, None)
+        for name in ("socket", "sock", "_socket")
+    ]
+    for candidate in candidates:
+        if not isinstance(candidate, socket.socket):
+            continue
+        try:
+            candidate.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            candidate.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            logging.debug("Unable to tune policy WebSocket socket", exc_info=True)
+        return
 
 
 def close_policy(policy: Any | None) -> None:
@@ -1449,9 +1607,21 @@ def apply_gripper_open_lookahead(
             ],
             dtype=np.float64,
         )
+        # Compute each forward-window maximum in one reverse pass instead of
+        # rescanning up to ``lookahead_steps`` rows for every action.
+        anticipated_values = np.empty_like(openings)
+        window: deque[int] = deque()
+        window_size = int(lookahead_steps)
+        for index in range(len(actions) - 1, -1, -1):
+            upper = index + window_size
+            while window and window[0] > upper:
+                window.popleft()
+            while window and openings[window[-1]] <= openings[index]:
+                window.pop()
+            window.append(index)
+            anticipated_values[index] = openings[window[0]]
         for index, item in enumerate(actions):
-            stop = min(len(actions), index + int(lookahead_steps) + 1)
-            anticipated = float(np.max(openings[index:stop]))
+            anticipated = float(anticipated_values[index])
             if anticipated <= openings[index] + 1e-9:
                 continue
             absolute = item.absolute_target.copy()
@@ -1588,6 +1758,12 @@ def decode_action_queue(
 
 def _freeze_snapshot_value(value: Any) -> Any:
     if isinstance(value, np.ndarray):
+        # CameraFrameSet arrays are already immutable.  Reusing them avoids a
+        # second full-frame copy when the control thread freezes an observation
+        # for the inference worker.  Mutable arrays (robot feedback and test
+        # inputs) still get an owned read-only copy.
+        if not value.flags.writeable:
+            return value
         frozen = np.array(value, copy=True)
         frozen.setflags(write=False)
         return frozen
@@ -2134,14 +2310,13 @@ class ExecutionController:
         self.last_command_at: float | None = None
         self.control_revision: int | None = None
         self.robot_status: dict[str, Any] | None = None
-        self.inference_hz = float(getattr(args, "hz", DEFAULT_INFERENCE_HZ))
-        self.policy_action_hz = float(getattr(args, "action_hz", None) or DEFAULT_ACTION_HZ)
-        self.control_hz = float(getattr(args, "control_hz", DEFAULT_ACTION_HZ))
-        self.min_action_chunk_steps = int(
-            getattr(args, "min_action_chunk_steps", DEFAULT_MIN_ACTION_CHUNK_STEPS)
-        )
+        runtime_rates = resolve_client_runtime_rates(args)
+        self.inference_hz = runtime_rates.inference_hz
+        self.policy_action_hz = runtime_rates.action_hz
+        self.control_hz = runtime_rates.control_hz
+        self.min_action_chunk_steps = runtime_rates.min_action_chunk_steps
         self.action_chunk_steps = self.min_action_chunk_steps  # legacy telemetry alias
-        self.blend_steps = int(getattr(args, "blend_steps", DEFAULT_BLEND_STEPS))
+        self.blend_steps = runtime_rates.blend_steps
         self.blend_profile = str(getattr(args, "blend_profile", "linear"))
         self.trajectory_shaping = bool(getattr(args, "trajectory_shaping", False))
         self.trajectory_max_speed_rad_s = float(
@@ -2315,6 +2490,8 @@ class ExecutionController:
         self.arm_hold_stable_since: dict[str, float] = {}
         self.robot_driver_enable_status: dict[str, dict[str, Any]] = {}
         self.ik_solver: PiperContinuousIK | None = None
+        self._ik_warm_starts: dict[str, np.ndarray] = {}
+        self.feedback_diagnostics_stride = 5
         self.rtc_enabled = False
         self.rtc_execution_horizon = DEFAULT_RTC_EXECUTION_HORIZON
         self.rtc_max_guidance_weight = DEFAULT_RTC_MAX_GUIDANCE_WEIGHT
@@ -2323,20 +2500,13 @@ class ExecutionController:
         self._rtc_config_sent_revision: int | None = None
 
     def configure_protocol(self, protocol: PolicyProtocol) -> None:
-        action_hz = getattr(self.args, "action_hz", None) or protocol.action_hz or DEFAULT_ACTION_HZ
-        self.policy_action_hz = float(action_hz)
-        self.control_hz = float(
-            getattr(self.args, "control_hz", DEFAULT_ACTION_HZ)
-        )
-        self.inference_hz = float(getattr(self.args, "hz", DEFAULT_INFERENCE_HZ))
-        self.min_action_chunk_steps = int(
-            getattr(self.args, "min_action_chunk_steps", DEFAULT_MIN_ACTION_CHUNK_STEPS)
-        )
-        legacy_override = getattr(self.args, "action_chunk_steps", None)
-        if legacy_override is not None:
-            self.min_action_chunk_steps = int(legacy_override)
+        runtime_rates = resolve_client_runtime_rates(self.args, protocol)
+        self.policy_action_hz = runtime_rates.action_hz
+        self.control_hz = runtime_rates.control_hz
+        self.inference_hz = runtime_rates.inference_hz
+        self.min_action_chunk_steps = runtime_rates.min_action_chunk_steps
         self.action_chunk_steps = self.min_action_chunk_steps
-        requested_blend_steps = int(getattr(self.args, "blend_steps", DEFAULT_BLEND_STEPS))
+        requested_blend_steps = runtime_rates.blend_steps
         self.rtc_enabled = bool(
             getattr(self.args, "rtc_enabled", True) and protocol.rtc_enabled
         )
@@ -2391,6 +2561,7 @@ class ExecutionController:
             )
         )
         self.joint_trajectory = None
+        self._ik_warm_starts.clear()
         self.last_command_monotonic = None
         self.external_control_checked = False
         self.latency_skip_compensation_steps = int(
@@ -2643,15 +2814,57 @@ class ExecutionController:
         self.last_transport_first_command_generation = None
 
     def metadata(
-        self, *, rtc_metadata: Mapping[str, Any] | None = None
+        self,
+        *,
+        rtc_metadata: Mapping[str, Any] | None = None,
+        compact: bool = False,
     ) -> dict[str, Any]:
         timing_snapshot_at = time.time()
         timing_snapshot_monotonic = time.monotonic()
         rtc_snapshot = (
-            self.rtc_request_metadata(None)
+            self._build_rtc_request_metadata(
+                None,
+                mark_config_sent=False,
+                include_config=False,
+            )
             if rtc_metadata is None
             else dict(rtc_metadata)
         )
+        if compact:
+            return {
+                "timing_snapshot_at": timing_snapshot_at,
+                "allow_execution": bool(getattr(self.args, "allow_execution", False)),
+                "execution_state": self.state,
+                "blocked_reason": self.blocked_reason,
+                "control_revision": self.control_revision,
+                "policy_action_hz": self.policy_action_hz,
+                "command_hz": self.control_hz,
+                "control_hz": self.control_hz,
+                "inference_hz": self.inference_hz,
+                "configured_inference_hz": self.inference_hz,
+                "expected_action_horizon": self.expected_action_horizon,
+                "min_action_chunk_steps": self.min_action_chunk_steps,
+                "action_chunk_steps": self.action_chunk_steps,
+                "robot_enabled_sides": sorted(self.robot_enabled),
+                "queued_action_count": len(self.pending_actions),
+                "queued_action_index": self.queued_action_index,
+                "last_queued_action_index": self.last_queued_action_index,
+                "active_generation": self.active_generation,
+                "inference_generation": self.inference_generation,
+                "inference_latency_s": self.inference_latency_s,
+                "inference_launch_count": self.inference_launch_count,
+                "inference_result_hz": estimate_event_rate_hz(
+                    self._inference_completion_times
+                ),
+                "queue_underrun": self.queue_underrun,
+                "hold_active": self.hold_active,
+                "unsafe_active": self.unsafe_active,
+                "last_feedback_at": self.last_feedback_at,
+                "last_command_at": self.last_command_at,
+                "last_queue_drop_kind": self.last_queue_drop_kind,
+                "last_queue_drop_reason": self.last_queue_drop_reason,
+                "rtc": rtc_snapshot,
+            }
         # Prefer the target that was actually sent on the most recent 20 Hz
         # control tick. ``last_safe_target`` is the fallback hold target and
         # can legitimately have ``hold=False`` while the controller is already
@@ -2892,7 +3105,13 @@ class ExecutionController:
             },
         }
 
-    def rtc_request_metadata(self, protocol: PolicyProtocol | None) -> dict[str, Any]:
+    def _build_rtc_request_metadata(
+        self,
+        protocol: PolicyProtocol | None,
+        *,
+        mark_config_sent: bool,
+        include_config: bool = True,
+    ) -> dict[str, Any]:
         """Describe the previous model chunk at the next inference launch.
 
         The server keeps the previous normalized chunk per WebSocket session.
@@ -2932,7 +3151,7 @@ class ExecutionController:
             "previous_chunk_generation": previous_generation,
             "predicted_capture_to_result_s": float(latency_s),
         }
-        if self._rtc_config_sent_revision != self.rtc_config_revision:
+        if include_config and self._rtc_config_sent_revision != self.rtc_config_revision:
             payload["config_revision"] = int(self.rtc_config_revision)
             payload["config"] = {
                 "enabled": bool(self.rtc_enabled),
@@ -2940,8 +3159,22 @@ class ExecutionController:
                 "max_guidance_weight": float(self.rtc_max_guidance_weight),
                 "prefix_attention_schedule": str(self.rtc_prefix_attention_schedule),
             }
-            self._rtc_config_sent_revision = self.rtc_config_revision
+            if mark_config_sent:
+                self._rtc_config_sent_revision = self.rtc_config_revision
         return payload
+
+    def rtc_request_metadata(self, protocol: PolicyProtocol | None) -> dict[str, Any]:
+        """Build request metadata and mark the RTC config as sent.
+
+        This is intentionally the only method that mutates the sent-revision
+        marker. Telemetry snapshots use the pure builder below so observing
+        controller state cannot consume the first-request configuration.
+        """
+        return self._build_rtc_request_metadata(
+            protocol,
+            mark_config_sent=True,
+            include_config=True,
+        )
 
     def _block(self, state: str, reason: str) -> bool:
         self.state = state
@@ -3126,6 +3359,7 @@ class ExecutionController:
         statuses: dict[str, dict[str, Any]],
         *,
         now_monotonic: float,
+        driver_statuses: Mapping[str, dict[str, Any]] | None = None,
     ) -> bool:
         """Refresh enable holds before timed-plan ageing and wait for fresh data."""
         hold_sides = [side for side in sides if side in self.arm_hold_targets]
@@ -3139,7 +3373,11 @@ class ExecutionController:
             if side not in self.arm_hold_targets:
                 continue
             status = statuses[side]
-            driver_status = driver_enable_status_dict(self.pipers[side])
+            driver_status = (
+                dict(driver_statuses[side])
+                if driver_statuses is not None and side in driver_statuses
+                else driver_enable_status_dict(self.pipers[side])
+            )
             self.robot_driver_enable_status[side] = driver_status
             if (
                 status["arm_status"] != 0
@@ -3349,10 +3587,18 @@ class ExecutionController:
     def _first_future_target_index(
         targets: list[DecodedQueuedAction], execution_time: float
     ) -> int | None:
-        for index, target in enumerate(targets):
-            if target.target_monotonic + 1e-9 >= execution_time:
-                return index
-        return None
+        # Target timestamps are monotonic within one decoded chunk.  Keep the
+        # lookup logarithmic so a long action horizon does not add a linear
+        # scan to every 20 Hz control tick.
+        low = 0
+        high = len(targets)
+        while low < high:
+            middle = (low + high) // 2
+            if targets[middle].target_monotonic + 1e-9 >= execution_time:
+                high = middle
+            else:
+                low = middle + 1
+        return low if low < len(targets) else None
 
     def _retime_actions_from(
         self,
@@ -3505,6 +3751,8 @@ class ExecutionController:
         current_joints_rad: np.ndarray,
         target_xyz_m: np.ndarray,
         target_rpy_deg: np.ndarray,
+        *,
+        warm_start_joints_rad: np.ndarray | None = None,
     ) -> PiperIKSolveResult:
         """Run IK with diagnostics while preserving compatibility with test/custom solvers."""
         if self.ik_solver is None:
@@ -3545,11 +3793,19 @@ class ExecutionController:
         }
         solve_with_diagnostics = getattr(self.ik_solver, "solve_with_diagnostics", None)
         if callable(solve_with_diagnostics):
+            solver_kwargs = dict(kwargs)
+            # Built-in numerical IK can safely warm-start from the previous
+            # solution.  Keep custom/test solvers on their legacy signature.
+            if (
+                warm_start_joints_rad is not None
+                and isinstance(self.ik_solver, PiperContinuousIK)
+            ):
+                solver_kwargs["initial_joints_rad"] = warm_start_joints_rad
             result = solve_with_diagnostics(
                 current_joints_rad,
                 target_xyz_m,
                 target_rpy_deg,
-                **kwargs,
+                **solver_kwargs,
             )
             if not isinstance(result, PiperIKSolveResult):
                 raise ExecutionBlocked(
@@ -3634,6 +3890,10 @@ class ExecutionController:
         gripper_errors: list[float] = []
         eef_translation_errors: list[float] = []
         eef_rotation_errors: list[float] = []
+        run_eef_diagnostics = (
+            self.command_sequence <= 1
+            or self.control_tick_count % max(1, self.feedback_diagnostics_stride) == 0
+        )
         for index, side in enumerate(current_sides):
             issued = pending_sides[side]
             issued = issued if isinstance(issued, dict) else {}
@@ -3673,7 +3933,7 @@ class ExecutionController:
             eef_rotation_error_rad = None
             measured_eef_rpy_deg = None
             measured_rotation = None
-            if measured_delivery is not None:
+            if measured_delivery is not None and run_eef_diagnostics:
                 try:
                     measured_rotation = rotation_from_state(measured_delivery)
                     measured_eef_rpy_deg = Rotation.from_matrix(measured_rotation).as_euler(
@@ -4156,6 +4416,7 @@ class ExecutionController:
         protocol: PolicyProtocol,
         *,
         feedback_captured_at: float | None = None,
+        feedback_snapshot: PiperFeedbackSnapshot | None = None,
     ) -> bool:
         """Execute one time-selected target or hold the last safe absolute target."""
         feedback_at = time.time() if feedback_captured_at is None else float(feedback_captured_at)
@@ -4206,8 +4467,21 @@ class ExecutionController:
         # Otherwise the queue advances by wall time while the controller is still
         # switching out of STANDBY, and the first real command can jump deep into
         # a chunk even though no earlier target reached the robot.
+        snapshot_matches = (
+            feedback_snapshot is not None
+            and set(feedback_snapshot.statuses) == set(sides)
+            and np.array_equal(np.asarray(feedback_snapshot.qpos_m), np.asarray(qpos_m))
+            and np.array_equal(
+                np.asarray(feedback_snapshot.delivery_state),
+                np.asarray(raw_delivery_state),
+            )
+        )
         try:
-            statuses = {side: arm_status_dict(self.pipers[side]) for side in sides}
+            statuses = (
+                {side: dict(feedback_snapshot.statuses[side]) for side in sides}
+                if snapshot_matches and feedback_snapshot is not None
+                else {side: arm_status_dict(self.pipers[side]) for side in sides}
+            )
             self.robot_status = (
                 statuses if protocol.arm_mode == "bimanual" else statuses[sides[0]]
             )
@@ -4228,11 +4502,21 @@ class ExecutionController:
                 raise ExecutionBlocked(f"Piper status is not normal: {bad_status}")
 
             if self.arm_hold_targets:
-                driver_statuses = {
-                    side: driver_enable_status_dict(self.pipers[side])
-                    for side in sides
-                    if side in self.arm_hold_targets
-                }
+                driver_statuses = (
+                    {
+                        side: dict(feedback_snapshot.driver_statuses[side])
+                        for side in sides
+                        if side in self.arm_hold_targets
+                        and feedback_snapshot is not None
+                        and side in feedback_snapshot.driver_statuses
+                    }
+                    if snapshot_matches and feedback_snapshot is not None
+                    else {
+                        side: driver_enable_status_dict(self.pipers[side])
+                        for side in sides
+                        if side in self.arm_hold_targets
+                    }
+                )
                 self.robot_driver_enable_status.update(driver_statuses)
                 staged_hold_invalid = bool(
                     self.enable_staged_generation is not None
@@ -4248,7 +4532,11 @@ class ExecutionController:
                     )
                 if self.enable_staged_generation is None:
                     if self._maintain_post_enable_hold(
-                        sides, qpos_m, statuses, now_monotonic=now_monotonic
+                        sides,
+                        qpos_m,
+                        statuses,
+                        now_monotonic=now_monotonic,
+                        driver_statuses=driver_statuses,
                     ):
                         return False
 
@@ -4277,7 +4565,11 @@ class ExecutionController:
                     kind="expired" if "expired" in gate_reason else "other",
                 ):
                     self._maintain_post_enable_hold(
-                        sides, qpos_m, statuses, now_monotonic=now_monotonic
+                        sides,
+                        qpos_m,
+                        statuses,
+                        now_monotonic=now_monotonic,
+                        driver_statuses=driver_statuses,
                     )
                     return False
                 self.discard_pending_actions(
@@ -4293,11 +4585,22 @@ class ExecutionController:
                 else:
                     return self._block(gate_state or "blocked", gate_reason)
 
-            active_driver_statuses = {
-                side: driver_enable_status_dict(self.pipers[side])
-                for side in sides
-                if side in self.robot_enabled and side not in self.arm_hold_targets
-            }
+            active_driver_statuses = (
+                {
+                    side: dict(feedback_snapshot.driver_statuses[side])
+                    for side in sides
+                    if side in self.robot_enabled
+                    and side not in self.arm_hold_targets
+                    and feedback_snapshot is not None
+                    and side in feedback_snapshot.driver_statuses
+                }
+                if snapshot_matches and feedback_snapshot is not None
+                else {
+                    side: driver_enable_status_dict(self.pipers[side])
+                    for side in sides
+                    if side in self.robot_enabled and side not in self.arm_hold_targets
+                }
+            )
             self.robot_driver_enable_status.update(active_driver_statuses)
             lost_control_mode = [
                 side
@@ -4318,6 +4621,8 @@ class ExecutionController:
             if lost_control_mode:
                 self.external_control_checked = False
                 self.joint_trajectory = None
+                for side in lost_control_mode:
+                    self._ik_warm_starts.pop(side, None)
                 self.last_command_monotonic = None
 
             missing_enabled = [side for side in sides if side not in self.robot_enabled]
@@ -4472,7 +4777,9 @@ class ExecutionController:
                         qpos_slice[:6],
                         target_xyz,
                         target_rpy_deg,
+                        warm_start_joints_rad=self._ik_warm_starts.get(side),
                     )
+                    self._ik_warm_starts[side] = ik_result.solution_joints_rad.copy()
                     target_joints = ik_result.command_joints_rad.copy()
                     prepared[side] = (target_joints, target_gripper_m)
                     command_pipeline[side] = {
@@ -4820,7 +5127,12 @@ def build_observation(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     """Build a policy payload using only a frozen control-thread snapshot."""
-    state = np.array(snapshot.state, dtype=np.float32, copy=True)
+    # Snapshot arrays are immutable and are consumed read-only by the official
+    # OpenPI client.  Avoid copying the state/images again on every request;
+    # the fallback copy is retained for alternate mutable snapshot callers.
+    state = np.asarray(snapshot.state, dtype=np.float32)
+    if state.flags.writeable:
+        state = np.array(state, copy=True)
     if state.shape != (protocol.state_dim,) or not np.all(np.isfinite(state)):
         raise RuntimeError(
             f"{protocol.arm_mode} {protocol.schema} observation state must be finite "
@@ -4831,7 +5143,13 @@ def build_observation(
     image_monotonic_timestamps = snapshot.image_monotonic_timestamps
     if protocol.arm_mode == "bimanual":
         observation_images = {
-            key: np.array(images[key], dtype=np.uint8, copy=True)
+            key: (
+                images[key]
+                if isinstance(images[key], np.ndarray)
+                and images[key].dtype == np.uint8
+                and not images[key].flags.writeable
+                else np.array(images[key], dtype=np.uint8, copy=True)
+            )
             for key in protocol.camera_keys
         }
         can_names = {"left": args.left_can, "right": args.right_can}
@@ -4843,8 +5161,20 @@ def build_observation(
     else:
         wrist_key = next(key for key in protocol.camera_keys if "wrist" in key)
         observation_images = {
-            "cam_high": np.array(images["cam_high"], dtype=np.uint8, copy=True),
-            wrist_key: np.array(images["cam_wrist"], dtype=np.uint8, copy=True),
+            "cam_high": (
+                images["cam_high"]
+                if isinstance(images["cam_high"], np.ndarray)
+                and images["cam_high"].dtype == np.uint8
+                and not images["cam_high"].flags.writeable
+                else np.array(images["cam_high"], dtype=np.uint8, copy=True)
+            ),
+            wrist_key: (
+                images["cam_wrist"]
+                if isinstance(images["cam_wrist"], np.ndarray)
+                and images["cam_wrist"].dtype == np.uint8
+                and not images["cam_wrist"].flags.writeable
+                else np.array(images["cam_wrist"], dtype=np.uint8, copy=True)
+            ),
         }
         can_names = {protocol.arm_side: args.can}
         camera_devices = {
@@ -4961,6 +5291,7 @@ def build_client_transport_timing(
     server_timing: dict[str, Any] | None,
     camera_capture_ms: float | None,
     inference_generation: int,
+    client_transport_timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Measure and report transport timing from the client side.
 
@@ -4971,6 +5302,11 @@ def build_client_transport_timing(
     local intervals use monotonic clocks.
     """
     server_timing = server_timing if isinstance(server_timing, dict) else {}
+    client_transport_timing = (
+        client_transport_timing
+        if isinstance(client_transport_timing, dict)
+        else {}
+    )
 
     def finite(value: Any) -> float | None:
         try:
@@ -5005,6 +5341,29 @@ def build_client_transport_timing(
         else None
     )
     return {
+        # Preserve the official WebSocket client's local breakdown.  These
+        # fields distinguish msgpack/image packing from actual network wait;
+        # without them a large ``round_trip_ms`` is easy to misdiagnose as
+        # model latency.
+        "client_pack_ms": finite(client_transport_timing.get("pack_ms")),
+        "client_send_ms": finite(client_transport_timing.get("send_ms")),
+        "client_wait_response_ms": finite(
+            client_transport_timing.get("wait_response_ms")
+        ),
+        "client_unpack_ms": finite(client_transport_timing.get("unpack_ms")),
+        "client_transport_total_ms": finite(
+            client_transport_timing.get("total_ms")
+        ),
+        "request_bytes": int(client_transport_timing["request_bytes"])
+        if isinstance(client_transport_timing.get("request_bytes"), (int, float))
+        and math.isfinite(float(client_transport_timing["request_bytes"]))
+        and float(client_transport_timing["request_bytes"]) >= 0
+        else None,
+        "response_bytes": int(client_transport_timing["response_bytes"])
+        if isinstance(client_transport_timing.get("response_bytes"), (int, float))
+        and math.isfinite(float(client_transport_timing["response_bytes"]))
+        and float(client_transport_timing["response_bytes"]) >= 0
+        else None,
         "camera_capture_ms": finite(camera_capture_ms),
         "observation_upload_ms": upload_ms,
         "client_observation_upload_ms": upload_ms,
@@ -5240,7 +5599,13 @@ def run_rtc_client(args: argparse.Namespace) -> None:
         pipers = {args.arm_side: connect_piper(args.can)}
         camera_ids = {"cam_high": args.cam_high_device, "cam_wrist": args.cam_wrist_device}
 
-    monitoring = MonitoringRecorder(args.monitoring_dir, args)
+    monitoring = MonitoringRecorder(
+        args.monitoring_dir,
+        args,
+        enabled=not bool(getattr(args, "no_monitoring", False)),
+        periodic_rate_hz=float(getattr(args, "monitoring_rate", 1.0)),
+        level=str(getattr(args, "monitoring_level", "compact")),
+    )
     monitoring.record(
         "piper_connected",
         can_interfaces={side: getattr(piper, "can_name", None) for side, piper in pipers.items()},
@@ -5259,6 +5624,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
         enabled=bool(getattr(args, "camera_preview", False)),
         fps=float(getattr(args, "camera_preview_fps", 8.0)),
     )
+    cameras.set_preview_enabled(preview.enabled)
     worker = AsyncPolicyInference()
     recorder = DeploymentRunRecorder(
         args.record_root,
@@ -5477,6 +5843,20 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                         ).astype(np.float32)
                     observation_captured_at = time.time()
                     observation_captured_monotonic = time.monotonic()
+                    feedback_snapshot = PiperFeedbackSnapshot(
+                        qpos_m=qpos,
+                        delivery_state=delivery_state,
+                        statuses={
+                            side: arm_status_dict(pipers[side]) for side in sides
+                        },
+                        driver_statuses={
+                            side: driver_enable_status_dict(pipers[side])
+                            for side in sides
+                            if side in execution.robot_enabled
+                            or side in execution.arm_hold_targets
+                        },
+                        captured_at=observation_captured_at,
+                    )
 
                     completion = worker.poll()
                     if completion is not None:
@@ -5541,10 +5921,47 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                 arrived_at=completion.arrived_at,
                                 image_timestamps=completion.launch.image_timestamps,
                                 accepted=accepted,
-                                result=completion.result,
-                                execution=execution.metadata(),
+                                # The raw action chunk is already persisted by
+                                # DeploymentRunRecorder.  Deep JSON conversion
+                                # of a 50x14 numpy array here used to run on the
+                                # 20 Hz control thread and could consume a
+                                # noticeable slice of the next tick.  Keep only
+                                # bounded diagnostics in the low-latency event
+                                # stream.
+                                result_summary=(
+                                    {
+                                        "actions_shape": list(
+                                            np.asarray(
+                                                completion.result.get("actions")
+                                                if isinstance(completion.result, dict)
+                                                else []
+                                            ).shape
+                                        ),
+                                        "transport_timing": (
+                                            completion.result.get("transport_timing")
+                                            if isinstance(completion.result, dict)
+                                            and isinstance(
+                                                completion.result.get("transport_timing"),
+                                                dict,
+                                            )
+                                            else None
+                                        ),
+                                        "rtc": (
+                                            completion.result.get("rtc")
+                                            if isinstance(completion.result, dict)
+                                            and isinstance(completion.result.get("rtc"), dict)
+                                            else None
+                                        ),
+                                    }
+                                    if isinstance(completion.result, dict)
+                                    else None
+                                ),
+                                # Keep result telemetry bounded on the control
+                                # thread. The recorder still stores the full
+                                # model response and command trace separately.
+                                execution=execution.metadata(compact=True),
                             )
-                            logging.info(
+                            logging.debug(
                                 "Inference generation=%d arrival latency=%.3fs skip=%d "
                                 "blend=%d old_remaining=%d accepted=%s queue=%d rejected=%s",
                                 completion.launch.generation,
@@ -5578,12 +5995,14 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                             camera_selection_started_monotonic = time.monotonic()
                             try:
                                 frame_set = cameras.read_nearest(
-                                    observation_captured_monotonic
+                                    observation_captured_monotonic,
+                                    copy=False,
                                 )
                                 generation = execution.allocate_inference_generation()
                                 rtc_snapshot = execution.rtc_request_metadata(protocol)
                                 execution_snapshot = execution.metadata(
-                                    rtc_metadata=rtc_snapshot
+                                    rtc_metadata=rtc_snapshot,
+                                    compact=True,
                                 )
                                 snapshot = make_observation_snapshot(
                                     generation=generation,
@@ -5614,10 +6033,10 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                     captured_monotonic=snapshot.captured_monotonic,
                                     launched_at=camera_selection_finished_at,
                                     launched_monotonic=camera_selection_finished_monotonic,
-                                    raw_delivery_state=np.array(
-                                        snapshot.raw_delivery_state, copy=True
-                                    ),
-                                    qpos_m=np.array(snapshot.qpos_m, copy=True),
+                                    # The snapshot is immutable and already owns
+                                    # these arrays; avoid a second hot-path copy.
+                                    raw_delivery_state=snapshot.raw_delivery_state,
+                                    qpos_m=snapshot.qpos_m,
                                     image_timestamps={
                                         key: float(value)
                                         for key, value in snapshot.image_timestamps.items()
@@ -5690,6 +6109,14 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                             response_received_monotonic
                                         ),
                                         server_timing=server_timing,
+                                        client_transport_timing=(
+                                            result.get("client_transport_timing")
+                                            if isinstance(
+                                                result.get("client_transport_timing"),
+                                                dict,
+                                            )
+                                            else result.get("_client_transport_timing")
+                                        ),
                                         camera_capture_ms=(
                                             camera_finished_monotonic
                                             - camera_started_monotonic
@@ -5730,17 +6157,25 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                         qpos,
                         protocol,
                         feedback_captured_at=observation_captured_at,
+                        feedback_snapshot=feedback_snapshot,
                     )
-                    monitoring.record(
-                        "control_tick",
-                        command_sent=command_sent,
-                        control_tick_count=execution.control_tick_count,
-                        captured_at=observation_captured_at,
-                        captured_monotonic=observation_captured_monotonic,
-                        raw_delivery_state=delivery_state,
-                        qpos_m=qpos,
-                        execution=execution.metadata(),
-                    )
+                    # Claim the periodic slot before constructing the
+                    # payload.  Otherwise Python evaluates the expensive
+                    # ``execution.metadata(...)`` argument on every 20 Hz
+                    # tick even when the recorder is configured for 1 Hz.
+                    if monitoring.periodic_due():
+                        monitoring.record(
+                            "control_tick",
+                            command_sent=command_sent,
+                            control_tick_count=execution.control_tick_count,
+                            captured_at=observation_captured_at,
+                            captured_monotonic=observation_captured_monotonic,
+                            raw_delivery_state=delivery_state,
+                            qpos_m=qpos,
+                            execution=execution.metadata(
+                                compact=monitoring.level != "full"
+                            ),
+                        )
                     if command_sent:
                         command_count += 1
                     if (
@@ -6182,6 +6617,23 @@ def main() -> None:
         default=os.environ.get("BIMANUAL_VLA_MONITORING_DIR", DEFAULT_MONITORING_DIR),
         help="local root for per-run monitoring_data/<session>/events.jsonl",
     )
+    parser.add_argument(
+        "--no-monitoring",
+        action="store_true",
+        help="disable JSONL monitoring telemetry without disabling deployment recording",
+    )
+    parser.add_argument(
+        "--monitoring-rate",
+        type=float,
+        default=1.0,
+        help="maximum periodic control telemetry rate in Hz (default 1 Hz)",
+    )
+    parser.add_argument(
+        "--monitoring-level",
+        choices=("compact", "full"),
+        default="compact",
+        help="periodic telemetry payload size; safety/error events remain detailed",
+    )
     parser.add_argument("--reconnect-delay", type=float, default=2.0)
     parser.add_argument("--once", action="store_true", help="run one successful inference and exit")
     parser.add_argument(
@@ -6341,6 +6793,8 @@ def main() -> None:
         help="return speed percentage; default reuses --speed-pct",
     )
     args = parser.parse_args()
+    if not math.isfinite(float(args.monitoring_rate)) or args.monitoring_rate < 0:
+        parser.error("--monitoring-rate must be finite and non-negative")
     if args.max_joint_gripper_step is not None and args.max_joint_gripper_step_m is not None:
         parser.error(
             "use only one of --max-joint-gripper-step or --max-joint-gripper-step-m"

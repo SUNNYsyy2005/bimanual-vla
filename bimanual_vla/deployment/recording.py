@@ -112,6 +112,8 @@ class DeploymentRunRecorder:
         self.run_dir: Path | None = None
         self._metadata: dict[str, Any] = {}
         self._trajectory_rows: list[dict[str, Any]] = []
+        self._trajectory_chunk_paths: list[Path] = []
+        self._trajectory_chunk_size = 500
         self._model_command_count = 0
         self._control_tick_count = 0
         self._dropped_event_count = 0
@@ -149,6 +151,7 @@ class DeploymentRunRecorder:
         (run_dir / "model_commands").mkdir()
         (run_dir / "videos").mkdir()
         (run_dir / "video_frames").mkdir()
+        (run_dir / "trajectory_chunks").mkdir()
 
         self.run_dir = run_dir
         self._metadata = {
@@ -162,6 +165,7 @@ class DeploymentRunRecorder:
             **_json_safe(dict(metadata or {})),
         }
         self._trajectory_rows.clear()
+        self._trajectory_chunk_paths.clear()
         self._model_command_count = 0
         self._control_tick_count = 0
         self._dropped_event_count = 0
@@ -170,13 +174,13 @@ class DeploymentRunRecorder:
         self._video_frame_fallback_dirs.clear()
         self._video_frame_counts.clear()
         self._trajectory_file = (run_dir / "trajectory.jsonl").open(
-            "w", encoding="utf-8", buffering=1
+            "w", encoding="utf-8", buffering=64 * 1024
         )
         self._model_file = (run_dir / "model_commands.jsonl").open(
-            "w", encoding="utf-8", buffering=1
+            "w", encoding="utf-8", buffering=64 * 1024
         )
         self._video_index_file = (run_dir / "videos" / "timestamps.jsonl").open(
-            "w", encoding="utf-8", buffering=1
+            "w", encoding="utf-8", buffering=64 * 1024
         )
         self._queue = Queue(maxsize=self.queue_size)
         self._closed = False
@@ -250,6 +254,11 @@ class DeploymentRunRecorder:
             "blocked_reason": "" if blocked_reason is None else str(blocked_reason)[:500],
         }
         self._trajectory_rows.append(row)
+        if len(self._trajectory_rows) >= self._trajectory_chunk_size:
+            # Compression must stay off the 20 Hz robot control thread.
+            chunk = self._trajectory_rows
+            self._trajectory_rows = []
+            self._enqueue(("trajectory_chunk", chunk))
         self._control_tick_count += 1
         self._enqueue(("control", row))
 
@@ -432,8 +441,16 @@ class DeploymentRunRecorder:
     def _write_trajectory_npz(self) -> None:
         if self.run_dir is None:
             return
-        rows = self._trajectory_rows
-        if not rows:
+        self._flush_trajectory_chunk()
+        chunks: list[dict[str, np.ndarray]] = []
+        for path in self._trajectory_chunk_paths:
+            try:
+                with np.load(path) as loaded:
+                    chunks.append({key: np.asarray(loaded[key]) for key in loaded.files})
+            except OSError:
+                LOGGER.exception("Failed to read trajectory chunk: %s", path)
+
+        if not chunks:
             data = {
                 "timestamp": np.empty((0,), dtype=np.float64),
                 "monotonic_timestamp": np.empty((0,), dtype=np.float64),
@@ -448,24 +465,8 @@ class DeploymentRunRecorder:
             }
         else:
             data = {
-                "timestamp": np.asarray([row["timestamp"] for row in rows], dtype=np.float64),
-                "monotonic_timestamp": np.asarray(
-                    [row["monotonic_timestamp"] for row in rows], dtype=np.float64
-                ),
-                "delivery_state": np.stack([row["delivery_state"] for row in rows]),
-                "qpos": np.stack([row["qpos"] for row in rows]),
-                "command_action": np.stack([row["command_action"] for row in rows]),
-                "command_absolute_target": np.stack(
-                    [row["command_absolute_target"] for row in rows]
-                ),
-                "command_sent": np.asarray([row["command_sent"] for row in rows], dtype=np.bool_),
-                "command_generation": np.asarray(
-                    [row["command_generation"] for row in rows], dtype=np.int64
-                ),
-                "command_queue_index": np.asarray(
-                    [row["command_queue_index"] for row in rows], dtype=np.int64
-                ),
-                "command_hold": np.asarray([row["command_hold"] for row in rows], dtype=np.bool_),
+                key: np.concatenate([chunk[key] for chunk in chunks], axis=0)
+                for key in chunks[0]
             }
         destination = self.run_dir / "trajectory.npz"
         temp = destination.with_suffix(".npz.tmp")
@@ -474,6 +475,60 @@ class DeploymentRunRecorder:
         with temp.open("wb") as handle:
             np.savez_compressed(handle, **data)
         temp.replace(destination)
+        for path in self._trajectory_chunk_paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        self._trajectory_chunk_paths.clear()
+
+    @staticmethod
+    def _trajectory_arrays(rows: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+        return {
+            "timestamp": np.asarray([row["timestamp"] for row in rows], dtype=np.float64),
+            "monotonic_timestamp": np.asarray(
+                [row["monotonic_timestamp"] for row in rows], dtype=np.float64
+            ),
+            "delivery_state": np.stack([row["delivery_state"] for row in rows]),
+            "qpos": np.stack([row["qpos"] for row in rows]),
+            "command_action": np.stack([row["command_action"] for row in rows]),
+            "command_absolute_target": np.stack(
+                [row["command_absolute_target"] for row in rows]
+            ),
+            "command_sent": np.asarray(
+                [row["command_sent"] for row in rows], dtype=np.bool_
+            ),
+            "command_generation": np.asarray(
+                [row["command_generation"] for row in rows], dtype=np.int64
+            ),
+            "command_queue_index": np.asarray(
+                [row["command_queue_index"] for row in rows], dtype=np.int64
+            ),
+            "command_hold": np.asarray(
+                [row["command_hold"] for row in rows], dtype=np.bool_
+            ),
+        }
+
+    def _write_trajectory_chunk(self, rows: list[dict[str, Any]]) -> None:
+        if self.run_dir is None or not rows:
+            return
+        chunk_dir = self.run_dir / "trajectory_chunks"
+        path = chunk_dir / f"chunk_{len(self._trajectory_chunk_paths):06d}.npz"
+        temp = path.with_suffix(".npz.tmp")
+        with temp.open("wb") as handle:
+            np.savez_compressed(handle, **self._trajectory_arrays(rows))
+        temp.replace(path)
+        self._trajectory_chunk_paths.append(path)
+
+    def _flush_trajectory_chunk(self) -> None:
+        if not self._trajectory_rows:
+            return
+        rows = self._trajectory_rows
+        # Detach the batch instead of clearing it in place.  Clearing the
+        # original list also clears ``rows`` because it is the same object,
+        # which silently produced an empty trajectory.npz at shutdown.
+        self._trajectory_rows = []
+        self._write_trajectory_chunk(rows)
 
     def _writer_loop(self) -> None:
         assert self._queue is not None
@@ -485,6 +540,8 @@ class DeploymentRunRecorder:
                 kind = event[0]
                 if kind == "control":
                     self._write_control_json(event[1])
+                elif kind == "trajectory_chunk":
+                    self._write_trajectory_chunk(event[1])
                 elif kind == "video":
                     self._write_video_frame(event[1])
                 elif kind == "model":
