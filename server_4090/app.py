@@ -4325,8 +4325,31 @@ def create_app(config_path: Path) -> Flask:
             return "unknown" in visible, dataset_ids, origins
         return any(origin in visible for origin in origins.values()), dataset_ids, origins
 
-    def list_base_models() -> list[dict[str, Any]]:
+    def list_base_models(
+        checkpoints: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """List foundation weights and complete training checkpoints.
+
+        ``checkpoint_base_dir`` may contain experiment directories implemented
+        as symlinks (the 4x4090 simulation storage uses this layout).  A
+        recursive ``Path.rglob`` does not descend into directory symlinks, so
+        relying on that scan alone makes those checkpoints appear in the
+        checkpoint table but disappear from the training base-model selector.
+        Reuse the complete-checkpoint inventory, which already walks the
+        logical experiment tree, and carry its experiment metadata along.
+        """
         candidates: set[Path] = {Path(config["base_checkpoint"]).resolve()}
+        checkpoint_metadata: dict[Path, dict[str, Any]] = {}
+        for item in checkpoints if checkpoints is not None else list_checkpoints():
+            raw_path = item.get("path")
+            if not raw_path:
+                continue
+            try:
+                path = Path(str(raw_path)).expanduser().resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            candidates.add(path)
+            checkpoint_metadata[path] = item
         for root in checkpoint_roots:
             if not root.exists():
                 continue
@@ -4345,7 +4368,19 @@ def create_app(config_path: Path) -> Flask:
             model_variant = infer_model_variant(path)
             if model_variant is None:
                 continue
+            checkpoint_info = checkpoint_metadata.get(path)
             identity = training_checkpoint_identity(path, checkpoint_base_dir)
+            if identity is None and checkpoint_info is not None:
+                # The resolved target of a symlink is outside the configured
+                # logical root, so derive the standard identity from the
+                # already validated checkpoint inventory instead.
+                identity = {
+                    "config_name": checkpoint_info.get("config_name"),
+                    "experiment": checkpoint_info.get("experiment"),
+                    "checkpoint_step": checkpoint_info.get("step"),
+                    "model_variant": checkpoint_info.get("model_variant"),
+                    "arm_mode": checkpoint_info.get("arm_mode"),
+                }
             foundation = bool(
                 path == default_path
                 or path.is_relative_to(Path.home() / ".cache/openpi")
@@ -4353,7 +4388,15 @@ def create_app(config_path: Path) -> Flask:
             dataset_ids: list[str] = []
             dataset_origins: dict[str, str] = {}
             if not foundation:
-                visible_checkpoint, dataset_ids, dataset_origins = checkpoint_matches_visible_datasets(path)
+                if checkpoint_info is not None:
+                    dataset_ids = list(checkpoint_info.get("dataset_ids") or [])
+                    dataset_origins = dict(checkpoint_info.get("dataset_origins") or {})
+                    visible_checkpoint = any(
+                        origin in visible_dataset_origin_set()
+                        for origin in dataset_origins.values()
+                    ) if dataset_ids else "unknown" in visible_dataset_origin_set()
+                else:
+                    visible_checkpoint, dataset_ids, dataset_origins = checkpoint_matches_visible_datasets(path)
                 if not visible_checkpoint:
                     continue
             models.append(
@@ -4591,6 +4634,7 @@ def create_app(config_path: Path) -> Flask:
                     pass
         latest_observation = observations.latest(task_list)
         checkpoints = list_checkpoints()
+        base_models = list_base_models(checkpoints)
         visible_experiments = {item.get("experiment") for item in checkpoints if item.get("experiment")}
         experiments = [
             item for item in training_experiment_catalog(Path(config["checkpoint_base_dir"]))
@@ -4601,7 +4645,7 @@ def create_app(config_path: Path) -> Flask:
                 "datasets": list_datasets(),
                 "checkpoints": checkpoints,
                 "experiments": experiments,
-                "base_models": list_base_models(),
+                "base_models": base_models,
                 "robot_observation": latest_observation,
                 "tasks": task_list,
                 "gpus": gpu_inventory(),

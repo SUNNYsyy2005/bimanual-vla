@@ -39,7 +39,8 @@
   "max_chunk_mib": 64,
   "checkpoint_allowed_roots": [
     "/mnt/nvme0n1p4_1T/sunny/tsq-storage/checkpoints/openpi",
-    "/mnt/nvme0n1p4_1T/sunny/tsq-storage/checkpoints/base-models"
+    "/mnt/nvme0n1p4_1T/sunny/tsq-storage/checkpoints/base-models",
+    "/home/sunny/checkpoints/dashboard-sim"
   ],
   "eval_video_roots": [
     "/home/sunny/.local/share/bimanual-vla-sim-dashboard/eval_videos",
