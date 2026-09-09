@@ -21,7 +21,7 @@ ROBOTWIN_EMBODIMENTS = frozenset(
 )
 
 
-REAL_PIPER_RIGHT_AXIS_SIGNS = (1, -1, 1)
+REAL_PIPER_RIGHT_AXIS_SIGNS = (-1, -1, 1)
 
 
 def normalize_robot_type(value: Any) -> str | None:
