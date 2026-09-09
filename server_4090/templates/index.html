@@ -7,25 +7,27 @@
   <style>
     :root {
       color-scheme:dark;
-      --bg:#07101d; --bg-soft:#0c1626; --card:#111d30; --card-strong:#15243a;
-      --surface:#111d30; --surface-raised:#162740; --surface-inset:#07121f;
-      --control:#091525; --table-head:#102038; --topbar-bg:rgba(7,16,29,.86);
-      --page-bg:radial-gradient(circle at 10% -5%,#17335b 0,transparent 34%),radial-gradient(circle at 90% 8%,#122b40 0,transparent 28%),#07101d;
-      --line:#263a55; --line-soft:#1d3049; --line-hover:#3e668d; --muted:#91a4bd; --text:#edf4ff;
-      --heading:#f7fbff; --control-text:#edf4ff; --code:#bfeaff;
-      --blue:#42c7ff; --blue-strong:#0ea5e9; --green:#3ee6a8; --yellow:#ffd166;
-      --red:#ff6f91; --purple:#a78bfa; --nav-height:112px;
-      --shadow:0 18px 50px rgba(0,0,0,.2); --shadow-soft:0 8px 24px rgba(0,0,0,.14);
+      --bg:#0a1020; --bg-soft:#111a2d; --card:#121d31; --card-strong:#192840;
+      --surface:#121d31; --surface-raised:#192840; --surface-inset:#0c1527;
+      --control:#0f192c; --table-head:#1b2a44; --table-head-text:#c9dcf2; --table-head-border:#38516f; --table-row-hover:rgba(105,182,255,.09); --table-row-alt:rgba(255,255,255,.018); --topbar-bg:rgba(10,16,32,.9);
+      --page-bg:radial-gradient(circle at 8% -8%,rgba(56,98,173,.35) 0,transparent 34%),radial-gradient(circle at 92% 5%,rgba(20,125,133,.24) 0,transparent 29%),linear-gradient(145deg,#0a1020,#0d1728);
+      --line:#2a3b58; --line-soft:#1e2d45; --line-hover:#4b6a91; --muted:#94a5bd; --text:#e9eff8;
+      --heading:#f7faff; --control-text:#edf3fb; --code:#a9e4ff;
+      --blue:#69b6ff; --blue-strong:#3b82f6; --green:#4ed9ac; --yellow:#f4c66d;
+      --red:#fb7185; --purple:#b794f4; --button-start:#347fb8; --button-end:#245a91; --button-border:#468fc2; --danger-bg:#8d2c49; --danger-border:#c95a75; --nav-height:112px;
+      --shadow:0 18px 50px rgba(0,0,0,.24); --shadow-soft:0 8px 24px rgba(0,0,0,.16);
     }
     html[data-theme="light"] {
       color-scheme:light;
-      --bg:#f3f7fb; --bg-soft:#e9f0f8; --card:#ffffff; --card-strong:#f7fbff;
-      --surface:rgba(255,255,255,.92); --surface-raised:#ffffff; --surface-inset:#f5f8fc;
-      --control:#ffffff; --table-head:#edf5fc; --topbar-bg:rgba(255,255,255,.88);
-      --page-bg:radial-gradient(circle at 8% -8%,rgba(66,199,255,.2) 0,transparent 33%),radial-gradient(circle at 94% 8%,rgba(62,230,168,.13) 0,transparent 26%),linear-gradient(145deg,#f6f9fd,#edf3f9);
-      --line:#cbd9e8; --line-soft:#dce6f0; --line-hover:#8bb5d7; --muted:#61758b; --text:#1b2b3d;
-      --heading:#112337; --control-text:#1b2b3d; --code:#12638a;
-      --shadow:0 18px 45px rgba(52,83,112,.12); --shadow-soft:0 8px 24px rgba(52,83,112,.1);
+      --bg:#f4f7fb; --bg-soft:#eaf0f7; --card:#ffffff; --card-strong:#f9fbfe;
+      --surface:rgba(255,255,255,.94); --surface-raised:#ffffff; --surface-inset:#f7f9fc;
+      --control:#ffffff; --table-head:#e7eff8; --table-head-text:#1e4666; --table-head-border:#bfd0e2; --table-row-hover:rgba(43,112,217,.07); --table-row-alt:#f9fbfd; --topbar-bg:rgba(255,255,255,.92);
+      --page-bg:radial-gradient(circle at 8% -8%,rgba(88,155,230,.2) 0,transparent 33%),radial-gradient(circle at 94% 8%,rgba(52,190,157,.14) 0,transparent 26%),linear-gradient(145deg,#f8fafd,#edf3f9);
+      --line:#d2deeb; --line-soft:#e3eaf2; --line-hover:#a6bfd9; --muted:#64768b; --text:#25364b;
+      --heading:#10243c; --control-text:#203247; --code:#1d6e9c;
+      --blue:#2b7de9; --blue-strong:#2563d3; --green:#159b79; --yellow:#b7791f;
+      --red:#d94b68; --purple:#7657c5; --button-start:#3f86dc; --button-end:#2866c4; --button-border:#3578ca; --danger-bg:#c44a68; --danger-border:#b93b5b;
+      --shadow:0 18px 45px rgba(52,83,112,.13); --shadow-soft:0 8px 24px rgba(52,83,112,.1);
     }
     * { box-sizing:border-box; }
     html { scroll-behavior:smooth; }
@@ -69,11 +71,11 @@
     .stat-detail { margin-top:3px; color:var(--muted); font-size:12px; }
     .muted { color:var(--muted); } .ok { color:var(--green); } .bad { color:var(--red); } .warn { color:var(--yellow); }
     label { display:block; margin:6px 0 3px; color:var(--text); font-weight:650; }
-    input,select,textarea,button { width:100%; min-height:40px; padding:9px 11px; border:1px solid var(--line); border-radius:10px; color:var(--control-text); background:var(--control); transition:border-color .18s ease,box-shadow .18s ease,background .18s ease; }
+    input,select,textarea,button { width:100%; min-height:40px; padding:9px 11px; border:1px solid var(--line); border-radius:10px; color:var(--control-text); background:var(--control); transition:border-color .18s ease,box-shadow .18s ease,background .18s ease,transform .18s ease; }
     input::placeholder,textarea::placeholder { color:var(--muted); }
     input:focus,select:focus,textarea:focus { outline:2px solid rgba(66,199,255,.22); border-color:var(--blue-strong); box-shadow:0 0 0 4px rgba(66,199,255,.08); }
-    button { border-color:#159bd2; background:linear-gradient(180deg,#087bad,#075b85); font-weight:700; }
-    button:hover { filter:brightness(1.14); } button.secondary { border-color:var(--line); background:var(--surface-raised); } button.danger { border-color:#e33d69; background:#8c1638; }
+    button { border-color:var(--button-border); background:linear-gradient(180deg,var(--button-start),var(--button-end)); font-weight:700; }
+    button:hover { filter:brightness(1.08); transform:translateY(-1px); } button.secondary { border-color:var(--line); background:var(--surface-raised); } button.danger { border-color:var(--danger-border); background:var(--danger-bg); }
     button.inline { width:auto; min-height:36px; padding:7px 11px; margin:2px; } button:disabled { cursor:not-allowed; opacity:.45; filter:none; }
     .theme-toggle { display:inline-flex; align-items:center; justify-content:center; gap:7px; min-width:98px; }
     .theme-toggle-icon { font-size:15px; line-height:1; }
@@ -89,8 +91,8 @@
     form.compact-submission > p.muted,form.compact-submission > p.warn { max-height:0; margin-top:0; margin-bottom:0; overflow:hidden; opacity:0; transition:max-height .18s ease,margin .18s ease,opacity .18s ease; }
     form.compact-submission.context-help-visible > p.muted,form.compact-submission.context-help-visible > p.warn { max-height:180px; margin-top:2px; margin-bottom:2px; opacity:1; }
     .toolbar:not(.auth-token-toolbar):not(.auth-login-toolbar) > input:not([type=checkbox]),.toolbar:not(.auth-token-toolbar):not(.auth-login-toolbar) > select { width:auto; min-width:110px; max-width:280px; }
-    .table-wrap { overflow:auto; border:1px solid var(--line-soft); border-radius:12px; background:var(--surface-inset); }
-    table { width:100%; border-collapse:collapse; font-size:13px; } th,td { padding:10px; border-bottom:1px solid var(--line-soft); text-align:left; vertical-align:top; } th { position:sticky; top:0; z-index:1; color:#9edcff; background:var(--table-head); } tbody tr { transition:background .16s ease; } tbody tr:hover { background:rgba(66,199,255,.055); } tr:last-child td { border-bottom:0; }
+    .table-wrap { overflow:auto; border:1px solid var(--line-soft); border-radius:13px; background:var(--surface-inset); }
+    table { width:100%; border-collapse:collapse; font-size:13px; } th,td { padding:10px; border-bottom:1px solid var(--line-soft); text-align:left; vertical-align:top; } thead { background:var(--table-head); } table thead th { position:sticky; top:0; z-index:1; color:var(--table-head-text); background:var(--table-head); border-bottom:2px solid var(--table-head-border); font-size:11px; font-weight:800; letter-spacing:.045em; white-space:nowrap; } tbody tr { transition:background .16s ease; } tbody tr:nth-child(even):not(.dataset-group-row) { background:var(--table-row-alt); } tbody tr:hover { background:var(--table-row-hover); } tr:last-child td { border-bottom:0; }
     /* Keep training task management readable without making the status cell
        determine the table's minimum width. Long dependency IDs/errors wrap in
        their own column, so parameters and actions remain visible. */
@@ -119,7 +121,7 @@
     .episode-panel { padding:12px; border:1px solid #334c69; border-radius:11px; background:#091727; }
     #episodeEditorPanel { scroll-margin-top:calc(var(--nav-height) + 18px); }
     .episode-panel.table-wrap { max-height:430px; overflow:auto; }
-    .episode-panel.table-wrap thead th { position:sticky; top:0; z-index:2; background:#0b1d31; }
+    .episode-panel.table-wrap thead th { position:sticky; top:0; z-index:2; background:var(--table-head); }
     .episode-detail-toolbar { display:flex; flex-wrap:wrap; align-items:end; gap:8px; margin-bottom:10px; }
     .episode-detail-toolbar label { margin:0; }
     .episode-detail-toolbar select { min-width:180px; }
@@ -188,7 +190,7 @@
     .dataset-origin-real { color:#bfffe5; border-color:#217a5f !important; background:#103529 !important; }
     .dataset-origin-simulation { color:#d9ccff; border-color:#624ca8 !important; background:#261f46 !important; }
     .dataset-origin-unknown { color:#ffe5a3; border-color:#8d6c22 !important; background:#392d14 !important; }
-    .dataset-group-row td { padding:9px 12px; background:#0a1728; color:#cfe2f7; border-top:2px solid #31506f; font-weight:800; }
+    .dataset-group-row td { padding:9px 12px; background:var(--table-head); color:var(--table-head-text); border-top:2px solid var(--table-head-border); font-weight:800; }
     .dataset-origin-select,.dataset-sync-select { width:auto; min-width:104px; display:inline-block; padding:6px 8px; margin:2px; }
     .location-list { display:flex; flex-wrap:wrap; gap:5px; margin-top:5px; }
     .location-pill { max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -305,8 +307,10 @@
     html[data-theme="light"] .media-card img,
     html[data-theme="light"] .preview-grid img,
     html[data-theme="light"] .telemetry-camera-card img { border-color:var(--line); background:#e8eef5; }
-    html[data-theme="light"] .episode-panel.table-wrap thead th { background:var(--table-head); }
-    html[data-theme="light"] th { color:#245775; background:var(--table-head); border-bottom-color:var(--line); }
+    html[data-theme="light"] .table-wrap table thead th,
+    html[data-theme="light"] .episode-panel.table-wrap thead th { color:var(--table-head-text) !important; background:var(--table-head) !important; border-bottom:2px solid var(--table-head-border) !important; }
+    html[data-theme="light"] .dataset-group-row td { color:var(--table-head-text); background:var(--table-head); border-top-color:var(--table-head-border); }
+    html[data-theme="light"] .table-wrap { box-shadow:inset 0 1px 0 rgba(255,255,255,.72); }
     html[data-theme="light"] .telemetry-alert { background:#fff7e6; color:#8a5a00; }
     html[data-theme="light"] .telemetry-note { background:#eaf7ff; color:#245b7d; }
     html[data-theme="light"] .section-note { background:#eaf7ff; color:#45677f; }
@@ -345,7 +349,7 @@
     <header class="topbar">
       <div class="brand">
         <div class="brand-mark">π</div>
-        <div><h1>{{ dashboard_title }} <span class="pill" id="dashboardBuildBadge">build {{ dashboard_build }}</span></h1><div class="muted">{{ "仿真数据上传、4×4090/H100/H200 训练评测与视频查看" if dashboard_profile == "simulation" else "数据集、训练、Policy 与实机遥测统一管理" }}</div></div>
+        <div><h1>{{ dashboard_title }}</h1></div>
       </div>
       <div class="auth-panel">
         <div class="toolbar auth-token-toolbar"><input id="token" type="password" placeholder="Dashboard API Token"><button class="inline" onclick="saveToken()">保存 Token</button><button class="inline secondary" onclick="refreshAll()">刷新</button></div>
@@ -388,7 +392,7 @@
       <div class="grid">
         <div class="card half"><h2>上传数据集</h2><p>{{ "仿真数据上传执行：" if dashboard_profile == "simulation" else "真机采集机执行：" }}</p><pre id="uploadCommand">bin/bimanual-vla data-upload LEROBOT_OR_GUI_NPZ_DIR --name my_dataset --dataset-origin {{ upload_default_origin }} --server http://192.168.101.9:{{ server_port }} --token TOKEN --workers 4 --merge</pre><p class="muted">{{ "仿真 Dashboard 默认只接收并显示 --dataset-origin simulation 的数据；正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。" if dashboard_profile == "simulation" else "仿真数据上传时仍使用 --dataset-origin simulation，其暂存目录与真机数据隔离，并且不会出现在实机 Dashboard 列表或训练/Policy 数据集选择器中。正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。" }}</p></div>
         <div class="card half"><h2>格式与媒体说明</h2><div class="section-note">Dashboard 可识别单臂 7D / 10D、双臂 14D / 20D 和其他自定义维度，并显示所有 <code>dtype: video</code> / <code>dtype: image</code> 相机。{{ "这里只呈现仿真数据集；可从本页面统一提交 4×4090 本地训练/评测或 H100/H200 Slurm 训练/评测。" if dashboard_profile == "simulation" else "这里只呈现真机和未分类数据集；将来源标记为仿真后，该数据集会从 Dashboard 隐藏，但数据集 ID 和底层训练加载路径不会改变。" }}</div></div>
-        <div class="card"><h2>{{ "已接收仿真数据集" if dashboard_profile == "simulation" else "已接收真机数据集" }}</h2><div class="toolbar"><label style="margin:0">来源筛选</label><select id="datasetOriginFilter" class="dataset-origin-select"><option value="all">全部</option>{% for origin in visible_dataset_origins %}<option value="{{ origin }}">{{ "真机" if origin == "real" else "仿真" if origin == "simulation" else "未分类" }}</option>{% endfor %}</select><button class="inline secondary" type="button" onclick="loadDatasetLocations(true)">刷新 4×4090/H100/H200 位置</button><span id="datasetOriginSummary" class="muted">等待状态数据。</span></div><div class="table-wrap"><table><thead><tr><th>ID / 来源</th><th>位置 / 同步</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div><div id="datasetsPagination"></div></div>
+        <div class="card"><h2>{{ "已接收仿真数据集" if dashboard_profile == "simulation" else "已接收真机数据集" }}</h2><div class="toolbar"><label style="margin:0">来源筛选</label><select id="datasetOriginFilter" class="dataset-origin-select"><option value="all">全部</option>{% for origin in visible_dataset_origins %}<option value="{{ origin }}">{{ "真机" if origin == "real" else "仿真" if origin == "simulation" else "未分类" }}</option>{% endfor %}</select><button class="inline secondary" type="button" onclick="loadDatasetLocations(true)">刷新 4×4090/H100/H200 位置</button><span id="datasetOriginSummary" class="muted">等待状态数据。</span></div><div class="table-wrap"><table class="dataset-table"><thead><tr><th>ID / 来源</th><th>位置 / 同步</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div><div id="datasetsPagination"></div></div>
         <div class="card">
           <h2>数据传输任务</h2>
           <p class="muted">显示数据集、checkpoint 和评估视频 transfer 的实时状态；进度来自传输 runner 的 sidecar，旧任务会用目标目录清单做保守估算。</p>
