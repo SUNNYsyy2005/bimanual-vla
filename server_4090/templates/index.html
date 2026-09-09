@@ -499,6 +499,8 @@ let episodeFramePending = null;
 let episodeFrameThrottleTimer = null;
 let episodeTrajectoryView = {yaw: 0, pitch: 0.45, zoom: 1, dragging: false, lastX: 0, lastY: 0};
 let episodeTrajectoryRenderCache = null;
+let episodeTrajectoryDrawPending = false;
+let episodeTrajectoryDrawRequest = null;
 let trainingMetricsData = null;
 let enabledMetrics = new Set();
 let metricsRequestSerial = 0;
@@ -1834,6 +1836,18 @@ function resetEpisodeTrajectoryView() {
   drawEpisodeTrajectory(episodeAnalysisData, episodeFrameCache.current?.frame_index || 0, episodeFrameCache.current);
 }
 
+function prepareEpisodeTrajectoryCanvas(canvas, width, height, ratio) {
+  const pixelWidth = Math.round(width * ratio);
+  const pixelHeight = Math.round(height * ratio);
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+  }
+  const context = canvas.getContext('2d');
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  return context;
+}
+
 function drawEpisodeTrajectoryFull(data, frame = 0, frameData = null) {
   const canvas = document.getElementById('episodeTrajectoryChart');
   const legend = document.getElementById('episodeTrajectoryLegend');
@@ -1841,10 +1855,7 @@ function drawEpisodeTrajectoryFull(data, frame = 0, frameData = null) {
   ensureEpisodeTrajectoryInteractions();
   const width = Math.max(320, canvas.clientWidth || 1000), height = 360;
   const ratio = window.devicePixelRatio || 1;
-  canvas.width = Math.round(width * ratio);
-  canvas.height = Math.round(height * ratio);
-  const ctx = canvas.getContext('2d');
-  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  const ctx = prepareEpisodeTrajectoryCanvas(canvas, width, height, ratio);
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = '#07121f';
   ctx.fillRect(0, 0, width, height);
@@ -2244,10 +2255,7 @@ function drawEpisodeTrajectoryIncremental(data, frame = 0, frameData = null) {
   }
   episodeTrajectoryRenderCache = cache;
 
-  const context = canvas.getContext('2d');
-  canvas.width = Math.round(width * ratio);
-  canvas.height = Math.round(height * ratio);
-  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  const context = prepareEpisodeTrajectoryCanvas(canvas, width, height, ratio);
   context.clearRect(0, 0, width, height);
   context.drawImage(cache.historyCanvas, 0, 0, width, height);
   const colors = {left: '#42c7ff', right: '#ff9f68'};
@@ -2280,13 +2288,25 @@ function drawEpisodeTrajectoryIncremental(data, frame = 0, frameData = null) {
   }
 }
 
-function drawEpisodeTrajectory(data, frame = 0, frameData = null) {
+function renderEpisodeTrajectoryNow(data, frame = 0, frameData = null) {
   try {
     drawEpisodeTrajectoryIncremental(data, frame, frameData);
   } catch (_error) {
     episodeTrajectoryRenderCache = null;
     drawEpisodeTrajectoryFull(data, frame, frameData);
   }
+}
+
+function drawEpisodeTrajectory(data, frame = 0, frameData = null) {
+  episodeTrajectoryDrawRequest = {data, frame, frameData};
+  if (episodeTrajectoryDrawPending) return;
+  episodeTrajectoryDrawPending = true;
+  requestAnimationFrame(() => {
+    episodeTrajectoryDrawPending = false;
+    const request = episodeTrajectoryDrawRequest;
+    episodeTrajectoryDrawRequest = null;
+    if (request) renderEpisodeTrajectoryNow(request.data, request.frame, request.frameData);
+  });
 }
 
 function renderEpisodeFrame(frame) {
