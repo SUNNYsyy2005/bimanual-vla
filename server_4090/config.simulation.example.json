@@ -11,6 +11,10 @@
   "openpi_repo": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05",
   "openpi_python": "/home/sunny/miniconda3/envs/openpi/bin/python",
   "dataset_root": "/mnt/nvme0n1p4_1T/sunny/tsq-storage/datasets/lerobot",
+  "dataset_read_roots": [
+    "/mnt/nvme0n1p4_1T/sunny/tsq-storage/datasets/lerobot",
+    "/mnt/sda1_16T/sunny/tsq-archive/datasets"
+  ],
   "workspace_root": "/mnt/nvme0n1p4_1T/sunny/tsq-storage/dashboard-workspace",
   "cache_root": "/mnt/nvme0n1p4_1T/sunny/tsq-storage/cache",
   "assets_base_dir": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/assets",

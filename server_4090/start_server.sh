@@ -29,6 +29,7 @@ if [[ ! -f "$TOKEN_FILE" ]]; then
 fi
 # shellcheck disable=SC1090
 source "$TOKEN_FILE"
+export BIMANUAL_VLA_TOKEN_FILE="$TOKEN_FILE"
 
 # Migrate an existing server.env created before username/password login was
 # added.  Keep the credentials in the same 0600 file as the API token so the

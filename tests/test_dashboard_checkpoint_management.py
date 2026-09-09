@@ -156,5 +156,85 @@ class DashboardCheckpointManagementTest(unittest.TestCase):
             self.assertEqual(matching[0]["arm_mode"], "bimanual")
 
 
+class DashboardSettingsAndDatasetRootsTest(unittest.TestCase):
+    def _make_app(self, root: Path):
+        storage = root / "datasets"
+        archive = root / "archive"
+        workspace = root / "workspace"
+        assets = root / "assets"
+        checkpoints = root / "checkpoints"
+        base = root / "base"
+        for path in (storage, archive, workspace, assets, checkpoints, base):
+            path.mkdir(parents=True, exist_ok=True)
+        for dataset in (storage / "stored_ds", archive / "archived_ds"):
+            (dataset / "meta").mkdir(parents=True)
+            (dataset / "meta" / "info.json").write_text(
+                json.dumps({"robot_type": "piper"}), encoding="utf-8"
+            )
+        (base / "params").mkdir()
+        (base / "params" / "_METADATA").write_text("{}", encoding="utf-8")
+        config = {
+            "openpi_repo": str(Path.cwd()),
+            "openpi_python": sys.executable,
+            "dataset_root": str(storage),
+            "dataset_read_roots": [str(archive)],
+            "workspace_root": str(workspace),
+            "assets_base_dir": str(assets),
+            "checkpoint_base_dir": str(checkpoints),
+            "base_checkpoint": str(base),
+            "checkpoint_allowed_roots": [str(checkpoints), str(base)],
+            "eval_video_roots": [],
+        }
+        config_path = root / "config.json"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        token = "z" * 32
+        with mock.patch.dict(os.environ, {"BIMANUAL_VLA_SERVER_TOKEN": token}, clear=False):
+            app = create_app(config_path)
+            app.config["TESTING"] = True
+        return app, token, config_path, storage, archive
+
+    def test_multiple_dataset_read_roots_are_scanned_and_external_is_read_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app, token, _config_path, _storage, _archive = self._make_app(Path(directory))
+            client = app.test_client()
+            headers = {"Authorization": f"Bearer {token}"}
+            response = client.get("/api/status", headers=headers)
+            self.assertEqual(response.status_code, 200)
+            datasets = {item["id"]: item for item in response.get_json()["datasets"]}
+            self.assertEqual(set(datasets), {"stored_ds", "archived_ds"})
+            self.assertFalse(datasets["stored_ds"]["read_only"])
+            self.assertTrue(datasets["archived_ds"]["read_only"])
+            blocked = client.patch(
+                "/api/datasets/archived_ds/origin",
+                headers=headers,
+                json={"dataset_origin": "real"},
+            )
+            self.assertEqual(blocked.status_code, 400)
+
+    def test_settings_round_trip_persists_single_storage_and_multiple_read_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, token, config_path, storage, archive = self._make_app(root)
+            client = app.test_client()
+            headers = {"Authorization": f"Bearer {token}"}
+            current = client.get("/api/settings", headers=headers).get_json()
+            self.assertEqual(
+                current["paths"]["dataset_read_roots"],
+                [str(storage.resolve()), str(archive.resolve())],
+            )
+            extra = root / "extra"
+            extra.mkdir()
+            paths = dict(current["paths"])
+            paths["dataset_read_roots"] = [str(storage), str(archive), str(extra)]
+            updated = client.put("/api/settings", headers=headers, json={"paths": paths})
+            self.assertEqual(updated.status_code, 200)
+            self.assertIn("dataset_read_roots", updated.get_json()["changed"])
+            persisted = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["dataset_read_roots"],
+                [str(storage.resolve()), str(archive.resolve()), str(extra.resolve())],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

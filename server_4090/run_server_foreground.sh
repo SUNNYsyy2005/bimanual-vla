@@ -39,6 +39,7 @@ chmod 600 "$TOKEN_FILE"
 # systemd EnvironmentFile syntax, so source it in this small foreground wrapper.
 # shellcheck disable=SC1090
 source "$TOKEN_FILE"
+export BIMANUAL_VLA_TOKEN_FILE="$TOKEN_FILE"
 
 # Migrate credentials created by older versions of start_server.sh.
 if [[ -z "${BIMANUAL_VLA_SERVER_TOKEN:-}" ]]; then
