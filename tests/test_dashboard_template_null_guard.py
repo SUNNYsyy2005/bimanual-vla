@@ -193,6 +193,28 @@ class DashboardTemplateNullGuardTest(unittest.TestCase):
             template,
         )
 
+    def test_settings_panel_loads_values_when_opened_and_uses_full_width(self):
+        template = (
+            REPO_ROOT / "server_4090/templates/index.html"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "if (moduleName === 'settings') {\n    // Settings are loaded when the panel is opened",
+            template,
+        )
+        self.assertIn(
+            "loadSettings({quiet: true});\n  }\n}\n\nfunction cameraDisplayName",
+            template,
+        )
+        self.assertIn(
+            '<section class="card">\n          <h2>路径配置</h2>',
+            template,
+        )
+        self.assertNotIn(
+            '<section class="card two-third">\n          <h2>路径配置</h2>',
+            template,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -306,6 +306,7 @@
     html[data-theme="light"] .preview-grid img,
     html[data-theme="light"] .telemetry-camera-card img { border-color:var(--line); background:#e8eef5; }
     html[data-theme="light"] .episode-panel.table-wrap thead th { background:var(--table-head); }
+    html[data-theme="light"] th { color:#245775; background:var(--table-head); border-bottom-color:var(--line); }
     html[data-theme="light"] .telemetry-alert { background:#fff7e6; color:#8a5a00; }
     html[data-theme="light"] .telemetry-note { background:#eaf7ff; color:#245b7d; }
     html[data-theme="light"] .section-note { background:#eaf7ff; color:#45677f; }
@@ -604,7 +605,7 @@
     <section id="module-settings" class="dashboard-module" data-module="settings" hidden>
       <div class="module-heading"><div><h2>设置</h2><p>配置数据集、模型、基础模型和 Dashboard 运行产物的服务器路径；目录浏览器只显示已授权的服务器目录。</p></div></div>
       <div class="grid">
-        <section class="card two-third">
+        <section class="card">
           <h2>路径配置</h2>
           <p class="muted">模型路径保存后立即用于扫描和新任务。数据集、assets、工作目录和缓存路径保存到配置文件，重启 Dashboard 后完全生效。</p>
           <form id="settingsForm" class="compact-submission">
@@ -1716,6 +1717,12 @@ function showModule(name, updateHash = true) {
       loadTrainingMetrics({quiet: true});
     }
   }
+  if (moduleName === 'settings') {
+    // Settings are loaded when the panel is opened, rather than relying on an
+    // unrelated dataset-editor render to populate the form.  This keeps the
+    // configured/default directory values visible immediately after login.
+    loadSettings({quiet: true});
+  }
 }
 
 function cameraDisplayName(key, armSide = 'right') {
@@ -2102,7 +2109,6 @@ function renderEpisodeEditorSelector(episodes) {
       ? `当前正在编辑 Episode ${selector.value}；相机帧与逐帧分析同步更新。`
       : '编辑区位于列表下方；可在这里切换当前页 Episode。';
   }
-  if (moduleName === 'settings') loadSettings({quiet: true});
 }
 
 function renderEpisodeEventCell(episode) {
