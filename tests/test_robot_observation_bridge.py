@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from threading import Event
 from types import SimpleNamespace
+import os
 import tempfile
 import time
 import unittest
@@ -47,6 +49,7 @@ from bimanual_vla.deployment.client import (
     GRIPPER_OPENING_METRES,
     InferenceLaunch,
     InferenceWorkerResult,
+    ManualInferenceTrigger,
     MonitoringRecorder,
     PeriodicSchedule,
     PolicyProtocol,
@@ -2188,6 +2191,45 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         np.testing.assert_allclose(due_at, [0.0, 0.25, 0.50, 0.75], atol=1e-12)
         self.assertAlmostEqual(schedule.period_s, 0.25)
 
+    def test_chunk_step_trigger_uses_published_source_index_once_per_generation(self):
+        execution, _ = self.configured_execution(
+            inference_trigger_mode="chunk_step", inference_trigger_step=10
+        )
+        _, actions = decode_action_queue(
+            self.joint_chunk(20), self.joint_protocol, self.raw_state, self.qpos,
+            generation=7, observation_capture_monotonic=100.0, action_hz=20.0,
+        )
+        schedule = PeriodicSchedule(4.0, next_at=0.0)
+        self.assertTrue(execution.async_launch_due(schedule, 0.0))  # first request
+        execution.active_generation = 7
+        execution.pending_actions = actions[10:]
+        execution.last_safe_target = actions[8]
+        self.assertFalse(execution.chunk_step_launch_due())
+        self.assertFalse(execution.async_launch_due(schedule, 0.10))
+        execution.last_safe_target = actions[9]
+        self.assertTrue(execution.chunk_step_launch_due())
+        self.assertTrue(execution.async_launch_due(schedule, 0.10))
+        launch, _ = inference_launch(self.raw_state, self.qpos, generation=8)
+        execution.record_inference_launch(launch)
+        self.assertFalse(execution.chunk_step_launch_due())
+        self.assertFalse(execution.async_launch_due(schedule, 0.20))
+        execution.rejected_result = {"generation": 8}
+        self.assertTrue(execution.async_launch_due(schedule, 0.25))
+        execution.rejected_result = None
+
+        # A replacement may start after skipped rows. Its own source index,
+        # rather than the number of rows left in the local queue, governs the
+        # next request.
+        execution.active_generation = 8
+        execution.last_safe_target = replace(actions[9], generation=8)
+        self.assertTrue(execution.chunk_step_launch_due())
+
+    def test_chunk_step_must_fit_advertised_horizon(self):
+        with self.assertRaisesRegex(ValueError, "trigger step"):
+            self.configured_execution(
+                inference_trigger_mode="chunk_step", inference_trigger_step=50
+            )
+
     def test_control_rate_must_match_policy_action_rate(self):
         execution = ExecutionController(
             FakePiper(), execution_args(control_hz=10.0, action_hz=None)
@@ -2332,6 +2374,143 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         )
         self.assertIn("translation step", execution.blocked_reason)
         self.assertNotIn("EndPoseCtrl", [call[0] for call in piper.calls])
+
+    def test_async_inference_default_keeps_full_accepted_chunk(self):
+        execution, _piper = self.configured_execution()
+        chunk = self.joint_chunk(50, 0.1)
+        launch, arrived_at = inference_launch(self.raw_state, self.qpos, generation=1)
+        self.assertTrue(
+            execution.accept_inference_result(
+                execution_result(chunk),
+                launch,
+                self.joint_protocol,
+                arrived_at=arrived_at,
+                arrived_monotonic=time.monotonic(),
+            )
+        )
+        self.assertEqual(execution.pending_action_count, len(chunk))
+
+    def test_sync_inference_truncates_accepted_chunk_to_wait_steps(self):
+        execution, _piper = self.configured_execution(
+            async_inference=False, sync_wait_steps=5
+        )
+        self.assertFalse(execution.async_inference)
+        self.assertEqual(execution.sync_wait_steps, 5)
+        chunk = self.joint_chunk(50, 0.1)
+        launch, arrived_at = inference_launch(self.raw_state, self.qpos, generation=1)
+        self.assertTrue(
+            execution.accept_inference_result(
+                execution_result(chunk),
+                launch,
+                self.joint_protocol,
+                arrived_at=arrived_at,
+                arrived_monotonic=time.monotonic(),
+            )
+        )
+        self.assertEqual(execution.pending_action_count, 5)
+
+    def test_sync_wait_steps_defaults_and_clamps_to_at_least_one(self):
+        execution, _piper = self.configured_execution(sync_wait_steps=0)
+        self.assertEqual(execution.sync_wait_steps, 1)
+
+    def test_sync_mode_truncated_chunk_survives_realistic_latency_without_stale_drop(self):
+        """Regression test for the concern that a delayed (but truncated) sync
+        chunk could be immediately eaten by the execute-time staleness catch-up
+        (``_first_future_target_index`` in ``execute_next``). The chunk is
+        retimed from ``arrived_monotonic`` on accept (same cold-start path
+        exercised by ``test_cold_start_retimes_chunk_and_executes_rows_sequentially``),
+        so every truncated row should still execute exactly once, one per
+        control tick, with zero rows dropped as stale.
+        """
+        execution, piper = self.configured_execution(
+            control_hz=20.0, async_inference=False, sync_wait_steps=5
+        )
+        actions = self.joint_chunk(50, np.linspace(0.01, 0.50, 50))
+        launch, _ = inference_launch(
+            self.raw_state,
+            self.qpos,
+            generation=1,
+            captured_monotonic=100.0,
+        )
+        # 0.24s of round-trip latency, matching real measured Policy latency.
+        self.assertTrue(
+            execution.accept_inference_result(
+                execution_result(actions),
+                launch,
+                self.joint_protocol,
+                arrived_at=launch.captured_at + 0.24,
+                arrived_monotonic=100.24,
+            )
+        )
+        self.assertEqual(execution.pending_action_count, 5)
+        self.assertEqual(execution.expired_drop_count, 0)
+
+        for tick, now_monotonic in enumerate((100.24, 100.29, 100.34, 100.39, 100.44)):
+            with self.subTest(tick=tick):
+                with patch(
+                    "bimanual_vla.deployment.client.time.monotonic",
+                    return_value=now_monotonic,
+                ):
+                    self.assertTrue(
+                        execution.execute_next(
+                            self.raw_state,
+                            self.qpos,
+                            self.joint_protocol,
+                            feedback_captured_at=time.time(),
+                        )
+                    )
+                self.assertEqual(execution.last_queued_action_index, tick)
+                self.assertEqual(execution.expired_drop_count, 0)
+
+        self.assertEqual(execution.pending_action_count, 0)
+
+    def test_auto_next_inference_defaults_true_and_reads_from_args(self):
+        execution, _piper = self.configured_execution()
+        self.assertTrue(execution.async_inference)
+        self.assertTrue(execution.auto_next_inference)
+        manual, _piper = self.configured_execution(
+            async_inference=False, auto_next_inference=False
+        )
+        self.assertFalse(manual.auto_next_inference)
+
+
+class ManualInferenceTriggerTest(unittest.TestCase):
+    def test_disabled_without_a_path_never_fires(self):
+        trigger = ManualInferenceTrigger(None)
+        self.assertFalse(trigger.enabled)
+        self.assertFalse(trigger.consume())
+        self.assertFalse(trigger.consume())
+
+    def test_missing_file_is_treated_as_no_request_yet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "does-not-exist.txt")
+            trigger = ManualInferenceTrigger(path)
+            self.assertTrue(trigger.enabled)
+            self.assertFalse(trigger.consume())
+
+    def test_each_distinct_value_fires_exactly_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "trigger.txt")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("0")
+            trigger = ManualInferenceTrigger(path)
+
+            # The GUI writes an initial sentinel before the subprocess starts;
+            # that first value must not itself count as a click.
+            self.assertFalse(trigger.consume())
+            self.assertFalse(trigger.consume())
+
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("1727600000.123")
+            self.assertTrue(trigger.consume())
+            # Repeated polls before the next click must not re-fire.
+            self.assertFalse(trigger.consume())
+            self.assertFalse(trigger.consume())
+
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("1727600001.456")
+            self.assertTrue(trigger.consume())
+            self.assertFalse(trigger.consume())
 
 
 class ExecutionQueueTest(unittest.TestCase):
@@ -2520,6 +2699,11 @@ class ExecutionQueueTest(unittest.TestCase):
         np.testing.assert_array_equal(
             side["piper_jointctrl_units"],
             np.rint(np.asarray(side["commanded_joints_rad"]) * RAD_FACTOR).astype(np.int64),
+        )
+        np.testing.assert_allclose(
+            execution.last_commanded_joint_positions,
+            np.asarray(side["piper_jointctrl_units"]) / RAD_FACTOR,
+            atol=1e-6,
         )
 
         next_qpos = self.qpos.copy()

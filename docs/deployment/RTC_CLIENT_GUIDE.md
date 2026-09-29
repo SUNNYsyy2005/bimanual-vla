@@ -76,8 +76,11 @@ telemetry 断开或任一逐周期安全检查失败时，客户端只会保持�
 ## 控制与 RTC 时序
 
 - 相机和 Piper 反馈持续运行；
-- Policy 推理默认以 4 Hz **尝试发起**，单次只允许一个在途请求；
-- 因此 4 Hz 是调度目标，不是实际吞吐保证；若 capture-to-result 为 550 ms，实际频率上限约为 `1/0.55=1.82 Hz`；
+- 异步推理默认使用 `--inference-trigger-mode periodic`，以 `--hz 4` **尝试发起**请求，单次只允许一个在途请求；
+- 可改用 `--inference-trigger-mode chunk_step --inference-trigger-step 10`：每个已接受 chunk 的原始第 10 步成功下发后发起下一次请求，旧 chunk 在推理期间继续执行。若新 chunk 跳过了前缀，仍按其原始步号判断触发点；每个 chunk 只触发一次；
+- `chunk_step` 模式下 `--hz` 是首次请求、失败及队列耗尽时的重试频率，不限制正常的步号触发。触发步号必须小于服务端公布的 action horizon；
+- `--control-hz` 控制机器人下发频率，必须与服务端公布的 action rate 一致；GUI 左侧 Policy and task 的 Inference timing 区域可设置触发模式、步号、请求频率和控制频率；
+- 周期模式的 4 Hz 是调度目标，不是实际吞吐保证；若 capture-to-result 为 550 ms，实际频率上限约为 `1/0.55=1.82 Hz`；
 - 客户端 telemetry 分开上报 `configured_inference_hz`、`inference_launch_hz`、`inference_result_hz`，并上报单在途上限；
 - 客户端根据上一轮 capture-to-result latency 估计本次 `inference_delay_steps`；
 - 客户端根据 active chunk 的 `source_index` 发送 `previous_chunk_offset_steps`；
@@ -86,6 +89,19 @@ telemetry 断开或任一逐周期安全检查失败时，客户端只会保持�
 - RTC 模式默认不做额外客户端轨迹插值；只有显式设置 `--rtc-client-blend-steps` 才启用安全 fallback；
 - 推理失败、generation 不匹配、连接断开或队列耗尽时 fail closed 并保持最后安全目标；
 - `monitoring_data/<session>/events.jsonl` 和模型结果记录中包含 RTC telemetry。
+
+运行中的 Trajectory jitter 显示在 Dashboard 的 Policy 实时观测区，并保存在
+`monitoring_data/<session>/events.jsonl` 的周期 `control_tick.trajectory_jitter`
+和结束事件中。完整运行记录还包含 `deployment_runs/<run>/trajectory_jitter.jsonl`
+（逐 chunk 与边界事件）、`metadata.json` 的 `trajectory_jitter` 汇总，以及
+`trajectory.npz` 的 `command_joints_rad` 和 `command_monotonic_timestamp`。
+使用 `--no-recording` 时不生成这些抖动统计。
+
+- **Mean intra-chunk acceleration magnitude**：同一 chunk 内，连续且接近固定控制周期的已下发关节命令，其二阶差分 L2 范数的均值，单位 `rad/step²`。跳步、未下发命令和保持命令不参与计算；此指标只在固定采样频率下有意义。
+- **Position jump at chunk boundary**：上一 chunk 最后一条实际下发关节命令与下一 chunk 第一条之间的位置 L2 距离均值，单位 `rad`。
+- **Cosine similarity of velocity direction at chunk boundary**：用上一 chunk 最后两个连续命令及下一 chunk 最前两个连续命令计算方向余弦均值。存在保持、漏周期或零速度时，该边界不纳入余弦均值；Dashboard 同时显示有效样本数。
+
+监控 JSONL 写盘、运行记录与视频编码均在后台线程执行；GUI 控制台日志通过有界队列输出，队列满时丢弃控制台日志以保护控制周期。日志不通过动作 WebSocket 传输。Dashboard 图像预览最多每秒更新一次，浏览器只在新图像序号出现时重新下载。
 
 ### 重要约束
 

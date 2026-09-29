@@ -29,7 +29,7 @@ server_4090/SIMULATION_DASHBOARD.md
 - Dashboard 可以新建、健康检测、停止、强制结束 Policy，并用新 checkpoint 替换运行中的 Policy。
 - 已完成、失败、丢失或停止的训练 / Policy 历史任务可从对应模块删除任务记录和日志；checkpoint、模型与训练输出不会被删除。
 - 机械臂客户端默认是 shadow-only；只有显式添加 `--allow-execution`、Dashboard 对同一 Policy 给出未过期的 EXECUTE 授权、telemetry 新鲜、`action_horizon >= 16` 且本地安全检查全部通过时，才会发布异步 chunk 命令。
-- 机械臂客户端默认把完整本地监测轨迹追加保存到 `./monitoring_data/<session>/events.jsonl`；可用 `--monitoring-dir` 指定其他目录。记录器在后台线程写盘，不阻塞 20 Hz 控制循环；原始图像不写入 JSONL，只保留相机设备和时间戳。
+- 机械臂客户端默认把本地监测轨迹追加保存到 `./monitoring_data/<session>/events.jsonl`；可用 `--monitoring-dir` 指定其他目录。记录器在后台线程写盘，控制台日志也经有界后台队列输出。监控日志不走动作 WebSocket；原始图像不写入 JSONL，只保留相机设备和时间戳。Dashboard 图像预览最多每秒更新一次，减小与动作传输共享网络时的流量。
 
 ## 部署并启动 Dashboard
 

@@ -368,6 +368,42 @@ def connect(can_name: str) -> Any:
     )
     piper.ConnectPort(can_init=True, piper_init=True)
     time.sleep(0.5)
+
+    # Robustly initialize arm to CAN joint control mode
+    # This ensures the arm is ready for inference/collection without enable timeout
+    max_retries = 10
+    for attempt in range(max_retries):
+        try:
+            # Read current status
+            status_msg = piper.GetArmStatus()
+            if not hasattr(status_msg, 'arm_status'):
+                time.sleep(0.1)
+                continue
+
+            feedback = status_msg.arm_status
+            current_ctrl_mode = int(feedback.ctrl_mode)
+
+            # If already in CAN mode, done
+            if current_ctrl_mode == 0x01:
+                break
+
+            # Send mode control command
+            piper.ModeCtrl(
+                0x01,  # PIPER_CTRL_MODE_CAN
+                0x01,  # PIPER_MOVE_MODE_J (joint mode)
+                10,    # speed_pct
+                0x00,
+            )
+            time.sleep(0.15)
+
+        except Exception as e:
+            # Log but continue retrying
+            if attempt == max_retries - 1:
+                # Last attempt, print warning but don't fail
+                import logging
+                logging.warning(f"Could not set CAN mode for {can_name}: {e}")
+            time.sleep(0.1)
+
     return piper
 
 

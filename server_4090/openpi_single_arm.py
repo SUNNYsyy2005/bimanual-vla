@@ -2654,6 +2654,32 @@ def sanitize_async_client_telemetry(
     result["client_delivery_safety_limits"] = _telemetry_json_value(
         client.get("delivery_safety_limits"), action_dim=action_dim
     )
+    jitter = client.get("trajectory_jitter")
+    if isinstance(jitter, dict):
+        cosine = _telemetry_finite_float(jitter.get("boundary_momentum_cosine_mean"))
+        result["client_trajectory_jitter"] = {
+            "basis": str(jitter.get("basis", ""))[:96],
+            "nominal_control_hz": _telemetry_positive_float(jitter.get("nominal_control_hz")),
+            "intra_accel_mean_rad_per_step2": _telemetry_nonnegative_float(
+                jitter.get("intra_accel_mean_rad_per_step2")
+            ),
+            "intra_accel_samples": _telemetry_nonnegative_int(jitter.get("intra_accel_samples")),
+            "boundary_jump_mean_rad_l2": _telemetry_nonnegative_float(
+                jitter.get("boundary_jump_mean_rad_l2")
+            ),
+            "boundary_jump_samples": _telemetry_nonnegative_int(jitter.get("boundary_jump_samples")),
+            "boundary_momentum_cosine_mean": (
+                cosine if cosine is not None and -1.0 <= cosine <= 1.0 else None
+            ),
+            "boundary_momentum_samples": _telemetry_nonnegative_int(
+                jitter.get("boundary_momentum_samples")
+            ),
+            "stationary_boundary_count": _telemetry_nonnegative_int(
+                jitter.get("stationary_boundary_count")
+            ),
+        }
+    else:
+        result["client_trajectory_jitter"] = None
     result["client_async_telemetry_present"] = any(value is not None for value in result.values())
     return result
 
@@ -2714,6 +2740,11 @@ class PolicyTelemetry:
         self._last_json_drop_log = 0.0
         self._image_drop_count = 0
         self._last_image_drop_log = 0.0
+        # Dashboard preview traffic is best effort and deliberately slower
+        # than the action WebSocket. Pollers only download a newly sampled frame.
+        self._image_period_s = 1.0
+        self._next_image_at = 0.0
+        self._image_sequence: int | None = None
         self._execution_control_cache: dict[str, Any] = {}
         self._execution_control_mtime_ns: int | None = None
         self._execution_control_checked_at = 0.0
@@ -2827,9 +2858,10 @@ class PolicyTelemetry:
             except Exception:
                 logging.exception("failed to stop policy telemetry writer")
 
-    def _enqueue_images(self, images: dict[str, np.ndarray]) -> None:
+    def _enqueue_images(self, images: dict[str, np.ndarray]) -> bool:
         try:
             self._image_queue.put_nowait(images)
+            return True
         except queue.Full:
             # Telemetry is not part of the robot control contract. Dropping a
             # frame is preferable to adding latency to policy inference.
@@ -2841,6 +2873,7 @@ class PolicyTelemetry:
                     "Policy telemetry image queue full; dropped=%d",
                     self._image_drop_count,
                 )
+            return False
 
     @staticmethod
     def _client_address(remote_address: Any) -> str:
@@ -3009,11 +3042,14 @@ class PolicyTelemetry:
         images = observation.get("images", {})
         camera_shapes: dict[str, list[int]] = {}
         image_payload: dict[str, np.ndarray] = {}
+        now_monotonic = time.monotonic()
+        image_due = now_monotonic >= self._next_image_at and not self._image_queue.full()
         for camera_key in self.metadata["camera_keys"]:
-            image = np.asarray(images[camera_key], dtype=np.uint8).copy()
+            image = np.asarray(images[camera_key], dtype=np.uint8)
             camera_shapes[camera_key] = list(image.shape)
-            image_payload[camera_key] = image
-        if self.metadata["arm_mode"] == "single":
+            if image_due:
+                image_payload[camera_key] = image.copy()
+        if image_due and self.metadata["arm_mode"] == "single":
             wrist_key = next(key for key in self.metadata["camera_keys"] if "wrist" in key)
             if wrist_key != "cam_wrist":
                 # The writer only reads frames; reuse the already copied
@@ -3199,10 +3235,13 @@ class PolicyTelemetry:
             "policy_timing": result.get("policy_timing"),
             "execution_control": result.get("execution_control"),
         }
+        if image_payload and self._enqueue_images(image_payload):
+            self._image_sequence = sequence
+            self._next_image_at = now_monotonic + self._image_period_s
+        payload["image_sequence"] = self._image_sequence
         with self.lock:
             self._latest_payload = payload
         self._enqueue_json(self.root / "latest.json", payload)
-        self._enqueue_images(image_payload)
         return sequence
 
     def mark_response_ready(self, sequence: int, response_ready_at: float) -> None:

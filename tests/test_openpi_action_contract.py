@@ -164,6 +164,61 @@ class OpenPiActionTransformTest(unittest.TestCase):
 
 
 class AsyncTelemetrySanitizerTest(unittest.TestCase):
+    def test_trajectory_jitter_is_bounded_and_finite(self):
+        telemetry = HELPER.sanitize_async_client_telemetry(
+            {"trajectory_jitter": {
+                "basis": "published_joint_commands",
+                "nominal_control_hz": 20.0,
+                "intra_accel_mean_rad_per_step2": 0.02,
+                "intra_accel_samples": 12,
+                "boundary_jump_mean_rad_l2": 0.1,
+                "boundary_jump_samples": 3,
+                "boundary_momentum_cosine_mean": float("nan"),
+                "boundary_momentum_samples": 0,
+            }},
+            action_dim=14,
+            action_horizon=50,
+        )["client_trajectory_jitter"]
+        self.assertEqual(telemetry["intra_accel_mean_rad_per_step2"], 0.02)
+        self.assertEqual(telemetry["boundary_jump_mean_rad_l2"], 0.1)
+        self.assertIsNone(telemetry["boundary_momentum_cosine_mean"])
+
+    def test_dashboard_images_are_sampled_independently_of_policy_results(self):
+        metadata = {
+            "camera_keys": ["cam_high", "cam_right_wrist"],
+            "arm_mode": "single",
+            "arm_side": "right",
+            "schema": "joint",
+            "state_dim": 7,
+            "action_dim": 7,
+            "action_horizon": 50,
+        }
+        observation = {
+            "images": {
+                "cam_high": np.zeros((3, 8, 8), dtype=np.uint8),
+                "cam_right_wrist": np.zeros((3, 8, 8), dtype=np.uint8),
+            },
+            "state": np.zeros(7, dtype=np.float32),
+            "client_metadata": {},
+        }
+        result = {"actions": np.zeros((2, 7), dtype=np.float32)}
+        with tempfile.TemporaryDirectory() as directory:
+            telemetry = HELPER.PolicyTelemetry(Path(directory), metadata)
+            queued_images = []
+            telemetry._enqueue_images = lambda images: queued_images.append(images) or True
+            try:
+                telemetry.publish(observation, result, 0.1)
+                self.assertEqual(telemetry._latest_payload["image_sequence"], 1)
+                telemetry.publish(observation, result, 0.1)
+                self.assertEqual(telemetry._latest_payload["image_sequence"], 1)
+                self.assertEqual(len(queued_images), 1)
+                telemetry._next_image_at = 0.0
+                telemetry.publish(observation, result, 0.1)
+                self.assertEqual(telemetry._latest_payload["image_sequence"], 3)
+                self.assertEqual(len(queued_images), 2)
+            finally:
+                telemetry.close()
+
     def test_valid_async_fields_are_sanitized_and_preserved(self):
         telemetry = HELPER.sanitize_async_client_telemetry(
             {

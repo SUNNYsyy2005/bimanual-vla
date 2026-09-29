@@ -24,13 +24,15 @@ import json
 import logging
 import os
 from pathlib import Path
-from queue import Full, Queue
+from queue import Empty, Full, Queue
 import threading
 import time
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 import numpy as np
+
+from bimanual_vla.deployment.jitter import TrajectoryJitterMonitor
 
 
 LOGGER = logging.getLogger(__name__)
@@ -119,15 +121,19 @@ class DeploymentRunRecorder:
         self._dropped_event_count = 0
         self._queue: Queue[Any] | None = None
         self._worker: threading.Thread | None = None
+        self._video_queue: Queue[Any] | None = None
+        self._video_worker: threading.Thread | None = None
         self._closed = True
         self._trajectory_file: Any | None = None
         self._model_file: Any | None = None
         self._video_index_file: Any | None = None
+        self._jitter_file: Any | None = None
+        self._jitter_monitor: TrajectoryJitterMonitor | None = None
+        self._jitter_snapshot: dict[str, Any] | None = None
         self._video_writers: dict[str, Any] = {}
         self._video_paths: dict[str, Path] = {}
         self._video_frame_fallback_dirs: dict[str, Path] = {}
         self._video_frame_counts: dict[str, int] = {}
-        self._lock = threading.Lock()
 
     @property
     def is_active(self) -> bool:
@@ -182,7 +188,15 @@ class DeploymentRunRecorder:
         self._video_index_file = (run_dir / "videos" / "timestamps.jsonl").open(
             "w", encoding="utf-8", buffering=64 * 1024
         )
+        self._jitter_file = (run_dir / "trajectory_jitter.jsonl").open(
+            "w", encoding="utf-8", buffering=64 * 1024
+        )
+        self._jitter_monitor = TrajectoryJitterMonitor(
+            float(self._metadata.get("control_hz", 20.0))
+        )
+        self._jitter_snapshot = self._jitter_monitor.summary()
         self._queue = Queue(maxsize=self.queue_size)
+        self._video_queue = Queue(maxsize=min(64, max(8, self.queue_size // 64)))
         self._closed = False
         self._worker = threading.Thread(
             target=self._writer_loop,
@@ -190,17 +204,27 @@ class DeploymentRunRecorder:
             daemon=True,
         )
         self._worker.start()
+        self._video_worker = threading.Thread(
+            target=self._video_writer_loop,
+            name="deployment-video-recorder",
+            daemon=True,
+        )
+        self._video_worker.start()
         self._write_metadata()
         LOGGER.info("Deployment recording started: %s", run_dir)
         return run_dir
 
     def update_metadata(self, values: Mapping[str, Any]) -> None:
-        """Merge connection/protocol metadata and update ``metadata.json``."""
+        """Queue connection/protocol metadata without writing on the control loop."""
         if not self.is_active:
             return
-        with self._lock:
-            self._metadata.update(_json_safe(dict(values)))
-            self._write_metadata()
+        self._enqueue(("metadata", dict(values)))
+
+    @property
+    def jitter_snapshot(self) -> dict[str, Any] | None:
+        """Latest complete worker snapshot; reading it never waits for disk I/O."""
+        snapshot = self._jitter_snapshot
+        return None if snapshot is None else dict(snapshot)
 
     def record_control_tick(
         self,
@@ -214,6 +238,8 @@ class DeploymentRunRecorder:
         absolute_dim: int,
         command_action: np.ndarray | None = None,
         command_absolute_target: np.ndarray | None = None,
+        command_joints_rad: np.ndarray | None = None,
+        command_monotonic_timestamp: float | None = None,
         command_generation: int | None = None,
         command_queue_index: int | None = None,
         command_hold: bool = False,
@@ -227,6 +253,8 @@ class DeploymentRunRecorder:
         joints = _as_finite_array(qpos)
         raw = np.full(int(action_dim), np.nan, dtype=np.float32)
         absolute = np.full(int(absolute_dim), np.nan, dtype=np.float32)
+        joint_dim = (len(joints) // 7) * 6
+        command_joints = np.full(joint_dim, np.nan, dtype=np.float32)
         if command_action is not None:
             candidate = _as_finite_array(command_action)
             if candidate.shape != raw.shape:
@@ -239,6 +267,13 @@ class DeploymentRunRecorder:
                     f"command_absolute_target must have shape {absolute.shape}, got {candidate.shape}"
                 )
             absolute[:] = candidate
+        if command_joints_rad is not None:
+            candidate = _as_finite_array(command_joints_rad)
+            if candidate.shape != command_joints.shape:
+                raise ValueError(
+                    f"command_joints_rad must have shape {command_joints.shape}, got {candidate.shape}"
+                )
+            command_joints[:] = candidate
         row = {
             "timestamp": float(timestamp),
             "monotonic_timestamp": float(monotonic_timestamp),
@@ -246,6 +281,11 @@ class DeploymentRunRecorder:
             "qpos": joints,
             "command_action": raw,
             "command_absolute_target": absolute,
+            "command_joints_rad": command_joints,
+            "command_monotonic_timestamp": (
+                np.nan if command_monotonic_timestamp is None
+                else float(command_monotonic_timestamp)
+            ),
             "command_sent": bool(command_sent),
             "command_generation": -1 if command_generation is None else int(command_generation),
             "command_queue_index": -1 if command_queue_index is None else int(command_queue_index),
@@ -284,7 +324,7 @@ class DeploymentRunRecorder:
             ts = float(timestamps.get(key, time.time()))
             if not np.isfinite(ts):
                 raise ValueError(f"camera timestamp for {key!r} must be finite")
-            self._enqueue(
+            self._enqueue_video(
                 (
                     "video",
                     _VideoFrame(
@@ -378,12 +418,24 @@ class DeploymentRunRecorder:
         if not self.is_active:
             return self.run_dir
         assert self._queue is not None
+        # Camera capture remains alive until after recorder shutdown in the
+        # client. Stop accepting new frames before placing worker sentinels.
+        self._closed = True
         self._enqueue(("metadata", {"stopped_reason": str(reason)[:200]}), force=True)
         self._enqueue(_STOP, force=True)
+        self._enqueue_video(_STOP, force=True)
         if self._worker is not None:
             self._worker.join(timeout=30.0)
             if self._worker.is_alive():
                 LOGGER.error("Timed out flushing deployment recording: %s", self.run_dir)
+        if self._video_worker is not None:
+            self._video_worker.join(timeout=30.0)
+            if self._video_worker.is_alive():
+                LOGGER.error("Timed out flushing deployment video: %s", self.run_dir)
+        if self._worker is not None and not self._worker.is_alive() and self._jitter_monitor is not None:
+            final_chunk = self._jitter_monitor.finish()
+            if final_chunk is not None and self._jitter_file is not None:
+                self._jitter_file.write(json.dumps(final_chunk, ensure_ascii=False) + "\n")
         for writer in self._video_writers.values():
             try:
                 writer.release()
@@ -401,18 +453,21 @@ class DeploymentRunRecorder:
                 "dropped_event_count": self._dropped_event_count,
                 "video_cameras": sorted(self._video_paths),
                 "video_fallback_cameras": sorted(self._video_frame_fallback_dirs),
+                "trajectory_jitter": self.jitter_snapshot,
             }
         )
         self._write_metadata()
-        for stream in (self._trajectory_file, self._model_file, self._video_index_file):
+        for stream in (self._trajectory_file, self._model_file, self._video_index_file, self._jitter_file):
             if stream is not None:
                 stream.close()
         self._trajectory_file = None
         self._model_file = None
         self._video_index_file = None
+        self._jitter_file = None
         self._queue = None
         self._worker = None
-        self._closed = True
+        self._video_queue = None
+        self._video_worker = None
         LOGGER.info("Deployment recording saved: %s", self.run_dir)
         return self.run_dir
 
@@ -429,6 +484,31 @@ class DeploymentRunRecorder:
             self._dropped_event_count += 1
             if self._dropped_event_count == 1 or self._dropped_event_count % 100 == 0:
                 LOGGER.warning("Deployment recording queue full; dropped %d events", self._dropped_event_count)
+
+    def _enqueue_video(self, event: Any, *, force: bool = False) -> None:
+        video_queue = self._video_queue
+        if video_queue is None:
+            return
+        if force:
+            # A full best-effort video queue must not prevent the shutdown
+            # sentinel from reaching its worker. Drop the oldest frame.
+            while True:
+                try:
+                    video_queue.put_nowait(event)
+                    return
+                except Full:
+                    try:
+                        video_queue.get_nowait()
+                        video_queue.task_done()
+                        self._dropped_event_count += 1
+                    except Empty:
+                        continue
+        try:
+            video_queue.put_nowait(event)
+        except Full:
+            self._dropped_event_count += 1
+            if self._dropped_event_count == 1 or self._dropped_event_count % 100 == 0:
+                LOGGER.warning("Deployment video queue full; dropped %d events", self._dropped_event_count)
 
     def _write_metadata(self) -> None:
         if self.run_dir is None:
@@ -458,6 +538,8 @@ class DeploymentRunRecorder:
                 "qpos": np.empty((0, 0), dtype=np.float32),
                 "command_action": np.empty((0, 0), dtype=np.float32),
                 "command_absolute_target": np.empty((0, 0), dtype=np.float32),
+                "command_joints_rad": np.empty((0, 0), dtype=np.float32),
+                "command_monotonic_timestamp": np.empty((0,), dtype=np.float64),
                 "command_sent": np.empty((0,), dtype=np.bool_),
                 "command_generation": np.empty((0,), dtype=np.int64),
                 "command_queue_index": np.empty((0,), dtype=np.int64),
@@ -494,6 +576,10 @@ class DeploymentRunRecorder:
             "command_action": np.stack([row["command_action"] for row in rows]),
             "command_absolute_target": np.stack(
                 [row["command_absolute_target"] for row in rows]
+            ),
+            "command_joints_rad": np.stack([row["command_joints_rad"] for row in rows]),
+            "command_monotonic_timestamp": np.asarray(
+                [row["command_monotonic_timestamp"] for row in rows], dtype=np.float64
             ),
             "command_sent": np.asarray(
                 [row["command_sent"] for row in rows], dtype=np.bool_
@@ -539,11 +625,10 @@ class DeploymentRunRecorder:
                     return
                 kind = event[0]
                 if kind == "control":
+                    self._observe_jitter(event[1])
                     self._write_control_json(event[1])
                 elif kind == "trajectory_chunk":
                     self._write_trajectory_chunk(event[1])
-                elif kind == "video":
-                    self._write_video_frame(event[1])
                 elif kind == "model":
                     self._write_model(event[1], event[2])
                 elif kind == "metadata":
@@ -554,6 +639,19 @@ class DeploymentRunRecorder:
             finally:
                 self._queue.task_done()
 
+    def _video_writer_loop(self) -> None:
+        assert self._video_queue is not None
+        while True:
+            event = self._video_queue.get()
+            try:
+                if event is _STOP:
+                    return
+                self._write_video_frame(event[1])
+            except Exception:
+                LOGGER.exception("Failed to write deployment video frame")
+            finally:
+                self._video_queue.task_done()
+
     def _write_control_json(self, row: Mapping[str, Any]) -> None:
         if self._trajectory_file is None:
             return
@@ -562,6 +660,30 @@ class DeploymentRunRecorder:
             for key, value in row.items()
         }
         self._trajectory_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _observe_jitter(self, row: Mapping[str, Any]) -> None:
+        monitor = self._jitter_monitor
+        if monitor is None:
+            return
+        joints = np.asarray(row["command_joints_rad"])
+        command_at = float(row["command_monotonic_timestamp"])
+        valid = (
+            bool(row["command_sent"])
+            and bool(np.isfinite(joints).all())
+            and int(row["command_generation"]) >= 0
+            and int(row["command_queue_index"]) >= 0
+        )
+        events = monitor.observe(
+            joints_rad=joints if valid else None,
+            generation=int(row["command_generation"]) if valid else None,
+            queue_index=int(row["command_queue_index"]) if valid else None,
+            command_at=command_at if valid else None,
+            hold=bool(row["command_hold"]),
+        )
+        self._jitter_snapshot = monitor.summary()
+        if self._jitter_file is not None:
+            for event in events:
+                self._jitter_file.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     def _write_model(self, payload: dict[str, Any], arrays: dict[str, np.ndarray]) -> None:
         if self.run_dir is None or self._model_file is None:

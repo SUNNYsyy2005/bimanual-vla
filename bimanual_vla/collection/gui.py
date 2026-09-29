@@ -13,6 +13,7 @@ still rejected before and during recording.
 from __future__ import annotations
 
 import json
+import math
 import os
 import pathlib
 import queue
@@ -20,6 +21,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -501,20 +503,70 @@ def build_inference_bridge_command(
     cam_right_wrist_device: str,
     instruction: str,
     allow_execution: bool,
+    control_hz: float = 20.0,
+    inference_trigger_mode: str = "periodic",
+    inference_trigger_step: int = 10,
     camera_preview: bool = False,
     rtc_enabled: bool = True,
     rtc_execution_horizon: int = 8,
     rtc_max_guidance_weight: float = 5.0,
     rtc_prefix_attention_schedule: str = "linear",
     rtc_client_blend_steps: int = 0,
+    async_inference: bool = True,
+    sync_wait_steps: int = 8,
+    lowpass_filter_enabled: bool = True,
+    trajectory_smoothing_hz: float = 3.0,
+    gripper_lowpass_alpha: float = 0.5,
+    trajectory_shaping_enabled: bool = True,
+    joint_lowpass_enabled: bool | None = None,
+    joint_tracking_enabled: bool = True,
+    joint_speed_limit_enabled: bool = True,
+    joint_acceleration_limit_enabled: bool = True,
+    joint_jerk_limit_enabled: bool = True,
+    joint_lookahead_enabled: bool = True,
+    joint_max_speed_rad_s: float = 0.30,
+    joint_max_acceleration_rad_s2: float = 0.80,
+    joint_max_jerk_rad_s3: float = 4.0,
+    joint_tracking_time_constant_s: float = 0.25,
+    joint_lookahead_rad: float = 0.02,
+    blend_enabled: bool = True,
+    blend_steps: int = 3,
+    blend_profile: str = "smootherstep",
+    rtc_client_blend_enabled: bool | None = None,
+    gripper_lowpass_enabled: bool | None = None,
+    gripper_endpoint_filter_enabled: bool = True,
+    gripper_hysteresis: float = 0.05,
+    gripper_confirm_steps: int = 2,
+    gripper_open_lookahead_enabled: bool = True,
+    gripper_open_lookahead_steps: int = 30,
+    ik_rate_limit_enabled: bool = True,
+    ik_max_joint_step_rad: float = 0.02,
+    auto_next_inference: bool = True,
+    manual_trigger_file: str | None = None,
 ) -> list[str]:
     """Build the local robot-observation bridge command without shell quoting."""
     if not host.strip():
         raise ValueError("policy host must not be empty")
     if not 1 <= int(port) <= 65_535:
         raise ValueError("policy port must be in [1, 65535]")
-    if float(hz) <= 0:
-        raise ValueError("inference rate must be positive")
+    if not math.isfinite(float(hz)) or float(hz) <= 0:
+        raise ValueError("inference rate must be positive and finite")
+    if not math.isfinite(float(control_hz)) or float(control_hz) <= 0:
+        raise ValueError("control rate must be positive and finite")
+    if inference_trigger_mode not in {"periodic", "chunk_step"}:
+        raise ValueError("inference trigger mode must be periodic or chunk_step")
+    if int(inference_trigger_step) < 1:
+        raise ValueError("inference trigger step must be positive")
+    if int(sync_wait_steps) < 1:
+        raise ValueError("sync wait steps must be positive")
+    if not async_inference and not auto_next_inference and not manual_trigger_file:
+        raise ValueError("manual next-inference mode requires a trigger file path")
+    # RTC prefix guidance requires an old chunk still executing while the new
+    # one is generated. Synchronous mode always fully drains the queue (and
+    # therefore has no live "previous chunk") before the next request is
+    # launched, so RTC is force-disabled here regardless of the checkbox --
+    # this is the safety net behind the GUI's own grey-out/auto-uncheck.
+    rtc_enabled = bool(rtc_enabled) and bool(async_inference)
     if not 1 <= int(rtc_execution_horizon) <= 50:
         raise ValueError("RTC execution horizon must be in [1, 50]")
     if float(rtc_max_guidance_weight) <= 0:
@@ -523,6 +575,32 @@ def build_inference_bridge_command(
         raise ValueError("unsupported RTC prefix attention schedule")
     if int(rtc_client_blend_steps) not in {0, 2, 3, 4}:
         raise ValueError("RTC client blend steps must be one of 0, 2, 3, 4")
+    if int(blend_steps) not in {2, 3, 4}:
+        raise ValueError("client blend steps must be 2, 3, or 4")
+    if blend_profile not in {"linear", "smootherstep"}:
+        raise ValueError("blend profile must be linear or smootherstep")
+    for name, value in (
+        ("joint low-pass cutoff", trajectory_smoothing_hz),
+        ("joint max speed", joint_max_speed_rad_s),
+        ("joint max acceleration", joint_max_acceleration_rad_s2),
+        ("joint max jerk", joint_max_jerk_rad_s3),
+        ("joint tracking time constant", joint_tracking_time_constant_s),
+        ("gripper low-pass alpha", gripper_lowpass_alpha),
+        ("gripper hysteresis", gripper_hysteresis),
+        ("IK max joint step", ik_max_joint_step_rad),
+    ):
+        if not math.isfinite(float(value)) or float(value) <= 0:
+            raise ValueError(f"{name} must be positive and finite")
+    if not math.isfinite(float(joint_lookahead_rad)) or joint_lookahead_rad < 0:
+        raise ValueError("joint lookahead must be finite and non-negative")
+    if not 0 < gripper_lowpass_alpha <= 1:
+        raise ValueError("gripper low-pass alpha must be in (0, 1]")
+    if not 0 < gripper_hysteresis < 0.5:
+        raise ValueError("gripper hysteresis must be in (0, 0.5)")
+    if int(gripper_confirm_steps) < 1 or int(gripper_open_lookahead_steps) < 0:
+        raise ValueError("gripper confirmation must be positive; lookahead must be non-negative")
+    if float(ik_max_joint_step_rad) > 0.30:
+        raise ValueError("IK max joint step must not exceed the 0.30 rad search radius")
     if arm_mode not in {SINGLE_ARM, BIMANUAL}:
         raise ValueError(f"unsupported arm mode: {arm_mode}")
     if arm_mode == BIMANUAL:
@@ -551,6 +629,12 @@ def build_inference_bridge_command(
         str(int(port)),
         "--hz",
         str(float(hz)),
+        "--control-hz",
+        str(float(control_hz)),
+        "--inference-trigger-mode",
+        inference_trigger_mode if async_inference else "periodic",
+        "--inference-trigger-step",
+        str(int(inference_trigger_step)),
         "--arm-mode",
         arm_mode,
         "--arm-side",
@@ -577,6 +661,11 @@ def build_inference_bridge_command(
     if allow_execution:
         command.append("--allow-execution")
     command.append("--rtc-enabled" if rtc_enabled else "--no-rtc-enabled")
+    rtc_blend_steps = (
+        int(rtc_client_blend_steps)
+        if rtc_enabled and (rtc_client_blend_enabled is None or rtc_client_blend_enabled)
+        else 0
+    )
     command.extend(
         (
             "--rtc-execution-horizon",
@@ -586,9 +675,54 @@ def build_inference_bridge_command(
             "--rtc-prefix-attention-schedule",
             rtc_prefix_attention_schedule,
             "--rtc-client-blend-steps",
-            str(int(rtc_client_blend_steps)),
+            str(rtc_blend_steps),
         )
     )
+    # 异步推理和等待步数
+    if not async_inference:
+        command.extend(("--no-async-inference", "--sync-wait-steps", str(int(sync_wait_steps))))
+        if not auto_next_inference:
+            command.extend(
+                (
+                    "--no-auto-next-inference",
+                    "--manual-trigger-file",
+                    str(manual_trigger_file),
+                )
+            )
+    joint_lowpass = lowpass_filter_enabled if joint_lowpass_enabled is None else joint_lowpass_enabled
+    gripper_lowpass = lowpass_filter_enabled if gripper_lowpass_enabled is None else gripper_lowpass_enabled
+    switches = {
+        "trajectory-shaping": trajectory_shaping_enabled,
+        "trajectory-lowpass": joint_lowpass,
+        "trajectory-tracking": joint_tracking_enabled,
+        "trajectory-speed-limit": joint_speed_limit_enabled,
+        "trajectory-acceleration-limit": joint_acceleration_limit_enabled,
+        "trajectory-jerk-limit": joint_jerk_limit_enabled,
+        "trajectory-lookahead": joint_lookahead_enabled,
+        "gripper-lowpass": gripper_lowpass,
+        "gripper-endpoint-filter": gripper_endpoint_filter_enabled,
+        "ik-rate-limit": ik_rate_limit_enabled,
+    }
+    command.extend(
+        flag if enabled else "--no-" + flag[2:]
+        for name, enabled in switches.items()
+        for flag in ("--" + name,)
+    )
+    command.extend((
+        "--trajectory-smoothing-cutoff-hz", str(float(trajectory_smoothing_hz)),
+        "--trajectory-tracking-time-constant-s", str(float(joint_tracking_time_constant_s)),
+        "--trajectory-max-speed-rad-s", str(float(joint_max_speed_rad_s)),
+        "--trajectory-max-acceleration-rad-s2", str(float(joint_max_acceleration_rad_s2)),
+        "--trajectory-max-jerk-rad-s3", str(float(joint_max_jerk_rad_s3)),
+        "--trajectory-command-lookahead-rad", str(float(joint_lookahead_rad)),
+        "--gripper-lowpass-alpha", str(float(gripper_lowpass_alpha)),
+        "--gripper-hysteresis", str(float(gripper_hysteresis)),
+        "--gripper-confirm-steps", str(int(gripper_confirm_steps)),
+        "--gripper-open-lookahead-steps", str(int(gripper_open_lookahead_steps) if gripper_open_lookahead_enabled else "0"),
+        "--ik-max-joint-step-rad", str(float(ik_max_joint_step_rad)),
+        "--blend-steps", str(int(blend_steps) if blend_enabled and not rtc_enabled else 0),
+        "--blend-profile", blend_profile,
+    ))
     return command
 
 
@@ -759,6 +893,7 @@ class CollectorGUI:
         self.inference_start_button: ttk.Button | None = None
         self.inference_stop_button: ttk.Button | None = None
         self.inference_activate_can_button: ttk.Button | None = None
+        self.inference_connect_button: ttk.Button | None = None
         self.inference_device_settings_button: ttk.Button | None = None
         self.inference_swap_camera_button: ttk.Checkbutton | None = None
         self.app_mode = "collection"
@@ -841,6 +976,15 @@ class CollectorGUI:
         self.inference_hz_var = tk.StringVar(
             value=str(self.gui_preferences.get("inference_hz") or "4")
         )
+        self.inference_control_hz_var = tk.StringVar(
+            value=str(self.gui_preferences.get("inference_control_hz") or "20")
+        )
+        self.inference_trigger_mode_var = tk.StringVar(
+            value=str(self.gui_preferences.get("inference_trigger_mode") or "periodic")
+        )
+        self.inference_trigger_step_var = tk.StringVar(
+            value=str(self.gui_preferences.get("inference_trigger_step") or "10")
+        )
         self.inference_allow_execution_var = tk.BooleanVar(
             value=bool(self.gui_preferences.get("inference_allow_execution", True))
         )
@@ -861,6 +1005,110 @@ class CollectorGUI:
         )
         self.inference_rtc_blend_steps_var = tk.StringVar(
             value=str(self.gui_preferences.get("inference_rtc_blend_steps") or "0")
+        )
+        self.inference_async_enabled_var = tk.BooleanVar(
+            value=bool(self.gui_preferences.get("inference_async_enabled", True))
+        )
+        self.inference_sync_wait_steps_var = tk.StringVar(
+            value=str(self.gui_preferences.get("inference_sync_wait_steps") or "8")
+        )
+        self.inference_auto_next_var = tk.BooleanVar(
+            value=bool(self.gui_preferences.get("inference_auto_next", True))
+        )
+        self.inference_manual_trigger_path: pathlib.Path | None = None
+        self.inference_next_button: ttk.Button | None = None
+        self.inference_lowpass_filter_enabled_var = tk.BooleanVar(
+            value=bool(self.gui_preferences.get("inference_lowpass_filter_enabled", True))
+        )
+        self.inference_trajectory_smoothing_var = tk.StringVar(
+            value=str(self.gui_preferences.get("inference_trajectory_smoothing_hz") or "3.0")
+        )
+        self.inference_gripper_lowpass_alpha_var = tk.StringVar(
+            value=str(self.gui_preferences.get("inference_gripper_lowpass_alpha") or "0.5")
+        )
+        preferences = self.gui_preferences
+        legacy_lowpass = bool(preferences.get("inference_lowpass_filter_enabled", True))
+        self.inference_trajectory_shaping_var = tk.BooleanVar(
+            value=bool(preferences.get("inference_trajectory_shaping_enabled", True))
+        )
+        self.inference_joint_lowpass_var = tk.BooleanVar(
+            value=bool(preferences.get("inference_joint_lowpass_enabled", legacy_lowpass))
+        )
+        self.inference_joint_tracking_var = tk.BooleanVar(
+            value=bool(preferences.get("inference_joint_tracking_enabled", True))
+        )
+        self.inference_joint_speed_limit_var = tk.BooleanVar(
+            value=bool(preferences.get("inference_joint_speed_limit_enabled", True))
+        )
+        self.inference_joint_acceleration_limit_var = tk.BooleanVar(
+            value=bool(preferences.get("inference_joint_acceleration_limit_enabled", True))
+        )
+        self.inference_joint_jerk_limit_var = tk.BooleanVar(
+            value=bool(preferences.get("inference_joint_jerk_limit_enabled", True))
+        )
+        self.inference_joint_lookahead_var = tk.BooleanVar(
+            value=bool(preferences.get("inference_joint_lookahead_enabled", True))
+        )
+        self.inference_joint_tracking_time_var = tk.StringVar(
+            value=str(preferences.get("inference_joint_tracking_time_constant_s") or "0.25")
+        )
+        self.inference_joint_max_speed_var = tk.StringVar(
+            value=str(preferences.get("inference_joint_max_speed_rad_s") or "0.30")
+        )
+        self.inference_joint_max_acceleration_var = tk.StringVar(
+            value=str(preferences.get("inference_joint_max_acceleration_rad_s2") or "0.80")
+        )
+        self.inference_joint_max_jerk_var = tk.StringVar(
+            value=str(preferences.get("inference_joint_max_jerk_rad_s3") or "4.0")
+        )
+        self.inference_joint_lookahead_rad_var = tk.StringVar(
+            value=str(
+                preferences.get("inference_joint_lookahead_rad")
+                if preferences.get("inference_joint_lookahead_rad") is not None else "0.02"
+            )
+        )
+        self._nonrtc_blend_preference = bool(preferences.get("inference_blend_enabled", True))
+        self.inference_blend_enabled_var = tk.BooleanVar(
+            value=self._nonrtc_blend_preference if not self.inference_rtc_enabled_var.get() else False
+        )
+        self.inference_blend_steps_var = tk.StringVar(
+            value=str(preferences.get("inference_blend_steps") or "3")
+        )
+        self.inference_blend_profile_var = tk.StringVar(
+            value=str(preferences.get("inference_blend_profile") or "smootherstep")
+        )
+        saved_rtc_blend = str(preferences.get("inference_rtc_blend_steps") or "0")
+        self._rtc_blend_preference = bool(preferences.get("inference_rtc_blend_enabled", saved_rtc_blend != "0"))
+        self.inference_rtc_blend_enabled_var = tk.BooleanVar(
+            value=self._rtc_blend_preference if self.inference_rtc_enabled_var.get() else False
+        )
+        self.inference_rtc_blend_steps_var.set(saved_rtc_blend if saved_rtc_blend != "0" else "3")
+        self.inference_gripper_lowpass_var = tk.BooleanVar(
+            value=bool(preferences.get("inference_gripper_lowpass_enabled", legacy_lowpass))
+        )
+        self.inference_gripper_endpoint_var = tk.BooleanVar(
+            value=bool(preferences.get("inference_gripper_endpoint_filter_enabled", True))
+        )
+        self.inference_gripper_hysteresis_var = tk.StringVar(
+            value=str(preferences.get("inference_gripper_hysteresis") or "0.05")
+        )
+        self.inference_gripper_confirm_steps_var = tk.StringVar(
+            value=str(preferences.get("inference_gripper_confirm_steps") or "2")
+        )
+        self.inference_gripper_lookahead_var = tk.BooleanVar(
+            value=bool(preferences.get("inference_gripper_open_lookahead_enabled", True))
+        )
+        self.inference_gripper_lookahead_steps_var = tk.StringVar(
+            value=str(
+                preferences.get("inference_gripper_open_lookahead_steps")
+                if preferences.get("inference_gripper_open_lookahead_steps") is not None else "30"
+            )
+        )
+        self.inference_ik_rate_limit_var = tk.BooleanVar(
+            value=bool(preferences.get("inference_ik_rate_limit_enabled", True))
+        )
+        self.inference_ik_max_step_var = tk.StringVar(
+            value=str(preferences.get("inference_ik_max_joint_step_rad") or "0.02")
         )
         self.inference_status_var = tk.StringVar(value="Inference idle")
         self.inference_pid_var = tk.StringVar(value="No inference process")
@@ -1376,14 +1624,40 @@ class CollectorGUI:
         Shared hardware settings are edited through the same Device settings
         dialog used by collection mode.
         """
-        frame = ttk.Frame(self.root, padding=28)
-        self.inference_mode_frame = frame
+        container = ttk.Frame(self.root)
+        self.inference_mode_frame = container
+        canvas = tk.Canvas(container, bg="#eef1f5", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        frame = ttk.Frame(canvas, padding=(16, 16))
+        canvas_window = canvas.create_window((0, 0), window=frame, anchor="nw")
+        frame.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(canvas_window, width=event.width),
+        )
         frame.columnconfigure(0, weight=1)
         frame.columnconfigure(1, weight=1)
         frame.rowconfigure(2, weight=1)
 
+        def enable_when(widget: tk.Misc, *conditions: tuple[tk.BooleanVar, bool],
+                        enabled_state: str = "normal") -> None:
+            """Keep inactive parameter fields out of the editing and validation path."""
+            def refresh(*_args: object) -> None:
+                active = all(variable.get() == expected for variable, expected in conditions)
+                widget.configure(state=enabled_state if active else "disabled")
+
+            for variable, _expected in conditions:
+                variable.trace_add("write", refresh)
+            refresh()
+
         intro = tk.Frame(frame, bg="#ffffff", highlightthickness=1, highlightbackground="#d9dde5")
-        intro.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
+        intro.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         tk.Label(
             intro,
             text="Model inference",
@@ -1391,7 +1665,7 @@ class CollectorGUI:
             fg="#202124",
             font=(self.ui_font, 16, "bold"),
             anchor="w",
-        ).pack(fill="x", padx=18, pady=(14, 2))
+        ).pack(fill="x", padx=18, pady=(10, 2))
         tk.Label(
             intro,
             text="Run the RTC robot client with the current CAN and camera mapping.",
@@ -1399,24 +1673,20 @@ class CollectorGUI:
             fg="#68707d",
             font=(self.ui_font, 10),
             anchor="w",
-        ).pack(fill="x", padx=18, pady=(0, 14))
+        ).pack(fill="x", padx=18, pady=(0, 8))
 
         config = ttk.LabelFrame(frame, text="Policy and task", padding=14)
-        config.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 14))
+        config.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
         config.columnconfigure(1, weight=1)
         ttk.Label(config, text="Policy host").grid(row=0, column=0, sticky="w", pady=5)
-        ttk.Entry(config, textvariable=self.inference_host_var, width=36).grid(
+        ttk.Entry(config, textvariable=self.inference_host_var, width=18).grid(
             row=0, column=1, sticky="ew", padx=(12, 0), pady=5
         )
         ttk.Label(config, text="Policy port").grid(row=1, column=0, sticky="w", pady=5)
-        ttk.Entry(config, textvariable=self.inference_port_var, width=36).grid(
+        ttk.Entry(config, textvariable=self.inference_port_var, width=18).grid(
             row=1, column=1, sticky="ew", padx=(12, 0), pady=5
         )
-        ttk.Label(config, text="Inference rate (Hz)").grid(row=2, column=0, sticky="w", pady=5)
-        ttk.Entry(config, textvariable=self.inference_hz_var, width=36).grid(
-            row=2, column=1, sticky="ew", padx=(12, 0), pady=5
-        )
-        ttk.Label(config, text="Arm mode").grid(row=3, column=0, sticky="w", pady=5)
+        ttk.Label(config, text="Arm mode").grid(row=2, column=0, sticky="w", pady=5)
         arm_display = tk.StringVar(value="Bimanual" if self.arm_mode == BIMANUAL else "Single arm")
         arm_selector = ttk.Combobox(
             config,
@@ -1424,7 +1694,7 @@ class CollectorGUI:
             values=("Single arm", "Bimanual"),
             state="readonly",
         )
-        arm_selector.grid(row=3, column=1, sticky="ew", padx=(12, 0), pady=5)
+        arm_selector.grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=5)
         arm_selector.bind(
             "<<ComboboxSelected>>",
             lambda _event: self._set_arm_mode_from_display(arm_display.get()),
@@ -1432,7 +1702,7 @@ class CollectorGUI:
         self.inference_mode_selectors.append(arm_selector)
         self.inference_mode_display_vars.append(arm_display)
 
-        ttk.Label(config, text="Arm side").grid(row=4, column=0, sticky="w", pady=5)
+        ttk.Label(config, text="Arm side").grid(row=3, column=0, sticky="w", pady=5)
         side_display = tk.StringVar(value="Both" if self.arm_side == "both" else self.arm_side.capitalize())
         side_selector = ttk.Combobox(
             config,
@@ -1440,13 +1710,52 @@ class CollectorGUI:
             values=("Left", "Right", "Both"),
             state="readonly",
         )
-        side_selector.grid(row=4, column=1, sticky="ew", padx=(12, 0), pady=5)
+        side_selector.grid(row=3, column=1, sticky="ew", padx=(12, 0), pady=5)
         side_selector.bind(
             "<<ComboboxSelected>>",
             lambda _event: self._set_arm_side_from_display(side_display.get()),
         )
         self.inference_mode_selectors.append(side_selector)
         self.inference_mode_display_vars.append(side_display)
+
+        timing = ttk.LabelFrame(config, text="Inference timing", padding=(10, 6))
+        timing.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        timing.columnconfigure(1, weight=1)
+        ttk.Label(timing, text="Periodic / retry rate (Hz)").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Entry(timing, textvariable=self.inference_hz_var, width=18).grid(
+            row=0, column=1, sticky="ew", padx=(12, 0), pady=3
+        )
+        ttk.Checkbutton(timing, text="Asynchronous inference", variable=self.inference_async_enabled_var).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=3
+        )
+        ttk.Label(timing, text="Async request trigger").grid(row=2, column=0, sticky="w", pady=3)
+        trigger_mode_box = ttk.Combobox(
+            timing, textvariable=self.inference_trigger_mode_var,
+            values=("periodic", "chunk_step"), state="readonly", width=13,
+        )
+        trigger_mode_box.grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=3)
+        enable_when(trigger_mode_box, (self.inference_async_enabled_var, True), enabled_state="readonly")
+        ttk.Label(timing, text="Chunk source step").grid(row=3, column=0, sticky="w", pady=3)
+        trigger_step_entry = ttk.Entry(timing, textvariable=self.inference_trigger_step_var, width=9)
+        trigger_step_entry.grid(row=3, column=1, sticky="ew", padx=(12, 0), pady=3)
+
+        def refresh_trigger_step(*_args: object) -> None:
+            active = (
+                self.inference_async_enabled_var.get()
+                and self.inference_trigger_mode_var.get() == "chunk_step"
+            )
+            trigger_step_entry.configure(state="normal" if active else "disabled")
+
+        self.inference_async_enabled_var.trace_add("write", refresh_trigger_step)
+        self.inference_trigger_mode_var.trace_add("write", refresh_trigger_step)
+        refresh_trigger_step()
+        ttk.Label(timing, text="Robot control rate (Hz)").grid(row=4, column=0, sticky="w", pady=3)
+        ttk.Entry(timing, textvariable=self.inference_control_hz_var, width=9).grid(
+            row=4, column=1, sticky="ew", padx=(12, 0), pady=3
+        )
+        ttk.Label(timing, text="Must match the policy action rate.", foreground="#68707d").grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(0, 3)
+        )
 
         instruction_line = ttk.Frame(config)
         instruction_line.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 3))
@@ -1474,50 +1783,12 @@ class CollectorGUI:
             text="Camera preview",
             variable=self.inference_camera_preview_var,
         ).pack(side="left", padx=(18, 0))
-        ttk.Checkbutton(
-            options,
-            text="Model-side RTC",
-            variable=self.inference_rtc_enabled_var,
-            takefocus=False,
-        ).pack(side="left", padx=(18, 0))
+        right_panel = ttk.Frame(frame)
+        right_panel.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 8))
+        right_panel.columnconfigure(0, weight=1)
 
-        rtc_settings = ttk.LabelFrame(config, text="Client RTC settings", padding=8)
-        rtc_settings.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        rtc_settings.columnconfigure(1, weight=1)
-        rtc_settings.columnconfigure(3, weight=1)
-        ttk.Label(rtc_settings, text="Execution horizon").grid(row=0, column=0, sticky="w", pady=3)
-        ttk.Entry(rtc_settings, textvariable=self.inference_rtc_horizon_var, width=10).grid(
-            row=0, column=1, sticky="ew", padx=(8, 14), pady=3
-        )
-        ttk.Label(rtc_settings, text="Max guidance weight").grid(row=0, column=2, sticky="w", pady=3)
-        ttk.Entry(rtc_settings, textvariable=self.inference_rtc_weight_var, width=10).grid(
-            row=0, column=3, sticky="ew", padx=(8, 0), pady=3
-        )
-        ttk.Label(rtc_settings, text="Prefix schedule").grid(row=1, column=0, sticky="w", pady=3)
-        ttk.Combobox(
-            rtc_settings,
-            textvariable=self.inference_rtc_schedule_var,
-            values=("zeros", "ones", "linear", "exp"),
-            state="readonly",
-            width=10,
-        ).grid(row=1, column=1, sticky="ew", padx=(8, 14), pady=3)
-        ttk.Label(rtc_settings, text="Client blend steps").grid(row=1, column=2, sticky="w", pady=3)
-        ttk.Combobox(
-            rtc_settings,
-            textvariable=self.inference_rtc_blend_steps_var,
-            values=("0", "2", "3", "4"),
-            state="readonly",
-            width=10,
-        ).grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=3)
-        ttk.Label(
-            rtc_settings,
-            text="这些值属于客户端；Policy 只提供服务器能力上限，修改后无需重启 Policy。",
-            foreground="#68707d",
-            justify="left",
-        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(5, 0))
-
-        devices = ttk.LabelFrame(frame, text="Devices", padding=14)
-        devices.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 14))
+        devices = ttk.LabelFrame(right_panel, text="Devices", padding=12)
+        devices.grid(row=0, column=0, sticky="ew")
         devices.columnconfigure(0, weight=1)
         ttk.Label(
             devices,
@@ -1535,13 +1806,20 @@ class CollectorGUI:
             command=self.activate_can,
             style="Teal.TButton",
         )
-        self.inference_activate_can_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self.inference_activate_can_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.inference_connect_button = ttk.Button(
+            device_buttons,
+            text="Connect devices",
+            command=self.toggle_connection,
+            style="Accent.TButton",
+        )
+        self.inference_connect_button.grid(row=0, column=1, sticky="ew", padx=(3, 0))
         self.inference_device_settings_button = ttk.Button(
             device_buttons,
             text="Device settings...",
             command=self.open_device_settings,
         )
-        self.inference_device_settings_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        self.inference_device_settings_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.inference_swap_camera_button = ttk.Checkbutton(
             devices,
             text="Swap left/right wrist cameras",
@@ -1549,14 +1827,177 @@ class CollectorGUI:
             command=self.swap_camera_roles,
             takefocus=False,
         )
-        self.inference_swap_camera_button.grid(row=2, column=0, sticky="w", pady=(12, 0))
+        self.inference_swap_camera_button.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        motion = ttk.LabelFrame(right_panel, text="Action continuity settings", padding=10)
+        motion.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        motion.columnconfigure(0, weight=1)
+        tabs = ttk.Notebook(motion)
+        tabs.grid(row=0, column=0, sticky="nsew")
+        chunk_tab = ttk.Frame(tabs, padding=10)
+        joint_tab = ttk.Frame(tabs, padding=10)
+        gripper_tab = ttk.Frame(tabs, padding=10)
+        tabs.add(chunk_tab, text="Chunk transition")
+        tabs.add(joint_tab, text="Joint motion")
+        tabs.add(gripper_tab, text="Gripper")
+
+        for tab in (chunk_tab, joint_tab, gripper_tab):
+            tab.columnconfigure(1, weight=1)
+
+        rtc_checkbox = ttk.Checkbutton(
+            chunk_tab, text="Model-side RTC", variable=self.inference_rtc_enabled_var
+        )
+        rtc_checkbox.grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=3
+        )
+        # RTC prefix guidance assumes an old chunk is still actively executing
+        # while the new one is generated (the async overlap window). In
+        # synchronous mode the queue is fully drained -- and RTC forcibly
+        # disabled -- before the next request is even launched, so there is
+        # never a real "previous chunk" to blend against. Grey the checkbox
+        # out and force it off whenever async is unchecked; restore the
+        # user's prior choice when they switch back to async.
+        enable_when(rtc_checkbox, (self.inference_async_enabled_var, True))
+        self._rtc_enabled_preference_before_sync = bool(self.inference_rtc_enabled_var.get())
+
+        def force_rtc_off_in_sync_mode(*_args: object) -> None:
+            if self.inference_async_enabled_var.get():
+                self.inference_rtc_enabled_var.set(
+                    self._rtc_enabled_preference_before_sync
+                )
+            else:
+                self._rtc_enabled_preference_before_sync = bool(
+                    self.inference_rtc_enabled_var.get()
+                )
+                self.inference_rtc_enabled_var.set(False)
+
+        self.inference_async_enabled_var.trace_add("write", force_rtc_off_in_sync_mode)
+        ttk.Label(chunk_tab, text="Execution horizon").grid(row=1, column=0, sticky="w", pady=3)
+        rtc_horizon_entry = ttk.Entry(chunk_tab, textvariable=self.inference_rtc_horizon_var, width=9)
+        rtc_horizon_entry.grid(row=1, column=2, sticky="e")
+        ttk.Label(chunk_tab, text="Max guidance weight").grid(row=2, column=0, sticky="w", pady=3)
+        rtc_weight_entry = ttk.Entry(chunk_tab, textvariable=self.inference_rtc_weight_var, width=9)
+        rtc_weight_entry.grid(row=2, column=2, sticky="e")
+        ttk.Label(chunk_tab, text="Prefix schedule").grid(row=3, column=0, sticky="w", pady=3)
+        rtc_schedule_box = ttk.Combobox(chunk_tab, textvariable=self.inference_rtc_schedule_var,
+                                        values=("zeros", "ones", "linear", "exp"), state="readonly", width=11)
+        rtc_schedule_box.grid(row=3, column=2, sticky="e")
+        for widget in (rtc_horizon_entry, rtc_weight_entry):
+            enable_when(widget, (self.inference_rtc_enabled_var, True))
+        enable_when(rtc_schedule_box, (self.inference_rtc_enabled_var, True), enabled_state="readonly")
+        blend_check = ttk.Checkbutton(chunk_tab, text="Blend when RTC is off", variable=self.inference_blend_enabled_var)
+        blend_check.grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=3
+        )
+        enable_when(blend_check, (self.inference_rtc_enabled_var, False))
+        blend_steps_box = ttk.Combobox(chunk_tab, textvariable=self.inference_blend_steps_var,
+                                       values=("2", "3", "4"), state="readonly", width=9)
+        blend_steps_box.grid(row=4, column=2, sticky="e")
+        enable_when(blend_steps_box, (self.inference_rtc_enabled_var, False),
+                    (self.inference_blend_enabled_var, True), enabled_state="readonly")
+        rtc_blend_check = ttk.Checkbutton(chunk_tab, text="Extra blend with RTC", variable=self.inference_rtc_blend_enabled_var)
+        rtc_blend_check.grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=3
+        )
+        enable_when(rtc_blend_check, (self.inference_rtc_enabled_var, True))
+        rtc_blend_steps_box = ttk.Combobox(chunk_tab, textvariable=self.inference_rtc_blend_steps_var,
+                                           values=("2", "3", "4"), state="readonly", width=9)
+        rtc_blend_steps_box.grid(row=5, column=2, sticky="e")
+        enable_when(rtc_blend_steps_box, (self.inference_rtc_enabled_var, True),
+                    (self.inference_rtc_blend_enabled_var, True), enabled_state="readonly")
+        active_rtc_mode = self.inference_rtc_enabled_var.get()
+        def sync_blend_mode(*_args: object) -> None:
+            nonlocal active_rtc_mode
+            next_rtc_mode = self.inference_rtc_enabled_var.get()
+            if next_rtc_mode == active_rtc_mode:
+                return
+            if active_rtc_mode:
+                self._rtc_blend_preference = self.inference_rtc_blend_enabled_var.get()
+                self.inference_rtc_blend_enabled_var.set(False)
+                self.inference_blend_enabled_var.set(self._nonrtc_blend_preference)
+            else:
+                self._nonrtc_blend_preference = self.inference_blend_enabled_var.get()
+                self.inference_blend_enabled_var.set(False)
+                self.inference_rtc_blend_enabled_var.set(self._rtc_blend_preference)
+            active_rtc_mode = next_rtc_mode
+
+        self.inference_rtc_enabled_var.trace_add("write", sync_blend_mode)
+        ttk.Label(chunk_tab, text="Blend profile").grid(row=6, column=0, sticky="w", pady=3)
+        blend_profile_box = ttk.Combobox(chunk_tab, textvariable=self.inference_blend_profile_var,
+                                         values=("smootherstep", "linear"), state="readonly", width=13)
+        blend_profile_box.grid(row=6, column=2, sticky="e")
+        def refresh_blend_profile(*_args: object) -> None:
+            active = (not self.inference_rtc_enabled_var.get() and self.inference_blend_enabled_var.get()) or (
+                self.inference_rtc_enabled_var.get() and self.inference_rtc_blend_enabled_var.get()
+            )
+            blend_profile_box.configure(state="readonly" if active else "disabled")
+
+        for variable in (self.inference_blend_enabled_var, self.inference_rtc_enabled_var,
+                         self.inference_rtc_blend_enabled_var):
+            variable.trace_add("write", refresh_blend_profile)
+        refresh_blend_profile()
+        ttk.Label(chunk_tab, text="Sync wait steps").grid(row=7, column=0, sticky="w", pady=3)
+        sync_wait_entry = ttk.Entry(chunk_tab, textvariable=self.inference_sync_wait_steps_var, width=9)
+        sync_wait_entry.grid(row=7, column=2, sticky="e")
+        enable_when(sync_wait_entry, (self.inference_async_enabled_var, False))
+        auto_next_check = ttk.Checkbutton(
+            chunk_tab,
+            text="Automatic next inference",
+            variable=self.inference_auto_next_var,
+        )
+        auto_next_check.grid(row=8, column=0, columnspan=2, sticky="w", pady=3)
+        enable_when(auto_next_check, (self.inference_async_enabled_var, False))
         ttk.Label(
-            devices,
-            text="The bridge uses the selected left/right CAN and three camera devices.",
+            chunk_tab,
+            text="Unchecked: hold at the end of each chunk and wait for the\n"
+            "\"Next inference\" button before launching the next request.",
             foreground="#68707d",
             justify="left",
-            wraplength=460,
-        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 3))
+        for variable in (self.inference_async_enabled_var, self.inference_auto_next_var):
+            variable.trace_add("write", lambda *_args: self._update_mode_controls())
+
+        ttk.Checkbutton(joint_tab, text="Joint trajectory shaper",
+                        variable=self.inference_trajectory_shaping_var).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 6)
+        )
+        joint_controls = (
+            ("Reference low-pass", self.inference_joint_lowpass_var, self.inference_trajectory_smoothing_var, "Cutoff Hz"),
+            ("Second-order tracking", self.inference_joint_tracking_var, self.inference_joint_tracking_time_var, "Time s"),
+            ("Speed limit", self.inference_joint_speed_limit_var, self.inference_joint_max_speed_var, "rad/s"),
+            ("Acceleration limit", self.inference_joint_acceleration_limit_var, self.inference_joint_max_acceleration_var, "rad/s²"),
+            ("Jerk limit", self.inference_joint_jerk_limit_var, self.inference_joint_max_jerk_var, "rad/s³"),
+            ("Velocity lookahead", self.inference_joint_lookahead_var, self.inference_joint_lookahead_rad_var, "rad"),
+            ("Delivery IK step limit", self.inference_ik_rate_limit_var, self.inference_ik_max_step_var, "rad/step"),
+        )
+        for row, (label, enabled_var, value_var, unit) in enumerate(joint_controls, start=1):
+            check = ttk.Checkbutton(joint_tab, text=label, variable=enabled_var)
+            check.grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Label(joint_tab, text=unit, foreground="#68707d").grid(row=row, column=1, sticky="e", padx=(6, 7))
+            entry = ttk.Entry(joint_tab, textvariable=value_var, width=9)
+            entry.grid(row=row, column=2, sticky="e")
+            if enabled_var is self.inference_ik_rate_limit_var:
+                enable_when(entry, (enabled_var, True))
+            else:
+                enable_when(check, (self.inference_trajectory_shaping_var, True))
+                enable_when(entry, (self.inference_trajectory_shaping_var, True), (enabled_var, True))
+
+        gripper_controls = (
+            ("Opening low-pass", self.inference_gripper_lowpass_var, self.inference_gripper_lowpass_alpha_var, "α"),
+            ("Endpoint hysteresis", self.inference_gripper_endpoint_var, self.inference_gripper_hysteresis_var, "fraction"),
+            ("Opening lookahead", self.inference_gripper_lookahead_var, self.inference_gripper_lookahead_steps_var, "steps"),
+        )
+        for row, (label, enabled_var, value_var, unit) in enumerate(gripper_controls):
+            ttk.Checkbutton(gripper_tab, text=label, variable=enabled_var).grid(row=row, column=0, sticky="w", pady=5)
+            ttk.Label(gripper_tab, text=unit, foreground="#68707d").grid(row=row, column=1, sticky="e", padx=(6, 7))
+            entry = ttk.Entry(gripper_tab, textvariable=value_var, width=9)
+            entry.grid(row=row, column=2, sticky="e")
+            enable_when(entry, (enabled_var, True))
+        ttk.Label(gripper_tab, text="Confirm cycles").grid(row=3, column=0, sticky="w", pady=5)
+        confirm_entry = ttk.Entry(gripper_tab, textvariable=self.inference_gripper_confirm_steps_var, width=9)
+        confirm_entry.grid(row=3, column=2, sticky="e")
+        enable_when(confirm_entry, (self.inference_gripper_endpoint_var, True))
+        ttk.Label(gripper_tab, text="Hard robot safety checks remain active.",
+                  foreground="#68707d", wraplength=390).grid(row=4, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
         action = ttk.Frame(frame)
         action.grid(row=2, column=0, columnspan=2, sticky="nsew")
@@ -1579,6 +2020,13 @@ class CollectorGUI:
             style="Violet.TButton",
         )
         self.inference_stop_button.pack(side="left")
+        self.inference_next_button = ttk.Button(
+            buttons,
+            text="Next inference",
+            command=self.trigger_next_inference,
+            state="disabled",
+        )
+        self.inference_next_button.pack(side="left", padx=(8, 0))
         ttk.Label(
             action,
             textvariable=self.inference_status_var,
@@ -1589,7 +2037,7 @@ class CollectorGUI:
         )
         self.inference_log_widget = tk.Text(
             action,
-            height=20,
+            height=8,
             wrap="none",
             state="disabled",
             bg="#16181c",
@@ -1600,7 +2048,7 @@ class CollectorGUI:
             pady=8,
         )
         self.inference_log_widget.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
-        frame.pack_forget()
+        container.pack_forget()
 
     def _data_process_roots(self) -> tuple[pathlib.Path, ...]:
         """Return read-only roots visible to the Data process page."""
@@ -1816,10 +2264,20 @@ class CollectorGUI:
             self.inference_start_button.configure(state="disabled" if running else "normal")
         if self.inference_stop_button is not None:
             self.inference_stop_button.configure(state="normal" if running else "disabled")
+        if self.inference_next_button is not None:
+            manual_mode = (
+                not self.inference_async_enabled_var.get()
+                and not self.inference_auto_next_var.get()
+            )
+            self.inference_next_button.configure(
+                state="normal" if running and manual_mode else "disabled"
+            )
         if self.inference_activate_can_button is not None:
             self.inference_activate_can_button.configure(
                 state="disabled" if running or self._can_activation_running() else "normal"
             )
+        if self.inference_connect_button is not None:
+            self.inference_connect_button.configure(state="disabled" if running else "normal")
         if self.inference_device_settings_button is not None:
             self.inference_device_settings_button.configure(state="disabled" if running else "normal")
         if self.inference_swap_camera_button is not None:
@@ -1853,6 +2311,8 @@ class CollectorGUI:
             self.inference_activate_can_button.configure(
                 state="normal" if enabled and not self._can_activation_running() else "disabled"
             )
+        if self.inference_connect_button is not None:
+            self.inference_connect_button.configure(state="normal" if enabled else "disabled")
         self._update_mode_controls()
 
     def _refresh_dataset_choices(self) -> None:
@@ -1913,6 +2373,9 @@ class CollectorGUI:
             "inference_host": self.inference_host_var.get().strip(),
             "inference_port": self.inference_port_var.get().strip(),
             "inference_hz": self.inference_hz_var.get().strip(),
+            "inference_control_hz": self.inference_control_hz_var.get().strip(),
+            "inference_trigger_mode": self.inference_trigger_mode_var.get().strip(),
+            "inference_trigger_step": self.inference_trigger_step_var.get().strip(),
             "inference_allow_execution": bool(self.inference_allow_execution_var.get()),
             "inference_camera_preview": bool(self.inference_camera_preview_var.get()),
             "inference_rtc_enabled": bool(self.inference_rtc_enabled_var.get()),
@@ -1920,6 +2383,42 @@ class CollectorGUI:
             "inference_rtc_weight": self.inference_rtc_weight_var.get().strip(),
             "inference_rtc_schedule": self.inference_rtc_schedule_var.get().strip(),
             "inference_rtc_blend_steps": self.inference_rtc_blend_steps_var.get().strip(),
+            "inference_async_enabled": bool(self.inference_async_enabled_var.get()),
+            "inference_sync_wait_steps": self.inference_sync_wait_steps_var.get().strip(),
+            "inference_auto_next": bool(self.inference_auto_next_var.get()),
+            "inference_lowpass_filter_enabled": bool(self.inference_lowpass_filter_enabled_var.get()),
+            "inference_trajectory_smoothing_hz": self.inference_trajectory_smoothing_var.get().strip(),
+            "inference_gripper_lowpass_alpha": self.inference_gripper_lowpass_alpha_var.get().strip(),
+            "inference_trajectory_shaping_enabled": self.inference_trajectory_shaping_var.get(),
+            "inference_joint_lowpass_enabled": self.inference_joint_lowpass_var.get(),
+            "inference_joint_tracking_enabled": self.inference_joint_tracking_var.get(),
+            "inference_joint_speed_limit_enabled": self.inference_joint_speed_limit_var.get(),
+            "inference_joint_acceleration_limit_enabled": self.inference_joint_acceleration_limit_var.get(),
+            "inference_joint_jerk_limit_enabled": self.inference_joint_jerk_limit_var.get(),
+            "inference_joint_lookahead_enabled": self.inference_joint_lookahead_var.get(),
+            "inference_joint_tracking_time_constant_s": self.inference_joint_tracking_time_var.get().strip(),
+            "inference_joint_max_speed_rad_s": self.inference_joint_max_speed_var.get().strip(),
+            "inference_joint_max_acceleration_rad_s2": self.inference_joint_max_acceleration_var.get().strip(),
+            "inference_joint_max_jerk_rad_s3": self.inference_joint_max_jerk_var.get().strip(),
+            "inference_joint_lookahead_rad": self.inference_joint_lookahead_rad_var.get().strip(),
+            "inference_blend_enabled": (
+                self._nonrtc_blend_preference if self.inference_rtc_enabled_var.get()
+                else self.inference_blend_enabled_var.get()
+            ),
+            "inference_blend_steps": self.inference_blend_steps_var.get().strip(),
+            "inference_blend_profile": self.inference_blend_profile_var.get().strip(),
+            "inference_rtc_blend_enabled": (
+                self.inference_rtc_blend_enabled_var.get() if self.inference_rtc_enabled_var.get()
+                else self._rtc_blend_preference
+            ),
+            "inference_gripper_lowpass_enabled": self.inference_gripper_lowpass_var.get(),
+            "inference_gripper_endpoint_filter_enabled": self.inference_gripper_endpoint_var.get(),
+            "inference_gripper_hysteresis": self.inference_gripper_hysteresis_var.get().strip(),
+            "inference_gripper_confirm_steps": self.inference_gripper_confirm_steps_var.get().strip(),
+            "inference_gripper_open_lookahead_enabled": self.inference_gripper_lookahead_var.get(),
+            "inference_gripper_open_lookahead_steps": self.inference_gripper_lookahead_steps_var.get().strip(),
+            "inference_ik_rate_limit_enabled": self.inference_ik_rate_limit_var.get(),
+            "inference_ik_max_joint_step_rad": self.inference_ik_max_step_var.get().strip(),
             "left_wrist_device": self.left_wrist_var.get().strip(),
             "right_wrist_device": self.right_wrist_var.get().strip(),
             "swap_wrist_cameras": bool(self.swap_wrist_cameras_var.get()),
@@ -2387,6 +2886,8 @@ class CollectorGUI:
         if self.inference_activate_can_button is not None:
             self.inference_activate_can_button.configure(state="disabled")
         self.connect_button.configure(state="disabled")
+        if self.inference_connect_button is not None:
+            self.inference_connect_button.configure(state="disabled")
         self._set_connection_config_enabled(False)
 
         def worker(secret: str) -> None:
@@ -2425,20 +2926,75 @@ class CollectorGUI:
         widget.configure(state="disabled")
 
     def _validate_inference_settings(self) -> tuple[list[str], str]:
+        def numeric_setting(variable: tk.StringVar, enabled: bool, default: int | float,
+                            parse: type[int] | type[float]) -> int | float:
+            return parse(variable.get()) if enabled else default
+
+        shaping = self.inference_trajectory_shaping_var.get()
+        endpoint_filter = self.inference_gripper_endpoint_var.get()
         try:
             port = int(self.inference_port_var.get())
             hz = float(self.inference_hz_var.get())
-            rtc_horizon = int(self.inference_rtc_horizon_var.get())
-            rtc_weight = float(self.inference_rtc_weight_var.get())
-            rtc_blend_steps = int(self.inference_rtc_blend_steps_var.get())
+            control_hz = float(self.inference_control_hz_var.get())
+            trigger_mode = (
+                self.inference_trigger_mode_var.get().strip()
+                if self.inference_async_enabled_var.get() else "periodic"
+            )
+            trigger_step = numeric_setting(
+                self.inference_trigger_step_var,
+                self.inference_async_enabled_var.get() and trigger_mode == "chunk_step",
+                10, int,
+            )
+            rtc_horizon = numeric_setting(self.inference_rtc_horizon_var, self.inference_rtc_enabled_var.get(), 8, int)
+            rtc_weight = numeric_setting(self.inference_rtc_weight_var, self.inference_rtc_enabled_var.get(), 5.0, float)
+            rtc_blend_steps = numeric_setting(self.inference_rtc_blend_steps_var,
+                self.inference_rtc_enabled_var.get() and self.inference_rtc_blend_enabled_var.get(), 3, int)
+            sync_wait_steps = numeric_setting(self.inference_sync_wait_steps_var, not self.inference_async_enabled_var.get(), 8, int)
+            trajectory_smoothing_hz = numeric_setting(self.inference_trajectory_smoothing_var,
+                shaping and self.inference_joint_lowpass_var.get(), 3.0, float)
+            gripper_lowpass_alpha = numeric_setting(self.inference_gripper_lowpass_alpha_var,
+                self.inference_gripper_lowpass_var.get(), 0.5, float)
+            joint_max_speed = numeric_setting(self.inference_joint_max_speed_var,
+                shaping and self.inference_joint_speed_limit_var.get(), 0.30, float)
+            joint_max_acceleration = numeric_setting(self.inference_joint_max_acceleration_var,
+                shaping and self.inference_joint_acceleration_limit_var.get(), 0.80, float)
+            joint_max_jerk = numeric_setting(self.inference_joint_max_jerk_var,
+                shaping and self.inference_joint_jerk_limit_var.get(), 4.0, float)
+            joint_tracking_time = numeric_setting(self.inference_joint_tracking_time_var,
+                shaping and self.inference_joint_tracking_var.get(), 0.25, float)
+            joint_lookahead_rad = numeric_setting(self.inference_joint_lookahead_rad_var,
+                shaping and self.inference_joint_lookahead_var.get(), 0.02, float)
+            blend_steps = numeric_setting(self.inference_blend_steps_var,
+                not self.inference_rtc_enabled_var.get() and self.inference_blend_enabled_var.get(), 3, int)
+            gripper_hysteresis = numeric_setting(self.inference_gripper_hysteresis_var, endpoint_filter, 0.05, float)
+            gripper_confirm_steps = numeric_setting(self.inference_gripper_confirm_steps_var, endpoint_filter, 2, int)
+            gripper_lookahead_steps = numeric_setting(self.inference_gripper_lookahead_steps_var,
+                self.inference_gripper_lookahead_var.get(), 30, int)
+            ik_max_step = numeric_setting(self.inference_ik_max_step_var, self.inference_ik_rate_limit_var.get(), 0.02, float)
         except ValueError as exc:
-            raise ValueError("Policy port, inference rate, and RTC values must be numeric") from exc
+            raise ValueError("Policy port, inference rate, and enabled numeric values must be valid") from exc
+        manual_next_mode = (
+            not self.inference_async_enabled_var.get()
+            and not self.inference_auto_next_var.get()
+        )
+        if manual_next_mode:
+            fd, trigger_path = tempfile.mkstemp(
+                prefix="bimanual-vla-manual-trigger-", suffix=".txt"
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write("0")
+            self.inference_manual_trigger_path = pathlib.Path(trigger_path)
+        else:
+            self.inference_manual_trigger_path = None
         command = build_inference_bridge_command(
             python_executable=sys.executable,
             module_name=RTC_CLIENT_MODULE,
             host=self.inference_host_var.get(),
             port=port,
             hz=hz,
+            control_hz=control_hz,
+            inference_trigger_mode=trigger_mode,
+            inference_trigger_step=trigger_step,
             arm_mode=self.arm_mode,
             arm_side=self.arm_side,
             can=self.can_var.get(),
@@ -2454,10 +3010,56 @@ class CollectorGUI:
             rtc_enabled=bool(self.inference_rtc_enabled_var.get()),
             rtc_execution_horizon=rtc_horizon,
             rtc_max_guidance_weight=rtc_weight,
-            rtc_prefix_attention_schedule=self.inference_rtc_schedule_var.get().strip().lower(),
+            rtc_prefix_attention_schedule=(
+                self.inference_rtc_schedule_var.get().strip().lower()
+                if self.inference_rtc_enabled_var.get() else "linear"
+            ),
             rtc_client_blend_steps=rtc_blend_steps,
+            async_inference=bool(self.inference_async_enabled_var.get()),
+            sync_wait_steps=sync_wait_steps,
+            lowpass_filter_enabled=bool(self.inference_lowpass_filter_enabled_var.get()),
+            trajectory_smoothing_hz=trajectory_smoothing_hz,
+            gripper_lowpass_alpha=gripper_lowpass_alpha,
+            trajectory_shaping_enabled=self.inference_trajectory_shaping_var.get(),
+            joint_lowpass_enabled=self.inference_joint_lowpass_var.get(),
+            joint_tracking_enabled=self.inference_joint_tracking_var.get(),
+            joint_speed_limit_enabled=self.inference_joint_speed_limit_var.get(),
+            joint_acceleration_limit_enabled=self.inference_joint_acceleration_limit_var.get(),
+            joint_jerk_limit_enabled=self.inference_joint_jerk_limit_var.get(),
+            joint_lookahead_enabled=self.inference_joint_lookahead_var.get(),
+            joint_max_speed_rad_s=joint_max_speed,
+            joint_max_acceleration_rad_s2=joint_max_acceleration,
+            joint_max_jerk_rad_s3=joint_max_jerk,
+            joint_tracking_time_constant_s=joint_tracking_time,
+            joint_lookahead_rad=joint_lookahead_rad,
+            blend_enabled=not self.inference_rtc_enabled_var.get() and self.inference_blend_enabled_var.get(),
+            blend_steps=blend_steps,
+            blend_profile=(
+                self.inference_blend_profile_var.get().strip().lower()
+                if (not self.inference_rtc_enabled_var.get() and self.inference_blend_enabled_var.get())
+                or (self.inference_rtc_enabled_var.get() and self.inference_rtc_blend_enabled_var.get())
+                else "smootherstep"
+            ),
+            rtc_client_blend_enabled=self.inference_rtc_enabled_var.get() and self.inference_rtc_blend_enabled_var.get(),
+            gripper_lowpass_enabled=self.inference_gripper_lowpass_var.get(),
+            gripper_endpoint_filter_enabled=self.inference_gripper_endpoint_var.get(),
+            gripper_hysteresis=gripper_hysteresis,
+            gripper_confirm_steps=gripper_confirm_steps,
+            gripper_open_lookahead_enabled=self.inference_gripper_lookahead_var.get(),
+            gripper_open_lookahead_steps=gripper_lookahead_steps,
+            ik_rate_limit_enabled=self.inference_ik_rate_limit_var.get(),
+            ik_max_joint_step_rad=ik_max_step,
+            auto_next_inference=bool(self.inference_auto_next_var.get()),
+            manual_trigger_file=(
+                str(self.inference_manual_trigger_path)
+                if self.inference_manual_trigger_path is not None
+                else None
+            ),
         )
-        return command, f"{self.inference_host_var.get().strip()}:{port} @ {hz:g} Hz"
+        endpoint = f"{self.inference_host_var.get().strip()}:{port}"
+        if self.inference_async_enabled_var.get() and trigger_mode == "chunk_step":
+            return command, f"{endpoint} @ chunk step {trigger_step}, control {control_hz:g} Hz"
+        return command, f"{endpoint} @ {hz:g} Hz"
 
     def start_inference(self) -> None:
         if self._inference_running():
@@ -2535,6 +3137,15 @@ class CollectorGUI:
         except (OSError, ProcessLookupError):
             process.send_signal(signal.SIGINT)
 
+    def trigger_next_inference(self) -> None:
+        path = self.inference_manual_trigger_path
+        if path is None or not self._inference_running():
+            return
+        try:
+            path.write_text(str(time.time()), encoding="utf-8")
+        except OSError as exc:
+            self.status_var.set(f"Could not trigger next inference: {exc}")
+
     def _finish_inference(self, return_code: int | None, requested: bool) -> None:
         restart_requested = self.inference_restart_requested
         self.inference_process = None
@@ -2542,6 +3153,12 @@ class CollectorGUI:
         self.inference_stop_requested = False
         self.inference_restart_requested = False
         self.inference_pid_var.set("No inference process")
+        if self.inference_manual_trigger_path is not None:
+            try:
+                self.inference_manual_trigger_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.inference_manual_trigger_path = None
         if requested or return_code == 0:
             self.inference_status_var.set("Inference idle")
         else:
@@ -2559,6 +3176,8 @@ class CollectorGUI:
         self.can_activation_thread = None
         self._set_connection_config_enabled(True)
         self.connect_button.configure(state="normal")
+        if self.inference_connect_button is not None:
+            self.inference_connect_button.configure(state="normal")
         self.activate_can_button.configure(state="normal")
         if self.inference_activate_can_button is not None:
             self.inference_activate_can_button.configure(state="normal")
@@ -2733,7 +3352,12 @@ class CollectorGUI:
 
     def _clear_main_button_focus(self, event: tk.Event) -> None:
         """Remove mouse focus rings without stealing focus from dialogs."""
-        if event.widget.winfo_toplevel()._w != self.root._w:
+        # Handle case where event.widget might be a string instead of a widget object
+        try:
+            widget = event.widget if not isinstance(event.widget, str) else self.root.nametowidget(event.widget)
+            if widget.winfo_toplevel()._w != self.root._w:
+                return
+        except (AttributeError, KeyError, tk.TclError):
             return
 
         def clear_if_main_still_focused() -> None:

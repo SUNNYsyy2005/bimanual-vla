@@ -255,6 +255,58 @@ class InferenceCommandTest(unittest.TestCase):
         self.assertIn("--no-rtc-enabled", command)
         self.assertNotIn("--rtc-enabled", command)
 
+    def test_client_blend_options_follow_rtc_mode(self):
+        rtc_command = self._command(
+            rtc_enabled=True, blend_enabled=True,
+            rtc_client_blend_enabled=True, rtc_client_blend_steps=4,
+        )
+        self.assertEqual(rtc_command[rtc_command.index("--blend-steps") + 1], "0")
+        self.assertEqual(rtc_command[rtc_command.index("--rtc-client-blend-steps") + 1], "4")
+
+        non_rtc_command = self._command(
+            rtc_enabled=False, blend_enabled=True,
+            rtc_client_blend_enabled=True, rtc_client_blend_steps=4,
+        )
+        self.assertEqual(non_rtc_command[non_rtc_command.index("--blend-steps") + 1], "3")
+        self.assertEqual(non_rtc_command[non_rtc_command.index("--rtc-client-blend-steps") + 1], "0")
+
+    def test_trigger_mode_step_and_rates_reach_client_command(self):
+        command = self._command(
+            inference_trigger_mode="chunk_step", inference_trigger_step=10,
+            hz=3.0, control_hz=20.0,
+        )
+        self.assertEqual(command[command.index("--inference-trigger-mode") + 1], "chunk_step")
+        self.assertEqual(command[command.index("--inference-trigger-step") + 1], "10")
+        self.assertEqual(command[command.index("--hz") + 1], "3.0")
+        self.assertEqual(command[command.index("--control-hz") + 1], "20.0")
+
+        sync_command = self._command(async_inference=False, inference_trigger_mode="chunk_step")
+        self.assertEqual(sync_command[sync_command.index("--inference-trigger-mode") + 1], "periodic")
+
+    def test_independent_motion_switches_and_parameters(self):
+        command = self._command(
+            joint_lowpass_enabled=False,
+            gripper_lowpass_enabled=True,
+            joint_jerk_limit_enabled=False,
+            joint_lookahead_enabled=False,
+            blend_enabled=False,
+            rtc_client_blend_enabled=False,
+            rtc_client_blend_steps=3,
+            gripper_open_lookahead_enabled=False,
+            ik_rate_limit_enabled=False,
+            joint_max_speed_rad_s=0.22,
+        )
+        for flag in (
+            "--no-trajectory-lowpass", "--gripper-lowpass",
+            "--no-trajectory-jerk-limit", "--no-trajectory-lookahead",
+            "--no-ik-rate-limit",
+        ):
+            self.assertIn(flag, command)
+        self.assertEqual(command[command.index("--blend-steps") + 1], "0")
+        self.assertEqual(command[command.index("--rtc-client-blend-steps") + 1], "0")
+        self.assertEqual(command[command.index("--gripper-open-lookahead-steps") + 1], "0")
+        self.assertEqual(command[command.index("--trajectory-max-speed-rad-s") + 1], "0.22")
+
     def test_bimanual_rejects_duplicate_devices(self):
         with self.assertRaises(ValueError):
             self._command(right_can="can0")

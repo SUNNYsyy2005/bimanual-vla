@@ -98,10 +98,12 @@ DEFAULT_POLICY_HOST = "192.168.101.9"
 DEFAULT_POLICY_PORT = 8000
 DEFAULT_ACTION_HZ = 20.0
 DEFAULT_INFERENCE_HZ = 4.0
+DEFAULT_INFERENCE_TRIGGER_STEP = 10
 DEFAULT_CAMERA_FPS = 20
 DEFAULT_OPENPI_CHUNK_STEPS = 50
 DEFAULT_MIN_ACTION_CHUNK_STEPS = 16
 DEFAULT_BLEND_STEPS = 3
+DEFAULT_SYNC_WAIT_STEPS = 8
 DEFAULT_RTC_EXECUTION_HORIZON = 8
 DEFAULT_RTC_MAX_GUIDANCE_WEIGHT = 5.0
 INFERENCE_RATE_HISTORY_SIZE = 32
@@ -110,7 +112,7 @@ DEFAULT_GRIPPER_LOWPASS_ALPHA = 0.5
 DEFAULT_GRIPPER_HYSTERESIS = 0.05
 DEFAULT_GRIPPER_CONFIRM_STEPS = 2
 DEFAULT_FEEDBACK_MAX_AGE_S = 0.5
-DEFAULT_MAX_IMAGE_STATE_SKEW_S = 0.075
+DEFAULT_MAX_IMAGE_STATE_SKEW_S = 0.100  # 放宽到100ms，避免频繁跳过
 DEFAULT_TRACKING_LAG_THRESHOLD_RAD = 0.10
 DEFAULT_TRACKING_LAG_CONFIRM_CYCLES = 3
 DEFAULT_ARM_HOLD_TOLERANCE_RAD = 0.05
@@ -180,6 +182,55 @@ class ExecutionBlocked(RuntimeError):
 
 class PiperFeedbackStaleError(ExecutionBlocked):
     """Piper SDK getters contain missing or cached CAN feedback."""
+
+
+class NonBlockingConsoleHandler(logging.Handler):
+    """Move console formatting and pipe writes off the robot control thread."""
+
+    def __init__(self, *, queue_size: int = 1024) -> None:
+        super().__init__()
+        self.records: queue.Queue[logging.LogRecord | None] = queue.Queue(maxsize=queue_size)
+        self.sink = logging.StreamHandler()
+        self.sink.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        self.dropped_count = 0
+        self._stopping = threading.Event()
+        self.writer = threading.Thread(
+            target=self._write_loop, name="console-log-writer", daemon=True
+        )
+        self.writer.start()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.records.put_nowait(record)
+        except queue.Full:
+            self.dropped_count += 1
+
+    def _write_loop(self) -> None:
+        while True:
+            try:
+                record = self.records.get(timeout=0.1)
+            except queue.Empty:
+                if self._stopping.is_set():
+                    return
+                continue
+            try:
+                if record is None:
+                    return
+                self.sink.handle(record)
+            finally:
+                self.records.task_done()
+
+    def close(self) -> None:
+        if self._stopping.is_set():
+            return
+        self._stopping.set()
+        try:
+            self.records.put_nowait(None)
+        except queue.Full:
+            # Shutdown must not wait for a blocked GUI stdout/stderr consumer.
+            pass
+        self.writer.join(timeout=0.5)
+        super().close()
 
 
 class MonitoringRecorder:
@@ -1995,6 +2046,46 @@ class PeriodicSchedule:
         return True
 
 
+class ManualInferenceTrigger:
+    """Polls a small file the GUI writes to for a manually requested launch.
+
+    Used only when ``--no-auto-next-inference`` is set: the control loop
+    launches the next synchronous-mode request exactly once per distinct
+    value written to this file, instead of automatically as soon as the
+    truncated chunk drains. Missing/unreadable files are treated as "no
+    request yet" rather than an error, since the GUI creates the file before
+    the subprocess starts but a transient race is harmless here.
+    """
+
+    def __init__(self, path: str | None) -> None:
+        self._path = Path(path) if path else None
+        # The GUI writes a sentinel value to this file before the subprocess
+        # even starts, so it exists with content the instant this is
+        # constructed. Treat whatever is already there as the baseline --
+        # only a value written *after* startup (a real click) should fire.
+        self._last_seen: str | None = self._read()
+
+    def _read(self) -> str | None:
+        if self._path is None:
+            return None
+        try:
+            return self._path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+
+    @property
+    def enabled(self) -> bool:
+        return self._path is not None
+
+    def consume(self) -> bool:
+        """Return True at most once per new value written to the file."""
+        value = self._read()
+        if not value or value == self._last_seen:
+            return False
+        self._last_seen = value
+        return True
+
+
 def estimate_event_rate_hz(timestamps: Any) -> float | None:
     """Estimate the observed rate from a short monotonic timestamp history."""
     values = [float(value) for value in timestamps]
@@ -2318,7 +2409,21 @@ class ExecutionController:
         self.action_chunk_steps = self.min_action_chunk_steps  # legacy telemetry alias
         self.blend_steps = runtime_rates.blend_steps
         self.blend_profile = str(getattr(args, "blend_profile", "linear"))
+        self.async_inference = bool(getattr(args, "async_inference", True))
+        self.inference_trigger_mode = str(getattr(args, "inference_trigger_mode", "periodic"))
+        self.inference_trigger_step = int(getattr(args, "inference_trigger_step", DEFAULT_INFERENCE_TRIGGER_STEP))
+        self._chunk_step_launched_generation = 0
+        self.sync_wait_steps = max(
+            1, int(getattr(args, "sync_wait_steps", DEFAULT_SYNC_WAIT_STEPS))
+        )
+        self.auto_next_inference = bool(getattr(args, "auto_next_inference", True))
         self.trajectory_shaping = bool(getattr(args, "trajectory_shaping", False))
+        self.trajectory_lowpass = bool(getattr(args, "trajectory_lowpass", True))
+        self.trajectory_tracking = bool(getattr(args, "trajectory_tracking", True))
+        self.trajectory_speed_limit = bool(getattr(args, "trajectory_speed_limit", True))
+        self.trajectory_acceleration_limit = bool(getattr(args, "trajectory_acceleration_limit", True))
+        self.trajectory_jerk_limit = bool(getattr(args, "trajectory_jerk_limit", True))
+        self.trajectory_lookahead = bool(getattr(args, "trajectory_lookahead", True))
         self.trajectory_max_speed_rad_s = float(
             getattr(args, "trajectory_max_speed_rad_s", DEFAULT_TRAJECTORY_MAX_SPEED_RAD_S)
         )
@@ -2375,6 +2480,9 @@ class ExecutionController:
         self.gripper_lowpass_alpha = float(
             getattr(args, "gripper_lowpass_alpha", DEFAULT_GRIPPER_LOWPASS_ALPHA)
         )
+        self.gripper_lowpass = bool(getattr(args, "gripper_lowpass", True))
+        self.gripper_endpoint_filter = bool(getattr(args, "gripper_endpoint_filter", True))
+        self.ik_rate_limit = bool(getattr(args, "ik_rate_limit", True))
         self.gripper_hysteresis = float(
             getattr(args, "gripper_hysteresis", DEFAULT_GRIPPER_HYSTERESIS)
         )
@@ -2387,6 +2495,13 @@ class ExecutionController:
         self.hold_active = False
         self.hold_count = 0
         self.hold_started_at: float | None = None
+        # Wall-clock duration of the hold that just ended, captured right
+        # before ``accept_inference_result`` clears ``hold_started_at``. This
+        # is the objective, measurable proof of a synchronous-mode pause: it
+        # should closely track ``inference_latency_s`` for the accepted
+        # generation, since the next launch fires the instant the queue goes
+        # empty in synchronous mode.
+        self.last_hold_duration_s: float | None = None
         self.current_timed_target: dict[str, Any] | None = None
         # Keep the decoded target object so telemetry can recompute its signed
         # age against the current snapshot time instead of freezing the value at
@@ -2460,6 +2575,7 @@ class ExecutionController:
         self.control_overrun_count = 0
         self.command_sequence = 0
         self.last_actuator_command: dict[str, Any] | None = None
+        self.last_commanded_joint_positions: np.ndarray | None = None
         self.last_command_feedback: dict[str, Any] | None = None
         self._pending_feedback_command: dict[str, Any] | None = None
         self.tracking_lag_threshold_rad = float(
@@ -2549,6 +2665,20 @@ class ExecutionController:
         self.blend_profile = str(
             getattr(self.args, "blend_profile", "linear")
         )
+        self.async_inference = bool(getattr(self.args, "async_inference", True))
+        self.inference_trigger_mode = str(getattr(self.args, "inference_trigger_mode", "periodic"))
+        self.inference_trigger_step = int(getattr(self.args, "inference_trigger_step", DEFAULT_INFERENCE_TRIGGER_STEP))
+        if self.inference_trigger_mode not in {"periodic", "chunk_step"}:
+            raise ValueError("inference trigger mode must be periodic or chunk_step")
+        if self.async_inference and self.inference_trigger_mode == "chunk_step" and not 1 <= self.inference_trigger_step < int(protocol.action_horizon):
+            raise ValueError(
+                f"inference trigger step must be in [1, {int(protocol.action_horizon) - 1}]"
+            )
+        self._chunk_step_launched_generation = 0
+        self.sync_wait_steps = max(
+            1, int(getattr(self.args, "sync_wait_steps", DEFAULT_SYNC_WAIT_STEPS))
+        )
+        self.auto_next_inference = bool(getattr(self.args, "auto_next_inference", True))
         # Unit-test callers that construct a minimal Namespace retain the
         # historical direct-command behavior.  The CLI explicitly enables
         # shaping by default.
@@ -2625,10 +2755,12 @@ class ExecutionController:
         self.timeline_resync_active = False
         self.queue_underrun = False
         logging.info(
-            "Async action timing: control=%.3g Hz inference=%.3g Hz expected_chunk=%d "
+            "Action timing: control=%.3g Hz periodic/retry=%.3g Hz trigger=%s step=%d expected_chunk=%d "
             "minimum_chunk=%d blend=%d actuator_delay=%.4fs latency_compensation=%d",
             self.control_hz,
             self.inference_hz,
+            self.inference_trigger_mode,
+            self.inference_trigger_step,
             self.expected_action_horizon,
             self.min_action_chunk_steps,
             self.blend_steps,
@@ -2691,6 +2823,12 @@ class ExecutionController:
                 tracking_time_constant_s=self.trajectory_tracking_time_constant_s,
                 command_lookahead_rad=self.trajectory_command_lookahead_rad,
                 max_tracking_error_rad=self.trajectory_max_tracking_error_rad,
+                lowpass_enabled=self.trajectory_lowpass,
+                tracking_enabled=self.trajectory_tracking,
+                speed_limit_enabled=self.trajectory_speed_limit,
+                acceleration_limit_enabled=self.trajectory_acceleration_limit,
+                jerk_limit_enabled=self.trajectory_jerk_limit,
+                lookahead_enabled=self.trajectory_lookahead,
             )
         proposed = qpos.copy()
         for index, side in enumerate(sides):
@@ -2731,7 +2869,35 @@ class ExecutionController:
         self.inference_capture_monotonic = launch.captured_monotonic
         self.inference_launch_at = launch.launched_at
         self.inference_launch_count += 1
+        if self.inference_trigger_mode == "chunk_step":
+            self._chunk_step_launched_generation = self.active_generation
         self._inference_launch_times.append(float(launch.launched_monotonic))
+
+    def chunk_step_launch_due(self) -> bool:
+        """Trigger once after the configured source row was actually sent."""
+        target = self.last_safe_target
+        return bool(
+            self.active_generation > 0
+            and self._chunk_step_launched_generation != self.active_generation
+            and target is not None
+            and target.generation == self.active_generation
+            and target.source_index is not None
+            and target.source_index + 1 >= self.inference_trigger_step
+        )
+
+    def async_launch_due(self, schedule: PeriodicSchedule, now: float) -> bool:
+        if self.inference_trigger_mode == "periodic":
+            return schedule.due(now)
+        if self.chunk_step_launch_due():
+            return True
+        recovering = (
+            self.active_generation == 0
+            or not self.pending_actions
+            or self.rejected_result is not None
+            or self.tracking_lag_active
+            or self.waiting_fresh_after_enable
+        )
+        return recovering and schedule.due(now)
 
     def record_inference_completion(self, arrived_monotonic: float) -> None:
         """Record every completed response, including rejected action chunks."""
@@ -2842,6 +3008,8 @@ class ExecutionController:
                 "control_hz": self.control_hz,
                 "inference_hz": self.inference_hz,
                 "configured_inference_hz": self.inference_hz,
+                "inference_trigger_mode": self.inference_trigger_mode,
+                "inference_trigger_step": self.inference_trigger_step,
                 "expected_action_horizon": self.expected_action_horizon,
                 "min_action_chunk_steps": self.min_action_chunk_steps,
                 "action_chunk_steps": self.action_chunk_steps,
@@ -2925,6 +3093,8 @@ class ExecutionController:
             "control_hz": self.control_hz,
             "inference_hz": self.inference_hz,
             "configured_inference_hz": self.inference_hz,
+            "inference_trigger_mode": self.inference_trigger_mode,
+            "inference_trigger_step": self.inference_trigger_step,
             "inference_launch_hz": estimate_event_rate_hz(self._inference_launch_times),
             "inference_result_hz": estimate_event_rate_hz(self._inference_completion_times),
             "inference_single_inflight_ceiling_hz": estimate_single_inflight_ceiling_hz(
@@ -3029,6 +3199,12 @@ class ExecutionController:
             "estimated_actuator_delay_s": self.estimated_actuator_delay_s,
             "trajectory_shaper": {
                 "enabled": self.trajectory_shaping,
+                "lowpass_enabled": self.trajectory_lowpass,
+                "tracking_enabled": self.trajectory_tracking,
+                "speed_limit_enabled": self.trajectory_speed_limit,
+                "acceleration_limit_enabled": self.trajectory_acceleration_limit,
+                "jerk_limit_enabled": self.trajectory_jerk_limit,
+                "lookahead_enabled": self.trajectory_lookahead,
                 "blend_profile": self.blend_profile,
                 "max_speed_rad_s": self.trajectory_max_speed_rad_s,
                 "max_acceleration_rad_s2": self.trajectory_max_acceleration_rad_s2,
@@ -3072,6 +3248,8 @@ class ExecutionController:
                 "recovered_generation": self.tracking_lag_recovered_generation,
             },
             "gripper_filter": {
+                "lowpass_enabled": self.gripper_lowpass,
+                "endpoint_filter_enabled": self.gripper_endpoint_filter,
                 "lowpass_alpha": self.gripper_lowpass_alpha,
                 "hysteresis": self.gripper_hysteresis,
                 "confirm_steps": self.gripper_confirm_steps,
@@ -3081,6 +3259,7 @@ class ExecutionController:
             "safety_profile": SAFETY_PROFILE,
             "delivery_command_mode": "continuous_ik_joint",
             "continuous_ik": {
+                "rate_limit_enabled": self.ik_rate_limit,
                 "max_joint_step_rad": float(getattr(self.args, "ik_max_joint_step_rad", DEFAULT_IK_MAX_JOINT_STEP_RAD)),
                 "search_joint_radius_rad": float(getattr(self.args, "ik_search_joint_radius_rad", DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD)),
                 "joint_regularization_weight": float(getattr(self.args, "ik_joint_regularization_weight", DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT)),
@@ -3659,6 +3838,8 @@ class ExecutionController:
         previous: float,
     ) -> float:
         """Apply open/closed hysteresis and consecutive-command confirmation."""
+        if not self.gripper_endpoint_filter:
+            return desired
         hysteresis = self.gripper_hysteresis
         latch = self._gripper_extreme_latch.get(side)
         extreme: str | None = None
@@ -3723,7 +3904,8 @@ class ExecutionController:
             current = float(np.clip(qpos_slice[6] / GRIPPER_MAX_M, 0.0, 1.0))
             previous = self._filtered_gripper_opening.get(side, current)
             confirmed = self._confirmed_gripper_desired(side, desired, previous)
-            filtered = previous + self.gripper_lowpass_alpha * (confirmed - previous)
+            alpha = self.gripper_lowpass_alpha if self.gripper_lowpass else 1.0
+            filtered = previous + alpha * (confirmed - previous)
             if protocol.schema == "delivery":
                 max_step_value = getattr(
                     self.args, "max_gripper_step", DEFAULT_MAX_GRIPPER_STEP
@@ -3760,6 +3942,10 @@ class ExecutionController:
         kwargs = {
             "max_joint_step_rad": float(
                 getattr(self.args, "ik_max_joint_step_rad", DEFAULT_IK_MAX_JOINT_STEP_RAD)
+                if self.ik_rate_limit
+                else getattr(
+                    self.args, "ik_search_joint_radius_rad", DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD
+                )
             ),
             "search_joint_radius_rad": float(
                 getattr(
@@ -4285,6 +4471,17 @@ class ExecutionController:
             ),
         )
 
+        # Synchronous mode intentionally throttles execution to a fixed prefix
+        # of the accepted chunk. The gripper lookahead above already saw the
+        # full fresh chunk, so truncating here does not weaken that decision.
+        # Once this short queue drains, ``execute_next`` holds the last safe
+        # target (the existing queue-underrun path) until the next inference
+        # is launched and accepted -- see the launch gating in the control
+        # loop, which only launches a new request once ``pending_actions`` is
+        # empty when ``async_inference`` is disabled.
+        if not self.async_inference:
+            candidate = candidate[: self.sync_wait_steps]
+
         # All decoding/blending/authorization checks finished. The control thread
         # performs one atomic list replacement; inference never mutates this queue.
         self.pending_actions = candidate
@@ -4307,6 +4504,9 @@ class ExecutionController:
         )
         self.queue_underrun = False
         self.hold_active = False
+        self.last_hold_duration_s = (
+            arrived_at - self.hold_started_at if self.hold_started_at is not None else None
+        )
         self.hold_started_at = None
         if self.arm_hold_targets:
             # This is only a staged plan until its first checked command is
@@ -4675,6 +4875,12 @@ class ExecutionController:
                 self._record_queue_drop(
                     len(self.pending_actions), reason, kind="expired"
                 )
+                logging.debug(
+                    "Execution catch-up: dropped entire %d-row queue as stale "
+                    "(execution_time=%.6f)",
+                    len(self.pending_actions),
+                    execution_time,
+                )
                 self.pending_actions.clear()
                 self.queued_action_index = None
                 self.timeline_resync_active = False
@@ -4683,6 +4889,13 @@ class ExecutionController:
                     f"dropped {future_index} targets older than execution_time={execution_time:.6f}"
                 )
                 self._record_queue_drop(future_index, reason, kind="expired")
+                logging.debug(
+                    "Execution catch-up: dropped %d/%d stale rows from the front "
+                    "of the active queue (execution_time=%.6f)",
+                    future_index,
+                    len(self.pending_actions),
+                    execution_time,
+                )
                 del self.pending_actions[:future_index]
 
         if self.enable_staged_generation is not None and not self.pending_actions:
@@ -5074,6 +5287,11 @@ class ExecutionController:
             "sides": command_pipeline,
         }
         self.last_actuator_command = command_trace
+        # Use the quantized values actually sent through JointCtrl for jitter
+        # metrics, excluding grippers and decoded/model targets.
+        self.last_commanded_joint_positions = np.concatenate(
+            [wire_commands[side][0].astype(np.float32) / RAD_FACTOR for side in sides]
+        )
         self._pending_feedback_command = command_trace
         self.last_command_at = command_at
         self.unsafe_active = False
@@ -5735,19 +5953,22 @@ def run_rtc_client(args: argparse.Namespace) -> None:
         )
         monitoring.record("camera_ready", camera_checks=camera_checks, camera_ids=camera_ids)
         logging.warning(
-            "%s %s client: output_mode=%s control=%.3g Hz inference=%.3g Hz "
+            "%s %s client: output_mode=%s control=%.3g Hz periodic/retry=%.3g Hz trigger=%s step=%d "
             "expected_chunk=%d minimum_chunk=%d. Robot commands still require Dashboard EXECUTE.",
             "EXECUTION-CAPABLE" if args.allow_execution else "SHADOW-ONLY",
             args.arm_mode,
             output_mode,
             args.control_hz,
             args.hz,
+            execution.inference_trigger_mode,
+            execution.inference_trigger_step,
             DEFAULT_OPENPI_CHUNK_STEPS,
             args.min_action_chunk_steps,
         )
 
         next_control_at = time.monotonic()
         launch_schedule = PeriodicSchedule(args.hz, next_at=next_control_at)
+        manual_trigger = ManualInferenceTrigger(getattr(args, "manual_trigger_file", None))
         while True:
             tick_started = time.monotonic()
             execution.record_control_tick(overrun=tick_started > next_control_at + control_period)
@@ -5798,14 +6019,14 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                 "policy_connected",
                                 requested_output_mode=output_mode,
                                 protocol=vars(protocol),
-                                metadata=execution.metadata(),
+                                metadata=execution.metadata(compact=monitoring.level != "full"),
                             )
                         except Exception as exc:
                             execution._block("blocked", f"policy connection unavailable: {exc}")
                             monitoring.record(
                                 "policy_connection_error",
                                 error=repr(exc),
-                                execution=execution.metadata(),
+                                execution=execution.metadata(compact=monitoring.level != "full"),
                             )
                             logging.warning("Policy connection unavailable: %s", exc)
 
@@ -5883,7 +6104,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                 arrived_at=completion.arrived_at,
                                 image_timestamps=completion.launch.image_timestamps,
                                 error=repr(completion.error),
-                                execution=execution.metadata(),
+                                execution=execution.metadata(compact=monitoring.level != "full"),
                             )
                             if policy is not None:
                                 close_policy(policy)
@@ -5973,6 +6194,28 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                 execution.pending_action_count,
                                 execution.rejected_result,
                             )
+                            if not execution.async_inference:
+                                # Synchronous mode never overlaps a request with
+                                # execution of the previous chunk, so this is a
+                                # clean, uncontaminated round-trip measurement.
+                                # ``hold_s`` is the wall-clock time the robot
+                                # actually sat still waiting for this result --
+                                # it should track ``latency`` closely, since the
+                                # next launch fires the instant the queue drains.
+                                logging.info(
+                                    "Synchronous inference generation=%d round-trip "
+                                    "latency=%.3fs hold_s=%s accepted=%s queued=%d/%d steps",
+                                    completion.launch.generation,
+                                    execution.inference_latency_s or 0.0,
+                                    (
+                                        f"{execution.last_hold_duration_s:.3f}"
+                                        if execution.last_hold_duration_s is not None
+                                        else "n/a"
+                                    ),
+                                    accepted,
+                                    execution.pending_action_count,
+                                    execution.sync_wait_steps,
+                                )
                             count += 1
                             if args.once and accepted:
                                 once_result_accepted = True
@@ -5987,9 +6230,41 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                     launch_candidate: tuple[
                         InferenceLaunch, Callable[[], InferenceWorkerResult]
                     ] | None = None
-                    if launch_schedule.due(tick_started):
+                    # Asynchronous launches can follow either wall-clock slots
+                    # or a successfully published source row in each chunk.
+                    # Synchronous mode instead launches only once the active
+                    # chunk (truncated to ``sync_wait_steps`` on accept) has
+                    # fully drained, so capture-to-result latency is never
+                    # contaminated by an overlapping in-flight request. Within
+                    # synchronous mode, manual stepping additionally requires a
+                    # fresh value in the GUI-written trigger file before that
+                    # drained state is allowed to launch -- the ``and`` short
+                    # circuits so an early click made before the queue drains
+                    # is not silently consumed and lost.
+                    if execution.async_inference:
+                        launch_due = execution.async_launch_due(launch_schedule, tick_started)
+                    else:
+                        queue_drained = not execution.pending_action_count
+                        # ``launch_schedule`` still applies as an upper bound
+                        # on retry rate. Without it, a server that rejects
+                        # requests *faster* than it fulfills them (e.g. an
+                        # expired Dashboard authorization failing before the
+                        # model even runs) would retry as fast as the round
+                        # trip allows, with no floor -- the same failure mode
+                        # async mode's periodic schedule already prevents. A
+                        # legitimate accepted chunk's natural drain time is
+                        # normally well above one schedule period, so this
+                        # floor rarely binds outside of a rejection loop.
+                        rate_limited = queue_drained and launch_schedule.due(tick_started)
+                        launch_due = (
+                            rate_limited
+                            if execution.auto_next_inference
+                            else rate_limited and manual_trigger.consume()
+                        )
+                    if launch_due:
                         if worker.in_flight:
-                            execution.record_launch_deferred()
+                            if execution.async_inference and execution.inference_trigger_mode == "periodic":
+                                execution.record_launch_deferred()
                         elif policy is not None:
                             camera_selection_started_at = time.time()
                             camera_selection_started_monotonic = time.monotonic()
@@ -6004,6 +6279,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                     rtc_metadata=rtc_snapshot,
                                     compact=True,
                                 )
+                                execution_snapshot["trajectory_jitter"] = recorder.jitter_snapshot
                                 snapshot = make_observation_snapshot(
                                     generation=generation,
                                     raw_delivery_state=delivery_state,
@@ -6145,7 +6421,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                     captured_at=observation_captured_at,
                                     captured_monotonic=observation_captured_monotonic,
                                     error=repr(exc),
-                                    execution=execution.metadata(),
+                                    execution=execution.metadata(compact=monitoring.level != "full"),
                                 )
                                 logging.warning(
                                     "Inference snapshot skipped: %s", exc
@@ -6175,15 +6451,10 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                             execution=execution.metadata(
                                 compact=monitoring.level != "full"
                             ),
+                            trajectory_jitter=recorder.jitter_snapshot,
                         )
                     if command_sent:
                         command_count += 1
-                    if (
-                        args.once
-                        and once_result_accepted
-                        and (not args.allow_execution or command_sent)
-                    ):
-                        return
                     command_target = execution.current_timed_target_action
                     try:
                         recorder.record_control_tick(
@@ -6205,6 +6476,15 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                 if not command_sent or command_target is None
                                 else np.asarray(command_target.absolute_target, dtype=np.float32)
                             ),
+                            command_joints_rad=(
+                                execution.last_commanded_joint_positions
+                                if command_sent else None
+                            ),
+                            command_monotonic_timestamp=(
+                                float(execution.last_actuator_command["command_monotonic"])
+                                if command_sent and execution.last_actuator_command is not None
+                                else None
+                            ),
                             command_generation=(
                                 None
                                 if not command_sent or command_target is None
@@ -6225,6 +6505,12 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                         # Recording must never turn a safety-checked control tick
                         # into a robot-control failure.
                         logging.exception("Failed to record control tick")
+                    if (
+                        args.once
+                        and once_result_accepted
+                        and (not args.allow_execution or command_sent)
+                    ):
+                        return
                     if command_sent and args.max_commands is not None and command_count >= args.max_commands:
                         logging.warning(
                             "Reached --max-commands=%d; stopping after the checked command.",
@@ -6254,10 +6540,14 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                 generation=launch.generation,
                                 captured_monotonic=launch.captured_monotonic,
                                 reason="snapshot predates tracking-lag trigger",
-                                execution=execution.metadata(),
+                                execution=execution.metadata(compact=monitoring.level != "full"),
                             )
                         elif worker.launch_callable(inference_task, launch):
                             execution.record_inference_launch(launch)
+                            if execution.async_inference and execution.inference_trigger_mode == "chunk_step":
+                                # The periodic clock is only a bounded retry
+                                # interval for bootstrap, failure, and underrun.
+                                launch_schedule.next_at = tick_started + launch_schedule.period_s
                         else:  # defensive; the control thread owns launch()
                             execution.record_launch_deferred()
 
@@ -6267,7 +6557,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                 monitoring.record(
                     "control_tick_blocked",
                     error=repr(exc),
-                    execution=execution.metadata(),
+                    execution=execution.metadata(compact=monitoring.level != "full"),
                 )
                 logging.warning("20 Hz feedback/safety check blocked: %s", exc)
             except Exception as exc:
@@ -6275,7 +6565,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                 monitoring.record(
                     "control_tick_error",
                     error=repr(exc),
-                    execution=execution.metadata(),
+                    execution=execution.metadata(compact=monitoring.level != "full"),
                 )
                 logging.exception("20 Hz control tick failed")
 
@@ -6389,6 +6679,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
             command_count=command_count,
             return_attempted=return_attempted,
             returned_to_initial=returned_to_initial,
+            trajectory_jitter=recorder.jitter_snapshot,
         )
         monitoring.close(reason="stopped")
 
@@ -6451,9 +6742,22 @@ def main() -> None:
         type=float,
         default=DEFAULT_INFERENCE_HZ,
         help=(
-            "asynchronous policy launch frequency (default 4 Hz / every 250 ms); "
+            "periodic asynchronous launch frequency, or recovery retry rate in chunk_step mode "
+            "(default 4 Hz / every 250 ms); "
             "robot control remains independently configured by --control-hz"
         ),
+    )
+    parser.add_argument(
+        "--inference-trigger-mode",
+        choices=("periodic", "chunk_step"),
+        default="periodic",
+        help="asynchronous request trigger: wall-clock schedule or executed chunk source step",
+    )
+    parser.add_argument(
+        "--inference-trigger-step",
+        type=int,
+        default=DEFAULT_INFERENCE_TRIGGER_STEP,
+        help="1-based chunk source step to request the next chunk in chunk_step mode (default 10)",
     )
     parser.add_argument(
         "--control-hz",
@@ -6488,6 +6792,38 @@ def main() -> None:
         help="optional extra client blend after model-side RTC; default 0 to avoid adding latency",
     )
     parser.add_argument(
+        "--async-inference",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="asynchronous inference launch (default); --no-async-inference waits for chunk execution",
+    )
+    parser.add_argument(
+        "--sync-wait-steps",
+        type=int,
+        default=8,
+        help="steps to wait before next inference when async is disabled (default 8)",
+    )
+    parser.add_argument(
+        "--auto-next-inference",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "when async is disabled, automatically launch the next inference "
+            "once the truncated chunk drains (default); --no-auto-next-inference "
+            "instead holds and waits for --manual-trigger-file to change"
+        ),
+    )
+    parser.add_argument(
+        "--manual-trigger-file",
+        type=str,
+        default=None,
+        help=(
+            "path polled once per control tick for a manual next-inference "
+            "request; a launch fires once the file's contents change. "
+            "Required when --no-auto-next-inference is set"
+        ),
+    )
+    parser.add_argument(
         "--action-chunk-steps",
         type=int,
         default=None,
@@ -6502,9 +6838,9 @@ def main() -> None:
     parser.add_argument(
         "--blend-steps",
         type=int,
-        choices=(2, 3, 4),
+        choices=(0, 2, 3, 4),
         default=DEFAULT_BLEND_STEPS,
-        help="pose/joint old/new blend length (default 3; gripper is not interpolated)",
+        help="pose/joint old/new blend length; 0 disables client blending (default 3)",
     )
     parser.add_argument(
         "--blend-profile",
@@ -6518,6 +6854,18 @@ def main() -> None:
         default=True,
         help="apply velocity/acceleration/jerk-limited joint trajectory shaping",
     )
+    for option, description in (
+        ("trajectory-lowpass", "joint reference low-pass filter"),
+        ("trajectory-tracking", "second-order joint reference tracking"),
+        ("trajectory-speed-limit", "joint shaper speed limit"),
+        ("trajectory-acceleration-limit", "joint shaper acceleration limit"),
+        ("trajectory-jerk-limit", "joint shaper jerk limit"),
+        ("trajectory-lookahead", "velocity-based joint command lookahead"),
+    ):
+        parser.add_argument(
+            f"--{option}", action=argparse.BooleanOptionalAction,
+            default=True, help=f"enable {description} (default: enabled)",
+        )
     parser.add_argument(
         "--trajectory-max-speed-rad-s",
         type=float,
@@ -6591,6 +6939,18 @@ def main() -> None:
         type=float,
         default=DEFAULT_GRIPPER_LOWPASS_ALPHA,
         help="independent gripper opening low-pass alpha in (0,1]",
+    )
+    parser.add_argument(
+        "--gripper-lowpass", action=argparse.BooleanOptionalAction,
+        default=True, help="enable independent gripper low-pass filtering",
+    )
+    parser.add_argument(
+        "--gripper-endpoint-filter", action=argparse.BooleanOptionalAction,
+        default=True, help="enable gripper endpoint hysteresis and confirmation",
+    )
+    parser.add_argument(
+        "--ik-rate-limit", action=argparse.BooleanOptionalAction,
+        default=True, help="limit each delivery IK command to --ik-max-joint-step-rad",
     )
     parser.add_argument(
         "--gripper-hysteresis",
@@ -6795,6 +7155,12 @@ def main() -> None:
     args = parser.parse_args()
     if not math.isfinite(float(args.monitoring_rate)) or args.monitoring_rate < 0:
         parser.error("--monitoring-rate must be finite and non-negative")
+    if args.sync_wait_steps < 1:
+        parser.error("--sync-wait-steps must be positive")
+    if args.inference_trigger_step < 1:
+        parser.error("--inference-trigger-step must be positive")
+    if not args.auto_next_inference and not args.manual_trigger_file:
+        parser.error("--no-auto-next-inference requires --manual-trigger-file")
     if args.max_joint_gripper_step is not None and args.max_joint_gripper_step_m is not None:
         parser.error(
             "use only one of --max-joint-gripper-step or --max-joint-gripper-step-m"
@@ -6906,8 +7272,18 @@ def main() -> None:
     if not args.instruction.strip():
         parser.error("instruction must not be empty")
     args.instruction = args.instruction.strip()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    run_rtc_client(args)
+    root_logger = logging.getLogger()
+    previous_handlers = root_logger.handlers[:]
+    previous_level = root_logger.level
+    console_handler = NonBlockingConsoleHandler()
+    root_logger.handlers = [console_handler]
+    root_logger.setLevel(logging.INFO)
+    try:
+        run_rtc_client(args)
+    finally:
+        root_logger.handlers = previous_handlers
+        root_logger.setLevel(previous_level)
+        console_handler.close()
 
 
 # Backward-compatible import/entry-point name used by older scripts and tests.

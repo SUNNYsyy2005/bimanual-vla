@@ -710,7 +710,7 @@
       </div>
       <p class="muted">说明：上传/下行由客户端根据本次请求的服务端时间戳回显计算并汇报；单向值仍需两端 wall-clock 基本同步。RTT 和“结果→首条命令”由客户端 monotonic clock 实测，模型推理由服务端 monotonic clock 实测。</p>
       <div class="grid">
-        <div class="card"><h2>Policy 实时观测</h2><div id="robotObservation" class="warn">尚未收到 telemetry。</div><div id="telemetryContractBadges" class="telemetry-badges"></div><div class="telemetry-vector-grid"><div class="telemetry-vector-card"><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div><div class="telemetry-vector-card"><h3 id="policyFirstActionTitle">首条预测 action</h3><pre id="policyFirstAction">action: -</pre></div></div><details class="telemetry-details" open><summary>Prompt / 合同 / Chunk 与安全状态</summary><pre id="policyAction">action: -</pre></details><h3>模型 → IK → Piper 命令 → 下一周期反馈</h3><pre id="actuatorTrace">actuator trace: -</pre><div class="telemetry-camera-heading"><h3 style="margin:0">Policy 实际收到的相机</h3><span id="robotCameraSummary" class="muted">等待 telemetry。</span></div><div id="robotImages" class="telemetry-camera-grid"><div class="muted">尚无相机帧。</div></div></div>
+        <div class="card"><h2>Policy 实时观测</h2><div id="robotObservation" class="warn">尚未收到 telemetry。</div><div id="telemetryContractBadges" class="telemetry-badges"></div><div class="telemetry-vector-grid"><div class="telemetry-vector-card"><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div><div class="telemetry-vector-card"><h3 id="policyFirstActionTitle">首条预测 action</h3><pre id="policyFirstAction">action: -</pre></div></div><details class="telemetry-details" open><summary>Prompt / 合同 / Chunk 与安全状态</summary><pre id="policyAction">action: -</pre></details><h3>Trajectory jitter（实际下发关节命令）</h3><pre id="trajectoryJitter">等待命令样本。</pre><h3>模型 → IK → Piper 命令 → 下一周期反馈</h3><pre id="actuatorTrace">actuator trace: -</pre><div class="telemetry-camera-heading"><h3 style="margin:0">Policy 实际收到的相机</h3><span id="robotCameraSummary" class="muted">等待 telemetry。</span></div><div id="robotImages" class="telemetry-camera-grid"><div class="muted">尚无相机帧。</div></div></div>
       </div>
     </section>
   </main>
@@ -5068,6 +5068,7 @@ function telemetryCameraShape(shape) {
 }
 
 function clearObservationPreviews(message = '尚无相机帧。') {
+  latestTelemetryKey = null;
   previewUrls.forEach(url => URL.revokeObjectURL(url));
   previewUrls.clear();
   document.getElementById('robotImages').innerHTML = `<div class="muted">${esc(message)}</div>`;
@@ -5092,11 +5093,11 @@ async function loadObservationPreviews(obs) {
     clearObservationPreviews('Policy 未上报相机字段。');
     return;
   }
-  const requestKey = `${obs.telemetry_session}:${obs.sequence}`;
+  const requestKey = `${obs.telemetry_session}:${obs.image_sequence ?? obs.sequence}`;
   renderObservationCameraCards(obs, keys);
   previewUrls.forEach(url => URL.revokeObjectURL(url));
   previewUrls.clear();
-  const suffix = `?v=${encodeURIComponent(obs.sequence)}`;
+  const suffix = `?v=${encodeURIComponent(obs.image_sequence ?? obs.sequence)}`;
   const session = encodeURIComponent(obs.telemetry_session);
   const results = await Promise.allSettled(
     keys.map(key => apiBlob(`/api/policy-telemetry/${session}/image/${encodeURIComponent(key)}${suffix}`)),
@@ -5119,6 +5120,7 @@ async function loadObservationPreviews(obs) {
       console.warn(`telemetry camera ${key} refresh failed`, result.reason);
     }
   });
+  if (results.some(result => result.status === 'rejected')) latestTelemetryKey = null;
 }
 
 function telemetryVectorLabels(obs, kind, perArmDim) {
@@ -5205,6 +5207,7 @@ function fillObservation(obs) {
     document.getElementById('policyFirstActionTitle').textContent = '首条预测 action';
     document.getElementById('policyFirstAction').textContent = 'action: -';
     document.getElementById('policyAction').textContent = 'action: -';
+    document.getElementById('trajectoryJitter').textContent = '等待命令样本。';
     document.getElementById('actuatorTrace').textContent = 'actuator trace: -';
     clearObservationPreviews();
     ['telemetryUpload', 'telemetryModel', 'telemetryDownload', 'telemetryTransport', 'telemetryFirstCommand', 'telemetryActionError'].forEach(id => { document.getElementById(id).textContent = '-'; });
@@ -5272,6 +5275,12 @@ function fillObservation(obs) {
     obs.client_last_actuator_command,
     obs.client_last_command_feedback,
   );
+  const jitter = obs.client_trajectory_jitter || {};
+  const jitterNumber = (value, digits = 6) => value == null ? '-' : Number(value).toFixed(digits);
+  document.getElementById('trajectoryJitter').textContent =
+    `chunk 内二阶差分 L2 均值: ${jitterNumber(jitter.intra_accel_mean_rad_per_step2)} rad/step² · 样本 ${jitter.intra_accel_samples ?? 0}\n` +
+    `chunk 边界位置跳变 L2 均值: ${jitterNumber(jitter.boundary_jump_mean_rad_l2)} rad · 边界 ${jitter.boundary_jump_samples ?? 0}\n` +
+    `chunk 边界速度方向余弦均值: ${jitterNumber(jitter.boundary_momentum_cosine_mean, 4)} · 有效边界 ${jitter.boundary_momentum_samples ?? 0}`;
   const targetTimes = Array.isArray(obs.client_plan_target_times) ? JSON.stringify(obs.client_plan_target_times) : '-';
   const targetAt = actionTargetAt(obs);
   const rejectedResult = obs.client_rejected_result ? JSON.stringify(obs.client_rejected_result) : false;
@@ -5339,7 +5348,7 @@ driver enable feedback: ${obs.client_robot_driver_enable_status ? JSON.stringify
 enable hold handshake: ${obs.client_robot_enable_hold ? JSON.stringify(obs.client_robot_enable_hold) : '-'}
 last command sent: ${fmtTime(obs.client_last_command_at)}
 safety @20Hz: ${joint ? 'joint target/rate + gripper + Piper status checks' : 'translation<=0.05m, rotation<=0.18rad, gripper<=0.30 fraction; workspace x[-0.05,0.30] y[0.01,0.50] z[0.14,0.52]'}; CLI may tighten`;
-  const key = `${obs.telemetry_session}:${obs.sequence}`;
+  const key = `${obs.telemetry_session}:${obs.image_sequence ?? obs.sequence}`;
   if (key !== latestTelemetryKey) {
     latestTelemetryKey = key;
     loadObservationPreviews(obs);
