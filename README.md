@@ -340,6 +340,7 @@ source code and are excluded from Git.
 | Dataset fields and semantics | [Piper data contract](docs/collection/PIPER_DATA_CONTRACT.md) |
 | 7D/10D action design | [OpenPI action design](docs/collection/PI05_PIPER_7D_10D_DATA_ACTION_DESIGN.md) |
 | Real-robot inference | [RTC client guide](docs/deployment/RTC_CLIENT_GUIDE.md) |
+| RLSOK device review integration | [RLSOK integration guide](docs/rlsok/README.md) |
 | Dashboard backend | [Dashboard operations](server_4090/README.md) |
 | Dashboard API | [API reference](server_4090/API_USAGE.md) |
 
