@@ -374,6 +374,7 @@ class CameraCapture:
         self._last_direct_monotonic_timestamps: dict[str, float] = {}
         self._source_aspects: dict[str, float] = {}
         self._background_error: BaseException | None = None
+        self._background_started_monotonic: float | None = None
         self._preview_enabled = False
 
     def set_preview_enabled(self, enabled: bool) -> None:
@@ -430,6 +431,7 @@ class CameraCapture:
             self._last_direct_monotonic_timestamps.clear()
             self._source_aspects.clear()
             self._background_error = None
+            self._background_started_monotonic = None
 
     @property
     def source_aspects(self) -> dict[str, float]:
@@ -543,6 +545,29 @@ class CameraCapture:
             )
             return selected.copied() if copy else selected
 
+    def assert_background_healthy(self, *, max_frame_age_s: float = STALE_THRESHOLD_S) -> None:
+        """Check the live stream without reading or copying camera frames."""
+        if max_frame_age_s <= 0:
+            raise ValueError("max_frame_age_s must be positive")
+        with self._latest_condition:
+            if self._background_thread is None or self._background_stop.is_set():
+                raise RuntimeError("background camera capture is not running")
+            if self._background_error is not None:
+                raise RuntimeError("background camera capture failed") from self._background_error
+            now = time.monotonic()
+            timestamps = self._latest_monotonic_timestamps
+            if set(timestamps) != set(self._caps):
+                started = self._background_started_monotonic
+                if started is None or now - started > max_frame_age_s:
+                    raise RuntimeError("background camera capture has no complete fresh frame")
+                return
+            stale = [
+                key for key, captured in timestamps.items()
+                if now - captured > max_frame_age_s or captured > now + 1.0
+            ]
+            if stale:
+                raise RuntimeError("background camera frames are stale: " + ", ".join(sorted(stale)))
+
     def start_background_capture(
         self,
         callback: Callable[[dict[str, np.ndarray], dict[str, float], float], None] | None = None,
@@ -566,6 +591,8 @@ class CameraCapture:
         self._background_stop.clear()
         with self._latest_condition:
             self._frame_history.clear()
+            self._latest_monotonic_timestamps.clear()
+            self._background_started_monotonic = time.monotonic()
 
         def loop() -> None:
             period = 1.0 / capture_fps

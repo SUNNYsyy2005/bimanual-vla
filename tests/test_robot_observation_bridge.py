@@ -44,6 +44,7 @@ from bimanual_vla.deployment.client import (
     IK_FEEDBACK_LIMIT_TOLERANCE_RAD,
     PiperContinuousIK,
     PiperFeedbackStaleError,
+    RuntimeHardwareFault,
     GRIPPER_CLOSED_FRACTION,
     GRIPPER_OPENING_FRACTION,
     GRIPPER_OPENING_METRES,
@@ -2805,11 +2806,10 @@ class ExecutionQueueTest(unittest.TestCase):
             {"cam_high": now, "cam_wrist": now},
             0.01,
         )
-        self.assertFalse(
+        with self.assertRaisesRegex(RuntimeHardwareFault, "status is not normal"):
             bad.execute_next(
                 self.raw_state, self.qpos, protocol, feedback_captured_at=time.time()
             )
-        )
         self.assertIn("status is not normal", bad.blocked_reason)
         self.assertNotIn("JointCtrl", [call[0] for call in bad_piper.calls])
 

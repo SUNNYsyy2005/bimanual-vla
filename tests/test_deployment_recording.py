@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from queue import Queue
 from tempfile import TemporaryDirectory
@@ -15,6 +16,21 @@ from bimanual_vla.deployment.recording import DeploymentRunRecorder
 
 
 class DeploymentRunRecorderTest(unittest.TestCase):
+    def test_camera_health_detects_stale_and_failed_background_stream(self):
+        camera = CameraCapture(cam_ids={"cam_high": 0}, fps=20)
+        camera._caps = {"cam_high": object()}
+        camera._background_thread = object()
+        camera._background_started_monotonic = time.monotonic()
+        camera.assert_background_healthy(max_frame_age_s=0.5)
+        camera._latest_monotonic_timestamps = {"cam_high": time.monotonic() - 1.0}
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            camera.assert_background_healthy(max_frame_age_s=0.5)
+        camera._latest_monotonic_timestamps = {"cam_high": time.monotonic()}
+        camera.assert_background_healthy(max_frame_age_s=0.5)
+        camera._background_error = RuntimeError("synthetic unplug")
+        with self.assertRaisesRegex(RuntimeError, "capture failed"):
+            camera.assert_background_healthy(max_frame_age_s=0.5)
+
     def test_full_video_queue_cannot_block_shutdown_sentinel(self):
         recorder = DeploymentRunRecorder(queue_size=1)
         recorder._video_queue = Queue(maxsize=1)
