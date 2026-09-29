@@ -251,6 +251,7 @@ def select_video_devices(
     configured_devices: dict[str, object],
     *,
     device_root: Path = Path("/dev"),
+    strict_explicit: bool = False,
 ) -> dict[str, object]:
     """Resolve all camera roles together without assigning one node twice.
 
@@ -268,6 +269,10 @@ def select_video_devices(
             device_root=device_root,
         )
         if explicit is None:
+            if strict_explicit and str(configured_device).strip().lower() != "auto":
+                raise RuntimeError(
+                    f"Camera {camera_key} reviewed selector is unavailable"
+                )
             pending.append(camera_key)
             continue
         concrete = _concrete_video_device(explicit, device_root=device_root)
@@ -341,6 +346,7 @@ class CameraCapture:
         image_hw: tuple[int, int] = (IMG_H, IMG_W),
         capture_hw: tuple[int, int] | None = None,
         parallel_reads: bool = False,
+        strict_selectors: bool = False,
     ):
         self._ids = cam_ids or dict(DEFAULT_CAM_IDS)
         self._configured_ids = dict(self._ids)
@@ -348,6 +354,7 @@ class CameraCapture:
         self._image_hw = tuple(image_hw)
         self._capture_hw = tuple(capture_hw or image_hw)
         self._parallel_reads = parallel_reads
+        self._strict_selectors = strict_selectors
         self._caps: dict[str, cv2.VideoCapture] = {}
         self._executor: ThreadPoolExecutor | None = None
         self._read_lock = threading.Lock()
@@ -375,12 +382,16 @@ class CameraCapture:
 
     def open(self):
         try:
-            selected_ids = select_video_devices(self._configured_ids)
+            selected_ids = select_video_devices(
+                self._configured_ids, strict_explicit=self._strict_selectors
+            )
             for key, configured_id in self._configured_ids.items():
                 dev_id = selected_ids[key]
                 self._ids[key] = dev_id
                 cap = cv2.VideoCapture(dev_id)
                 if not cap.isOpened():
+                    if self._strict_selectors:
+                        raise RuntimeError(f"Cannot open reviewed camera {key}")
                     raise RuntimeError(
                         f"Cannot open camera {key} at {dev_id} "
                         f"(configured selector: {configured_id})"

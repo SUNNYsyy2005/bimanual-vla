@@ -93,6 +93,19 @@ class JointCameraSelectionTest(unittest.TestCase):
 
             self.assertEqual(set(selected.values()), {str(first), str(second)})
 
+    def test_reviewed_selector_never_falls_back_after_disappearing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch("bimanual_vla.collection.camera._enumerate_video_candidates") as discover:
+                with self.assertRaisesRegex(RuntimeError, "reviewed selector is unavailable") as rejected:
+                    select_video_devices(
+                        {"cam_high": str(root / "missing-video")},
+                        device_root=root,
+                        strict_explicit=True,
+                    )
+            self.assertNotIn("missing-video", str(rejected.exception))
+            discover.assert_not_called()
+
     def test_valid_explicit_device_is_reserved_before_auto_assignment(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

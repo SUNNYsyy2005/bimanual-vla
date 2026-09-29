@@ -41,6 +41,7 @@ except ImportError:  # pragma: no cover - OpenCV fallback is for minimal install
     ImageTk = None
 
 from bimanual_vla.collection.session import CollectionConfig, CollectionSession, SessionState
+from bimanual_vla.device_guard import DeviceCheckRejected, arm_role_request, camera_role_request, check_devices
 from bimanual_vla.collection.camera import select_video_device
 from bimanual_vla.collection.output import (
     DEFAULT_CAN,
@@ -935,6 +936,12 @@ class CollectorGUI:
         )
         self.right_wrist_var = tk.StringVar(
             value=str(self.gui_preferences.get("right_wrist_device") or DEFAULT_RIGHT_WRIST_DEVICE)
+        )
+        self.rlsok_resolver_var = tk.StringVar(
+            value=str(
+                self.gui_preferences.get("rlsok_resolver")
+                or os.environ.get("BIMANUAL_VLA_RLSOK_RESOLVER", "")
+            )
         )
         self.fps_var = tk.StringVar(value="20")
         self.camera_fps_var = tk.StringVar(value=str(DEFAULT_CAMERA_FPS))
@@ -2421,6 +2428,7 @@ class CollectorGUI:
             "inference_ik_max_joint_step_rad": self.inference_ik_max_step_var.get().strip(),
             "left_wrist_device": self.left_wrist_var.get().strip(),
             "right_wrist_device": self.right_wrist_var.get().strip(),
+            "rlsok_resolver": self.rlsok_resolver_var.get().strip(),
             "swap_wrist_cameras": bool(self.swap_wrist_cameras_var.get()),
         }
         if self.remember_can_password_var.get() and self.can_admin_password:
@@ -2557,6 +2565,7 @@ class CollectorGUI:
         rows.extend(
             (
                 ("Overhead camera", self.high_var),
+                ("RLSOK resolver", self.rlsok_resolver_var),
                 ("Collection rate (Hz)", self.fps_var),
                 ("Camera rate (Hz)", self.camera_fps_var),
                 ("Dataset root", self.out_var),
@@ -3078,6 +3087,34 @@ class CollectorGUI:
         except (ValueError, OSError) as exc:
             messagebox.showerror("Invalid inference settings", str(exc))
             return
+        try:
+            device_check = check_devices(
+                purpose="deployment",
+                arm_mode=self.arm_mode,
+                arm_side=self.arm_side,
+                arms=arm_role_request(
+                    self.arm_mode, self.arm_side,
+                    single=self.can_var.get().strip(),
+                    left=self.left_can_var.get().strip(),
+                    right=self.right_can_var.get().strip(),
+                ),
+                cameras=camera_role_request(
+                    self.arm_mode, self.arm_side,
+                    overhead=self.high_var.get().strip(),
+                    wrist=self.wrist_var.get().strip(),
+                    left_wrist=self.left_wrist_var.get().strip(),
+                    right_wrist=self.right_wrist_var.get().strip(),
+                ),
+                resolver=self.rlsok_resolver_var.get(),
+            )
+        except DeviceCheckRejected as exc:
+            if self.inference_manual_trigger_path is not None:
+                self.inference_manual_trigger_path.unlink(missing_ok=True)
+                self.inference_manual_trigger_path = None
+            self.inference_status_var.set(str(exc))
+            messagebox.showerror("Device check rejected", f"{exc}\nOpen Device settings to review the mapping.")
+            return
+        command.extend(("--rlsok-resolver", self.rlsok_resolver_var.get().strip()))
         self._save_gui_preferences()
         self._append_inference_log("$ " + " ".join(command))
         self.inference_stop_requested = False
@@ -3098,7 +3135,8 @@ class CollectorGUI:
             messagebox.showerror("Cannot start inference", str(exc))
             return
         process = self.inference_process
-        self.inference_status_var.set(f"Inference running · {endpoint}")
+        checked = " · RLSOK roles checked" if device_check is not None else ""
+        self.inference_status_var.set(f"Inference running · {endpoint}{checked}")
         self.inference_pid_var.set(f"PID {process.pid}")
         if self.inference_log_widget is not None:
             self.inference_log_widget.configure(state="normal")
@@ -3232,6 +3270,7 @@ class CollectorGUI:
                     right_can_name=self.right_can_var.get().strip(),
                     cam_left_wrist_device=self.left_wrist_var.get().strip(),
                     cam_right_wrist_device=self.right_wrist_var.get().strip(),
+                    rlsok_resolver=self.rlsok_resolver_var.get().strip(),
                 )
             )
             checks = self.session.connect()
@@ -3261,17 +3300,25 @@ class CollectorGUI:
                     self.preview_title_labels[slot].configure(
                         text=f"{self._camera_role_title(key)}\n{video_device}"
                     )
-            self.status_var.set(f"Ready: next episode {self.episode_index:04d}")
+            checked = " · RLSOK roles checked" if self.session.device_resolution is not None else ""
+            self.status_var.set(f"Ready: next episode {self.episode_index:04d}{checked}")
             self._set_connection_config_enabled(False)
             self.connect_button.configure(text="Disconnect devices")
             self.activate_can_button.configure(state="disabled")
             self._update_start_button()
         except Exception as exc:
-            self.status_var.set(f"Connection failed: {exc}")
+            prefix = "Device check rejected" if isinstance(exc, DeviceCheckRejected) else "Connection failed"
+            self.status_var.set(f"{prefix}: {exc}")
             self._cleanup_devices()
             self._set_connection_config_enabled(True)
             self.activate_can_button.configure(state="normal")
-            messagebox.showerror("Connection failed", str(exc))
+            if isinstance(exc, DeviceCheckRejected):
+                messagebox.showerror(
+                    "Device check rejected",
+                    f"{exc}\nOpen Device settings to review the mapping.",
+                )
+            else:
+                messagebox.showerror("Connection failed", str(exc))
 
     def _handle_space_key(self, event: tk.Event) -> str | None:
         """Capture Space before focused selector/button class bindings."""
