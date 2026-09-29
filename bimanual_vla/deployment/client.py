@@ -50,6 +50,7 @@ from scipy.spatial.transform import Rotation
 from bimanual_vla.collection.camera import CameraCapture, CameraFrameSet, CameraPreview
 from bimanual_vla.deployment.recording import DeploymentRunRecorder
 from bimanual_vla.collection.output import require_can_interface_up
+from bimanual_vla.device_guard import DeviceCheckRejected
 from bimanual_vla.data.action_conventions import (
     DELIVERY_CHUNK_ORIGIN_ACTION_SEMANTICS,
     DELIVERY_MODEL_ACTION_SEMANTICS,
@@ -5790,6 +5791,32 @@ def run_rtc_client(args: argparse.Namespace) -> None:
     chunks enter the timestamped queue only after schema, freshness, execution
     authorization, workspace, IK, and Piper-status checks pass.
     """
+    from bimanual_vla.device_guard import arm_role_request, camera_role_request, check_devices
+
+    resolved = check_devices(
+        purpose="deployment",
+        arm_mode=args.arm_mode,
+        arm_side=args.arm_side,
+        arms=arm_role_request(
+            args.arm_mode, args.arm_side,
+            single=args.can, left=args.left_can, right=args.right_can,
+        ),
+        cameras=camera_role_request(
+            args.arm_mode, args.arm_side,
+            overhead=args.cam_high_device, wrist=args.cam_wrist_device,
+            left_wrist=args.cam_left_wrist_device,
+            right_wrist=args.cam_right_wrist_device,
+        ),
+        resolver=getattr(args, "rlsok_resolver", None),
+    )
+    if resolved is not None:
+        args.can = resolved.arms.get(args.arm_side, args.can)
+        args.left_can = resolved.arms.get("left", args.left_can)
+        args.right_can = resolved.arms.get("right", args.right_can)
+        args.cam_high_device = resolved.cameras["overhead"]
+        args.cam_wrist_device = resolved.cameras.get(f"{args.arm_side}_wrist", args.cam_wrist_device)
+        args.cam_left_wrist_device = resolved.cameras.get("left_wrist", args.cam_left_wrist_device)
+        args.cam_right_wrist_device = resolved.cameras.get("right_wrist", args.cam_right_wrist_device)
     output_mode = getattr(args, "output_mode", "auto")
     for key in ("NO_PROXY", "no_proxy"):
         entries = [item.strip() for item in os.environ.get(key, "").split(",") if item.strip()]
@@ -5837,6 +5864,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
         image_hw=IMAGE_HW,
         capture_hw=CAMERA_SOURCE_HW,
         parallel_reads=True,
+        strict_selectors=resolved is not None,
     )
     preview = CameraPreview(
         enabled=bool(getattr(args, "camera_preview", False)),
@@ -6686,6 +6714,11 @@ def run_rtc_client(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--rlsok-resolver",
+        default=os.environ.get("BIMANUAL_VLA_RLSOK_RESOLVER", ""),
+        help="project-side RLSOK v1.5.8 resolver executable; checked before CAN/camera open",
+    )
     parser.add_argument("--host", default=os.environ.get("BIMANUAL_VLA_POLICY_HOST", DEFAULT_POLICY_HOST))
     parser.add_argument("--port", type=int, default=int(os.environ.get("BIMANUAL_VLA_POLICY_PORT", DEFAULT_POLICY_PORT)))
     parser.add_argument("--arm-mode", choices=("single", "bimanual"), default="single")
@@ -7265,7 +7298,12 @@ def main() -> None:
         args.arm_side = "both"
         if args.left_can == args.right_can:
             parser.error("--left-can and --right-can must differ in bimanual mode")
-        if len({args.cam_high_device, args.cam_left_wrist_device, args.cam_right_wrist_device}) != 3:
+        explicit_cameras = [
+            device for device in (
+                args.cam_high_device, args.cam_left_wrist_device, args.cam_right_wrist_device
+            ) if device.lower() != "auto"
+        ]
+        if len(set(explicit_cameras)) != len(explicit_cameras):
             parser.error("bimanual camera devices must be distinct")
     elif args.arm_side not in {"left", "right"}:
         parser.error("single mode requires --arm-side left or right")
@@ -7280,6 +7318,8 @@ def main() -> None:
     root_logger.setLevel(logging.INFO)
     try:
         run_rtc_client(args)
+    except DeviceCheckRejected as exc:
+        parser.exit(2, f"{exc}\n")
     finally:
         root_logger.handlers = previous_handlers
         root_logger.setLevel(previous_level)
