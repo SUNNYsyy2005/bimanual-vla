@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import uuid
 
 
@@ -32,6 +33,70 @@ class ResolvedDevices:
     arms: dict[str, str]
     cameras: dict[str, str]
     observed_at: str
+
+
+class RuntimeDeviceGuard:
+    """Recheck reviewed roles off the control thread and latch the first failure."""
+
+    def __init__(
+        self,
+        *,
+        baseline: ResolvedDevices,
+        purpose: str,
+        arm_mode: str,
+        arm_side: str,
+        arms: dict[str, str],
+        cameras: dict[str, str],
+        resolver: str | None,
+        interval_s: float = 5.0,
+    ) -> None:
+        if interval_s <= 0:
+            raise ValueError("interval_s must be positive")
+        self._baseline = baseline
+        self._request = dict(
+            purpose=purpose, arm_mode=arm_mode, arm_side=arm_side,
+            arms=dict(arms), cameras=dict(cameras), resolver=resolver,
+        )
+        self._interval_s = interval_s
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._fault: str | None = None
+
+    @property
+    def fault(self) -> str | None:
+        return self._fault
+
+    def check_once(self) -> None:
+        """Perform one fresh inventory comparison; useful for deterministic tests."""
+        try:
+            current = check_devices(**self._request)
+            if current is None:
+                raise DeviceCheckRejected("RLSOK runtime resolver is unavailable")
+            if current.arms != self._baseline.arms or current.cameras != self._baseline.cameras:
+                raise DeviceCheckRejected("RLSOK runtime endpoint changed; restart after review")
+        except DeviceCheckRejected as exc:
+            self._fault = str(exc)
+        except Exception:
+            # Do not expose a resolver traceback or unredacted device IDs.
+            self._fault = "RLSOK runtime device check failed"
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+
+        def loop() -> None:
+            while not self._stop.wait(self._interval_s):
+                self.check_once()
+                if self._fault is not None:
+                    return
+
+        self._thread = threading.Thread(target=loop, name="rlsok-runtime-check", daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.2)
 
 
 def configured_resolver(value: str | None = None) -> str | None:
@@ -101,20 +166,24 @@ def check_devices(
             raise ValueError("unsupported RLSOK version")
         if payload.get("request_id") != request["request_id"]:
             raise ValueError("response does not match request")
-        if payload.get("decision") == "deny":
-            if set(payload) != {"schema_version", "rlsok_version", "request_id", "decision", "reason_code"}:
-                raise ValueError("unexpected denial fields")
+        common_fields = {
+            "schema_version", "rlsok_version", "request_id",
+            "review_decision", "review_scope", "hardware_dispatch",
+        }
+        if payload.get("review_scope") != "saved-configuration-only" or payload.get("hardware_dispatch") is not False:
+            raise ValueError("not a saved-setup review")
+        review_decision = payload.get("review_decision")
+        if review_decision in {"NEEDS_MATERIAL", "REVIEW_REQUIRED"}:
+            if set(payload) != common_fields | {"reason_code"}:
+                raise ValueError("unexpected review fields")
             code = payload.get("reason_code")
             if not isinstance(code, str) or not re.fullmatch(r"[A-Z0-9_]{1,64}", code):
                 code = "DEVICE_CHECK_REJECTED"
-            raise DeviceCheckRejected(f"RLSOK rejected device check: {code}")
-        if payload.get("decision") != "allow":
-            raise ValueError("missing allow decision")
-        if set(payload) != {
-            "schema_version", "rlsok_version", "request_id", "decision",
-            "inventory_method", "observed_at", "resolved",
-        }:
-            raise ValueError("unexpected allow fields")
+            raise DeviceCheckRejected(f"RLSOK {review_decision}: {code}")
+        if review_decision != "UNCHANGED":
+            raise ValueError("invalid review decision")
+        if set(payload) != common_fields | {"inventory_method", "observed_at", "resolved"}:
+            raise ValueError("unexpected unchanged review fields")
         if payload.get("inventory_method") != "linux-sysfs-udev":
             raise ValueError("fresh Linux inventory required")
         timestamp = payload["observed_at"]

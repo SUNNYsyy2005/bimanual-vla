@@ -3135,7 +3135,7 @@ class CollectorGUI:
             messagebox.showerror("Cannot start inference", str(exc))
             return
         process = self.inference_process
-        checked = " · RLSOK roles checked" if device_check is not None else ""
+        checked = " · RLSOK UNCHANGED (saved setup)" if device_check is not None else ""
         self.inference_status_var.set(f"Inference running · {endpoint}{checked}")
         self.inference_pid_var.set(f"PID {process.pid}")
         if self.inference_log_widget is not None:
@@ -3300,7 +3300,7 @@ class CollectorGUI:
                     self.preview_title_labels[slot].configure(
                         text=f"{self._camera_role_title(key)}\n{video_device}"
                     )
-            checked = " · RLSOK roles checked" if self.session.device_resolution is not None else ""
+            checked = " · RLSOK UNCHANGED (saved setup)" if self.session.device_resolution is not None else ""
             self.status_var.set(f"Ready: next episode {self.episode_index:04d}{checked}")
             self._set_connection_config_enabled(False)
             self.connect_button.configure(text="Disconnect devices")
