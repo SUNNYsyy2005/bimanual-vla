@@ -160,3 +160,6 @@ return the small response above. The client separately requires its Dashboard
 execution authorization and live camera/CAN safety checks. See RLSOK v1.5.8
 `docs/saved-setup-review.md`, `docs/piper-confirmed-roles.md` and
 `packages/composable-shadow/saved-setup.ts` for the native review semantics.
+
+For project-side checks without a robot or an installed RLSOK CLI, run the
+temporary resolver fixture as described in [OFFLINE_TESTING.md](OFFLINE_TESTING.md).
