@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
-from bimanual_vla.deployment.client import ExecutionBlocked, check_external_control_streams
+from bimanual_vla.deployment.client import (
+    ExecutionBlocked, ExecutionController, PolicyProtocol, TimedTarget,
+    check_external_control_streams,
+)
+from bimanual_vla.data.contract import GRIPPER_MAX_M
 from bimanual_vla.deployment.trajectory import (
     JerkLimitedJointTrajectory,
     TrajectoryTrackingError,
@@ -15,6 +20,90 @@ from bimanual_vla.deployment.trajectory import (
 
 
 class TrajectoryShapingTest(unittest.TestCase):
+    def test_controller_passes_independent_joint_switches_to_shaper(self):
+        args = SimpleNamespace(
+            trajectory_shaping=True, trajectory_lowpass=False,
+            trajectory_tracking=False, trajectory_speed_limit=False,
+            trajectory_acceleration_limit=False, trajectory_jerk_limit=False,
+            trajectory_lookahead=False,
+        )
+        controller = ExecutionController(object(), args)
+        feedback = np.zeros(7, dtype=np.float32)
+        proposed = np.zeros(6, dtype=np.float32)
+        proposed[0] = 0.3
+        prepared = {"right": (proposed, 0.0)}
+        pipeline = {"right": {}}
+
+        controller._shape_prepared_targets(
+            feedback, prepared, pipeline, ("right",), now_monotonic=1.0,
+        )
+
+        np.testing.assert_allclose(prepared["right"][0], proposed, atol=1e-5)
+        self.assertTrue(pipeline["right"]["trajectory_shaped"])
+        self.assertFalse(controller.joint_trajectory.jerk_limit_enabled)
+
+    def test_gripper_and_ik_optional_filters(self):
+        args = SimpleNamespace(
+            gripper_lowpass=False, gripper_lowpass_alpha=0.5,
+            gripper_endpoint_filter=False, gripper_confirm_steps=2,
+            max_joint_gripper_step=1.0, ik_rate_limit=False,
+            ik_max_joint_step_rad=0.02, ik_search_joint_radius_rad=0.30,
+        )
+        controller = ExecutionController(object(), args)
+        protocol = PolicyProtocol(
+            schema="joint", state_dim=7, action_dim=7, arm_side="right",
+            action_semantics="absolute_joint_position", camera_keys=("cam_high",),
+        )
+        qpos = np.zeros(7, dtype=np.float32)
+        qpos[6] = 0.5 * GRIPPER_MAX_M
+        action = np.zeros(7, dtype=np.float32)
+        action[6] = 1.0
+        queued = TimedTarget(0, action, action, 1.0)
+        filtered = controller._filter_gripper_target(queued, qpos, protocol)
+        self.assertAlmostEqual(float(filtered.absolute_target[6]), 1.0)
+
+        observed = {}
+        def solve(_joints, _xyz, _rpy, **kwargs):
+            observed.update(kwargs)
+            return np.zeros(6)
+        controller.ik_solver = SimpleNamespace(solve=solve)
+        controller._solve_delivery_ik(np.zeros(6), np.zeros(3), np.zeros(3))
+        self.assertAlmostEqual(observed["max_joint_step_rad"], 0.30)
+
+    def test_independent_shaping_switches(self):
+        initial = np.zeros(7, dtype=np.float32)
+        lower = np.full(7, -2.0, dtype=np.float32)
+        upper = np.full(7, 2.0, dtype=np.float32)
+        target = initial.copy()
+        target[0] = 0.3
+        direct = JerkLimitedJointTrajectory(
+            initial, lower, upper,
+            lowpass_enabled=False, tracking_enabled=False,
+            speed_limit_enabled=False, acceleration_limit_enabled=False,
+            jerk_limit_enabled=False, lookahead_enabled=False,
+        )
+        direct_command, _ = direct.update(initial, target, 0.05)
+        self.assertAlmostEqual(float(direct_command[0]), 0.3, places=5)
+
+        limited = JerkLimitedJointTrajectory(
+            initial, lower, upper,
+            lowpass_enabled=False, tracking_enabled=False,
+            speed_limit_enabled=True, acceleration_limit_enabled=True,
+            jerk_limit_enabled=True, lookahead_enabled=False,
+        )
+        limited_command, _ = limited.update(initial, target, 0.05)
+        self.assertLess(float(limited_command[0]), 0.01)
+        self.assertAlmostEqual(float(limited.acceleration[0]), 0.2, places=5)
+
+        ahead = JerkLimitedJointTrajectory(
+            initial, lower, upper,
+            lowpass_enabled=False, tracking_enabled=False,
+            speed_limit_enabled=True, acceleration_limit_enabled=False,
+            jerk_limit_enabled=False, lookahead_enabled=True,
+        )
+        ahead_command, _ = ahead.update(initial, target, 0.05)
+        self.assertAlmostEqual(float(ahead_command[0]), 0.035, places=5)
+
     def test_smootherstep_has_zero_endpoint_slope(self):
         self.assertEqual(smootherstep(0.0), 0.0)
         self.assertEqual(smootherstep(1.0), 1.0)

@@ -39,6 +39,12 @@ class JerkLimitedJointTrajectory:
         tracking_time_constant_s: float = 0.25,
         command_lookahead_rad: float = 0.02,
         max_tracking_error_rad: float = 0.35,
+        lowpass_enabled: bool = True,
+        tracking_enabled: bool = True,
+        speed_limit_enabled: bool = True,
+        acceleration_limit_enabled: bool = True,
+        jerk_limit_enabled: bool = True,
+        lookahead_enabled: bool = True,
         joint_indices: Iterable[int] | None = None,
     ) -> None:
         initial = np.asarray(initial, dtype=np.float32)
@@ -82,6 +88,12 @@ class JerkLimitedJointTrajectory:
         self.tracking_time_constant = float(tracking_time_constant_s)
         self.lookahead = float(command_lookahead_rad)
         self.max_tracking_error = float(max_tracking_error_rad)
+        self.lowpass_enabled = bool(lowpass_enabled)
+        self.tracking_enabled = bool(tracking_enabled)
+        self.speed_limit_enabled = bool(speed_limit_enabled)
+        self.acceleration_limit_enabled = bool(acceleration_limit_enabled)
+        self.jerk_limit_enabled = bool(jerk_limit_enabled)
+        self.lookahead_enabled = bool(lookahead_enabled)
         self.reset(initial)
 
     def reset(self, state: np.ndarray) -> None:
@@ -108,7 +120,10 @@ class JerkLimitedJointTrajectory:
         dt = float(np.clip(dt, 0.001, 0.1))
         indices = self.joint_indices
 
-        alpha = 1.0 - np.exp(-2.0 * np.pi * self.cutoff_hz * dt)
+        alpha = (
+            1.0 - np.exp(-2.0 * np.pi * self.cutoff_hz * dt)
+            if self.lowpass_enabled else 1.0
+        )
         self.filtered_reference[indices] += alpha * (
             proposed[indices] - self.filtered_reference[indices]
         )
@@ -118,27 +133,35 @@ class JerkLimitedJointTrajectory:
 
         error = self.filtered_reference[indices] - self.position[indices]
         natural_frequency = 1.0 / self.tracking_time_constant
-        desired_acceleration = np.clip(
-            natural_frequency**2 * error
-            - 2.0 * natural_frequency * self.velocity[indices],
-            -self.max_acceleration,
-            self.max_acceleration,
-        )
-        acceleration_step = np.clip(
-            desired_acceleration - self.acceleration[indices],
-            -self.max_jerk * dt,
-            self.max_jerk * dt,
-        )
-        self.acceleration[indices] = np.clip(
-            self.acceleration[indices] + acceleration_step,
-            -self.max_acceleration,
-            self.max_acceleration,
-        )
-        self.velocity[indices] = np.clip(
-            self.velocity[indices] + self.acceleration[indices] * dt,
-            -self.max_speed,
-            self.max_speed,
-        )
+        if self.tracking_enabled:
+            desired_acceleration = (
+                natural_frequency**2 * error
+                - 2.0 * natural_frequency * self.velocity[indices]
+            )
+        else:
+            # Reach the reference in one tick when all motion limits are off;
+            # enabled limits still shape this direct request independently.
+            desired_velocity = error / dt
+            desired_acceleration = (desired_velocity - self.velocity[indices]) / dt
+        if self.acceleration_limit_enabled:
+            desired_acceleration = np.clip(
+                desired_acceleration, -self.max_acceleration, self.max_acceleration
+            )
+        acceleration_step = desired_acceleration - self.acceleration[indices]
+        if self.jerk_limit_enabled:
+            acceleration_step = np.clip(
+                acceleration_step, -self.max_jerk * dt, self.max_jerk * dt
+            )
+        self.acceleration[indices] += acceleration_step
+        if self.acceleration_limit_enabled:
+            self.acceleration[indices] = np.clip(
+                self.acceleration[indices], -self.max_acceleration, self.max_acceleration
+            )
+        self.velocity[indices] += self.acceleration[indices] * dt
+        if self.speed_limit_enabled:
+            self.velocity[indices] = np.clip(
+                self.velocity[indices], -self.max_speed, self.max_speed
+            )
         self.position[indices] += self.velocity[indices] * dt
 
         before_limit = self.position[indices].copy()
@@ -159,7 +182,10 @@ class JerkLimitedJointTrajectory:
                 f"error={float(np.max(tracking_error)):.5f}rad"
             )
 
-        lookahead = self.lookahead * self.velocity[indices] / self.max_speed
+        lookahead = (
+            self.lookahead * np.clip(self.velocity[indices] / self.max_speed, -1.0, 1.0)
+            if self.lookahead_enabled else 0.0
+        )
         shaped = self.position[indices] + lookahead
         before_firmware_limit = shaped.copy()
         shaped = np.clip(shaped, self.lower[indices], self.upper[indices])

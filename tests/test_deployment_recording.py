@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from queue import Queue
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -14,6 +15,52 @@ from bimanual_vla.deployment.recording import DeploymentRunRecorder
 
 
 class DeploymentRunRecorderTest(unittest.TestCase):
+    def test_full_video_queue_cannot_block_shutdown_sentinel(self):
+        recorder = DeploymentRunRecorder(queue_size=1)
+        recorder._video_queue = Queue(maxsize=1)
+        recorder._video_queue.put_nowait(("video", object()))
+        sentinel = object()
+        recorder._enqueue_video(sentinel, force=True)
+        self.assertIs(recorder._video_queue.get_nowait(), sentinel)
+        self.assertEqual(recorder._dropped_event_count, 1)
+
+    def test_jitter_metrics_and_joint_commands_are_recorded_off_control_thread(self):
+        with TemporaryDirectory() as tmp:
+            recorder = DeploymentRunRecorder(tmp)
+            run_dir = recorder.start({"control_hz": 20.0})
+            assert run_dir is not None
+            for tick, (generation, index, position) in enumerate(
+                [(1, 0, 0.0), (1, 1, 1.0), (1, 2, 3.0),
+                 (2, 0, 4.0), (2, 1, 6.0), (2, 2, 9.0)]
+            ):
+                recorder.record_control_tick(
+                    timestamp=100.0 + tick * 0.05,
+                    monotonic_timestamp=10.0 + tick * 0.05,
+                    delivery_state=np.zeros(7, dtype=np.float32),
+                    qpos=np.zeros(7, dtype=np.float32),
+                    command_sent=True,
+                    action_dim=7,
+                    absolute_dim=7,
+                    command_joints_rad=np.array([position, 0, 0, 0, 0, 0], dtype=np.float32),
+                    command_monotonic_timestamp=10.0 + tick * 0.05,
+                    command_generation=generation,
+                    command_queue_index=index,
+                )
+            recorder.stop(reason="test")
+            metadata = json.loads((run_dir / "metadata.json").read_text())
+            jitter = metadata["trajectory_jitter"]
+            self.assertAlmostEqual(jitter["intra_accel_mean_rad_per_step2"], 1.0)
+            self.assertAlmostEqual(jitter["boundary_jump_mean_rad_l2"], 1.0)
+            self.assertAlmostEqual(jitter["boundary_momentum_cosine_mean"], 1.0)
+            self.assertEqual(jitter["boundary_jump_samples"], 1)
+            with np.load(run_dir / "trajectory.npz") as trajectory:
+                self.assertEqual(trajectory["command_joints_rad"].shape, (6, 6))
+                self.assertAlmostEqual(float(trajectory["command_joints_rad"][-1, 0]), 9.0)
+            events = [json.loads(line) for line in (run_dir / "trajectory_jitter.jsonl").read_text().splitlines()]
+            self.assertEqual([event["event"] for event in events], [
+                "chunk_completed", "chunk_boundary", "chunk_boundary_momentum", "chunk_completed"
+            ])
+
     def test_saves_aligned_trajectory_model_chunk_and_video(self):
         with TemporaryDirectory() as tmp:
             recorder = DeploymentRunRecorder(tmp, video_fps=4.0)
