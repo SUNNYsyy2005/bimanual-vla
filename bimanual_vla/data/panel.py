@@ -21,6 +21,9 @@ from bimanual_vla.data.analysis import (
     motion_joint_names,
     scan_analysis_sources,
     selection_indices,
+    policy_trajectory_series,
+    sent_chunk_switch_indices,
+    trajectory_chunk_switch_times,
     trajectory_motion_series,
 )
 from bimanual_vla.data.eef_view import draw_end_effector_trajectory
@@ -42,6 +45,7 @@ PLOT_GROUPS = {
     "Timing": ("Inference latency", "Control interval"),
     "End effector": ("3D trajectory",),
 }
+TRAJECTORY_VIEWS = frozenset(PLOT_GROUPS["Trajectory"])
 
 
 def available_plot_groups(data: AnalysisData | None) -> dict[str, tuple[str, ...]]:
@@ -117,6 +121,7 @@ class DataProcessPanel(ttk.Frame):
         self.chart_y_label = ""
         self.chart_markers: list[tuple[str, np.ndarray, str]] = []
         self.chart_series_x: list[np.ndarray] = []
+        self.chart_series_dash_patterns: list[tuple[int, ...] | None] = []
         self.eef_yaw = 0.0
         self.eef_pitch = 0.45
         self.eef_zoom = 1.0
@@ -585,25 +590,39 @@ class DataProcessPanel(ttk.Frame):
         plot = self.plot_var.get()
         self.chart_markers = []
         self.chart_series_x = []
+        self.chart_series_dash_patterns = []
+        if plot in TRAJECTORY_VIEWS:
+            model_switches, sent_switches = trajectory_chunk_switch_times(data, start, end)
+            self.chart_markers = [
+                (label, switches, color)
+                for label, switches, color in (
+                    ("New prediction", model_switches, "#1a73e8"),
+                    ("Sent chunk switch", sent_switches, "#e76f51"),
+                )
+                if len(switches)
+            ]
         if plot in MOTION_VIEWS:
             order, unit = MOTION_VIEWS[plot]
             joints = motion_joint_names(data)
             joint_index = joints.index(signal) if signal in joints else None
-            model_x, model_values, model_switches = trajectory_motion_series(
-                data, start, end, stream="model_raw", order=order, joint_index=joint_index,
+            model_x, current_values, older_values, _ = policy_trajectory_series(
+                data, start, end, order=order, joint_index=joint_index,
             )
-            sent_x, sent_values, sent_switches = trajectory_motion_series(
+            sent_x, sent_values, _ = trajectory_motion_series(
                 data, start, end, stream="command_sent", order=order, joint_index=joint_index,
             )
-            self.chart_series_x = [model_x, sent_x]
-            self.chart_markers = [
-                ("New prediction", model_switches, "#1a73e8"),
-                ("Sent chunk switch", sent_switches, "#e76f51"),
-            ]
-            return [
-                ("Policy output", model_values, "#1a73e8"),
+            series: list[tuple[str, np.ndarray, str]] = []
+            if np.isfinite(older_values).any():
+                series.append(("Earlier prediction", older_values, "#8ab4f8"))
+                self.chart_series_x.append(model_x)
+                self.chart_series_dash_patterns.append((4, 3))
+            series.extend((
+                ("Policy output", current_values, "#1a73e8"),
                 ("Command sent", sent_values, "#e76f51"),
-            ], np.concatenate((model_x, sent_x)), unit
+            ))
+            self.chart_series_x.extend((model_x, sent_x))
+            self.chart_series_dash_patterns.extend((None, None))
+            return series, np.concatenate(self.chart_series_x), unit
         if plot in CHUNK_VIEWS:
             metric, unit = CHUNK_VIEWS[plot]
             x, model, sent = jitter_plot_series(data, start, end, metric)
@@ -626,11 +645,41 @@ class DataProcessPanel(ttk.Frame):
         measured = data.measured[start : end + 1]
         index = 0 if signal_index is None else signal_index
         if plot == "Tracking error":
+            self.chart_series_x = [times]
+            self.chart_series_dash_patterns = [None]
             return [(f"{data.names[index]} target - measured", desired[:, index] - measured[:, index], "#7c4dff")], times, "target - measured"
-        return [
-            ("Measured", measured[:, index], "#1a73e8"),
+        series = [
+            ("Measured", measured[:, index], "#68707d"),
             ("Recorded target", desired[:, index], "#e76f51"),
-        ], times, "joint / gripper value"
+        ]
+        self.chart_series_x = [times, times]
+        self.chart_series_dash_patterns = [None, None]
+        model_joints = motion_joint_names(data)
+        model_joint_index = model_joints.index(signal) if signal in model_joints else None
+        if model_joint_index is None and signal_index is not None:
+            state_width = data.measured.shape[1]
+            if state_width == 7 and signal_index < 6:
+                model_joint_index = signal_index
+            elif state_width == 14:
+                if signal_index < 6:
+                    model_joint_index = signal_index
+                elif 7 <= signal_index < 13:
+                    model_joint_index = signal_index - 1
+            elif state_width in {6, 12} and signal_index < len(model_joints):
+                model_joint_index = signal_index
+        if model_joint_index is not None:
+            model_x, current, older, _ = policy_trajectory_series(
+                data, start, end, order=0, joint_index=model_joint_index,
+            )
+            if np.isfinite(older).any():
+                series.append(("Earlier prediction", older, "#8ab4f8"))
+                self.chart_series_x.append(model_x)
+                self.chart_series_dash_patterns.append((4, 3))
+            if np.isfinite(current).any():
+                series.append(("Policy output", current, "#1a73e8"))
+                self.chart_series_x.append(model_x)
+                self.chart_series_dash_patterns.append(None)
+        return series, np.concatenate(self.chart_series_x), "joint position (rad)"
 
     def _draw_chart(self) -> None:
         canvas = self.chart
@@ -650,13 +699,13 @@ class DataProcessPanel(ttk.Frame):
                     canvas, self.data, poses, start, end, self.signal_var.get(),
                     width=width, height=height, yaw=self.eef_yaw,
                     pitch=self.eef_pitch, zoom=self.eef_zoom, font_name=self.font_name,
+                    chunk_switch_indices=sent_chunk_switch_indices(self.data, start, end),
                 )
             except Exception as exc:
                 canvas.create_text(width / 2, height / 2, text=f"3D trajectory unavailable: {exc}",
                                    fill="#68707d", font=(self.font_name, 10))
             return
-        motion_view = self.plot_var.get() in MOTION_VIEWS
-        left, top, right, bottom = 58, 40 if motion_view else 24, 18, 40
+        left, top, right, bottom = 58, 40 if self.chart_markers else 24, 18, 40
         if not self.chart_series or not len(self.chart_x):
             canvas.create_text(width // 2, height // 2, text="Select a source to display a chart", fill="#68707d", font=(self.font_name, 11))
             return
@@ -690,7 +739,8 @@ class DataProcessPanel(ttk.Frame):
         canvas.create_text(left, height - 14, text=f"{xmin:.2f}s", fill="#68707d", anchor="w", font=(self.font_name, 8))
         canvas.create_text(width - right, height - 14, text=f"{xmax:.2f}s", fill="#68707d", anchor="e", font=(self.font_name, 8))
         canvas.create_text(10, top, text=self.chart_y_label, fill="#68707d", anchor="nw", font=(self.font_name, 8))
-        if motion_view:
+        dash_patterns = getattr(self, "chart_series_dash_patterns", [])
+        if self.chart_markers:
             for _marker_label, marker_times, color in self.chart_markers:
                 for marker in marker_times:
                     if xmin <= marker <= xmax:
@@ -704,7 +754,15 @@ class DataProcessPanel(ttk.Frame):
         for series_index, (label, values, color) in enumerate(self.chart_series):
             points = []
             values = np.asarray(values, dtype=float)
-            series_x = self.chart_series_x[series_index] if motion_view else self.chart_x
+            series_x = (
+                self.chart_series_x[series_index]
+                if len(self.chart_series_x) == len(self.chart_series)
+                else self.chart_x
+            )
+            dash_pattern = (
+                dash_patterns[series_index]
+                if series_index < len(dash_patterns) else None
+            )
             limit = min(len(series_x), len(values))
             if self.plot_var.get() in CHUNK_VIEWS:
                 for x_value, y_value in zip(series_x[:limit], values[:limit]):
@@ -722,13 +780,18 @@ class DataProcessPanel(ttk.Frame):
                 continue
             for x_value, y_value in zip(series_x[:limit], values[:limit]):
                 if not np.isfinite(y_value):
-                    if len(points) > 1:
-                        canvas.create_line(*points, fill=color, width=1.5, smooth=False)
+                    # Canvas lines need at least two (x, y) points. A one
+                    # sample run can occur at NaN-separated forecast tails.
+                    if len(points) > 3:
+                        canvas.create_line(*points, fill=color, width=1.5, smooth=False,
+                                           dash=dash_pattern or "")
                     points = []
                     continue
                 points.extend((left + (float(x_value) - xmin) * xscale, top + (ymax - float(y_value)) * yscale))
             if len(points) > 3:
-                canvas.create_line(*points, fill=color, width=1.5, smooth=False)
-            canvas.create_line(legend_x, 10, legend_x + 14, 10, fill=color, width=2)
+                canvas.create_line(*points, fill=color, width=1.5, smooth=False,
+                                   dash=dash_pattern or "")
+            canvas.create_line(legend_x, 10, legend_x + 14, 10, fill=color, width=2,
+                               dash=dash_pattern or "")
             canvas.create_text(legend_x + 18, 10, text=label, fill="#68707d", anchor="w", font=(self.font_name, 8))
             legend_x += min(145, max(70, len(label) * 7 + 30))

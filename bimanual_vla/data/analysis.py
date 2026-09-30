@@ -546,16 +546,148 @@ def _model_chunk_joints(data: AnalysisData, record: dict[str, Any]) -> np.ndarra
     return joints
 
 
+def sent_chunk_switch_indices(
+    data: AnalysisData, start_index: int, end_index: int
+) -> np.ndarray:
+    """Rows where a sent command starts a different chunk, including range edges."""
+    if data.kind != "deployment" or end_index < start_index:
+        return np.empty(0, dtype=np.int64)
+    count = min(data.sample_count, len(data.command_sent), len(data.command_hold),
+                len(data.generations), len(data.queue_indices))
+    previous_generation: int | None = None
+    switches: list[int] = []
+    for row in range(min(count, end_index + 1)):
+        if not (data.command_sent[row] and not data.command_hold[row]
+                and data.generations[row] >= 0 and data.queue_indices[row] >= 0):
+            continue
+        generation = int(data.generations[row])
+        if previous_generation is not None and generation != previous_generation and row >= start_index:
+            switches.append(row)
+        previous_generation = generation
+    return np.asarray(switches, dtype=np.int64)
+
+
+def trajectory_chunk_switch_times(
+    data: AnalysisData, start_index: int, end_index: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Prediction arrival and actual command-switch times relative to the run."""
+    if data.kind != "deployment" or data.sample_count == 0 or end_index < start_index:
+        return np.empty(0), np.empty(0)
+    start_at, end_at = data.timestamps[start_index], data.timestamps[end_index]
+    origin = data.timestamps[0]
+    model_records: list[tuple[float, int]] = []
+    for record in data.command_records:
+        if record.get("accepted") is not True:
+            continue
+        try:
+            arrived = float(record.get("arrived_at") or record.get("captured_at"))
+            generation = int(record.get("generation"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not np.isfinite(arrived):
+            continue
+        model_records.append((arrived, generation))
+    model_switches: list[float] = []
+    previous_generation: int | None = None
+    for arrived, generation in sorted(model_records):
+        if previous_generation is not None and generation != previous_generation and start_at <= arrived <= end_at:
+            model_switches.append(arrived - origin)
+        previous_generation = generation
+    sent_rows = sent_chunk_switch_indices(data, start_index, end_index)
+    sent_switches = data.timestamps[sent_rows] - origin
+    return np.asarray(model_switches), np.asarray(sent_switches)
+
+
+def policy_trajectory_series(
+    data: AnalysisData, start_index: int, end_index: int, *,
+    order: int, joint_index: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return times, current forecast, superseded forecast and switch times.
+
+    Every accepted model horizon remains visible. Samples before the next
+    prediction arrival are solid/current; older forecasts beyond that arrival
+    are returned separately so the GUI can draw them dashed.
+    """
+    if order not in (0, 1, 2):
+        raise ValueError("unsupported trajectory order")
+    if data.sample_count == 0 or end_index < start_index:
+        empty = np.empty(0)
+        return empty, empty, empty, empty
+    start_at, end_at = data.timestamps[start_index], data.timestamps[end_index]
+    origin = data.timestamps[0]
+    x: list[float] = []
+    current: list[float] = []
+    superseded: list[float] = []
+    switches: list[float] = []
+
+    def select(values: np.ndarray) -> np.ndarray:
+        if joint_index is None:
+            return np.linalg.norm(values, axis=1)
+        if joint_index < 0 or joint_index >= values.shape[1]:
+            return np.full(len(values), np.nan)
+        return values[:, joint_index]
+
+    records: list[tuple[float, int, float, np.ndarray]] = []
+    for record in data.command_records:
+        if record.get("accepted") is not True:
+            continue
+        try:
+            arrived = float(record.get("arrived_at") or record.get("captured_at"))
+            generation = int(record.get("generation"))
+            protocol = record.get("protocol") or {}
+            hz = float(protocol.get("action_hz") or data.metadata.get("control_hz") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not np.isfinite(arrived) or not np.isfinite(hz) or hz <= 0:
+            continue
+        joints = _model_chunk_joints(data, record)
+        if joints is not None:
+            records.append((arrived, generation, hz, joints))
+    records.sort(key=lambda item: item[0])
+
+    previous_generation: int | None = None
+    for chunk_index, (arrived, generation, hz, joints) in enumerate(records):
+        if previous_generation is not None and generation != previous_generation and start_at <= arrived <= end_at:
+            switches.append(arrived - origin)
+        previous_generation = generation
+        if arrived > end_at or arrived + (len(joints) - 1) / hz < start_at:
+            continue
+        values = joints
+        if order == 1:
+            values = np.full(joints.shape, np.nan, dtype=np.float64)
+            if len(joints) > 1:
+                values[1:] = np.diff(joints, axis=0) * hz
+        elif order == 2:
+            values = np.full(joints.shape, np.nan, dtype=np.float64)
+            if len(joints) > 2:
+                values[2:] = np.diff(joints, n=2, axis=0) * hz * hz
+        chunk_time = arrived + np.arange(len(joints)) / hz
+        selected = (chunk_time >= start_at) & (chunk_time <= end_at)
+        if not np.any(selected):
+            continue
+        if x:
+            x.append(float(chunk_time[selected][0] - origin))
+            current.append(np.nan)
+            superseded.append(np.nan)
+        next_arrival = records[chunk_index + 1][0] if chunk_index + 1 < len(records) else np.inf
+        selected_times = chunk_time[selected]
+        selected_values = select(values[selected])
+        is_superseded = selected_times >= next_arrival
+        x.extend((selected_times - origin).tolist())
+        current.extend(np.where(is_superseded, np.nan, selected_values).tolist())
+        superseded.extend(np.where(is_superseded, selected_values, np.nan).tolist())
+    return np.asarray(x), np.asarray(current), np.asarray(superseded), np.asarray(switches)
+
+
 def trajectory_motion_series(
     data: AnalysisData, start_index: int, end_index: int, *,
     stream: str, order: int, joint_index: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (relative time, joint/L2 derivative, chunk switch times).
 
-    Model time is anchored at response arrival and advances at action_hz through
-    each complete predicted horizon. Published commands use wall time for the
-    horizontal axis and their monotonic timestamps for derivative intervals.
-    NaNs separate chunks, holds, skipped rows, and irregular control ticks.
+    Model samples retain each complete predicted horizon; published commands
+    use wall time and monotonic timestamps for derivative intervals. NaNs
+    separate chunks, holds, skipped rows, and irregular control ticks.
     """
     if order not in (1, 2) or stream not in {"model_raw", "command_sent"}:
         raise ValueError("unsupported motion chart")
@@ -575,44 +707,11 @@ def trajectory_motion_series(
         return values[:, joint_index]
 
     if stream == "model_raw":
-        previous_generation: int | None = None
-        records = sorted(
-            (r for r in data.command_records if r.get("accepted") is True),
-            key=lambda r: float(r.get("arrived_at") or r.get("captured_at") or 0.0),
+        model_x, current, superseded, model_switches = policy_trajectory_series(
+            data, start_index, end_index, order=order, joint_index=joint_index,
         )
-        for record in records:
-            arrived = float(record.get("arrived_at") or record.get("captured_at") or 0.0)
-            generation = int(record.get("generation") or 0)
-            protocol = record.get("protocol") or {}
-            try:
-                hz = float(protocol.get("action_hz") or data.metadata.get("control_hz") or 0.0)
-            except (TypeError, ValueError):
-                hz = 0.0
-            if not np.isfinite(hz) or hz <= 0:
-                continue
-            joints = _model_chunk_joints(data, record)
-            if joints is None:
-                continue
-            if previous_generation is not None and generation != previous_generation and start_at <= arrived <= end_at:
-                switches.append(arrived - origin)
-            previous_generation = generation
-            if arrived > end_at or arrived + (len(joints) - 1) / hz < start_at:
-                continue
-            derivative = np.full(joints.shape, np.nan, dtype=np.float64)
-            if order == 1 and len(joints) > 1:
-                derivative[1:] = np.diff(joints, axis=0) * hz
-            elif order == 2 and len(joints) > 2:
-                derivative[2:] = np.diff(joints, n=2, axis=0) * hz * hz
-            chunk_time = arrived + np.arange(len(joints)) / hz
-            selected = (chunk_time >= start_at) & (chunk_time <= end_at)
-            if not np.any(selected):
-                continue
-            if x:
-                x.append(float(chunk_time[selected][0] - origin))
-                y.append(np.nan)
-            x.extend((chunk_time[selected] - origin).tolist())
-            y.extend(select(derivative[selected]).tolist())
-        return np.asarray(x), np.asarray(y), np.asarray(switches)
+        values = np.where(np.isfinite(current), current, superseded)
+        return model_x, values, model_switches
 
     joints = data.command_joints_rad
     command_times = data.command_monotonic_timestamp

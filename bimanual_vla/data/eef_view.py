@@ -81,9 +81,10 @@ def draw_end_effector_trajectory(
     start: int, end: int, selection: str, *,
     width: int, height: int, yaw: float, pitch: float, zoom: float,
     font_name: str,
+    chunk_switch_indices: np.ndarray | None = None,
     _viewport_left: int = 0, _split_child: bool = False,
 ) -> None:
-    """Draw selected history, end points, bases, world/local axes and a ground grid."""
+    """Draw selected history, sent chunk changes, bases and world/local axes."""
     canvas.create_rectangle(_viewport_left, 0, _viewport_left + width, height,
                             fill="#07121f", outline="")
     sides = ("left", "right") if selection == "Both arms" else (selection.split()[0].lower(),)
@@ -112,6 +113,7 @@ def draw_end_effector_trajectory(
                 canvas, data, poses, start, end, f"{side.title()} arm",
                 width=viewport_width, height=height, yaw=yaw, pitch=pitch,
                 zoom=zoom, font_name=font_name,
+                chunk_switch_indices=chunk_switch_indices,
                 _viewport_left=viewport_left, _split_child=True,
             )
         divider = _viewport_left + left_width + gap / 2
@@ -119,6 +121,10 @@ def draw_end_effector_trajectory(
         canvas.create_text(_viewport_left + width / 2, height - 27,
                            text="Separate aligned arm frames · base offset unavailable",
                            fill="#ffd166", font=(font_name, 9))
+        if chunk_switch_indices is not None and len(chunk_switch_indices):
+            canvas.create_text(_viewport_left + 10, 32,
+                               text="Yellow rings: sent chunk switches",
+                               fill="#ffd166", anchor="w", font=(font_name, 8))
         canvas.create_text(_viewport_left + width / 2, height - 10,
                            text=f"Drag to rotate · Wheel to zoom · {zoom:.2f}x",
                            fill="#8fa9c3", font=(font_name, 9))
@@ -197,10 +203,24 @@ def draw_end_effector_trajectory(
                            fill=color, outline="#f7fbff", width=2)
         canvas.create_text(latest_x + 10, latest_y - 8, text=f"{side} latest", fill="#f7fbff",
                            anchor="sw", font=(font_name, 9))
+        if chunk_switch_indices is not None:
+            for row in chunk_switch_indices:
+                local_index = int(row) - start
+                if not 0 <= local_index < len(values) or not np.isfinite(values[local_index]).all():
+                    continue
+                switch_x, switch_y = project(values[local_index])
+                canvas.create_oval(
+                    switch_x - 5, switch_y - 5, switch_x + 5, switch_y + 5,
+                    fill="", outline="#ffd166", width=2, dash=(3, 2),
+                )
 
     title = f"{sides[0].title()} · samples {start + 1}–{end + 1} · m" if _split_child else f"Samples {start + 1}–{end + 1} · unit: m"
     canvas.create_text(_viewport_left + 10, 14, text=title, fill="#cfe2f7",
                        anchor="w", font=(font_name, 10))
+    if chunk_switch_indices is not None and len(chunk_switch_indices) and not _split_child:
+        canvas.create_text(_viewport_left + 10, 32,
+                           text="Yellow rings: sent chunk switches",
+                           fill="#ffd166", anchor="w", font=(font_name, 8))
     for index, side in enumerate(() if _split_child else sides):
         if side in valid_tracks and len(valid_tracks[side]):
             legend_x = _viewport_left + width - 135
