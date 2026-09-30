@@ -157,18 +157,7 @@ def execution_args(**overrides):
 
 
 def execution_result(actions: np.ndarray) -> dict:
-    now = time.time()
-    return {
-        "actions": np.asarray(actions, dtype=np.float64),
-        "execution_control": {
-            "mode": "execute",
-            "task_id": "policy-test",
-            "session_id": "session-test",
-            "server_time": now,
-            "expires_at": now + 30.0,
-            "revision": 7,
-        },
-    }
+    return {"actions": np.asarray(actions, dtype=np.float64)}
 
 
 def inference_launch(
@@ -1414,40 +1403,26 @@ class AsyncInferencePipelineTest(unittest.TestCase):
             np.rint(self.qpos[:6] * RAD_FACTOR).astype(np.int64),
         )
 
-    def test_authorization_expiry_cancels_staged_plan_and_refreshes_hold(self):
-        base = time.monotonic()
-        execution, piper = self.settled_enable_hold(base=base)
+    def test_legacy_server_authorization_does_not_gate_client_execution(self):
+        execution, _ = self.configured_execution()
         safe = self.joint_chunk(20, 0.02)
         launch, _ = inference_launch(
-            self.raw_state, self.qpos, generation=21, captured_monotonic=base + 0.01
+            self.raw_state, self.qpos, generation=21
         )
+        result = execution_result(safe)
+        result["execution_control"] = {"mode": "shadow", "expired": True}
         self.assertTrue(
             execution.accept_inference_result(
-                execution_result(safe),
+                result,
                 launch,
                 self.joint_protocol,
                 arrived_at=time.time(),
-                arrived_monotonic=base + 0.01,
+                arrived_monotonic=time.monotonic(),
             )
         )
-        execution.authorization_deadline_monotonic = base + 0.015
-        with patch(
-            "bimanual_vla.deployment.client.time.monotonic", return_value=base + 0.02
-        ):
-            self.assertFalse(
-                execution.execute_next(
-                    self.raw_state, self.qpos, self.joint_protocol,
-                    feedback_captured_at=time.time(),
-                )
-            )
-        self.assertIsNone(execution.enable_staged_generation)
-        self.assertTrue(execution.waiting_fresh_after_enable)
-        self.assertIn("right", execution.arm_hold_targets)
-        joint_call = [c for c in piper.calls if c[0] == "JointCtrl"][-1]
-        np.testing.assert_array_equal(
-            np.asarray(joint_call[1:]),
-            np.rint(self.qpos[:6] * RAD_FACTOR).astype(np.int64),
-        )
+        self.assertEqual(execution.state, "ready")
+        self.assertGreater(execution.pending_action_count, 0)
+        self.assertFalse(hasattr(execution, "authorization_deadline_monotonic"))
 
     def test_blocked_policy_state_streams_last_safe_target_after_commit(self):
         execution, piper = self.configured_execution()

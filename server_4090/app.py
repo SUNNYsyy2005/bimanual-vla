@@ -3517,7 +3517,6 @@ class PolicyTelemetryStore:
         payload = payload if isinstance(payload, dict) else {}
         connections = connections if isinstance(connections, dict) else {}
         runtime = runtime if isinstance(runtime, dict) else {}
-        control = self.control_for_task(task)
         received_at = payload.get("received_at")
         now = time.time()
         age_s = max(0.0, now - float(received_at)) if received_at is not None else None
@@ -3563,16 +3562,6 @@ class PolicyTelemetryStore:
         )
         horizon_status = policy_horizon_status(payload, metadata)
         time_contract_status = policy_time_contract_status(payload, metadata)
-        dual_gate_open = bool(
-            process_active
-            and client_connected
-            and age_s is not None
-            and age_s <= self.max_age_s
-            and control["mode"] == "execute"
-            and client_allow
-            and horizon_status["horizon_execution_ready"]
-            and time_contract_status["time_contract_ready"]
-        )
         return {
             **payload,
             "task_id": task["id"],
@@ -3596,7 +3585,6 @@ class PolicyTelemetryStore:
             "client_addresses": connections.get("client_addresses", []) if process_active else [],
             "connection_event": connections.get("event"),
             "connection_updated_at": connections.get("updated_at"),
-            "execution_control": control,
             "client_allow_execution": client_allow,
             "client_execution_state": client_state,
             "client_in_flight": client_in_flight,
@@ -3606,7 +3594,6 @@ class PolicyTelemetryStore:
             "policy_inference_finished_at": runtime.get("last_inference_finished_at"),
             **horizon_status,
             **time_contract_status,
-            "dual_gate_open": dual_gate_open,
         }
 
     def latest(self, task_list: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -8269,31 +8256,12 @@ print(json.dumps(rows, ensure_ascii=False))
     @app.get("/api/tasks/<task_id>/execution-control")
     def get_execution_control(task_id: str):
         task = tasks.get(task_id)
-        return jsonify({"task_id": task["id"], "execution_control": observations.control_for_task(task)})
+        return jsonify({"task_id": task["id"], "owner": "client", "execution_control": None})
 
     @app.post("/api/tasks/<task_id>/execution-control")
     def set_execution_control(task_id: str):
-        task = tasks.get(task_id)
-        payload = request.get_json(force=True)
-        mode = str(payload.get("mode", "")).strip().lower()
-        if mode == "execute" and str(payload.get("confirm_task_id", "")) != task["id"]:
-            raise ValueError("confirm_task_id must exactly match the policy task id")
-        if mode == "execute":
-            telemetry = observations.summary_for_task(task)
-            if telemetry is None or not telemetry.get("client_connected"):
-                raise ValueError("execution requires a connected robot client")
-            if not telemetry.get("fresh"):
-                raise ValueError("execution requires fresh robot telemetry")
-            if not telemetry.get("client_allow_execution"):
-                raise ValueError("robot client was not started with --allow-execution")
-            require_policy_execution_horizon(telemetry)
-            require_policy_execution_time_contract(telemetry)
-        control = observations.set_control(
-            task,
-            mode=mode,
-            expires_in_s=payload.get("expires_in_s"),
-        )
-        return jsonify({"task_id": task["id"], "execution_control": control})
+        tasks.get(task_id)
+        return jsonify({"error": "execution is controlled by the robot client"}), 410
 
     @app.post("/api/tasks/<task_id>/stop")
     def stop_task(task_id: str):

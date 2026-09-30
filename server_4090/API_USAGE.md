@@ -854,27 +854,14 @@ Content-Type: application/json
 GET /api/tasks/<task_id>/execution-control
 ```
 
-### 8.3 设置执行安全门
+### 8.3 执行权限
 
 ```http
 POST /api/tasks/<task_id>/execution-control
 Content-Type: application/json
 ```
 
-请求：
-
-```json
-{
-  "mode":"shadow",
-  "ttl_s":30,
-  "reason":"manual dashboard toggle"
-}
-```
-
-`mode` 常见值：
-
-- `shadow`：只推理/观测，不允许下发执行；
-- `execute`：短时授权执行，仍需客户端允许和本地安全检查。
+此旧接口返回 HTTP 410。执行权限仅由机械臂客户端的 `--allow-execution` 设置；每条命令仍经过客户端本地安全检查。
 
 ### 8.4 机器人实时遥测
 

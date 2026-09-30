@@ -4578,7 +4578,6 @@ function queueDropInfo(t) {
 
 function telemetrySummary(t) {
   if (!t) return '<span class="muted">客户端未连接，尚无 telemetry</span>';
-  const control = t.execution_control || {};
   const age = finiteMetric(t.age_s);
   const configuredHz = t.client_configured_inference_hz ?? t.client_inference_hz ?? t.recommended_inference_launch_hz ?? 4;
   const launchHz = t.client_inference_launch_hz;
@@ -4614,15 +4613,9 @@ function telemetrySummary(t) {
     : t.fresh
       ? `<span class="ok">近期推理 · age=${esc(age == null ? '-' : age.toFixed(1))}s</span>`
       : `<span class="warn">推理已过期 · age=${esc(age == null ? '-' : age.toFixed(1))}s</span>`;
-  const serverGate = control.mode === 'execute'
-    ? `<span class="warn">服务端 EXECUTE · 到期 ${esc(fmtTime(control.expires_at))}</span>`
-    : '<span class="muted">服务端 SHADOW</span>';
   const clientGate = t.client_allow_execution
     ? '<span class="warn">客户端允许执行</span>'
     : '<span class="muted">客户端禁止执行</span>';
-  const dualGate = t.dual_gate_open
-    ? '<span class="bad">双重门 OPEN</span>'
-    : '<span class="ok">双重门 CLOSED</span>';
   const drop = queueDropInfo(t);
   const clientRtc = t.client_rtc && typeof t.client_rtc === 'object' ? t.client_rtc : {};
   const clientRtcText = Object.keys(clientRtc).length
@@ -4656,7 +4649,7 @@ function telemetrySummary(t) {
     <div>gripper=${esc(t.raw_gripper_semantics || '-')} → ${esc(t.wire_gripper_semantics || '-')} · source=${esc(t.source_name || '-')} · action=${esc(JSON.stringify(t.actions_shape || []))}</div>
   `;
   return `<div class="policy-telemetry">
-    <div class="telemetry-badges">${connection}${freshness}${serverGate}${clientGate}${dualGate}${safetyBadge}</div>
+    <div class="telemetry-badges">${connection}${freshness}${clientGate}${safetyBadge}</div>
     <div class="telemetry-grid">
       ${item('实际状态', `<code>${esc(t.client_execution_state || 'unknown')}</code>`, t.client_execution_state === 'ready' || t.client_execution_state === 'executing' ? 'ok' : '')}
       ${item('推理频率（配置/启动/完成）', `${esc(configuredHz)} / ${esc(launchHz ?? '-')} / ${esc(resultHz ?? '-')} Hz`)}
@@ -4678,18 +4671,7 @@ function telemetrySummary(t) {
 }
 
 function policyControlButtons(task) {
-  const metadata = task.metadata || {};
-  if (!metadata.telemetry_session) return '<span class="muted">外部/旧版 Policy：可停止或切换；执行控制需切换为 Dashboard 启动的进程后可用。</span>';
-  const t = task.telemetry || {};
-  const control = t.execution_control || {};
-  const running = task.state === 'running';
-  const horizonReady = t.horizon_execution_ready === true;
-  const timeReady = t.time_contract_ready === true;
-  const canArm = running && t.client_connected && t.fresh && t.client_allow_execution && horizonReady && timeReady;
-  const why = !running ? 'Policy 未运行' : !t.client_connected ? '机械臂客户端未连接' : !t.fresh ? 'telemetry 不新鲜' : !t.client_allow_execution ? '客户端未使用 --allow-execution' : !horizonReady ? (t.horizon_error || 'action_horizon 必须至少为 16') : t.time_contract_ready !== true ? (t.time_contract_error || 'action timing contract is invalid') : '';
-  const shadow = `<button class="inline secondary" onclick="setPolicyShadow('${esc(task.id)}')" ${control.mode === 'shadow' ? 'disabled' : ''}>只推理 / SHADOW</button>`;
-  const execute = `<button class="inline danger" onclick="armPolicy('${esc(task.id)}')" ${canArm && control.mode !== 'execute' ? '' : `disabled title="${esc(why || '已经授权执行')}"`}>授权执行 5 分钟</button>`;
-  return `${shadow}${execute}`;
+  return '<span class="muted">执行由机械臂客户端控制</span>';
 }
 
 function jobDependencySummary(task) {
@@ -5180,7 +5162,6 @@ function telemetryJointDeltaSummary(obs, action) {
 function renderTelemetryContractBadges(obs) {
   const cameraCount = telemetryCameraKeys(obs).length;
   const chunkRows = obs.client_chunk_rows ?? ((obs.actions_shape || [])[0] ?? '-');
-  const control = obs.execution_control || {};
   const badges = [
     obs.arm_mode === 'bimanual' ? '双臂' : `单臂 ${obs.arm_side || '-'}`,
     `${obs.schema || '-'} schema`,
@@ -5188,7 +5169,7 @@ function renderTelemetryContractBadges(obs) {
     `action ${obs.model_action_dim || '?'}D × ${chunkRows}`,
     `camera ${cameraCount}`,
     `${obs.action_hz ?? '-'} Hz`,
-    String(control.mode || 'shadow').toUpperCase(),
+    obs.client_allow_execution ? 'CLIENT EXECUTION ENABLED' : 'CLIENT OBSERVE ONLY',
     obs.fresh ? 'telemetry fresh' : 'telemetry stale',
   ];
   document.getElementById('telemetryContractBadges').innerHTML = badges.map(value => `<span>${esc(value)}</span>`).join('');
@@ -5214,8 +5195,7 @@ function fillObservation(obs) {
     ['telemetryUploadDetail', 'telemetryDownloadDetail', 'telemetryTransportDetail'].forEach(id => { document.getElementById(id).textContent = '尚无客户端汇报'; });
     return;
   }
-  const control = obs.execution_control || {};
-  status.className = obs.dual_gate_open ? 'bad' : obs.fresh ? 'ok' : 'warn';
+  status.className = obs.fresh ? 'ok' : 'warn';
   const captured = fmtTime(obs.client_capture_at ?? obs.captured_at);
   const currentTargetErrorMs = actionTimeErrorMs(obs);
   // Client upload/download/transport values are reported asynchronously with
@@ -5248,7 +5228,7 @@ function fillObservation(obs) {
     : '尚无客户端总传输汇报 · RTT 为客户端 monotonic 实测';
   document.getElementById('telemetryFirstCommand').textContent = metricMs(obs.client_result_to_first_command_ms);
   document.getElementById('telemetryActionError').textContent = signedMetricMs(currentTargetErrorMs);
-  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · ${obs.arm_mode === 'bimanual' ? '双臂' : '单臂'} ${obs.schema || '-'} · state/action=${obs.state_dim || '?'}D/${obs.model_action_dim || '?'}D · camera=${cameraKeys.length} · 服务端=${control.mode || 'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open ? 'OPEN' : 'CLOSED'} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · 上传=${clientTimingMetric(clientUploadMs, serverUploadMs)} · 推理实测=${metricMs(modelMs)} · 下行=${clientTimingMetric(clientDownloadMs, null)} · 当前动作时间误差=${signedMetricMs(currentTargetErrorMs)} · 安全=${drop.unsafeLabel} · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
+  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · ${obs.arm_mode === 'bimanual' ? '双臂' : '单臂'} ${obs.schema || '-'} · state/action=${obs.state_dim || '?'}D/${obs.model_action_dim || '?'}D · camera=${cameraKeys.length} · 客户端允许=${Boolean(obs.client_allow_execution)} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · 上传=${clientTimingMetric(clientUploadMs, serverUploadMs)} · 推理实测=${metricMs(modelMs)} · 下行=${clientTimingMetric(clientDownloadMs, null)} · 当前动作时间误差=${signedMetricMs(currentTargetErrorMs)} · 安全=${drop.unsafeLabel} · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
   const joint = obs.schema === 'joint';
   const state = obs.state || [];
   document.getElementById('robotStateTitle').textContent = `${obs.state_dim}D ${obs.arm_mode === 'bimanual' ? 'bimanual ' : ''}${obs.schema} state`;
@@ -5401,37 +5381,6 @@ async function refreshAll() {
     if (evalVideoModule && !evalVideoModule.hidden) loadEvalVideos(evalVideoIncludeRemote);
     const trainingVisible = !document.getElementById('module-training').hidden;
     if (trainingVisible && document.getElementById('trainMetricsTask').value) loadTrainingMetrics({quiet: true});
-  } catch (error) {
-    show(error.message);
-  }
-}
-
-async function armPolicy(id) {
-  const typed = prompt(`这是实机动作授权。请输入完整 Policy task id 以确认：\n${id}`, '');
-  if (typed !== id) {
-    if (typed !== null) show('task id 不匹配，未授权执行。');
-    return;
-  }
-  try {
-    await api(`/api/tasks/${encodeURIComponent(id)}/execution-control`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({mode: 'execute', expires_in_s: 300, confirm_task_id: typed}),
-    });
-    show('已授权执行 5 分钟；客户端本地安全门仍独立生效。', false);
-    await refreshAll();
-  } catch (error) {
-    show(error.message);
-  }
-}
-
-async function setPolicyShadow(id) {
-  try {
-    await api(`/api/tasks/${encodeURIComponent(id)}/execution-control`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({mode: 'shadow'}),
-    });
-    show('已切回只推理 / SHADOW。', false);
-    await refreshAll();
   } catch (error) {
     show(error.message);
   }

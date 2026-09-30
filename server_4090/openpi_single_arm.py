@@ -3357,7 +3357,6 @@ class TelemetryPolicy:
                 "server_observation_upload_ms": observation_upload_ms,
             }
             result["transport_timing"] = transport_timing
-            result["execution_control"] = self.telemetry.execution_control()
             # Publish asynchronously. The response boundary is measured before
             # queueing so dashboard image copies/JSON serialization cannot add
             # latency or jitter to the robot request.
@@ -3371,6 +3370,29 @@ class TelemetryPolicy:
         reset = getattr(self.policy, "reset", None)
         if reset is not None:
             reset()
+
+
+def warmup_policy(policy: Any, metadata: dict[str, Any], prompt: str | None) -> None:
+    """Compile and run the complete inference path before accepting clients."""
+    images = {
+        key: np.zeros((224, 224, 3), dtype=np.uint8)
+        for key in metadata["camera_keys"]
+    }
+    observation = {
+        "state": np.zeros(int(metadata["state_dim"]), dtype=np.float32),
+        "images": images,
+        "prompt": prompt or "Move safely.",
+        "client_metadata": {"source_name": "__server_warmup__"},
+    }
+    started = time.monotonic()
+    result = policy.infer(observation)
+    actions = np.asarray(result["actions"])
+    if actions.ndim != 2 or actions.shape[1] != int(metadata["action_dim"]):
+        raise RuntimeError(f"policy warmup returned invalid actions shape {actions.shape}")
+    reset = getattr(policy, "reset", None)
+    if callable(reset):
+        reset()
+    logging.info("Policy warmup completed in %.2fs; actions=%s", time.monotonic() - started, actions.shape)
 
 
 def run_serve(args: argparse.Namespace) -> None:
@@ -3442,6 +3464,7 @@ def run_serve(args: argparse.Namespace) -> None:
             getattr(args, "image_jpeg_quality", 90)
         )
         policy = ImageTransportPolicy(policy)
+    warmup_policy(policy, policy_metadata, args.default_prompt)
     telemetry: PolicyTelemetry | None = None
     if args.telemetry_dir:
         telemetry = PolicyTelemetry(Path(args.telemetry_dir).expanduser().resolve(), policy_metadata)

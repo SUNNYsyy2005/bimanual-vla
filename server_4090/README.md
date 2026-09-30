@@ -28,7 +28,7 @@ server_4090/SIMULATION_DASHBOARD.md
 - 页面顶部按“总览 / 数据集 / 训练 / Policy / 实时遥测”分模块导航；总览集中显示 GPU、数据量和活动任务。
 - Dashboard 可以新建、健康检测、停止、强制结束 Policy，并用新 checkpoint 替换运行中的 Policy。
 - 已完成、失败、丢失或停止的训练 / Policy 历史任务可从对应模块删除任务记录和日志；checkpoint、模型与训练输出不会被删除。
-- 机械臂客户端默认是 shadow-only；只有显式添加 `--allow-execution`、Dashboard 对同一 Policy 给出未过期的 EXECUTE 授权、telemetry 新鲜、`action_horizon >= 16` 且本地安全检查全部通过时，才会发布异步 chunk 命令。
+- 机械臂客户端默认只推理；只有显式添加 `--allow-execution` 且本地逐条安全检查通过时，才会发布异步 chunk 命令。Policy 启动后会先用合成观测预热模型，再开放 WebSocket 服务。
 - 机械臂客户端默认把本地监测轨迹追加保存到 `./monitoring_data/<session>/events.jsonl`；可用 `--monitoring-dir` 指定其他目录。记录器在后台线程写盘，控制台日志也经有界后台队列输出。监控日志不走动作 WebSocket；原始图像不写入 JSONL，只保留相机设备和时间戳。Dashboard 图像预览最多每秒更新一次，减小与动作传输共享网络时的流量。
 
 ## 部署并启动 Dashboard
@@ -408,13 +408,13 @@ WebSocket 和独立 20 Hz 控制循环。旧的 `bin/bimanual-vla legacy-bridge`
 4. 在所选 checkpoint 上创建新 Policy 任务；
 5. 机械臂客户端自动重连。
 
-切换会先把旧 Policy 强制切回 SHADOW，再中断已有 WebSocket 连接；替代 Policy 默认也是 SHADOW，必须重新满足双重门条件后才能执行。
+切换会中断旧 Policy 的 WebSocket 连接；替代 Policy 先完成模型预热，再接收客户端请求。是否执行由机械臂客户端的 `--allow-execution` 决定。
 
 ## 安全边界
 
 - Dashboard 管理接口需要 Token，并只接受白名单参数，不接受任意 shell。
 - 真实观测不经过 Dashboard HTTP API。
 - Dashboard telemetry 是 Policy 收到数据后的只读镜像。
-- 服务端 EXECUTE 授权最长 1 小时，网页默认 5 分钟；Dashboard 重启、Policy 停止或模型切换都会回到 SHADOW。
-- 客户端没有 `--allow-execution` 时永远不会发布动作；即使双重门打开，动作新鲜度、每条 20 Hz command 的位移/旋转/夹爪变化、workspace、`action_horizon` 和 Piper 状态仍会在本地逐次检查。
+- Dashboard 不再授予执行权限；旧的执行控制 POST API 返回 HTTP 410。
+- 客户端没有 `--allow-execution` 时永远不会发布动作；启用后，动作新鲜度、每条 20 Hz command 的位移/旋转/夹爪变化、workspace、`action_horizon` 和 Piper 状态仍会在本地逐次检查。
 - 训练和 heldout eval 默认拒绝已有计算进程，并继续使用 `allow_busy_gpus` 与各自的空闲显存阈值。Policy 单独使用 `policy_allow_busy_gpus`（默认 `true`）和 `policy_min_free_gpu_mib`（默认 `12000`）；只应与显存占用稳定的小型任务共享，不能与后续还会持续增长显存的训练任务抢卡。
