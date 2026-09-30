@@ -107,8 +107,8 @@ telemetry 断开或任一逐周期安全检查失败时，客户端只会保持�
 使用 `--no-recording` 时不生成这些抖动统计。
 
 客户端 **Data Process** 页按 **Trajectory / Chunk boundaries / Timing / End effector**
-分组选择图表。Position 同时显示单个关节的测量值和录制目标；Velocity 和 Acceleration
-分别叠加模型输出与实际下发曲线；Tracking error 显示目标与测量值之差。
+分组选择图表。Position 显示单个关节的测量值和录制目标，部署记录还叠加原始模型预测；
+Velocity 和 Acceleration 分别叠加模型输出与实际下发曲线；Tracking error 显示目标与测量值之差。
 Chunk boundaries 保留位置跳变和速度方向两张边界图；chunk 内平均加速度仍在指标表中，
 无需再用每个 chunk 的平均值曲线重复展示。Timing 收纳推理延迟和
 控制间隔。End effector 的 **3D trajectory** 参考 Dashboard 的数据集末端位姿视图：
@@ -128,8 +128,12 @@ Episode 来源只提供有记录数据的视图。
 Data Process 的 **Velocity** 和 **Acceleration** 两张图均叠加 **Policy output**
 与 **Command sent** 曲线，展示逐关节或关节向量 L2 范数，单位分别为 `rad/s`、`rad/s²`；
 `Signal` 可切换具体关节。蓝色竖向虚线表示新预测到达，橙色竖向虚线表示实际下发命令
-切换 generation。Policy 曲线以预测到达时刻为起点，按该预测的 `action_hz`
-展开完整 horizon，因此不同预测的曲线可能在时间上重叠；它不是机器人的执行轨迹。
+切换 generation。这两种分隔线也显示在 Position 和 Tracking error 图上；
+3D 末端轨迹以黄色虚线圆圈标出实际下发 chunk 的切换点。
+模型曲线以预测到达时刻为起点，按该预测的 `action_hz` 展开完整 horizon。多次预测
+覆盖相同未来时间时，较新的预测用实线，较早预测被后续结果覆盖的部分仍保留并改用浅蓝虚线；
+这表示模型对同一时刻的不同预测，不代表机器人同时执行多个速度。位置图也显示这些预测，
+所以可以直接对照实测、记录目标和各代模型输出。模型预测曲线不是机器人的实际执行轨迹。
 Sent 曲线按实际命令时间戳求导，hold、漏发/跳步、不规则控制间隔以及 chunk 边界均断线，
 不会把这些间隔的变化误算为 chunk 内加速度。两张图均只使用弧度制关节目标，
 排除夹爪；影子推理仅显示 Policy 曲线。逐行 Action delta 不具备上述边界和时间戳语义，

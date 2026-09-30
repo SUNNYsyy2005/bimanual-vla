@@ -16,6 +16,8 @@ from bimanual_vla.data.analysis import (
     load_analysis_data,
     scan_analysis_sources,
     selection_indices,
+    sent_chunk_switch_indices,
+    trajectory_chunk_switch_times,
     trajectory_motion_series,
 )
 from bimanual_vla.data.panel import DataProcessPanel, available_plot_groups
@@ -86,6 +88,11 @@ class DataProcessAnalysisTest(unittest.TestCase):
                 data, 0, 10, stream="command_sent", order=1, joint_index=0,
             )
             np.testing.assert_allclose(sent_switches, [.2])
+            model_marker_times, sent_marker_times = trajectory_chunk_switch_times(data, 0, 10)
+            np.testing.assert_allclose(model_marker_times, [.25])
+            np.testing.assert_allclose(sent_marker_times, [.2])
+            np.testing.assert_array_equal(sent_chunk_switch_indices(data, 0, 10), [4])
+            np.testing.assert_array_equal(sent_chunk_switch_indices(data, 4, 10), [4])
             self.assertTrue(np.isnan(sent_velocity[[0, 4, 7, 8, 9]]).all())
             np.testing.assert_allclose(sent_velocity[[1, 2, 3, 5, 6, 10]], [2, 4, 6, 2, 4, 4])
             _, sent_acceleration, _ = trajectory_motion_series(
@@ -116,6 +123,7 @@ class DataProcessAnalysisTest(unittest.TestCase):
                 def __init__(self):
                     self.dashed = []
                     self.lines = []
+                    self.ovals = []
 
                 def delete(self, _what):
                     pass
@@ -133,6 +141,12 @@ class DataProcessAnalysisTest(unittest.TestCase):
 
                 def create_text(self, *_args, **_kwargs):
                     pass
+
+                def create_rectangle(self, *_args, **_kwargs):
+                    pass
+
+                def create_oval(self, *coords, **kwargs):
+                    self.ovals.append((coords, kwargs))
 
             canvas = Canvas()
             panel.chart = canvas
@@ -164,11 +178,27 @@ class DataProcessAnalysisTest(unittest.TestCase):
             self.assertEqual(groups["End effector"], ("3D trajectory",))
             panel.signal_var = SimpleNamespace(get=lambda: data.names[0])
             panel.plot_var = SimpleNamespace(get=lambda: "Position")
-            positions_series, _, _ = DataProcessPanel._make_series(panel, 0, 10)
-            self.assertEqual([name for name, *_ in positions_series], ["Measured", "Recorded target"])
+            positions_series, positions_x, positions_unit = DataProcessPanel._make_series(panel, 0, 10)
+            self.assertEqual([name for name, *_ in positions_series[:2]], ["Measured", "Recorded target"])
+            self.assertIn("Policy output", [name for name, *_ in positions_series])
+            self.assertEqual([item[0] for item in panel.chart_markers], ["New prediction", "Sent chunk switch"])
+            panel.chart_series, panel.chart_x, panel.chart_y_label = positions_series, positions_x, positions_unit
+            canvas.dashed.clear()
+            DataProcessPanel._draw_chart(panel)
+            self.assertEqual(len([line for line, _kwargs in canvas.dashed if len(line) == 4 and line[1] == 40]), 2)
             panel.plot_var = SimpleNamespace(get=lambda: "Tracking error")
             error_series, _, _ = DataProcessPanel._make_series(panel, 0, 10)
             self.assertEqual(len(error_series), 1)
+            self.assertEqual(len(panel.chart_markers), 2)
+
+            positions_3d = np.column_stack((np.arange(11) * .01, np.zeros(11), np.zeros(11)))
+            panel.plot_var = SimpleNamespace(get=lambda: "3D trajectory")
+            panel.signal_var = SimpleNamespace(get=lambda: "Right arm")
+            panel.pose_cache = {data.path: {"right_measured": positions_3d}}
+            panel._selected_indices = lambda: (0, 10)
+            panel.eef_yaw, panel.eef_pitch, panel.eef_zoom = 0, .45, 1
+            DataProcessPanel._draw_chart(panel)
+            self.assertEqual(sum(bool(kwargs.get("dash")) for _coords, kwargs in canvas.ovals), 1)
 
     def test_loads_episode_and_computes_selection_metrics(self):
         with TemporaryDirectory() as tmp:
