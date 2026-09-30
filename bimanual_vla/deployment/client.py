@@ -98,7 +98,7 @@ DEFAULT_POLICY_PORT = 8000
 DEFAULT_ACTION_HZ = 20.0
 DEFAULT_INFERENCE_HZ = 4.0
 DEFAULT_INFERENCE_TRIGGER_STEP = 10
-DEFAULT_CAMERA_FPS = 20
+DEFAULT_CAMERA_FPS = 30
 DEFAULT_OPENPI_CHUNK_STEPS = 50
 DEFAULT_MIN_ACTION_CHUNK_STEPS = 16
 DEFAULT_BLEND_STEPS = 3
@@ -3024,6 +3024,16 @@ class ExecutionController:
                 "last_command_at": self.last_command_at,
                 "last_queue_drop_kind": self.last_queue_drop_kind,
                 "last_queue_drop_reason": self.last_queue_drop_reason,
+                # The next request carries the previous request's bounded
+                # timing report to the Policy telemetry mirror.
+                "client_transport_timing": dict(self.last_client_transport_timing),
+                "timing_generation": self.last_transport_generation,
+                "timing_source": self.last_client_timing_source,
+                "one_way_timing_clock": self.last_client_one_way_clock,
+                "one_way_timing_requires_clock_sync": self.last_client_one_way_clock_sync_required,
+                "round_trip_ms": self.last_client_transport_timing.get("round_trip_ms"),
+                "result_to_first_command_ms": self.last_client_transport_timing.get("result_to_first_command_ms"),
+                "observation_to_first_command_ms": self.last_client_transport_timing.get("observation_to_first_command_ms"),
                 "rtc": rtc_snapshot,
             }
         # Prefer the target that was actually sent on the most recent 20 Hz
@@ -5491,6 +5501,10 @@ def build_client_transport_timing(
     model_inference_ms = finite(server_timing.get("model_inference_ms"))
     upload_ms = interval(server_request_received_at, request_sent_at)
     download_ms = interval(response_received_at, server_response_ready_at)
+    # A negative one-way leg proves the two wall clocks cannot be compared.
+    # The other leg can then look hundreds of milliseconds too large too.
+    if upload_ms is None or download_ms is None:
+        upload_ms = download_ms = None
     round_trip_ms = max(
         0.0, (float(response_received_monotonic) - float(request_sent_monotonic)) * 1000.0
     )
@@ -6212,6 +6226,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                         elif policy is not None:
                             camera_selection_started_at = time.time()
                             camera_selection_started_monotonic = time.monotonic()
+                            frame_set: CameraFrameSet | None = None
                             try:
                                 frame_set = cameras.read_nearest(
                                     observation_captured_monotonic,
@@ -6364,6 +6379,16 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                     "observation_snapshot_error",
                                     captured_at=observation_captured_at,
                                     captured_monotonic=observation_captured_monotonic,
+                                    camera_state_age_ms=(
+                                        {
+                                            key: round(
+                                                (observation_captured_monotonic - float(stamp)) * 1000.0,
+                                                2,
+                                            )
+                                            for key, stamp in frame_set.monotonic_timestamps.items()
+                                        }
+                                        if frame_set is not None else None
+                                    ),
                                     error=repr(exc),
                                     execution=execution.metadata(compact=monitoring.level != "full"),
                                 )
@@ -6670,7 +6695,7 @@ def main() -> None:
         "--camera-fps",
         type=int,
         default=DEFAULT_CAMERA_FPS,
-        help="camera acquisition rate (default 20 Hz; independent of 4 Hz inference launches)",
+        help="camera acquisition rate (default 30 Hz; independent of inference launches)",
     )
     parser.add_argument(
         "--max-image-state-skew-ms",

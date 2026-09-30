@@ -244,6 +244,7 @@ class InferenceCommandTest(unittest.TestCase):
         )
         self.assertIn("--allow-execution", command)
         self.assertIn("--rtc-enabled", command)
+        self.assertEqual(command[command.index("--camera-fps") + 1], "30")
         self.assertEqual(command[command.index("--left-can") + 1], "can0")
         self.assertEqual(command[command.index("--right-can") + 1], "can1")
 
