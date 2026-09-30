@@ -170,10 +170,10 @@ enable_timeout_s = float(getattr(self.args, "enable_timeout_s", 10.0))  # 改为
 ## 测试命令
 
 ```bash
-cd /home/user/project/bimanual-vla
+cd /path/to/bimanual-vla
 
 # 重新测试左臂
-source /home/user/miniconda3/bin/activate dual_arm
+conda activate <your-environment>
 python test_left_arm_mode.py
 
 # 如果成功，ctrl_mode应该变为 CAN_CTRL(0x1)

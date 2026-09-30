@@ -2,11 +2,16 @@
 set -euo pipefail
 
 REMOTE_HOST="${REMOTE_HOST:-4x4090}"
-REMOTE_ROOT="${REMOTE_ROOT:-/home/sunny/bimanual-vla}"
+if [[ -n "${REMOTE_ROOT:-}" ]]; then
+  REMOTE_ROOT="$REMOTE_ROOT"
+else
+  REMOTE_HOME="$(ssh "$REMOTE_HOST" 'printf %s "$HOME"')"
+  REMOTE_ROOT="${REMOTE_HOME%/}/bimanual-vla"
+fi
 LOCAL_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_ROOT/server_4090/templates'"
-rsync -av --relative \
+rsync -av --relative --exclude='__pycache__/' --exclude='*.py[cod]' \
   "$LOCAL_ROOT/./server_4090/app.py" \
   "$LOCAL_ROOT/./server_4090/dataset_editor.py" \
   "$LOCAL_ROOT/./server_4090/episode_split.py" \

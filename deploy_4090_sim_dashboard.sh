@@ -2,11 +2,16 @@
 set -euo pipefail
 
 REMOTE_HOST="${REMOTE_HOST:-4x4090}"
-REMOTE_ROOT="${REMOTE_ROOT:-/home/sunny/bimanual-vla}"
+if [[ -n "${REMOTE_ROOT:-}" ]]; then
+  REMOTE_ROOT="$REMOTE_ROOT"
+else
+  REMOTE_HOME="$(ssh "$REMOTE_HOST" 'printf %s "$HOME"')"
+  REMOTE_ROOT="${REMOTE_HOME%/}/bimanual-vla"
+fi
 LOCAL_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_ROOT/server_4090/templates'"
-rsync -av --relative \
+rsync -av --relative --exclude='__pycache__/' --exclude='*.py[cod]' \
   "$LOCAL_ROOT/./server_4090/app.py" \
   "$LOCAL_ROOT/./server_4090/dataset_editor.py" \
   "$LOCAL_ROOT/./server_4090/episode_split.py" \
@@ -43,7 +48,7 @@ example = json.loads(Path('server_4090/config.simulation.example.json').read_tex
 path = Path('server_4090/config.simulation.json')
 current = json.loads(path.read_text())
 for key in (
-    'dataset_root', 'workspace_root', 'cache_root', 'assets_base_dir', 'checkpoint_base_dir', 'base_checkpoint',
+    'dataset_root', 'dataset_read_roots', 'workspace_root', 'cache_root', 'assets_base_dir', 'checkpoint_base_dir', 'base_checkpoint',
     'checkpoint_allowed_roots', 'eval_video_roots', 'local_storage_locations', 'cluster_targets',
     'transfer_parallelism', 'cluster_resources_script', 'nas_dataset_staging_root',
     'nas_checkpoint_staging_root',
@@ -64,18 +69,25 @@ install -m 0644 \
 chmod +x bin/bimanual-vla server_4090/slurm_job_runner.py server_4090/dataset_transfer_runner.py server_4090/slurm_dataset_sync_runner.py server_4090/video_transfer_runner.py server_4090/run_server_foreground.sh scripts/query_h100_h200_resources.sh
 # Best-effort staging for H100/login-server Slurm helpers. H200 remains
 # independent and should be prepared via its dedicated setup Slurm jobs.
+LOGIN_SERVER_USER="${LOGIN_SERVER_USER:-$(ssh -n -o BatchMode=yes -o ConnectTimeout=8 login-server 'id -un' 2>/dev/null || true)}"
+LOGIN_SERVER_PROJECT_ROOT="${LOGIN_SERVER_PROJECT_ROOT:-/DATA/disk0/${LOGIN_SERVER_USER}/bimanual-vla}"
+LOGIN_SERVER_NAS_ROOT="${LOGIN_SERVER_NAS_ROOT:-/DATA/NAS/GPUServer/${LOGIN_SERVER_USER}}"
 if command -v rsync >/dev/null 2>&1; then
-  timeout 20 ssh -n -o BatchMode=yes -o ConnectTimeout=8 login-server 'mkdir -p /DATA/disk0/sunny/bimanual-vla /DATA/NAS/GPUServer/sunny/dashboard_dataset_sync' 2>/dev/null && \
-  timeout 60 rsync -az --delete \
-    server_4090 bimanual_vla bin scripts/models/download_openpi_checkpoint.py \
-    login-server:/DATA/disk0/sunny/bimanual-vla/ 2>/dev/null || true
+  if [[ -n "$LOGIN_SERVER_USER" ]]; then
+    timeout 20 ssh -n -o BatchMode=yes -o ConnectTimeout=8 login-server \
+      "mkdir -p '$LOGIN_SERVER_PROJECT_ROOT' '$LOGIN_SERVER_NAS_ROOT/dashboard_dataset_sync'" 2>/dev/null && \
+    timeout 60 rsync -az --delete \
+      server_4090 bimanual_vla bin scripts/models/download_openpi_checkpoint.py \
+      "login-server:$LOGIN_SERVER_PROJECT_ROOT/" 2>/dev/null || true
+  fi
 fi
 # Best-effort mirror of H200 Slurm inventory caches onto 4x4090 so the UI does
 # not block on SSH to login-server on every refresh.
 for node in h200-ali-01 h200-ali-02; do
   cache="$HOME/.local/share/bimanual-vla-sim-dashboard/cluster_inventory/${node}_inventory.json"
   tmp="${cache}.tmp"
-  if timeout 20 ssh -n -o BatchMode=yes -o ConnectTimeout=8 login-server "test -s /DATA/NAS/GPUServer/sunny/dashboard_probe/${node}_inventory.json && cat /DATA/NAS/GPUServer/sunny/dashboard_probe/${node}_inventory.json" > "$tmp" 2>/dev/null; then
+  if [[ -n "$LOGIN_SERVER_USER" ]] && timeout 20 ssh -n -o BatchMode=yes -o ConnectTimeout=8 login-server \
+    "test -s '$LOGIN_SERVER_NAS_ROOT/dashboard_probe/${node}_inventory.json' && cat '$LOGIN_SERVER_NAS_ROOT/dashboard_probe/${node}_inventory.json'" > "$tmp" 2>/dev/null; then
     if [[ -s "$tmp" ]]; then mv "$tmp" "$cache"; else rm -f "$tmp"; fi
   else
     rm -f "$tmp"

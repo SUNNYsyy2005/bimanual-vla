@@ -75,11 +75,18 @@ ADD_DATASET_OPTION = "Add new dataset..."
 EPISODE_FILE_RE = re.compile(r"ep_\d+\.npz")
 CAN_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+")
 CAN_BITRATE = 1_000_000
-CAN_ACTIVATE_SCRIPT = pathlib.Path(
-    "/home/user/dual_ARM_project/piper_sdk/piper_sdk/can_activate.sh"
-)
 GUI_PREFERENCES_PATH = pathlib.Path("~/.config/bimanual-vla/collect_gui_preferences.json").expanduser()
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_can_helper_config = pathlib.Path(
+    os.environ.get(
+        "BIMANUAL_VLA_CAN_ACTIVATE_SCRIPT",
+        str(PROJECT_ROOT / "piper_sdk" / "piper_sdk" / "can_activate.sh"),
+    )
+).expanduser()
+CAN_ACTIVATE_SCRIPT = (
+    _can_helper_config if _can_helper_config.is_absolute()
+    else (PROJECT_ROOT / _can_helper_config).resolve()
+)
 RTC_CLIENT_MODULE = "bimanual_vla.deployment.client"
 DATA_UPLOAD_MODULE = "bimanual_vla.data.upload"
 EPISODE_VIEWER_MODULE = "bimanual_vla.data.viewer"

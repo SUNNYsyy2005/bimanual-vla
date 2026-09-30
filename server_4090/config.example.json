@@ -1,16 +1,16 @@
 {
   "host": "0.0.0.0",
   "port": 8090,
-  "openpi_repo": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05",
-  "openpi_python": "/home/sunny/miniconda3/envs/openpi/bin/python",
-  "dataset_root": "/home/sunny/.cache/huggingface/lerobot",
+  "openpi_repo": "${HOME}/robotwin_ws/RoboTwin/policy/pi05",
+  "openpi_python": "${HOME}/miniconda3/envs/openpi/bin/python",
+  "dataset_root": "${HOME}/.cache/huggingface/lerobot",
   "dataset_read_roots": [
-    "/home/sunny/.cache/huggingface/lerobot"
+    "${HOME}/.cache/huggingface/lerobot"
   ],
-  "workspace_root": "/home/sunny/.local/share/bimanual-vla-server",
-  "assets_base_dir": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/assets",
-  "checkpoint_base_dir": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints",
-  "base_checkpoint": "/home/sunny/.cache/openpi/openpi-assets/checkpoints/pi05_base",
+  "workspace_root": "${HOME}/.local/share/bimanual-vla-server",
+  "assets_base_dir": "${HOME}/robotwin_ws/RoboTwin/policy/pi05/assets",
+  "checkpoint_base_dir": "${HOME}/robotwin_ws/RoboTwin/policy/pi05/checkpoints",
+  "base_checkpoint": "${HOME}/.cache/openpi/openpi-assets/checkpoints/pi05_base",
   "allowed_gpu_ids": [0, 1, 2, 3],
   "allow_busy_gpus": false,
   "small_gpu_process_memory_mib": 512,
@@ -35,7 +35,7 @@
   "policy_port_max": 8099,
   "training_task_launch_backend": "nohup",
   "checkpoint_allowed_roots": [
-    "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints",
-    "/home/sunny/.cache/openpi/openpi-assets/checkpoints"
+    "${HOME}/robotwin_ws/RoboTwin/policy/pi05/checkpoints",
+    "${HOME}/.cache/openpi/openpi-assets/checkpoints"
   ]
 }

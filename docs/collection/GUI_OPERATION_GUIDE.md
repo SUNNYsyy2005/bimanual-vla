@@ -5,13 +5,13 @@
 项目目录：
 
 ```text
-/home/user/dual_ARM_project/arm_collect/bimanual-vla
+<仓库根目录>
 ```
 
 默认原始数据目录：
 
 ```text
-/home/user/dual_ARM_project/arm_collect/bimanual-vla/episodes_piper_v21
+<仓库根目录>/episodes_piper_v21
 ```
 
 数据服务器：
@@ -55,7 +55,7 @@ USB 重新插拔后 `/dev/videoN` 编号可能变化。GUI 会使用稳定的设
 ## 2. 启动 GUI
 
 ```bash
-cd /home/user/dual_ARM_project/arm_collect/bimanual-vla
+cd /path/to/bimanual-vla
 bash start_gui.sh
 ```
 
@@ -178,7 +178,7 @@ LeRobot preparation complete: ...
 可在终端进行本地结构复查：
 
 ```bash
-cd /home/user/dual_ARM_project/arm_collect/bimanual-vla
+cd /path/to/bimanual-vla
 bin/bimanual-vla data-check <PREPARED_LEROBOT_PATH>
 ```
 
