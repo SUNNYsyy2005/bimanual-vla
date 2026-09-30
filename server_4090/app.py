@@ -1434,6 +1434,7 @@ def load_config(path: Path) -> dict[str, Any]:
         # selected by each robot client and can change without restarting the
         # Policy process.
         "policy_rtc_enabled": True,
+        "policy_inference_diagnostics_enabled": True,
         "policy_rtc_max_execution_horizon": 8,
         "policy_rtc_max_guidance_weight": 5.0,
         "max_upload_gib": 500,
@@ -8000,6 +8001,9 @@ print(json.dumps(rows, ensure_ascii=False))
         # their selected values at runtime and can change them without
         # restarting this process.
         rtc_enabled = bool(config.get("policy_rtc_enabled", True))
+        inference_diagnostics_enabled = bool(
+            config.get("policy_inference_diagnostics_enabled", True)
+        )
         rtc_execution_horizon = safe_int(
             config.get("policy_rtc_max_execution_horizon", 8),
             "policy_rtc_max_execution_horizon",
@@ -8208,6 +8212,7 @@ print(json.dumps(rows, ensure_ascii=False))
             "--port", str(port),
             "--telemetry-dir", str(telemetry_dir),
             "--rtc-enabled" if rtc_enabled else "--no-rtc-enabled",
+            "--inference-diagnostics" if inference_diagnostics_enabled else "--no-inference-diagnostics",
             "--rtc-execution-horizon", str(rtc_execution_horizon),
             "--rtc-max-guidance-weight", str(rtc_max_guidance_weight),
         ] + action_contract_command_args(model_contract)
@@ -8245,6 +8250,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 "telemetry_session": telemetry_session,
                 "telemetry_dir": str(telemetry_dir),
                 "rtc_server_enabled": rtc_enabled,
+                "inference_diagnostics_enabled": inference_diagnostics_enabled,
                 "rtc_server_max_execution_horizon": rtc_execution_horizon,
                 "rtc_server_max_guidance_weight": rtc_max_guidance_weight,
                 "replaced_task_id": replace_task_id or None,

@@ -284,6 +284,21 @@ checkpoint 都走模型侧 RTC。API 还可设置 `rtc_execution_horizon`、
 默认关闭额外的客户端 old/new blend；服务端按真实剩余步数填充固定 shape，避免
 JAX 因不同 offset 反复重新编译。
 
+推理诊断由 `server_4090/config.json` 的
+`policy_inference_diagnostics_enabled` 控制，默认 `true`；修改后重启 Dashboard，
+再启动 Policy 时生效。客户端 `monitoring_data/<session>/events.jsonl` 的
+`inference_result.result_summary.rtc` 记录实际传给采样器的
+`denoising_steps`、来源（默认值或显式覆盖）和 `sampler_wall_ms`；同一事件的
+`result_summary.transport_timing.model_phase_timing` 记录 RTC 准备、OpenPI 采样前处理、采样器及 CPU 回读、
+OpenPI 后处理、RTC 收尾等阶段。`transport_timing.policy_instance_id`
+用于确认两次会话是否来自同一个 Policy 进程。Dashboard 的 Policy 最新观测
+JSON 也保存这些字段。设为 `false` 后不执行这些额外的参数解析和阶段计时，
+基础 `model_inference_ms` 和客户端 RTT 仍会记录。JAX sampler 内的 prefix
+与每一步去噪同属一段 JIT 计算，常规日志不再拆开，以免逐步同步改变延迟。
+`openpi_input_transform_ms` 进一步量出采样前的完整输入变换；它只在该
+阶段实际执行且诊断开启时出现。用 `openpi_pre_sampler_ms` 减去它，可以估计
+批处理、JAX 数据上卡和 Observation 构造等剩余准备时间。
+
 脚本必须运行在物理连接 Piper CAN 和相机的电脑，而不是 4×4090；单臂使用一个 CAN 和两路相机：
 
 ```bash

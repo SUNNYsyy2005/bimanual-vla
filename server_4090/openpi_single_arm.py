@@ -3130,6 +3130,13 @@ class PolicyTelemetry:
                 result_rtc.get("client_config_revision")
             ),
             "server_rtc_limits": self._json_object(result_rtc.get("server_limits")),
+            "server_denoising_steps": self._positive_int(result_rtc.get("denoising_steps")),
+            "server_denoising_steps_source": result_rtc.get("denoising_steps_source"),
+            "model_phase_timing": self._json_object(
+                transport_timing.get("model_phase_timing")
+            ),
+            "policy_instance_id": self.metadata.get("policy_instance_id"),
+            "policy_instance_started_at": self.metadata.get("policy_instance_started_at"),
             "can_name": str(client.get("can_name", ""))[:256],
             "cam_high_device": str(client.get("cam_high_device", ""))[:256],
             "cam_wrist_device": str(client.get("cam_wrist_device", ""))[:256],
@@ -3283,8 +3290,9 @@ class ImageTransportPolicy:
     deployment.
     """
 
-    def __init__(self, policy: Any):
+    def __init__(self, policy: Any, *, diagnostics_enabled: bool = True):
         self.policy = policy
+        self.diagnostics_enabled = bool(diagnostics_enabled)
 
     def infer(self, observation: dict) -> dict:
         transport = observation.get("_transport")
@@ -3293,6 +3301,7 @@ class ImageTransportPolicy:
             return self.policy.infer(observation)
         if codec != "jpeg_chw_v1":
             raise ValueError(f"unsupported image transport: {codec!r}")
+        decode_started = time.monotonic() if self.diagnostics_enabled else None
         import cv2
 
         images = observation.get("images")
@@ -3316,7 +3325,15 @@ class ImageTransportPolicy:
         # than the compact byte payload.
         observation["images"] = decoded_images
         observation.pop("_transport", None)
-        return self.policy.infer(observation)
+        if decode_started is None:
+            return self.policy.infer(observation)
+        image_decode_ms = (time.monotonic() - decode_started) * 1000.0
+        result = dict(self.policy.infer(observation))
+        raw_phases = result.get("model_phase_timing")
+        phases = dict(raw_phases) if isinstance(raw_phases, dict) else {}
+        phases["image_decode_ms"] = image_decode_ms
+        result["model_phase_timing"] = phases
+        return result
 
     def reset(self) -> None:
         reset = getattr(self.policy, "reset", None)
@@ -3356,6 +3373,16 @@ class TelemetryPolicy:
                 "observation_upload_ms": observation_upload_ms,
                 "server_observation_upload_ms": observation_upload_ms,
             }
+            if self.telemetry.metadata.get("inference_diagnostics_enabled"):
+                transport_timing["policy_instance_id"] = self.telemetry.metadata.get(
+                    "policy_instance_id"
+                )
+                transport_timing["policy_instance_started_at"] = self.telemetry.metadata.get(
+                    "policy_instance_started_at"
+                )
+                phases = result.pop("model_phase_timing", None)
+                if isinstance(phases, dict):
+                    transport_timing["model_phase_timing"] = phases
             result["transport_timing"] = transport_timing
             # Publish asynchronously. The response boundary is measured before
             # queueing so dashboard image copies/JSON serialization cannot add
@@ -3373,22 +3400,54 @@ class TelemetryPolicy:
 
 
 def warmup_policy(policy: Any, metadata: dict[str, Any], prompt: str | None) -> None:
-    """Compile and run the complete inference path before accepting clients."""
+    """Compile both ordinary and RTC-guided inference before accepting clients."""
     images = {
         key: np.zeros((224, 224, 3), dtype=np.uint8)
         for key in metadata["camera_keys"]
     }
+    warmup_session = "__server_warmup__"
+    client_metadata: dict[str, Any] = {"source_name": warmup_session}
+    if metadata.get("rtc_supported"):
+        client_metadata["rtc"] = {
+            "session_id": warmup_session,
+            "inference_generation": 1,
+            "inference_delay_steps": 0,
+            "previous_chunk_offset_steps": 0,
+            "config_revision": 1,
+            "config": {"enabled": True},
+        }
     observation = {
         "state": np.zeros(int(metadata["state_dim"]), dtype=np.float32),
         "images": images,
         "prompt": prompt or "Move safely.",
-        "client_metadata": {"source_name": "__server_warmup__"},
+        "client_metadata": client_metadata,
     }
     started = time.monotonic()
     result = policy.infer(observation)
     actions = np.asarray(result["actions"])
     if actions.ndim != 2 or actions.shape[1] != int(metadata["action_dim"]):
         raise RuntimeError(f"policy warmup returned invalid actions shape {actions.shape}")
+    if metadata.get("rtc_supported"):
+        guided_observation = dict(observation)
+        guided_observation["client_metadata"] = {
+            "source_name": warmup_session,
+            "rtc": {
+                "session_id": warmup_session,
+                "inference_generation": 2,
+                "previous_chunk_generation": 1,
+                "previous_chunk_offset_steps": 0,
+                "inference_delay_steps": min(6, max(0, len(actions) - 1)),
+            },
+        }
+        guided_started = time.monotonic()
+        guided_result = policy.infer(guided_observation)
+        guided_actions = np.asarray(guided_result["actions"])
+        if guided_actions.shape != actions.shape or not guided_result.get("rtc", {}).get("enabled"):
+            raise RuntimeError(
+                "RTC warmup did not execute the guided sampler: "
+                f"actions={guided_actions.shape} rtc={guided_result.get('rtc')}"
+            )
+        logging.info("RTC-guided warmup completed in %.2fs", time.monotonic() - guided_started)
     reset = getattr(policy, "reset", None)
     if callable(reset):
         reset()
@@ -3404,6 +3463,10 @@ def run_serve(args: argparse.Namespace) -> None:
         default_prompt=args.default_prompt,
     )
     policy_metadata = dict(config.policy_metadata)
+    policy_metadata["inference_diagnostics_enabled"] = bool(args.inference_diagnostics)
+    if args.inference_diagnostics:
+        policy_metadata["policy_instance_id"] = f"{os.getpid()}-{time.time_ns()}"
+        policy_metadata["policy_instance_started_at"] = time.time()
     if args.rtc_enabled:
         rtc_backend = "pytorch" if bool(getattr(policy, "_is_pytorch_model", False)) else "jax"
         contract = getattr(getattr(config, "data", None), "contract", None)
@@ -3427,6 +3490,7 @@ def run_serve(args: argparse.Namespace) -> None:
             reanchor_action_mask=reanchor_action_mask,
             temporal_consistency=bool(args.rtc_temporal_consistency),
             temporal_seed=int(args.rtc_temporal_seed),
+            inference_diagnostics_enabled=bool(args.inference_diagnostics),
         )
         policy = build_rtc_policy(policy, rtc_config)
         policy_metadata.update(
@@ -3463,7 +3527,9 @@ def run_serve(args: argparse.Namespace) -> None:
         policy_metadata["image_jpeg_quality"] = int(
             getattr(args, "image_jpeg_quality", 90)
         )
-        policy = ImageTransportPolicy(policy)
+        policy = ImageTransportPolicy(
+            policy, diagnostics_enabled=bool(args.inference_diagnostics)
+        )
     warmup_policy(policy, policy_metadata, args.default_prompt)
     telemetry: PolicyTelemetry | None = None
     if args.telemetry_dir:
@@ -3586,6 +3652,12 @@ def parse_args() -> argparse.Namespace:
     serve.add_argument("--port", type=int, default=8000)
     serve.add_argument("--default-prompt", default=None)
     serve.add_argument("--telemetry-dir", default=None)
+    serve.add_argument(
+        "--inference-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="record detailed sampler arguments and phase timing in inference telemetry",
+    )
     serve.add_argument(
         "--image-transport",
         choices=("jpeg_chw_v1", "raw"),
