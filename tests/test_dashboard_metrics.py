@@ -710,7 +710,7 @@ class AsyncPolicyDashboardContractTest(unittest.TestCase):
         self.assertTrue(norm_extended_contract_matches({"version": 4, **fingerprint}, fingerprint))
         self.assertFalse(norm_extended_contract_matches({"version": 4, **fingerprint, "action_offset": 1}, fingerprint))
 
-    def test_summary_dual_gate_requires_valid_action_horizon(self):
+    def test_summary_reports_horizon_without_server_execution_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = PolicyTelemetryStore({"workspace_root": tmp, "robot_observation_max_age_s": 3})
             session, directory = store.create_session()
@@ -720,7 +720,6 @@ class AsyncPolicyDashboardContractTest(unittest.TestCase):
                 "state": "running",
                 "metadata": {"telemetry_session": session, "port": 8000},
             }
-            store.set_control(task, mode="execute", expires_in_s=300)
             (directory / "connections.json").write_text(
                 json.dumps({"client_connected": True, "active_clients": 1}), encoding="utf-8"
             )
@@ -745,14 +744,16 @@ class AsyncPolicyDashboardContractTest(unittest.TestCase):
                 json.dumps({"in_flight": True, "active_inferences": 1}), encoding="utf-8"
             )
             active = summary(50)
-            self.assertTrue(active["dual_gate_open"])
+            self.assertTrue(active["horizon_execution_ready"])
+            self.assertNotIn("dual_gate_open", active)
+            self.assertNotIn("execution_control", active)
             self.assertTrue(active["client_in_flight"])
             self.assertTrue(active["policy_in_flight"])
             (directory / "runtime.json").write_text(
                 json.dumps({"in_flight": False, "active_inferences": 0}), encoding="utf-8"
             )
-            self.assertFalse(summary(15)["dual_gate_open"])
-            self.assertFalse(summary(None)["dual_gate_open"])
+            self.assertFalse(summary(15)["horizon_execution_ready"])
+            self.assertFalse(summary(None)["horizon_execution_ready"])
 
     def test_summary_extrapolates_signed_target_error_and_falls_back_to_legacy_fields(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -985,9 +985,8 @@ class CollectorGUI:
         self.inference_trigger_step_var = tk.StringVar(
             value=str(self.gui_preferences.get("inference_trigger_step") or "10")
         )
-        self.inference_allow_execution_var = tk.BooleanVar(
-            value=bool(self.gui_preferences.get("inference_allow_execution", True))
-        )
+        # Execution is authorized locally for this GUI session only.
+        self.inference_allow_execution_var = tk.BooleanVar(value=False)
         self.inference_camera_preview_var = tk.BooleanVar(
             value=bool(self.gui_preferences.get("inference_camera_preview", False))
         )
@@ -2376,7 +2375,6 @@ class CollectorGUI:
             "inference_control_hz": self.inference_control_hz_var.get().strip(),
             "inference_trigger_mode": self.inference_trigger_mode_var.get().strip(),
             "inference_trigger_step": self.inference_trigger_step_var.get().strip(),
-            "inference_allow_execution": bool(self.inference_allow_execution_var.get()),
             "inference_camera_preview": bool(self.inference_camera_preview_var.get()),
             "inference_rtc_enabled": bool(self.inference_rtc_enabled_var.get()),
             "inference_rtc_horizon": self.inference_rtc_horizon_var.get().strip(),
@@ -2489,7 +2487,7 @@ class CollectorGUI:
                     dialog,
                     "Restart inference",
                     "The bridge received the instruction at startup. Restart inference now to apply the new instruction?\n\n"
-                    "The current bridge will stop gracefully; Dashboard EXECUTE authorization may need to be confirmed again.",
+                    "The current bridge will stop gracefully. The client execution setting will apply when inference restarts.",
                 )
                 if restart:
                     self.inference_restart_requested = True
@@ -2679,7 +2677,7 @@ class CollectorGUI:
                 self.root,
                 "Restart inference",
                 "Swap the wrist camera roles and restart inference now?\n\n"
-                "The current bridge will stop gracefully; Dashboard EXECUTE authorization may need to be confirmed again.",
+                "The current bridge will stop gracefully. The client execution setting will apply when inference restarts.",
             )
             if restart:
                 self.inference_restart_requested = True

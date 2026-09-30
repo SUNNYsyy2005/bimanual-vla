@@ -3,14 +3,13 @@
 
 This executable owns the physical control path: Piper CAN feedback and command
 I/O, camera capture, OpenPI WebSocket inference, timestamped action chunks, an
-independent 20 Hz servo loop, and fail-closed safety gates.  The historical
+independent 20 Hz servo loop, and fail-closed safety gates.
 The ``bin/bimanual-vla legacy-bridge`` command is a compatibility alias that
 forwards to this module and cannot select a different implementation.
 
 The client is fail-closed and follows validated single-arm/bimanual ``delivery``
 or ``joint`` policy metadata. By default it only sends real observations
-and prints predictions. Robot motion requires both a time-limited Dashboard
-``execute`` authorization and the local ``--allow-execution`` flag. Robot
+and prints predictions. Robot motion requires the local ``--allow-execution`` flag. Robot
 control and camera acquisition run continuously at 20 Hz while a single
 asynchronous policy request is launched every 250 ms (4 Hz) when the previous
 request has completed. A 50-row OpenPI chunk must contain at least 16 rows.
@@ -18,7 +17,7 @@ Every decoded row is timestamped from the observation's monotonic capture time;
 each control tick selects the closest future target for its estimated actuator
 execution time, then blends a new pose trajectory into the still-active plan
 over 2--4 steps (default 3). The gripper is filtered separately and is never
-pose-blended. If a plan runs out under a valid double gate, the last safe target
+pose-blended. If a plan runs out, the last safe target
 is held until a valid replacement arrives. Every command passes schema-specific
 freshness, range, delta, and Piper-status checks.
 """
@@ -2394,12 +2393,9 @@ class ExecutionController:
         self.piper = next(iter(self.pipers.values()))
         self.robot_enabled: set[str] = set()
         allow_execution = bool(getattr(args, "allow_execution", False))
-        self.state = "client_disabled" if not allow_execution else "shadow"
-        self.blocked_reason = (
-            "local --allow-execution is absent" if not allow_execution else "dashboard is shadow"
-        )
+        self.state = "client_disabled" if not allow_execution else "ready"
+        self.blocked_reason = "local --allow-execution is absent" if not allow_execution else ""
         self.last_command_at: float | None = None
-        self.control_revision: int | None = None
         self.robot_status: dict[str, Any] | None = None
         runtime_rates = resolve_client_runtime_rates(args)
         self.inference_hz = runtime_rates.inference_hz
@@ -2526,8 +2522,6 @@ class ExecutionController:
         self.queue_anchor_at: float | None = None
         self.queue_loaded_at: float | None = None
         self.queue_image_timestamps: dict[str, float] = {}
-        self.queue_control: dict[str, Any] | None = None
-        self.authorization_deadline_monotonic: float | None = None
         self.queued_action_index: int | None = None
         self.last_queued_action_index: int | None = None
         self.last_wire_action: list[float] | None = None
@@ -3002,7 +2996,6 @@ class ExecutionController:
                 "allow_execution": bool(getattr(self.args, "allow_execution", False)),
                 "execution_state": self.state,
                 "blocked_reason": self.blocked_reason,
-                "control_revision": self.control_revision,
                 "policy_action_hz": self.policy_action_hz,
                 "command_hz": self.control_hz,
                 "control_hz": self.control_hz,
@@ -3062,7 +3055,6 @@ class ExecutionController:
             "execution_state": self.state,
             "blocked_reason": self.blocked_reason,
             "last_command_at": self.last_command_at,
-            "control_revision": self.control_revision,
             "robot_arm_status": self.robot_status,
             "robot_enabled_sides": sorted(self.robot_enabled),
             "robot_driver_enable_status": self.robot_driver_enable_status,
@@ -3651,28 +3643,6 @@ class ExecutionController:
         self.arm_hold_gripper_targets.clear()
         self.arm_hold_started_at.clear()
         self.arm_hold_stable_since.clear()
-
-    def _candidate_execution_control(
-        self,
-        control: Any,
-        *,
-        arrived_monotonic: float,
-    ) -> tuple[int, float]:
-        if not isinstance(control, dict):
-            raise ExecutionBlocked("policy response has no execution_control")
-        if control.get("mode") != "execute":
-            reason = "dashboard authorization expired" if control.get("expired") else "dashboard is shadow"
-            raise PermissionError(reason)
-        if not control.get("task_id") or not control.get("session_id"):
-            raise ExecutionBlocked("execution authorization has no task/session identity")
-        try:
-            revision = int(control.get("revision", 0))
-            remaining_s = float(control["expires_at"]) - float(control["server_time"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ExecutionBlocked("execution authorization has no valid expiry") from exc
-        if remaining_s <= 0:
-            raise PermissionError("execution authorization expired")
-        return revision, arrived_monotonic + remaining_s
 
     def _target_telemetry(
         self, protocol: PolicyProtocol, absolute_target: np.ndarray
@@ -4306,18 +4276,6 @@ class ExecutionController:
         if not isinstance(result, dict) or "actions" not in result:
             return self._reject_result(launch.generation, "result has no actions", arrived_at)
 
-        control = result.get("execution_control")
-        try:
-            revision, authorization_deadline = self._candidate_execution_control(
-                control, arrived_monotonic=arrived_monotonic
-            )
-        except PermissionError as exc:
-            self.discard_pending_actions(str(exc), kind="expired")
-            state = "shadow" if "shadow" in str(exc) else "blocked"
-            return self._block(state, str(exc))
-        except ExecutionBlocked as exc:
-            return self._reject_result(launch.generation, str(exc), arrived_at)
-
         if self.waiting_fresh_after_enable:
             barrier = self.fresh_inference_required_after_monotonic
             if barrier is None:
@@ -4482,14 +4440,11 @@ class ExecutionController:
         if not self.async_inference:
             candidate = candidate[: self.sync_wait_steps]
 
-        # All decoding/blending/authorization checks finished. The control thread
+        # All decoding/blending checks finished. The control thread
         # performs one atomic list replacement; inference never mutates this queue.
         self.pending_actions = candidate
         self.timeline_resync_active = retime_from_arrival
         self.active_generation = launch.generation
-        self.control_revision = revision
-        self.authorization_deadline_monotonic = authorization_deadline
-        self.queue_control = control
         self.queue_anchor_state = anchor.tolist()
         self.queue_anchor_qpos_m = np.asarray(launch.qpos_m, dtype=np.float64).tolist()
         self.queue_anchor_at = launch.captured_at
@@ -4511,7 +4466,7 @@ class ExecutionController:
         if self.arm_hold_targets:
             # This is only a staged plan until its first checked command is
             # actually published.  Keep refreshing the physical hold if that
-            # first row later fails safety, authorization, IK, or queue timing.
+            # first row later fails safety, IK, or queue timing.
             self.enable_staged_generation = launch.generation
         self.waiting_fresh_after_enable = False
         if self.tracking_lag_active:
@@ -4746,17 +4701,11 @@ class ExecutionController:
             if not allow_execution:
                 gate_reason = "local --allow-execution is absent"
                 gate_state = "client_disabled"
-            elif self.state in {"shadow", "client_disabled"}:
-                gate_reason = self.blocked_reason or "dashboard is shadow"
-                gate_state = self.state
+            elif self.state == "client_disabled":
+                gate_reason = self.blocked_reason or "local --allow-execution is absent"
+                gate_state = "client_disabled"
             elif self.state == "blocked":
                 gate_reason = self.blocked_reason or "execution is blocked"
-                gate_state = "blocked"
-            elif (
-                self.authorization_deadline_monotonic is None
-                or now_monotonic >= self.authorization_deadline_monotonic
-            ):
-                gate_reason = "execution authorization expired"
                 gate_state = "blocked"
 
             if gate_reason is not None:
@@ -5259,7 +5208,6 @@ class ExecutionController:
                 "queue_index": int(queued.queue_index),
                 "inference_generation": self.inference_generation,
                 "timing_generation": self.last_transport_generation,
-                "control_revision": self.control_revision,
             },
             "schema": protocol.schema,
             "arm_mode": protocol.arm_mode,
@@ -5474,7 +5422,6 @@ def print_result(
     except ExecutionBlocked as exc:
         command_action, used_steps = np.asarray([], dtype=np.float64), 0
         logging.warning("Cannot summarize command action: %s", exc)
-    control = result.get("execution_control", {})
     if protocol.schema == "delivery":
         state_summary = " ".join(
             f"{side}_eef={np.array2string(state[i * 10:i * 10 + 3], precision=4)}"
@@ -5492,8 +5439,7 @@ def print_result(
         f"  command_action[{used_steps} steps]={np.array2string(command_action, precision=5, suppress_small=True)}\n"
         f"  queue_last={execution.last_queued_action_index} queue_next={execution.queued_action_index} "
         f"remaining={execution.pending_action_count} decoded={execution.last_decoded_absolute_target}\n"
-        f"  server_mode={control.get('mode', 'missing')} "
-        f"local_allow={getattr(execution.args, 'allow_execution', False)} "
+        f"  local_allow={getattr(execution.args, 'allow_execution', False)} "
         f"client_state={execution.state} command_sent={command_sent} "
         f"reason={execution.blocked_reason or '-'}",
         flush=True,
@@ -5954,7 +5900,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
         monitoring.record("camera_ready", camera_checks=camera_checks, camera_ids=camera_ids)
         logging.warning(
             "%s %s client: output_mode=%s control=%.3g Hz periodic/retry=%.3g Hz trigger=%s step=%d "
-            "expected_chunk=%d minimum_chunk=%d. Robot commands still require Dashboard EXECUTE.",
+            "expected_chunk=%d minimum_chunk=%d. Robot commands require local --allow-execution and safety checks.",
             "EXECUTION-CAPABLE" if args.allow_execution else "SHADOW-ONLY",
             args.arm_mode,
             output_mode,
@@ -6247,9 +6193,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                         queue_drained = not execution.pending_action_count
                         # ``launch_schedule`` still applies as an upper bound
                         # on retry rate. Without it, a server that rejects
-                        # requests *faster* than it fulfills them (e.g. an
-                        # expired Dashboard authorization failing before the
-                        # model even runs) would retry as fast as the round
+                        # requests *faster* than it fulfills them would retry as fast as the round
                         # trip allows, with no floor -- the same failure mode
                         # async mode's periodic schedule already prevents. A
                         # legitimate accepted chunk's natural drain time is
@@ -6999,7 +6943,7 @@ def main() -> None:
     parser.add_argument(
         "--allow-execution",
         action="store_true",
-        help="enable the client-side safety gate; Dashboard EXECUTE is still required",
+        help="allow local robot execution, subject to per-command safety checks",
     )
     parser.add_argument("--max-action-age-s", type=float, default=2.0)
     parser.add_argument(

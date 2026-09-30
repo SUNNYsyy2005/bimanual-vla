@@ -122,6 +122,33 @@ def _load_openpi_helper():
 HELPER = _load_openpi_helper()
 
 
+class PolicyWarmupTest(unittest.TestCase):
+    def test_warmup_runs_inference_with_contract_shaped_synthetic_observation(self):
+        class FakePolicy:
+            def __init__(self):
+                self.observation = None
+                self.reset_called = False
+
+            def infer(self, observation):
+                self.observation = observation
+                return {"actions": np.zeros((50, 14), dtype=np.float32)}
+
+            def reset(self):
+                self.reset_called = True
+
+        policy = FakePolicy()
+        HELPER.warmup_policy(policy, {
+            "state_dim": 14,
+            "action_dim": 14,
+            "camera_keys": ["cam_high", "cam_left_wrist", "cam_right_wrist"],
+        }, "pick up")
+        self.assertEqual(policy.observation["state"].shape, (14,))
+        self.assertEqual(set(policy.observation["images"]),
+                         {"cam_high", "cam_left_wrist", "cam_right_wrist"})
+        self.assertEqual(policy.observation["prompt"], "pick up")
+        self.assertTrue(policy.reset_called)
+
+
 def _rotation6d(matrix: np.ndarray) -> np.ndarray:
     return np.concatenate((matrix[:, 0], matrix[:, 1])).astype(np.float32)
 
