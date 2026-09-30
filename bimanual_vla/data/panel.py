@@ -16,10 +16,55 @@ from bimanual_vla.data.analysis import (
     AnalysisData,
     compute_metrics,
     compute_end_effector_positions,
+    jitter_plot_series,
     load_analysis_data,
+    motion_joint_names,
     scan_analysis_sources,
     selection_indices,
+    trajectory_motion_series,
 )
+from bimanual_vla.data.eef_view import draw_end_effector_trajectory
+
+
+MOTION_VIEWS = {
+    "Velocity": (1, "rad/s"),
+    "Acceleration": (2, "rad/s²"),
+}
+
+CHUNK_VIEWS = {
+    "Boundary position jump": ("boundary_jump_mean_rad_l2", "rad L2"),
+    "Boundary velocity direction": ("boundary_momentum_cosine_mean", "cosine"),
+}
+
+PLOT_GROUPS = {
+    "Trajectory": ("Position", *MOTION_VIEWS, "Tracking error"),
+    "Chunk boundaries": tuple(CHUNK_VIEWS),
+    "Timing": ("Inference latency", "Control interval"),
+    "End effector": ("3D trajectory",),
+}
+
+
+def available_plot_groups(data: AnalysisData | None) -> dict[str, tuple[str, ...]]:
+    """Only offer charts backed by the selected source's recording format."""
+    if data is not None and data.kind == "episode":
+        return {
+            "Trajectory": ("Position", "Tracking error"),
+            "Timing": ("Control interval",),
+            "End effector": PLOT_GROUPS["End effector"],
+        }
+    return PLOT_GROUPS
+
+
+def _timing_value_ms(record: dict[str, object], key: str) -> float:
+    """Represent missing or invalid per-request diagnostics as a chart gap."""
+    timing = record.get("_client_transport_timing")
+    if not isinstance(timing, dict):
+        return float("nan")
+    try:
+        value = float(timing.get(key))
+    except (TypeError, ValueError, OverflowError):
+        return float("nan")
+    return value if np.isfinite(value) else float("nan")
 
 
 class DataProcessPanel(ttk.Frame):
@@ -44,8 +89,9 @@ class DataProcessPanel(ttk.Frame):
         self.start_label_var = tk.StringVar(value="0.00 s")
         self.end_label_var = tk.StringVar(value="0.00 s")
         self._range_update_guard = False
-        self.plot_var = tk.StringVar(value="Measured position")
-        self.signal_var = tk.StringVar(value="All dimensions")
+        self.group_var = tk.StringVar(value="Trajectory")
+        self.plot_var = tk.StringVar(value="Velocity")
+        self.signal_var = tk.StringVar(value="")
         self.selection_var = tk.StringVar(value="No data selected")
         self.status_var = tk.StringVar(value="Select a data source")
         self.metric_vars: dict[str, tk.StringVar] = {
@@ -58,9 +104,6 @@ class DataProcessPanel(ttk.Frame):
                 "latency",
                 "jitter",
                 "sent",
-                "rejected",
-                "unsafe",
-                "discarded",
                 "action_rows",
                 "executed_actions",
                 "rejected_rows",
@@ -72,6 +115,12 @@ class DataProcessPanel(ttk.Frame):
         self.chart_series: list[tuple[str, np.ndarray, str]] = []
         self.chart_x = np.array([], dtype=np.float64)
         self.chart_y_label = ""
+        self.chart_markers: list[tuple[str, np.ndarray, str]] = []
+        self.chart_series_x: list[np.ndarray] = []
+        self.eef_yaw = 0.0
+        self.eef_pitch = 0.45
+        self.eef_zoom = 1.0
+        self.eef_drag_at: tuple[int, int] | None = None
         self._build_ui()
         self.refresh_sources()
 
@@ -119,23 +168,22 @@ class DataProcessPanel(ttk.Frame):
         right.rowconfigure(4, weight=1)
         summary = ttk.LabelFrame(right, text="Summary", padding=10)
         summary.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        for column in range(5):
+        for column in range(4):
             summary.columnconfigure(column, weight=1)
         cards = (
             ("source", "Source"), ("duration", "Selected duration"),
             ("control", "Control rate"), ("inference", "Model commands"),
             ("latency", "Round-trip P50 / P95"), ("jitter", "Tick jitter P95"),
-            ("sent", "Command coverage"), ("rejected", "Rejected actions"),
-            ("unsafe", "Unsafe drops"), ("discarded", "Discarded total"),
+            ("sent", "Command coverage"),
         )
         for index, (key, title) in enumerate(cards):
-            row, column = divmod(index, 5)
+            row, column = divmod(index, 4)
             card = tk.Frame(summary, bg="#f7f8fa", highlightthickness=1, highlightbackground="#e4e7ec")
             card.grid(row=row, column=column, sticky="ew", padx=4, pady=4)
             tk.Label(card, text=title, bg="#f7f8fa", fg="#68707d", font=("Liberation Serif", 9), anchor="w").pack(fill="x", padx=8, pady=(6, 1))
             tk.Label(card, textvariable=self.metric_vars[key], bg="#f7f8fa", fg="#202124", font=("Liberation Serif", 10, "bold"), anchor="w").pack(fill="x", padx=8, pady=(0, 6))
 
-        accounting = ttk.LabelFrame(right, text="Action accounting", padding=8)
+        accounting = ttk.LabelFrame(right, text="Actions and chunk metrics", padding=8)
         accounting.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         for column in range(4):
             accounting.columnconfigure(column, weight=1)
@@ -152,6 +200,22 @@ class DataProcessPanel(ttk.Frame):
             card.grid(row=row, column=column, sticky="ew", padx=4, pady=3)
             tk.Label(card, text=title, bg="#f7f8fa", fg="#68707d", font=("Liberation Serif", 9), anchor="w").pack(fill="x", padx=8, pady=(5, 1))
             tk.Label(card, textvariable=self.metric_vars[key], bg="#f7f8fa", fg="#202124", font=("Liberation Serif", 10, "bold"), anchor="w").pack(fill="x", padx=8, pady=(0, 5))
+        ttk.Label(
+            accounting,
+            text="Trajectory jitter · policy output uses the full horizon; sent uses issued joint commands",
+            foreground="#68707d",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", padx=4, pady=(5, 2))
+        self.jitter_tree = ttk.Treeview(
+            accounting, columns=("metric", "model", "sent"), show="headings", height=3
+        )
+        for key, title, width in (
+            ("metric", "Metric", 240),
+            ("model", "Policy output", 170),
+            ("sent", "Command sent", 170),
+        ):
+            self.jitter_tree.heading(key, text=title)
+            self.jitter_tree.column(key, width=width, minwidth=110, stretch=True)
+        self.jitter_tree.grid(row=3, column=0, columnspan=4, sticky="ew", padx=4, pady=(0, 4))
 
         controls = ttk.LabelFrame(right, text="Analysis range", padding=8)
         controls.grid(row=2, column=0, sticky="ew", pady=(0, 10))
@@ -170,18 +234,35 @@ class DataProcessPanel(ttk.Frame):
 
         chart_controls = ttk.Frame(right)
         chart_controls.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(chart_controls, text="Group").pack(side="left")
+        self.group_selector = ttk.Combobox(
+            chart_controls, textvariable=self.group_var, state="readonly",
+            values=tuple(PLOT_GROUPS), width=15,
+        )
+        self.group_selector.pack(side="left", padx=(8, 12))
+        self.group_selector.bind("<<ComboboxSelected>>", lambda _event: self._group_changed())
         ttk.Label(chart_controls, text="View").pack(side="left")
-        plot_selector = ttk.Combobox(chart_controls, textvariable=self.plot_var, state="readonly", values=("Measured position", "Target vs measured", "Action velocity", "Action error", "Latency", "Tick interval", "End-effector XY", "End-effector XYZ"), width=23)
-        plot_selector.pack(side="left", padx=(8, 14))
-        plot_selector.bind("<<ComboboxSelected>>", lambda _event: self._refresh_chart())
+        self.plot_selector = ttk.Combobox(
+            chart_controls, textvariable=self.plot_var, state="readonly",
+            values=PLOT_GROUPS["Trajectory"], width=27,
+        )
+        self.plot_selector.pack(side="left", padx=(8, 12))
+        self.plot_selector.bind("<<ComboboxSelected>>", lambda _event: self._plot_changed())
         ttk.Label(chart_controls, text="Signal").pack(side="left")
-        self.signal_selector = ttk.Combobox(chart_controls, textvariable=self.signal_var, state="readonly", values=("All dimensions",), width=24)
+        self.signal_selector = ttk.Combobox(chart_controls, textvariable=self.signal_var, state="readonly", values=("",), width=18)
         self.signal_selector.pack(side="left", padx=8)
         self.signal_selector.bind("<<ComboboxSelected>>", lambda _event: self._refresh_chart())
+        self.reset_3d_button = ttk.Button(chart_controls, text="Reset 3D view", command=self._reset_3d_view)
 
         self.chart = tk.Canvas(right, background="#ffffff", highlightthickness=1, highlightbackground="#d9dde5")
         self.chart.grid(row=4, column=0, sticky="nsew")
         self.chart.bind("<Configure>", lambda _event: self._draw_chart())
+        self.chart.bind("<ButtonPress-1>", self._eef_drag_start)
+        self.chart.bind("<B1-Motion>", self._eef_drag_move)
+        self.chart.bind("<ButtonRelease-1>", self._eef_drag_end)
+        self.chart.bind("<MouseWheel>", self._eef_mouse_wheel)
+        self.chart.bind("<Button-4>", self._eef_mouse_wheel)
+        self.chart.bind("<Button-5>", self._eef_mouse_wheel)
 
         events = ttk.LabelFrame(right, text="Events in selected range", padding=6)
         events.grid(row=5, column=0, sticky="ew", pady=(10, 0))
@@ -257,14 +338,14 @@ class DataProcessPanel(ttk.Frame):
             self._clear_view()
             return
         self.data = data
+        self.pose_cache.pop(data.path, None)
         self.start_scale.configure(to=max(0.01, data.duration_s))
         self.end_scale.configure(to=max(0.01, data.duration_s))
         self.start_scale.set(0.0)
         self.end_scale.set(data.duration_s)
         self.start_var.set("0.00")
         self.end_var.set(f"{data.duration_s:.2f}")
-        self.signal_selector.configure(values=("All dimensions", *data.names))
-        self.signal_var.set("All dimensions")
+        self._sync_plot_options()
         self.status_var.set(f"Loaded {data.label} · {data.sample_count} samples")
         self.apply_range()
 
@@ -272,10 +353,16 @@ class DataProcessPanel(ttk.Frame):
         for variable in self.metric_vars.values():
             variable.set("—")
         self.selection_var.set("No data selected")
+        self.chart_series = []
+        self.chart_x = np.array([], dtype=np.float64)
+        self.chart_markers = []
+        self.chart_series_x = []
         if self.chart is not None:
             self.chart.delete("all")
         for item in self.events_tree.get_children():
             self.events_tree.delete(item)
+        for item in self.jitter_tree.get_children():
+            self.jitter_tree.delete(item)
 
     def _range_changed(self, _value=None) -> None:
         if self.data is None or self._range_update_guard:
@@ -347,14 +434,26 @@ class DataProcessPanel(ttk.Frame):
         unsafe = int(metrics.get("unsafe_drop_count") or 0)
         discarded = int(metrics.get("discarded_action_count") or 0)
         rejected_rows = int(metrics.get("rejected_action_rows") or 0)
-        self.metric_vars["rejected"].set(str(rejected_rows))
-        self.metric_vars["unsafe"].set(str(unsafe))
-        self.metric_vars["discarded"].set(str(discarded))
         self.metric_vars["action_rows"].set(str(metrics.get("model_action_rows") or 0))
         self.metric_vars["executed_actions"].set(str(metrics.get("executed_control_actions") or 0))
         self.metric_vars["rejected_rows"].set(str(rejected_rows))
         self.metric_vars["unsafe_events"].set(str(unsafe))
         self.metric_vars["discarded_rows"].set(str(discarded))
+        for item in self.jitter_tree.get_children():
+            self.jitter_tree.delete(item)
+        jitter_metrics = metrics.get("trajectory_jitter") or {}
+        model = jitter_metrics.get("model_raw") or {}
+        sent_jitter = jitter_metrics.get("command_sent") or {}
+        for label, value_key, count_key in (
+            ("Intra accel (rad/step²)", "intra_accel_mean_rad_per_step2", "intra_accel_samples"),
+            ("Boundary jump (rad)", "boundary_jump_mean_rad_l2", "boundary_jump_samples"),
+            ("Boundary velocity cosine", "boundary_momentum_cosine_mean", "boundary_momentum_samples"),
+        ):
+            def display(values):
+                value = values.get(value_key)
+                count = int(values.get(count_key) or 0)
+                return "—" if value is None else f"{float(value):.4f} (n={count})"
+            self.jitter_tree.insert("", "end", values=(label, display(model), display(sent_jitter)))
 
     def _update_events(self, metrics: dict[str, object]) -> None:
         for item in self.events_tree.get_children():
@@ -385,13 +484,94 @@ class DataProcessPanel(ttk.Frame):
         if self.data is None:
             self.chart_series = []
             self.chart_x = np.array([], dtype=np.float64)
+            self.chart_markers = []
+            self.chart_series_x = []
             self._draw_chart()
             return
         start, end = self._selected_indices()
         if end < start:
             return
+        if self.plot_var.get() == "3D trajectory":
+            self.chart_series = []
+            self.chart_x = np.array([], dtype=np.float64)
+            self.chart_markers = []
+            self.chart_series_x = []
+            self._draw_chart()
+            return
         self.chart_series, self.chart_x, self.chart_y_label = self._make_series(start, end)
         self._draw_chart()
+
+    def _plot_changed(self) -> None:
+        self._update_signal_options()
+        self._update_3d_control()
+        self._refresh_chart()
+
+    def _group_changed(self) -> None:
+        self._sync_plot_options()
+        self._refresh_chart()
+
+    def _sync_plot_options(self) -> None:
+        groups = available_plot_groups(self.data)
+        self.group_selector.configure(values=tuple(groups))
+        if self.group_var.get() not in groups:
+            self.group_var.set(next(iter(groups)))
+        views = groups[self.group_var.get()]
+        self.plot_selector.configure(values=views)
+        if self.plot_var.get() not in views:
+            self.plot_var.set(views[0])
+        self._update_signal_options()
+        self._update_3d_control()
+
+    def _update_3d_control(self) -> None:
+        if self.plot_var.get() == "3D trajectory":
+            if not self.reset_3d_button.winfo_manager():
+                self.reset_3d_button.pack(side="right")
+        else:
+            self.eef_drag_at = None
+            self.reset_3d_button.pack_forget()
+
+    def _reset_3d_view(self) -> None:
+        self.eef_yaw, self.eef_pitch, self.eef_zoom = 0.0, 0.45, 1.0
+        self._draw_chart()
+
+    def _eef_drag_start(self, event: tk.Event) -> None:
+        if self.plot_var.get() == "3D trajectory":
+            self.eef_drag_at = (event.x, event.y)
+
+    def _eef_drag_move(self, event: tk.Event) -> None:
+        if self.plot_var.get() != "3D trajectory" or self.eef_drag_at is None:
+            return
+        last_x, last_y = self.eef_drag_at
+        self.eef_yaw += (event.x - last_x) * 0.012
+        self.eef_pitch = max(-1.35, min(1.35, self.eef_pitch + (event.y - last_y) * 0.012))
+        self.eef_drag_at = (event.x, event.y)
+        self._draw_chart()
+
+    def _eef_drag_end(self, _event: tk.Event) -> None:
+        self.eef_drag_at = None
+
+    def _eef_mouse_wheel(self, event: tk.Event) -> None:
+        if self.plot_var.get() != "3D trajectory":
+            return
+        upward = getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0
+        self.eef_zoom = max(0.55, min(3.5, self.eef_zoom * (1.1 if upward else 0.9)))
+        self._draw_chart()
+
+    def _update_signal_options(self) -> None:
+        if self.data is None:
+            return
+        plot = self.plot_var.get()
+        if plot in MOTION_VIEWS:
+            options = ("Joint L2 norm", *motion_joint_names(self.data))
+        elif plot in {"Position", "Tracking error"}:
+            options = self.data.names or ("No joints",)
+        elif plot == "3D trajectory":
+            options = ("Both arms", "Left arm", "Right arm")
+        else:
+            options = ("—",)
+        self.signal_selector.configure(values=options, state="readonly" if len(options) > 1 else "disabled")
+        if self.signal_var.get() not in options:
+            self.signal_var.set(options[0])
 
     def _make_series(self, start: int, end: int) -> tuple[list[tuple[str, np.ndarray, str]], np.ndarray, str]:
         assert self.data is not None
@@ -402,64 +582,55 @@ class DataProcessPanel(ttk.Frame):
             signal_index = data.names.index(signal)
         except ValueError:
             signal_index = None
-        colors = ("#1a73e8", "#e76f51", "#0f9d8a", "#7c4dff", "#f4b400", "#ab47bc", "#00acc1", "#5f6368")
         plot = self.plot_var.get()
-        if plot == "Latency":
+        self.chart_markers = []
+        self.chart_series_x = []
+        if plot in MOTION_VIEWS:
+            order, unit = MOTION_VIEWS[plot]
+            joints = motion_joint_names(data)
+            joint_index = joints.index(signal) if signal in joints else None
+            model_x, model_values, model_switches = trajectory_motion_series(
+                data, start, end, stream="model_raw", order=order, joint_index=joint_index,
+            )
+            sent_x, sent_values, sent_switches = trajectory_motion_series(
+                data, start, end, stream="command_sent", order=order, joint_index=joint_index,
+            )
+            self.chart_series_x = [model_x, sent_x]
+            self.chart_markers = [
+                ("New prediction", model_switches, "#1a73e8"),
+                ("Sent chunk switch", sent_switches, "#e76f51"),
+            ]
+            return [
+                ("Policy output", model_values, "#1a73e8"),
+                ("Command sent", sent_values, "#e76f51"),
+            ], np.concatenate((model_x, sent_x)), unit
+        if plot in CHUNK_VIEWS:
+            metric, unit = CHUNK_VIEWS[plot]
+            x, model, sent = jitter_plot_series(data, start, end, metric)
+            return [("Policy output", model, "#1a73e8"), ("Command sent", sent, "#e76f51")], x, unit
+        if plot == "Inference latency":
             records = [r for r in data.command_records if isinstance(r.get("captured_at"), (int, float))]
             records = [r for r in records if times[0] + data.timestamps[0] <= float(r["captured_at"]) <= times[-1] + data.timestamps[0]]
             x = np.asarray([float(r["captured_at"]) - data.timestamps[0] for r in records])
             series = []
             for label, key, color in (("Round trip", "round_trip_ms", "#1a73e8"), ("Model", "model_inference_ms", "#e76f51"), ("Upload", "observation_upload_ms", "#0f9d8a")):
-                values = [float((r.get("_client_transport_timing") or {}).get(key, np.nan)) for r in records]
+                values = [_timing_value_ms(r, key) for r in records]
                 series.append((label, np.asarray(values), color))
             return series, x, "milliseconds"
-        if plot == "Tick interval":
+        if plot == "Control interval":
             x = times[1:]
-            return [("Tick interval", np.diff(data.timestamps[start : end + 1]) * 1000.0, "#1a73e8")], x, "milliseconds"
-        if plot in {"End-effector XY", "End-effector XYZ"}:
-            poses = self.pose_cache.get(data.path)
-            if poses is None:
-                poses = compute_end_effector_positions(data)
-                self.pose_cache[data.path] = poses
-            series = []
-            if not poses:
-                return [], times, "FK unavailable for this data format"
-            pose_colors = ("#1a73e8", "#e76f51", "#0f9d8a", "#7c4dff", "#f4b400", "#ab47bc")
-            axes = (0, 1) if plot == "End-effector XY" else (0, 1, 2)
-            axis_names = ("X", "Y", "Z")
-            for side_index, side in enumerate(("left", "right")):
-                key = f"{side}_measured"
-                if key not in poses:
-                    continue
-                values = poses[key][start : end + 1]
-                for axis in axes:
-                    series.append((f"{side} {axis_names[axis]}", values[:, axis], pose_colors[(side_index * 3 + axis) % len(pose_colors)]))
-            return series, times, "meters"
+            return [("Control interval", np.diff(data.timestamps[start : end + 1]) * 1000.0, "#1a73e8")], x, "milliseconds"
+        if plot == "3D trajectory":
+            return [], times, "meters"
         desired = data.desired[start : end + 1]
         measured = data.measured[start : end + 1]
-        if plot == "Action velocity":
-            values = np.diff(desired, axis=0)
-            x = times[1:]
-            y_label = "action delta / tick"
-        elif plot == "Action error":
-            values = desired - measured
-            x = times
-            y_label = "target - measured"
-        else:
-            values = measured
-            x = times
-            y_label = "joint value"
-        series: list[tuple[str, np.ndarray, str]] = []
-        if plot == "Target vs measured":
-            index = 0 if signal_index is None else signal_index
-            series = [(f"{data.names[index]} measured", measured[:, index], "#1a73e8"), (f"{data.names[index]} target", desired[:, index], "#e76f51")]
-            return series, x, "joint / gripper value"
-        if signal_index is not None:
-            series.append((data.names[signal_index], values[:, signal_index], colors[signal_index % len(colors)]))
-        else:
-            for index, name in enumerate(data.names):
-                series.append((name, values[:, index], colors[index % len(colors)]))
-        return series, x, y_label
+        index = 0 if signal_index is None else signal_index
+        if plot == "Tracking error":
+            return [(f"{data.names[index]} target - measured", desired[:, index] - measured[:, index], "#7c4dff")], times, "target - measured"
+        return [
+            ("Measured", measured[:, index], "#1a73e8"),
+            ("Recorded target", desired[:, index], "#e76f51"),
+        ], times, "joint / gripper value"
 
     def _draw_chart(self) -> None:
         canvas = self.chart
@@ -468,7 +639,24 @@ class DataProcessPanel(ttk.Frame):
         canvas.delete("all")
         width = max(320, canvas.winfo_width())
         height = max(220, canvas.winfo_height())
-        left, top, right, bottom = 58, 24, 18, 40
+        if self.plot_var.get() == "3D trajectory" and self.data is not None:
+            try:
+                poses = self.pose_cache.get(self.data.path)
+                if poses is None:
+                    poses = compute_end_effector_positions(self.data)
+                    self.pose_cache[self.data.path] = poses
+                start, end = self._selected_indices()
+                draw_end_effector_trajectory(
+                    canvas, self.data, poses, start, end, self.signal_var.get(),
+                    width=width, height=height, yaw=self.eef_yaw,
+                    pitch=self.eef_pitch, zoom=self.eef_zoom, font_name=self.font_name,
+                )
+            except Exception as exc:
+                canvas.create_text(width / 2, height / 2, text=f"3D trajectory unavailable: {exc}",
+                                   fill="#68707d", font=(self.font_name, 10))
+            return
+        motion_view = self.plot_var.get() in MOTION_VIEWS
+        left, top, right, bottom = 58, 40 if motion_view else 24, 18, 40
         if not self.chart_series or not len(self.chart_x):
             canvas.create_text(width // 2, height // 2, text="Select a source to display a chart", fill="#68707d", font=(self.font_name, 11))
             return
@@ -484,7 +672,10 @@ class DataProcessPanel(ttk.Frame):
         else:
             pad = (ymax - ymin) * 0.08
             ymin, ymax = ymin - pad, ymax + pad
-        xmin, xmax = float(self.chart_x[0]), float(self.chart_x[-1])
+        finite_x = self.chart_x[np.isfinite(self.chart_x)]
+        if not len(finite_x):
+            return
+        xmin, xmax = float(np.min(finite_x)), float(np.max(finite_x))
         if math.isclose(xmin, xmax):
             xmax = xmin + 1.0
         xscale = (width - left - right) / (xmax - xmin)
@@ -499,12 +690,37 @@ class DataProcessPanel(ttk.Frame):
         canvas.create_text(left, height - 14, text=f"{xmin:.2f}s", fill="#68707d", anchor="w", font=(self.font_name, 8))
         canvas.create_text(width - right, height - 14, text=f"{xmax:.2f}s", fill="#68707d", anchor="e", font=(self.font_name, 8))
         canvas.create_text(10, top, text=self.chart_y_label, fill="#68707d", anchor="nw", font=(self.font_name, 8))
+        if motion_view:
+            for _marker_label, marker_times, color in self.chart_markers:
+                for marker in marker_times:
+                    if xmin <= marker <= xmax:
+                        x_pixel = left + (float(marker) - xmin) * xscale
+                        canvas.create_line(x_pixel, top, x_pixel, height - bottom, fill=color, dash=(4, 3), width=1)
+            for index, (marker_label, _times, color) in enumerate(self.chart_markers):
+                marker_x = left + 8 + index * min(180, max(120, (width - left - right) // 2))
+                canvas.create_line(marker_x, 26, marker_x + 14, 26, fill=color, dash=(4, 3))
+                canvas.create_text(marker_x + 18, 26, text=marker_label, fill="#68707d", anchor="w", font=(self.font_name, 8))
         legend_x = left + 8
-        for label, values, color in self.chart_series:
+        for series_index, (label, values, color) in enumerate(self.chart_series):
             points = []
             values = np.asarray(values, dtype=float)
-            limit = min(len(self.chart_x), len(values))
-            for x_value, y_value in zip(self.chart_x[:limit], values[:limit]):
+            series_x = self.chart_series_x[series_index] if motion_view else self.chart_x
+            limit = min(len(series_x), len(values))
+            if self.plot_var.get() in CHUNK_VIEWS:
+                for x_value, y_value in zip(series_x[:limit], values[:limit]):
+                    if not np.isfinite(y_value):
+                        continue
+                    x_pixel = left + (float(x_value) - xmin) * xscale
+                    y_pixel = top + (ymax - float(y_value)) * yscale
+                    points.extend((x_pixel, y_pixel))
+                    canvas.create_oval(x_pixel - 2, y_pixel - 2, x_pixel + 2, y_pixel + 2, fill=color, outline=color)
+                if len(points) > 3:
+                    canvas.create_line(*points, fill=color, width=1.5, smooth=False)
+                canvas.create_line(legend_x, 10, legend_x + 14, 10, fill=color, width=2)
+                canvas.create_text(legend_x + 18, 10, text=label, fill="#68707d", anchor="w", font=(self.font_name, 8))
+                legend_x += min(145, max(70, len(label) * 7 + 30))
+                continue
+            for x_value, y_value in zip(series_x[:limit], values[:limit]):
                 if not np.isfinite(y_value):
                     if len(points) > 1:
                         canvas.create_line(*points, fill=color, width=1.5, smooth=False)

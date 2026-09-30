@@ -1885,10 +1885,11 @@ def make_observation_snapshot(
         if protocol.arm_mode == "single"
         else set(protocol.camera_keys)
     )
-    if set(frame_set.images) != expected_camera_keys:
+    policy_images = frame_set.policy_images or frame_set.images
+    if set(policy_images) != expected_camera_keys:
         raise RuntimeError(
             f"camera snapshot keys must be {sorted(expected_camera_keys)}, "
-            f"got {sorted(frame_set.images)}"
+            f"got {sorted(policy_images)}"
         )
     skew_s = abs(float(frame_set.captured_monotonic) - float(captured_monotonic))
     if not math.isfinite(skew_s) or skew_s > float(max_image_state_skew_s):
@@ -1907,7 +1908,7 @@ def make_observation_snapshot(
         qpos_m=_freeze_snapshot_value(np.asarray(qpos_m, dtype=np.float32)),
         captured_at=float(captured_at),
         captured_monotonic=float(captured_monotonic),
-        images=_freeze_snapshot_value(frame_set.images),
+        images=_freeze_snapshot_value(policy_images),
         image_timestamps=_freeze_snapshot_value(frame_set.timestamps),
         image_monotonic_timestamps=_freeze_snapshot_value(
             frame_set.monotonic_timestamps
@@ -2023,10 +2024,11 @@ class AsyncPolicyInference:
 
 @dataclass
 class PeriodicSchedule:
-    """Drift-resistant periodic launch schedule used by deterministic tests/run."""
+    """Periodic launch clock with at most one coalesced pending request."""
 
     frequency_hz: float
     next_at: float
+    pending_latest: bool = False
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.frequency_hz) or self.frequency_hz <= 0:
@@ -2043,6 +2045,11 @@ class PeriodicSchedule:
         periods = int(math.floor(elapsed / self.period_s)) + 1
         self.next_at += periods * self.period_s
         return True
+
+    def mark_launched(self, now: float) -> None:
+        """Consume a coalesced request and rate-limit from its actual launch."""
+        self.pending_latest = False
+        self.next_at = now + self.period_s
 
 
 class ManualInferenceTrigger:
@@ -2879,9 +2886,18 @@ class ExecutionController:
             and target.source_index + 1 >= self.inference_trigger_step
         )
 
-    def async_launch_due(self, schedule: PeriodicSchedule, now: float) -> bool:
+    def async_launch_due(
+        self, schedule: PeriodicSchedule, now: float, *, in_flight: bool = False
+    ) -> bool:
         if self.inference_trigger_mode == "periodic":
-            return schedule.due(now)
+            slot_due = schedule.due(now)
+            if slot_due and in_flight:
+                # Coalesce all missed slots into one pending request. Capture
+                # the observation only after the worker is free so the next
+                # request always uses the latest camera frames and feedback.
+                schedule.pending_latest = True
+                self.record_launch_deferred()
+            return not in_flight and (slot_due or schedule.pending_latest)
         if self.chunk_step_launch_due():
             return True
         recovering = (
@@ -5315,8 +5331,7 @@ def build_observation(
             f"{protocol.state_dim}D, got {state.shape}"
         )
     images = snapshot.images
-    image_timestamps = snapshot.image_timestamps
-    image_monotonic_timestamps = snapshot.image_monotonic_timestamps
+    send_policy_telemetry = bool(getattr(args, "send_policy_telemetry", True))
     if protocol.arm_mode == "bimanual":
         observation_images = {
             key: (
@@ -5327,12 +5342,6 @@ def build_observation(
                 else np.array(images[key], dtype=np.uint8, copy=True)
             )
             for key in protocol.camera_keys
-        }
-        can_names = {"left": args.left_can, "right": args.right_can}
-        camera_devices = {
-            "cam_high": str(args.cam_high_device),
-            "cam_left_wrist": str(args.cam_left_wrist_device),
-            "cam_right_wrist": str(args.cam_right_wrist_device),
         }
     else:
         wrist_key = next(key for key in protocol.camera_keys if "wrist" in key)
@@ -5352,22 +5361,40 @@ def build_observation(
                 else np.array(images["cam_wrist"], dtype=np.uint8, copy=True)
             ),
         }
-        can_names = {protocol.arm_side: args.can}
-        camera_devices = {
-            "cam_high": str(args.cam_high_device),
-            wrist_key: str(args.cam_wrist_device),
-        }
-    observation = {
-        "state": state,
-        "images": observation_images,
-        "client_metadata": {
-            "captured_at": float(snapshot.captured_at),
+    client_metadata = {
+        # Keep RTC, request correlation, one-way timing and the local execution
+        # authorization visible to the dashboard in the minimal mode.
+        "captured_at": float(snapshot.captured_at),
+        "source_name": source_name,
+        "allow_execution": bool(getattr(args, "allow_execution", False)),
+        "rtc": {
+            **_thaw_snapshot_value(snapshot.rtc_metadata),
+            "session_id": str(getattr(args, "rtc_session_id", "")),
+            "inference_generation": int(snapshot.generation),
+        },
+    }
+    if send_policy_telemetry:
+        image_timestamps = snapshot.image_timestamps
+        image_monotonic_timestamps = snapshot.image_monotonic_timestamps
+        if protocol.arm_mode == "bimanual":
+            can_names = {"left": args.left_can, "right": args.right_can}
+            camera_devices = {
+                "cam_high": str(args.cam_high_device),
+                "cam_left_wrist": str(args.cam_left_wrist_device),
+                "cam_right_wrist": str(args.cam_right_wrist_device),
+            }
+        else:
+            can_names = {protocol.arm_side: args.can}
+            camera_devices = {
+                "cam_high": str(args.cam_high_device),
+                wrist_key: str(args.cam_wrist_device),
+            }
+        client_metadata.update({
             "captured_monotonic": float(snapshot.captured_monotonic),
             "state_captured_at": float(snapshot.captured_at),
             "state_captured_monotonic": float(snapshot.captured_monotonic),
             "image_set_captured_monotonic": float(snapshot.image_captured_monotonic),
             "image_state_skew_ms": snapshot.image_state_skew_s * 1000.0,
-            "source_name": source_name,
             "arm_mode": protocol.arm_mode,
             "arm_side": protocol.arm_side,
             "can_names": can_names,
@@ -5399,18 +5426,44 @@ def build_observation(
             "policy_contract_version": protocol.contract_version,
             "policy_gripper_semantics_explicit": protocol.metadata_gripper_semantics_explicit,
             **_thaw_snapshot_value(snapshot.execution_metadata),
-            "rtc": {
-                **_thaw_snapshot_value(snapshot.rtc_metadata),
-                "session_id": str(getattr(args, "rtc_session_id", "")),
-                "inference_generation": int(snapshot.generation),
-            },
-        },
+        })
+    observation = {
+        "state": state,
+        "images": observation_images,
+        "client_metadata": client_metadata,
     }
     # Prompt text is session state on the Policy side. The client sends it on
     # the first request and only when the local prompt revision changes.
     if instruction is not None:
         observation["prompt"] = str(instruction)
     return observation
+
+
+def request_metadata_for_inference(
+    *,
+    prompt_revision: int,
+    request_sent_at: float,
+    inference_generation: int,
+    send_policy_telemetry: bool,
+    camera_capture_started_at: float,
+    camera_capture_finished_at: float,
+    camera_selection_started_monotonic: float,
+    camera_selection_finished_monotonic: float,
+) -> dict[str, Any]:
+    """Keep correlation/timing fields while gating optional camera diagnostics."""
+    metadata: dict[str, Any] = {
+        "prompt_revision": int(prompt_revision),
+        "request_sent_at": float(request_sent_at),
+        "inference_generation": int(inference_generation),
+    }
+    if send_policy_telemetry:
+        metadata.update({
+            "camera_capture_started_at": camera_capture_started_at,
+            "camera_capture_finished_at": camera_capture_finished_at,
+            "camera_selection_started_monotonic": camera_selection_started_monotonic,
+            "camera_selection_finished_monotonic": camera_selection_finished_monotonic,
+        })
+    return metadata
 
 
 def print_result(
@@ -5797,6 +5850,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
         image_hw=IMAGE_HW,
         capture_hw=CAMERA_SOURCE_HW,
         parallel_reads=True,
+        policy_image_hw=(224, 224) if args.preresize_policy_images else None,
     )
     preview = CameraPreview(
         enabled=bool(getattr(args, "camera_preview", False)),
@@ -6202,7 +6256,9 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                     # circuits so an early click made before the queue drains
                     # is not silently consumed and lost.
                     if execution.async_inference:
-                        launch_due = execution.async_launch_due(launch_schedule, tick_started)
+                        launch_due = execution.async_launch_due(
+                            launch_schedule, tick_started, in_flight=worker.in_flight
+                        )
                     else:
                         queue_drained = not execution.pending_action_count
                         # ``launch_schedule`` still applies as an upper bound
@@ -6221,8 +6277,9 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                         )
                     if launch_due:
                         if worker.in_flight:
-                            if execution.async_inference and execution.inference_trigger_mode == "periodic":
-                                execution.record_launch_deferred()
+                            # Chunk-step mode waits for the current request;
+                            # periodic mode records its coalesced slot above.
+                            pass
                         elif policy is not None:
                             camera_selection_started_at = time.time()
                             camera_selection_started_monotonic = time.monotonic()
@@ -6234,11 +6291,17 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                 )
                                 generation = execution.allocate_inference_generation()
                                 rtc_snapshot = execution.rtc_request_metadata(protocol)
-                                execution_snapshot = execution.metadata(
-                                    rtc_metadata=rtc_snapshot,
-                                    compact=True,
-                                )
-                                execution_snapshot["trajectory_jitter"] = recorder.jitter_snapshot
+                                if bool(getattr(args, "send_policy_telemetry", True)):
+                                    execution_snapshot = execution.metadata(
+                                        rtc_metadata=rtc_snapshot,
+                                        compact=True,
+                                    )
+                                    execution_snapshot["trajectory_jitter"] = recorder.jitter_snapshot
+                                else:
+                                    # Local monitoring samples execution state
+                                    # separately. Avoid constructing/freezing
+                                    # it on the control thread for this request.
+                                    execution_snapshot = {}
                                 snapshot = make_observation_snapshot(
                                     generation=generation,
                                     raw_delivery_state=delivery_state,
@@ -6306,24 +6369,21 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                         source_name=source_name,
                                         args=args,
                                     )
-                                    observation["client_metadata"]["prompt_revision"] = int(
-                                        prompt_revision
-                                    )
                                     request_sent_at = time.time()
                                     request_sent_monotonic = time.monotonic()
                                     observation["client_metadata"].update(
-                                        {
-                                            "request_sent_at": request_sent_at,
-                                            "camera_capture_started_at": camera_started_at,
-                                            "camera_capture_finished_at": camera_finished_at,
-                                            "camera_selection_started_monotonic": (
-                                                camera_started_monotonic
-                                            ),
-                                            "camera_selection_finished_monotonic": (
-                                                camera_finished_monotonic
-                                            ),
-                                            "inference_generation": launch_ref.generation,
-                                        }
+                                        request_metadata_for_inference(
+                                            prompt_revision=prompt_revision,
+                                            request_sent_at=request_sent_at,
+                                            inference_generation=launch_ref.generation,
+                                            send_policy_telemetry=bool(getattr(
+                                                args, "send_policy_telemetry", True
+                                            )),
+                                            camera_capture_started_at=camera_started_at,
+                                            camera_capture_finished_at=camera_finished_at,
+                                            camera_selection_started_monotonic=camera_started_monotonic,
+                                            camera_selection_finished_monotonic=camera_finished_monotonic,
+                                        )
                                     )
                                     result = dict(policy_ref.infer(observation))
                                     if send_prompt:
@@ -6421,6 +6481,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                 compact=monitoring.level != "full"
                             ),
                             trajectory_jitter=recorder.jitter_snapshot,
+                            model_trajectory_jitter=recorder.model_jitter_snapshot,
                         )
                     if command_sent:
                         command_count += 1
@@ -6513,12 +6574,16 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                             )
                         elif worker.launch_callable(inference_task, launch):
                             execution.record_inference_launch(launch)
-                            if execution.async_inference and execution.inference_trigger_mode == "chunk_step":
+                            if execution.async_inference and execution.inference_trigger_mode == "periodic":
+                                launch_schedule.mark_launched(tick_started)
+                            elif execution.async_inference and execution.inference_trigger_mode == "chunk_step":
                                 # The periodic clock is only a bounded retry
                                 # interval for bootstrap, failure, and underrun.
                                 launch_schedule.next_at = tick_started + launch_schedule.period_s
                         else:  # defensive; the control thread owns launch()
                             execution.record_launch_deferred()
+                            if execution.async_inference and execution.inference_trigger_mode == "periodic":
+                                launch_schedule.pending_latest = True
 
                 # Launch retries happen on the next tick; no synchronous infer call.
             except ExecutionBlocked as exc:
@@ -6649,6 +6714,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
             return_attempted=return_attempted,
             returned_to_initial=returned_to_initial,
             trajectory_jitter=recorder.jitter_snapshot,
+            model_trajectory_jitter=recorder.model_jitter_snapshot,
         )
         monitoring.close(reason="stopped")
 
@@ -6696,6 +6762,15 @@ def main() -> None:
         type=int,
         default=DEFAULT_CAMERA_FPS,
         help="camera acquisition rate (default 30 Hz; independent of inference launches)",
+    )
+    parser.add_argument(
+        "--preresize-policy-images",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "precompute the server's exact PIL 256-to-224 resize on the camera "
+            "thread for policy requests; recorded frames remain 256 pixels"
+        ),
     )
     parser.add_argument(
         "--max-image-state-skew-ms",
@@ -6962,6 +7037,16 @@ def main() -> None:
         choices=("compact", "full"),
         default="compact",
         help="periodic telemetry payload size; safety/error events remain detailed",
+    )
+    parser.add_argument(
+        "--send-policy-telemetry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "include detailed client execution and device diagnostics in the main "
+            "policy request (default: enabled); disable for transport A/B tests "
+            "without disabling local monitoring or RTC"
+        ),
     )
     parser.add_argument("--reconnect-delay", type=float, default=2.0)
     parser.add_argument("--once", action="store_true", help="run one successful inference and exit")

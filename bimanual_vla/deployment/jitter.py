@@ -8,6 +8,21 @@ from typing import Any
 import numpy as np
 
 
+def model_joint_positions(actions: np.ndarray, *, schema: str, arm_mode: str) -> np.ndarray | None:
+    """Select only absolute joint targets; gripper fractions have different units."""
+    if schema != "joint" or arm_mode not in {"single", "bimanual"}:
+        return None
+    values = np.asarray(actions, dtype=np.float64)
+    arm_count = 2 if arm_mode == "bimanual" else 1
+    if (
+        values.ndim != 2 or values.shape[1] != arm_count * 7
+        or not len(values) or not np.isfinite(values).all()
+    ):
+        return None
+    columns = [index for arm in range(arm_count) for index in range(arm * 7, arm * 7 + 6)]
+    return values[:, columns]
+
+
 class TrajectoryJitterMonitor:
     """Measure contiguous, fixed-rate command samples without storing chunks.
 
@@ -16,10 +31,11 @@ class TrajectoryJitterMonitor:
     the last published row of the old chunk and the first of the new chunk.
     """
 
-    def __init__(self, control_hz: float) -> None:
+    def __init__(self, control_hz: float, *, basis: str = "published_joint_commands_excluding_gripper_and_holds") -> None:
         if not math.isfinite(control_hz) or control_hz <= 0:
             raise ValueError("control_hz must be positive and finite")
         self.control_hz = float(control_hz)
+        self.basis = str(basis)
         self._tick = 0
         self._generation: int | None = None
         self._last_position: np.ndarray | None = None
@@ -166,7 +182,7 @@ class TrajectoryJitterMonitor:
 
     def summary(self) -> dict[str, Any]:
         return {
-            "basis": "published_joint_commands_excluding_gripper_and_holds",
+            "basis": self.basis,
             "nominal_control_hz": self.control_hz,
             "intra_accel_mean_rad_per_step2": (
                 self._accel_sum / self._accel_count if self._accel_count else None

@@ -12,9 +12,119 @@ import numpy as np
 
 from bimanual_vla.collection.camera import CameraCapture, CameraFrameSet
 from bimanual_vla.deployment.recording import DeploymentRunRecorder
+from bimanual_vla.data.analysis import compute_metrics, jitter_plot_series, load_analysis_data
+from bimanual_vla.data.panel import DataProcessPanel
 
 
 class DeploymentRunRecorderTest(unittest.TestCase):
+    def test_shadow_run_records_model_smoothness_without_fabricating_sent_commands(self):
+        with TemporaryDirectory() as tmp:
+            recorder = DeploymentRunRecorder(tmp)
+            run_dir = recorder.start({"control_hz": 20.0})
+            assert run_dir is not None
+            for tick in range(4):
+                recorder.record_control_tick(
+                    timestamp=100.0 + tick * 0.05,
+                    monotonic_timestamp=20.0 + tick * 0.05,
+                    delivery_state=np.zeros(7), qpos=np.zeros(7),
+                    command_sent=False, action_dim=7, absolute_dim=7,
+                )
+            actions = np.zeros((3, 7), dtype=np.float32)
+            actions[:, 0] = (0.0, 1.0, 3.0)
+            launch = SimpleNamespace(
+                generation=1, captured_at=100.05, captured_monotonic=20.05,
+                launched_at=100.05, launched_monotonic=20.05,
+                raw_delivery_state=np.zeros(7), qpos_m=np.zeros(7), image_timestamps={},
+            )
+            protocol = SimpleNamespace(
+                schema="joint", arm_mode="single", arm_side="left", state_dim=7,
+                action_dim=7, action_semantics="absolute_joint_position_opening_fraction",
+                gripper_semantics="absolute_opening_fraction_0_closed_1_open",
+                camera_keys=("cam_high", "cam_wrist"), action_hz=20.0,
+                contract_version=3,
+            )
+            recorder.record_model_result(
+                launch=launch, result={"actions": actions},
+                arrived_at=100.15, arrived_monotonic=20.15,
+                protocol=protocol, accepted=True,
+            )
+            recorder.stop(reason="shadow")
+            jitter = compute_metrics(load_analysis_data(run_dir))["trajectory_jitter"]
+            self.assertAlmostEqual(jitter["model_raw"]["intra_accel_mean_rad_per_step2"], 1.0)
+            self.assertIsNone(jitter["command_sent"]["intra_accel_mean_rad_per_step2"])
+
+    def test_model_and_sent_jitter_are_separate_and_legacy_runs_reconstruct(self):
+        with TemporaryDirectory() as tmp:
+            recorder = DeploymentRunRecorder(tmp)
+            run_dir = recorder.start({"control_hz": 20.0})
+            assert run_dir is not None
+            protocol = SimpleNamespace(
+                schema="joint", arm_mode="single", arm_side="left", state_dim=7,
+                action_dim=7, action_semantics="absolute_joint_position_opening_fraction",
+                gripper_semantics="absolute_opening_fraction_0_closed_1_open",
+                camera_keys=("cam_high", "cam_wrist"), action_hz=20.0,
+                contract_version=3,
+            )
+            for generation, values in ((1, (0.0, 1.0, 3.0)), (2, (4.0, 6.0, 9.0))):
+                actions = np.zeros((3, 7), dtype=np.float32)
+                actions[:, 0] = values
+                actions[:, 6] = generation * 100.0  # Gripper must not enter joint L2 metrics.
+                captured_at = 100.0 + (generation - 1) * 0.15
+                launch = SimpleNamespace(
+                    generation=generation, captured_at=captured_at,
+                    captured_monotonic=10.0 + (generation - 1) * 0.15,
+                    launched_at=captured_at, launched_monotonic=10.0,
+                    raw_delivery_state=np.zeros(7), qpos_m=np.zeros(7),
+                    image_timestamps={},
+                )
+                recorder.record_model_result(
+                    launch=launch, result={"actions": actions},
+                    arrived_at=captured_at + 0.1, arrived_monotonic=10.1,
+                    protocol=protocol, accepted=True,
+                )
+            sent_values = (0.0, 0.5, 1.0, 1.1, 1.2, 1.3)
+            for tick, value in enumerate(sent_values):
+                generation = 1 if tick < 3 else 2
+                recorder.record_control_tick(
+                    timestamp=100.0 + tick * 0.05,
+                    monotonic_timestamp=20.0 + tick * 0.05,
+                    delivery_state=np.zeros(7), qpos=np.zeros(7),
+                    command_sent=True, action_dim=7, absolute_dim=7,
+                    command_joints_rad=np.array([value, 0, 0, 0, 0, 0]),
+                    command_monotonic_timestamp=20.0 + tick * 0.05,
+                    command_generation=generation,
+                    command_queue_index=tick % 3,
+                )
+            recorder.stop(reason="test")
+            metadata = json.loads((run_dir / "metadata.json").read_text())
+            self.assertAlmostEqual(metadata["model_trajectory_jitter"]["boundary_jump_mean_rad_l2"], 1.0)
+            self.assertAlmostEqual(metadata["trajectory_jitter"]["boundary_jump_mean_rad_l2"], 0.1, places=5)
+            data = load_analysis_data(run_dir)
+            metrics = compute_metrics(data)["trajectory_jitter"]
+            self.assertAlmostEqual(metrics["model_raw"]["intra_accel_mean_rad_per_step2"], 1.0)
+            self.assertAlmostEqual(metrics["model_raw"]["boundary_jump_mean_rad_l2"], 1.0)
+            self.assertAlmostEqual(metrics["command_sent"]["boundary_jump_mean_rad_l2"], 0.1, places=5)
+            self.assertAlmostEqual(metrics["model_raw"]["boundary_momentum_cosine_mean"], 1.0)
+            x, model, sent = jitter_plot_series(data, 0, 5, "boundary_jump_mean_rad_l2")
+            self.assertEqual(len(x), 2)
+            self.assertEqual(int(np.isfinite(model).sum()), 1)
+            self.assertEqual(int(np.isfinite(sent).sum()), 1)
+            panel = SimpleNamespace(
+                data=data,
+                signal_var=SimpleNamespace(get=lambda: "All dimensions"),
+                plot_var=SimpleNamespace(get=lambda: "Boundary position jump"),
+            )
+            chart_series, chart_x, units = DataProcessPanel._make_series(panel, 0, 5)
+            self.assertEqual(len(chart_series), 2)
+            self.assertEqual(len(chart_x), 2)
+            self.assertEqual(units, "rad L2")
+
+            # Older recordings have the arrays but no stream-tagged jitter events.
+            (run_dir / "trajectory_jitter.jsonl").unlink()
+            legacy = compute_metrics(load_analysis_data(run_dir))["trajectory_jitter"]
+            self.assertAlmostEqual(legacy["model_raw"]["boundary_jump_mean_rad_l2"], 1.0)
+            self.assertAlmostEqual(legacy["command_sent"]["boundary_jump_mean_rad_l2"], 0.1, places=5)
+
     def test_full_video_queue_cannot_block_shutdown_sentinel(self):
         recorder = DeploymentRunRecorder(queue_size=1)
         recorder._video_queue = Queue(maxsize=1)

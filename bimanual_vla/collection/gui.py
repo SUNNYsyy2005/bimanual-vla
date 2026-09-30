@@ -503,6 +503,8 @@ def build_inference_bridge_command(
     cam_right_wrist_device: str,
     instruction: str,
     allow_execution: bool,
+    send_policy_telemetry: bool = True,
+    preresize_policy_images: bool = False,
     control_hz: float = 20.0,
     camera_fps: int = 30,  # This rig negotiates a 20 FPS request down to 15.
     inference_trigger_mode: str = "periodic",
@@ -665,6 +667,14 @@ def build_inference_bridge_command(
         command.append("--camera-preview")
     if allow_execution:
         command.append("--allow-execution")
+    command.append(
+        "--send-policy-telemetry" if send_policy_telemetry
+        else "--no-send-policy-telemetry"
+    )
+    command.append(
+        "--preresize-policy-images" if preresize_policy_images
+        else "--no-preresize-policy-images"
+    )
     command.append("--rtc-enabled" if rtc_enabled else "--no-rtc-enabled")
     rtc_blend_steps = (
         int(rtc_client_blend_steps)
@@ -994,6 +1004,12 @@ class CollectorGUI:
         self.inference_allow_execution_var = tk.BooleanVar(value=False)
         self.inference_camera_preview_var = tk.BooleanVar(
             value=bool(self.gui_preferences.get("inference_camera_preview", False))
+        )
+        self.inference_send_policy_telemetry_var = tk.BooleanVar(
+            value=bool(self.gui_preferences.get("inference_send_policy_telemetry", True))
+        )
+        self.inference_preresize_policy_images_var = tk.BooleanVar(
+            value=bool(self.gui_preferences.get("inference_preresize_policy_images", False))
         )
         self.inference_rtc_enabled_var = tk.BooleanVar(
             value=bool(self.gui_preferences.get("inference_rtc_enabled", True))
@@ -1787,6 +1803,21 @@ class CollectorGUI:
             text="Camera preview",
             variable=self.inference_camera_preview_var,
         ).pack(side="left", padx=(18, 0))
+        request_diagnostics = ttk.LabelFrame(
+            config, text="Policy request diagnostics", padding=(10, 6)
+        )
+        request_diagnostics.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Checkbutton(
+            request_diagnostics,
+            text="Send detailed client diagnostics",
+            variable=self.inference_send_policy_telemetry_var,
+        ).pack(anchor="w")
+        ttk.Label(
+            request_diagnostics,
+            text="Local monitoring continues when off. Restart inference to compare latency.",
+            foreground="#68707d",
+            wraplength=310,
+        ).pack(anchor="w", pady=(3, 0))
         right_panel = ttk.Frame(frame)
         right_panel.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 8))
         right_panel.columnconfigure(0, weight=1)
@@ -1832,6 +1863,11 @@ class CollectorGUI:
             takefocus=False,
         )
         self.inference_swap_camera_button.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(
+            devices,
+            text="Pre-resize policy images to 224 px",
+            variable=self.inference_preresize_policy_images_var,
+        ).grid(row=3, column=0, sticky="w", pady=(5, 0))
         motion = ttk.LabelFrame(right_panel, text="Action continuity settings", padding=10)
         motion.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         motion.columnconfigure(0, weight=1)
@@ -2381,6 +2417,12 @@ class CollectorGUI:
             "inference_trigger_mode": self.inference_trigger_mode_var.get().strip(),
             "inference_trigger_step": self.inference_trigger_step_var.get().strip(),
             "inference_camera_preview": bool(self.inference_camera_preview_var.get()),
+            "inference_send_policy_telemetry": bool(
+                self.inference_send_policy_telemetry_var.get()
+            ),
+            "inference_preresize_policy_images": bool(
+                self.inference_preresize_policy_images_var.get()
+            ),
             "inference_rtc_enabled": bool(self.inference_rtc_enabled_var.get()),
             "inference_rtc_horizon": self.inference_rtc_horizon_var.get().strip(),
             "inference_rtc_weight": self.inference_rtc_weight_var.get().strip(),
@@ -3009,6 +3051,8 @@ class CollectorGUI:
             cam_right_wrist_device=self.right_wrist_var.get(),
             instruction=self.instruction_var.get(),
             allow_execution=bool(self.inference_allow_execution_var.get()),
+            send_policy_telemetry=bool(self.inference_send_policy_telemetry_var.get()),
+            preresize_policy_images=bool(self.inference_preresize_policy_images_var.get()),
             camera_preview=bool(self.inference_camera_preview_var.get()),
             rtc_enabled=bool(self.inference_rtc_enabled_var.get()),
             rtc_execution_horizon=rtc_horizon,
