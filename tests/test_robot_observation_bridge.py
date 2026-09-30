@@ -1143,6 +1143,41 @@ class ClientTransportTimingTest(unittest.TestCase):
         self.assertIsNone(timing["network_transport_total_ms"])
         self.assertEqual(timing["inference_generation"], 8)
 
+    def test_clock_skew_invalidates_both_one_way_legs_but_preserves_rtt(self):
+        timing = build_client_transport_timing(
+            request_sent_at=100.300,
+            request_sent_monotonic=10.0,
+            response_received_at=100.600,
+            response_received_monotonic=10.3,
+            server_timing={
+                "server_request_received_at": 100.100,
+                "server_response_ready_at": 100.330,
+                "model_inference_ms": 220.0,
+            },
+            camera_capture_ms=1.0,
+            inference_generation=9,
+        )
+        self.assertIsNone(timing["observation_upload_ms"])
+        self.assertIsNone(timing["result_download_ms"])
+        self.assertIsNone(timing["network_transport_total_ms"])
+        self.assertAlmostEqual(timing["round_trip_ms"], 300.0)
+        self.assertAlmostEqual(timing["non_model_rtt_ms"], 80.0)
+
+    def test_compact_observation_carries_previous_request_timing(self):
+        execution = ExecutionController(FakePiper(), execution_args())
+        execution._record_client_transport_timing({
+            "_client_transport_timing": {
+                "round_trip_ms": 270.0,
+                "model_inference_ms": 220.0,
+                "non_model_rtt_ms": 50.0,
+                "timing_source": "client_wall_clock_echo",
+            }
+        }, generation=4)
+        compact = execution.metadata(compact=True)
+        self.assertEqual(compact["round_trip_ms"], 270.0)
+        self.assertEqual(compact["timing_generation"], 4)
+        self.assertEqual(compact["client_transport_timing"]["non_model_rtt_ms"], 50.0)
+
 
 class AsyncInferencePipelineTest(unittest.TestCase):
     def setUp(self):

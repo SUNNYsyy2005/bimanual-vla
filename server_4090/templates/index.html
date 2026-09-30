@@ -692,7 +692,7 @@
       <div class="module-heading"><div><h2>Policy 管理</h2><p>从 checkpoint 启动、切换、健康检测和实机执行授权。</p></div></div>
       <div class="grid policy-workspace">
         <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm" class="compact-submission"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><input type="hidden" name="model_variant" id="policyModelVariant" value="pi05"><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div></div><p class="muted">Prompt 与 RTC 运行参数由机械臂客户端配置；Policy 仅提供服务器能力上限。客户端改动后无需重启 Policy。</p><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
-        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code>、<code>action_horizon &gt;= 16</code> 和本地逐 20 Hz command 安全检查。异步客户端默认 4 Hz 启动推理（推理+传输通常约 200 ms），旧 chunk 在推理期间持续执行；新 chunk 到达后按实时 arrival 延迟动态过期 prefix，融合 2~4 步后切换 generation。已结束的历史进程可删除记录和日志。</p><div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('policy')" disabled data-bulk-delete-scope="policy">批量删除已选日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束 Policy；不会删除模型或其他输出。</span></div><div class="table-wrap"><table><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="policy" onchange="toggleTaskSelection('policy', this.checked)" aria-label="全选当前页 Policy 历史任务"></th><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端状态 / 延迟摘要</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div><div id="policyTasksPagination"></div></div>
+        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">动作执行由客户端 <code>--allow-execution</code> 控制，并要求 <code>action_horizon &gt;= 16</code> 和本地逐 20 Hz command 安全检查。异步客户端按所选固定频率或 chunk 步数触发推理，旧 chunk 在推理期间持续执行；新 chunk 到达后按实际延迟过期 prefix，再融合切换 generation。已结束的历史进程可删除记录和日志。</p><div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('policy')" disabled data-bulk-delete-scope="policy">批量删除已选日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束 Policy；不会删除模型或其他输出。</span></div><div class="table-wrap"><table><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="policy" onchange="toggleTaskSelection('policy', this.checked)" aria-label="全选当前页 Policy 历史任务"></th><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端状态 / 延迟摘要</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div><div id="policyTasksPagination"></div></div>
         <div class="card" id="policyTaskLogCard"><h2>Policy 进程日志</h2><p class="muted">从 Policy 进程表点击“日志”查看最近输出。</p><pre id="policyTaskLog">尚未选择 Policy 进程。</pre></div>
         <div class="card"><h2>机械臂客户端命令</h2><p class="muted">以下只生成连接/设备示例；prompt 和 RTC 运行参数属于客户端。连接后以 telemetry 中的 client prompt/RTC 为准。</p><pre id="policyClientCommand">bin/bimanual-vla rtc-client --host 192.168.101.9 --port 8000 --hz 4 --arm-mode single --arm-side right --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16</pre></div>
       </div>
@@ -704,11 +704,11 @@
         <div class="stat-card"><div class="stat-label">客户端测量：上传</div><div id="telemetryUpload" class="stat-value">-</div><div id="telemetryUploadDetail" class="stat-detail">client report · one-way wall-clock</div></div>
         <div class="stat-card"><div class="stat-label">模型推理（实测）</div><div id="telemetryModel" class="stat-value">-</div><div class="stat-detail">server model execution</div></div>
         <div class="stat-card"><div class="stat-label">客户端测量：下行</div><div id="telemetryDownload" class="stat-value">-</div><div id="telemetryDownloadDetail" class="stat-detail">client report · one-way wall-clock</div></div>
-        <div class="stat-card"><div class="stat-label">网络总传输 / RTT</div><div id="telemetryTransport" class="stat-value">-</div><div id="telemetryTransportDetail" class="stat-detail">client report · RTT monotonic measured</div></div>
+        <div class="stat-card"><div class="stat-label">非模型开销 / RTT</div><div id="telemetryTransport" class="stat-value">-</div><div id="telemetryTransportDetail" class="stat-detail">同次请求 RTT 减模型时间，含序列化和网络</div></div>
         <div class="stat-card"><div class="stat-label">结果 → 首条命令</div><div id="telemetryFirstCommand" class="stat-value">-</div><div class="stat-detail">client response → 20 Hz command</div></div>
         <div class="stat-card"><div class="stat-label">当前动作时间误差</div><div id="telemetryActionError" class="stat-value">-</div><div class="stat-detail">now - target time（带符号）</div></div>
       </div>
-      <p class="muted">说明：上传/下行由客户端根据本次请求的服务端时间戳回显计算并汇报；单向值仍需两端 wall-clock 基本同步。RTT 和“结果→首条命令”由客户端 monotonic clock 实测，模型推理由服务端 monotonic clock 实测。</p>
+      <p class="muted">说明：上传/下行依赖两端时钟同步；检测到明显时钟偏差时显示不可测。非模型开销是同次请求的 RTT 减模型耗时，包含编解码、网络和服务端发送。RTT 与“结果→首条命令”由客户端单调时钟实测，模型推理由服务端单调时钟实测。</p>
       <div class="grid">
         <div class="card"><h2>Policy 实时观测</h2><div id="robotObservation" class="warn">尚未收到 telemetry。</div><div id="telemetryContractBadges" class="telemetry-badges"></div><div class="telemetry-vector-grid"><div class="telemetry-vector-card"><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div><div class="telemetry-vector-card"><h3 id="policyFirstActionTitle">首条预测 action</h3><pre id="policyFirstAction">action: -</pre></div></div><details class="telemetry-details" open><summary>Prompt / 合同 / Chunk 与安全状态</summary><pre id="policyAction">action: -</pre></details><h3>Trajectory jitter（实际下发关节命令）</h3><pre id="trajectoryJitter">等待命令样本。</pre><h3>模型 → IK → Piper 命令 → 下一周期反馈</h3><pre id="actuatorTrace">actuator trace: -</pre><div class="telemetry-camera-heading"><h3 style="margin:0">Policy 实际收到的相机</h3><span id="robotCameraSummary" class="muted">等待 telemetry。</span></div><div id="robotImages" class="telemetry-camera-grid"><div class="muted">尚无相机帧。</div></div></div>
       </div>
@@ -4406,6 +4406,7 @@ function fmtTime(epoch) {
 }
 
 function finiteMetric(value) {
+  if (value == null || value === '' || typeof value === 'boolean') return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
@@ -4594,7 +4595,7 @@ function telemetrySummary(t) {
   const targetAge = t.client_target_age_s ?? target.target_age_s ?? '-';
   const targetTimes = Array.isArray(t.client_plan_target_times) ? JSON.stringify(t.client_plan_target_times) : '-';
   const targetError = actionTimeErrorMs(t);
-  const uploadTiming = clientTimingMetric(t.client_observation_upload_ms, t.server_observation_upload_ms);
+  const uploadTiming = clientTimingMetric(t.client_observation_upload_ms, null);
   const downloadTiming = clientTimingMetric(t.client_result_download_ms, null);
   const transportTiming = clientTimingMetric(t.client_network_transport_total_ms, null);
   const activeGeneration = t.client_active_plan_generation ?? t.client_queue_generation ?? '-';
@@ -5198,37 +5199,31 @@ function fillObservation(obs) {
   status.className = obs.fresh ? 'ok' : 'warn';
   const captured = fmtTime(obs.client_capture_at ?? obs.captured_at);
   const currentTargetErrorMs = actionTimeErrorMs(obs);
-  // Client upload/download/transport values are reported asynchronously with
-  // the next request. Keep the server-side upload boundary as an explicitly
-  // labelled diagnostic fallback instead of presenting it as a client measure.
+  // Client timing values arrive with the next request. Server-side upload
+  // uses a different wall clock and cannot be a reliable fallback here.
   const clientUploadMs = obs.client_observation_upload_ms;
-  const serverUploadMs = obs.server_observation_upload_ms;
-  const uploadMs = clientUploadMs ?? serverUploadMs;
+  const uploadMs = clientUploadMs;
   const modelMs = obs.server_model_inference_ms ?? obs.client_model_inference_ms;
   const clientDownloadMs = obs.client_result_download_ms;
-  const clientTransportMs = obs.client_network_transport_total_ms;
   const roundTripMs = obs.client_round_trip_ms;
+  const nonModelMs = obs.client_transport_timing?.non_model_rtt_ms;
   const drop = queueDropInfo(obs);
   const cameraKeys = telemetryCameraKeys(obs);
   renderTelemetryContractBadges(obs);
   document.getElementById('telemetryUpload').textContent = metricMs(uploadMs);
   document.getElementById('telemetryUploadDetail').textContent = clientUploadMs != null
     ? '客户端汇报 · wall-clock 单向测量'
-    : serverUploadMs != null
-      ? '无客户端汇报 · 服务端请求入口诊断'
-      : '尚无客户端汇报';
+    : obs.client_timing_source ? '单向延迟不可测（时钟或时间戳）' : '尚无客户端汇报';
   document.getElementById('telemetryModel').textContent = metricMs(modelMs);
   document.getElementById('telemetryDownload').textContent = metricMs(clientDownloadMs);
   document.getElementById('telemetryDownloadDetail').textContent = clientDownloadMs != null
     ? '客户端汇报 · wall-clock 单向测量'
-    : '尚无客户端汇报';
-  document.getElementById('telemetryTransport').textContent = `${metricMs(clientTransportMs)} / ${metricMs(roundTripMs)}`;
-  document.getElementById('telemetryTransportDetail').textContent = clientTransportMs != null
-    ? '总传输为客户端汇报 · RTT 为客户端 monotonic 实测'
-    : '尚无客户端总传输汇报 · RTT 为客户端 monotonic 实测';
+    : obs.client_timing_source ? '单向延迟不可测（时钟或时间戳）' : '尚无客户端汇报';
+  document.getElementById('telemetryTransport').textContent = `${metricMs(nonModelMs)} / ${metricMs(roundTripMs)}`;
+  document.getElementById('telemetryTransportDetail').textContent = '上次请求的非模型开销含编解码、网络和服务端发送；RTT 为客户端单调时钟实测';
   document.getElementById('telemetryFirstCommand').textContent = metricMs(obs.client_result_to_first_command_ms);
   document.getElementById('telemetryActionError').textContent = signedMetricMs(currentTargetErrorMs);
-  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · ${obs.arm_mode === 'bimanual' ? '双臂' : '单臂'} ${obs.schema || '-'} · state/action=${obs.state_dim || '?'}D/${obs.model_action_dim || '?'}D · camera=${cameraKeys.length} · 客户端允许=${Boolean(obs.client_allow_execution)} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · 上传=${clientTimingMetric(clientUploadMs, serverUploadMs)} · 推理实测=${metricMs(modelMs)} · 下行=${clientTimingMetric(clientDownloadMs, null)} · 当前动作时间误差=${signedMetricMs(currentTargetErrorMs)} · 安全=${drop.unsafeLabel} · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
+  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · ${obs.arm_mode === 'bimanual' ? '双臂' : '单臂'} ${obs.schema || '-'} · state/action=${obs.state_dim || '?'}D/${obs.model_action_dim || '?'}D · camera=${cameraKeys.length} · 客户端允许=${Boolean(obs.client_allow_execution)} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · 上传=${clientTimingMetric(clientUploadMs, null)} · 推理实测=${metricMs(modelMs)} · 下行=${clientTimingMetric(clientDownloadMs, null)} · 当前动作时间误差=${signedMetricMs(currentTargetErrorMs)} · 安全=${drop.unsafeLabel} · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
   const joint = obs.schema === 'joint';
   const state = obs.state || [];
   document.getElementById('robotStateTitle').textContent = `${obs.state_dim}D ${obs.arm_mode === 'bimanual' ? 'bimanual ' : ''}${obs.schema} state`;
@@ -5319,7 +5314,7 @@ async switch: old chunk keeps executing during inference; returned chunk expires
 last feedback: ${fmtTime(obs.client_last_feedback_at)}
 min/max: ${obs.action_min} / ${obs.action_max}
 policy elapsed: ${Number(obs.policy_elapsed_s || 0).toFixed(4)}s
-server gate: ${control.mode || 'shadow'} (revision ${control.revision || 0})
+execution authority: robot client
 client allow: ${Boolean(obs.client_allow_execution)}
 client state: ${obs.client_execution_state || 'unknown'}
 bridge reason (raw): ${obs.client_blocked_reason || '-'}

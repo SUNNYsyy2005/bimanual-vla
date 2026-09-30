@@ -504,6 +504,7 @@ def build_inference_bridge_command(
     instruction: str,
     allow_execution: bool,
     control_hz: float = 20.0,
+    camera_fps: int = 30,  # This rig negotiates a 20 FPS request down to 15.
     inference_trigger_mode: str = "periodic",
     inference_trigger_step: int = 10,
     camera_preview: bool = False,
@@ -599,6 +600,8 @@ def build_inference_bridge_command(
         raise ValueError("gripper hysteresis must be in (0, 0.5)")
     if int(gripper_confirm_steps) < 1 or int(gripper_open_lookahead_steps) < 0:
         raise ValueError("gripper confirmation must be positive; lookahead must be non-negative")
+    if not 1 <= int(camera_fps) <= 60:
+        raise ValueError("inference camera FPS must be in [1, 60]")
     if float(ik_max_joint_step_rad) > 0.30:
         raise ValueError("IK max joint step must not exceed the 0.30 rad search radius")
     if arm_mode not in {SINGLE_ARM, BIMANUAL}:
@@ -631,6 +634,8 @@ def build_inference_bridge_command(
         str(float(hz)),
         "--control-hz",
         str(float(control_hz)),
+        "--camera-fps",
+        str(int(camera_fps)),
         "--inference-trigger-mode",
         inference_trigger_mode if async_inference else "periodic",
         "--inference-trigger-step",

@@ -858,7 +858,7 @@ class AsyncPolicyDashboardContractTest(unittest.TestCase):
             "result→first command",
         ):
             self.assertIn(marker, template)
-        for marker in ("action_horizon", "action_hz", "action_time_step_s", "action_start_offset_steps", "--hz 4", "4 Hz", "200 ms", "旧 chunk", "动态", "2~4 步", "0.05", "0.18", "0.30", "x[-0.05,0.30]", "y[0.01,0.50]", "z[0.14,0.52]"):
+        for marker in ("action_horizon", "action_hz", "action_time_step_s", "action_start_offset_steps", "--hz 4", "固定频率或 chunk 步数", "旧 chunk", "实际延迟", "0.05", "0.18", "0.30", "x[-0.05,0.30]", "y[0.01,0.50]", "z[0.14,0.52]"):
             self.assertIn(marker, template)
         for marker in ("action_horizon", "action_hz", "action_time_step_s", "action_start_offset_steps", "action_offset", "model_action_start_offset", "--hz 4", "4 Hz", "actual_hz <= 1 / latency_s", "550 ms", "旧 chunk", "动态", "2~4 步", "0.05", "0.18", "0.30"):
             self.assertIn(marker, readme)
