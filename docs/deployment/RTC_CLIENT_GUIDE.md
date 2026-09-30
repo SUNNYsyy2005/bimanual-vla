@@ -17,7 +17,7 @@
 默认只读反馈、采集相机并请求 Policy，不向机械臂发送动作：
 
 ```bash
-cd /home/user/dual_ARM_project/arm_collect/bimanual-vla
+cd /path/to/bimanual-vla
 bin/bimanual-vla rtc-client \
   --host 192.168.101.9 \
   --port 8000 \

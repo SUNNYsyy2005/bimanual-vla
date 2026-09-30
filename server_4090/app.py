@@ -22,6 +22,7 @@ import signal
 import socket
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import threading
 import time
@@ -1409,6 +1410,11 @@ def normalize_ssh_host(value: Any) -> str:
     return str(value or "").strip()
 
 
+def expand_config_path(value: Any) -> str:
+    """Expand home and environment references in configurable filesystem paths."""
+    return os.path.expandvars(os.path.expanduser(str(value)))
+
+
 def load_config(path: Path) -> dict[str, Any]:
     config = read_json(path)
     if not isinstance(config, dict):
@@ -1459,8 +1465,8 @@ def load_config(path: Path) -> dict[str, Any]:
         "cluster_resources_script": str(REPO_DIR / "scripts" / "query_h100_h200_resources.sh"),
         "transfer_parallelism": 4,
         "auto_sync_cluster_dataset": True,
-        "nas_dataset_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync",
-        "nas_checkpoint_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_checkpoint_sync",
+        "nas_dataset_staging_root": str(Path.home() / "nas" / "dashboard_dataset_sync"),
+        "nas_checkpoint_staging_root": str(Path.home() / "nas" / "dashboard_checkpoint_sync"),
     }
     defaults.update(config)
     profile = str(defaults.get("dashboard_profile") or "real").lower()
@@ -1482,12 +1488,12 @@ def load_config(path: Path) -> dict[str, Any]:
         "checkpoint_base_dir",
         "base_checkpoint",
     ):
-        defaults[key] = str(Path(defaults[key]).expanduser().resolve())
+        defaults[key] = str(Path(expand_config_path(defaults[key])).resolve())
     raw_dataset_read_roots = defaults.get("dataset_read_roots", [])
     if isinstance(raw_dataset_read_roots, str):
         raw_dataset_read_roots = [raw_dataset_read_roots]
     dataset_read_roots = [
-        str(Path(item).expanduser().resolve())
+        str(Path(expand_config_path(item)).resolve())
         for item in raw_dataset_read_roots
         if str(item).strip()
     ]
@@ -1495,7 +1501,7 @@ def load_config(path: Path) -> dict[str, Any]:
         dataset_read_roots.insert(0, defaults["dataset_root"])
     defaults["dataset_read_roots"] = list(dict.fromkeys(dataset_read_roots))
     checkpoint_allowed_roots = [
-        str(Path(item).expanduser().resolve()) for item in defaults.get("checkpoint_allowed_roots", [])
+        str(Path(expand_config_path(item)).resolve()) for item in defaults.get("checkpoint_allowed_roots", [])
     ]
     # Keep configured paths usable after symlink resolution.  A common layout
     # keeps ~/.cache/openpi on one NVMe mount while pi05_base is a symlink to a
@@ -1506,15 +1512,15 @@ def load_config(path: Path) -> dict[str, Any]:
             checkpoint_allowed_roots.append(required_root)
     defaults["checkpoint_allowed_roots"] = checkpoint_allowed_roots
     defaults["eval_video_roots"] = [
-        str(Path(item).expanduser().resolve()) for item in defaults.get("eval_video_roots", [])
+        str(Path(expand_config_path(item)).resolve()) for item in defaults.get("eval_video_roots", [])
     ]
     defaults["cluster_resources_script"] = str(
-        Path(defaults["cluster_resources_script"]).expanduser().resolve()
+        Path(expand_config_path(defaults["cluster_resources_script"])).resolve()
     )
     if defaults.get("nas_dataset_staging_root"):
-        defaults["nas_dataset_staging_root"] = str(defaults["nas_dataset_staging_root"])
+        defaults["nas_dataset_staging_root"] = expand_config_path(defaults["nas_dataset_staging_root"])
     if defaults.get("nas_checkpoint_staging_root"):
-        defaults["nas_checkpoint_staging_root"] = str(defaults["nas_checkpoint_staging_root"])
+        defaults["nas_checkpoint_staging_root"] = expand_config_path(defaults["nas_checkpoint_staging_root"])
     try:
         defaults["transfer_parallelism"] = max(1, min(16, int(defaults.get("transfer_parallelism", 4))))
     except (TypeError, ValueError):
@@ -1526,7 +1532,7 @@ def load_config(path: Path) -> dict[str, Any]:
         item = dict(storage)
         for path_key in ("dataset_root", "checkpoint_base_dir"):
             if item.get(path_key):
-                item[path_key] = str(Path(item[path_key]).expanduser().resolve())
+                item[path_key] = str(Path(expand_config_path(item[path_key])).resolve())
         item["kind"] = str(item.get("kind") or "local_archive")
         item["available"] = bool(item.get("available", True))
         normalized_local_storage[str(name)] = item
@@ -1553,12 +1559,20 @@ def load_config(path: Path) -> dict[str, Any]:
             "inventory_cache_path",
             "inventory_source_path",
             "nas_dataset_staging_root",
+            "nas_checkpoint_staging_root",
+            "cache_root",
+            "log_dir",
+            "remote_job_dir",
+            "conda_sh",
         ):
             if item.get(path_key):
                 if path_key in {"eval_video_roots", "dataset_read_roots"} and isinstance(item[path_key], list):
-                    item[path_key] = [str(value) for value in item[path_key]]
+                    item[path_key] = [expand_config_path(value) for value in item[path_key]]
                 else:
-                    item[path_key] = str(item[path_key])
+                    item[path_key] = expand_config_path(item[path_key])
+        for path_key in ("openpi_python",):
+            if item.get(path_key):
+                item[path_key] = expand_config_path(item[path_key])
         normalized_targets[str(name)] = item
     defaults["cluster_targets"] = normalized_targets
     return defaults
@@ -3984,7 +3998,13 @@ def _compatible_nccl_preload_path(config: dict[str, Any]) -> str | None:
     candidate_paths.extend(
         sorted(Path.home().glob(".cache/uv/archive-v0/*/nvidia/nccl/lib/libnccl.so.2"))
     )
-    candidate_paths.append(Path("/usr/local/lib/python3.10/dist-packages/nvidia/nccl/lib/libnccl.so.2"))
+    system_site_paths = sysconfig.get_paths()
+    for site_key in ("platlib", "purelib"):
+        site_path = system_site_paths.get(site_key)
+        if site_path:
+            candidate_paths.append(
+                Path(site_path) / "nvidia" / "nccl" / "lib" / "libnccl.so.2"
+            )
 
     candidates: list[tuple[int, int, Path]] = []
     seen: set[Path] = set()

@@ -65,7 +65,7 @@ ssh 4x4090 'systemctl --user restart bimanual-vla-sim-dashboard.service'
 
 部署脚本会：
 
-1. 同步 Dashboard 运行需要的文件到 `4x4090:/home/sunny/bimanual-vla`。
+1. 同步 Dashboard 运行需要的文件到远端用户主目录下的 `bimanual-vla`（默认 `$HOME/bimanual-vla`，可通过 `REMOTE_ROOT` 覆盖）。
 2. 如果不存在 `server_4090/config.simulation.json`，从 `config.simulation.example.json` 复制。
 3. 安装并启用 `bimanual-vla-sim-dashboard.service`。
 4. 重启 8091 服务。
@@ -166,7 +166,7 @@ curl -sS -X POST "$SIM_DASHBOARD/api/tasks/train" \
     "dataset_id": "pick_cube_piper_v1",
     "exp_name": "pick_cube_piper_v1_pi05_sim_001",
     "model_variant": "pi05",
-    "base_checkpoint": "/home/sunny/.cache/openpi/openpi-assets/checkpoints/pi05_base",
+    "base_checkpoint": "${HOME}/.cache/openpi/openpi-assets/checkpoints/pi05_base",
     "execution_target": "local_4090",
     "gpu_ids": ["0", "1"],
     "fsdp_devices": 2,
@@ -203,7 +203,7 @@ curl -sS -X POST "$SIM_DASHBOARD/api/tasks/train" \
     "dataset_id": "pick_cube_piper_v1",
     "exp_name": "pick_cube_piper_v1_pi05_h100_001",
     "model_variant": "pi05",
-    "base_checkpoint": "/home/sunny/.cache/openpi/openpi-assets/checkpoints/pi05_base",
+    "base_checkpoint": "${HOME}/.cache/openpi/openpi-assets/checkpoints/pi05_base",
     "execution_target": "h100",
     "cluster_gpus": 1,
     "fsdp_devices": 1,
@@ -245,7 +245,7 @@ curl -sS -X POST "$SIM_DASHBOARD/api/tasks/train" \
     "dataset_id": "pick_cube_piper_v1",
     "exp_name": "pick_cube_piper_v1_pi05_h200_001",
     "model_variant": "pi05",
-    "base_checkpoint": "/home/sunny/.cache/openpi/openpi-assets/checkpoints/pi05_base",
+    "base_checkpoint": "${HOME}/.cache/openpi/openpi-assets/checkpoints/pi05_base",
     "execution_target": "h200-ali-01",
     "cluster_gpus": 1,
     "fsdp_devices": 1,
@@ -392,9 +392,9 @@ curl -sS -X POST "$SIM_DASHBOARD/api/tasks/eval" \
   -d '{
     "execution_target": "local_4090",
     "dataset_id": "pick_cube_piper_v1",
-    "checkpoint": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints/pi05_piper_single_arm_lora/pick_cube_piper_v1_pi05_sim_001/5000",
+    "checkpoint": "${HOME}/robotwin_ws/RoboTwin/policy/pi05/checkpoints/pi05_piper_single_arm_lora/pick_cube_piper_v1_pi05_sim_001/5000",
     "model_variant": "pi05",
-    "base_checkpoint": "/home/sunny/.cache/openpi/openpi-assets/checkpoints/pi05_base",
+    "base_checkpoint": "${HOME}/.cache/openpi/openpi-assets/checkpoints/pi05_base",
     "gpu_ids": ["2"],
     "batch_size": 1,
     "num_workers": 2,
@@ -413,9 +413,9 @@ curl -sS -X POST "$SIM_DASHBOARD/api/tasks/eval" \
     "execution_target": "h100",
     "cluster_gpus": 1,
     "dataset_id": "pick_cube_piper_v1",
-    "checkpoint": "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints/pi05_piper_single_arm_lora/pick_cube_piper_v1_pi05_sim_001/5000",
+    "checkpoint": "${HOME}/robotwin_ws/RoboTwin/policy/pi05/checkpoints/pi05_piper_single_arm_lora/pick_cube_piper_v1_pi05_sim_001/5000",
     "model_variant": "pi05",
-    "base_checkpoint": "/home/sunny/.cache/openpi/openpi-assets/checkpoints/pi05_base",
+    "base_checkpoint": "${HOME}/.cache/openpi/openpi-assets/checkpoints/pi05_base",
     "batch_size": 1,
     "num_workers": 2,
     "max_batches": 50,
@@ -426,8 +426,8 @@ curl -sS -X POST "$SIM_DASHBOARD/api/tasks/eval" \
 H100 评测同样通过 `slurm_job_runner.py` 提交 `sbatch`。路径会按 `config.simulation.json` 中的 target 配置从 4×4090 路径映射到远端路径，例如：
 
 ```text
-/home/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints
-→ /DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints
+${HOME}/robotwin_ws/RoboTwin/policy/pi05/checkpoints
+→ /DATA/sync/${USER}/robotwin_ws/RoboTwin/policy/pi05/checkpoints
 ```
 
 因此提交前要确保远端节点对应路径已经同步了代码、数据集、base checkpoint 和目标 checkpoint。
@@ -438,7 +438,7 @@ H100 评测同样通过 `slurm_job_runner.py` 提交 `sbatch`。路径会按 `co
 
 ```text
 ~/.local/share/bimanual-vla-sim-dashboard/eval_videos
-/home/sunny/robotwin_ws/RoboTwin/policy/pi05/outputs
+${HOME}/robotwin_ws/RoboTwin/policy/pi05/outputs
 ```
 
 支持：
@@ -450,7 +450,7 @@ H100 评测同样通过 `slurm_job_runner.py` 提交 `sbatch`。路径会按 `co
 如果仿真评测脚本产生视频，推荐保存到：
 
 ```text
-/home/sunny/.local/share/bimanual-vla-sim-dashboard/eval_videos/<experiment>/<run>.mp4
+${HOME}/.local/share/bimanual-vla-sim-dashboard/eval_videos/<experiment>/<run>.mp4
 ```
 
 或软链进去：
@@ -477,17 +477,17 @@ Dashboard 可以封装提交，但不会自动同步大数据和环境。提交 
 H100 通过 `login-server` 提交，`login-server` 和 `h100-ksy-01` 共享 `/DATA/sync/$USER`。建议远端路径：
 
 ```text
-/DATA/sync/sunny/bimanual-vla
-/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05
-/DATA/sync/sunny/.cache/huggingface/lerobot
-/DATA/sync/sunny/.cache/openpi/openpi-assets/checkpoints
-/DATA/sync/sunny/miniconda3/envs/openpi
+/DATA/sync/${USER}/bimanual-vla
+/DATA/sync/${USER}/robotwin_ws/RoboTwin/policy/pi05
+/DATA/sync/${USER}/.cache/huggingface/lerobot
+/DATA/sync/${USER}/.cache/openpi/openpi-assets/checkpoints
+/DATA/sync/${USER}/miniconda3/envs/openpi
 ```
 
 提交前：
 
 ```bash
-ssh login-server 'hostname; pwd; resources; myquota; ls /DATA/sync/sunny/bimanual-vla/server_4090/openpi_single_arm.py'
+ssh login-server 'hostname; pwd; resources; myquota; ls /DATA/sync/${USER}/bimanual-vla/server_4090/openpi_single_arm.py'
 ```
 
 ### 10.2 H200
@@ -495,11 +495,11 @@ ssh login-server 'hostname; pwd; resources; myquota; ls /DATA/sync/sunny/bimanua
 H200 节点存储互相独立，也不和 H100/login-server 共享。每个 H200 节点都要单独准备：
 
 ```text
-/DATA/sync/sunny/bimanual-vla
-/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05
-/DATA/sync/sunny/.cache/huggingface/lerobot
-/DATA/sync/sunny/.cache/openpi/openpi-assets/checkpoints
-/DATA/sync/sunny/miniconda3/envs/openpi
+/DATA/sync/${USER}/bimanual-vla
+/DATA/sync/${USER}/robotwin_ws/RoboTwin/policy/pi05
+/DATA/sync/${USER}/.cache/huggingface/lerobot
+/DATA/sync/${USER}/.cache/openpi/openpi-assets/checkpoints
+/DATA/sync/${USER}/miniconda3/envs/openpi
 ```
 
 并且需要解决非交互 SSH 认证；否则 Dashboard 后台无法提交 sbatch。
@@ -509,7 +509,7 @@ H200 节点存储互相独立，也不和 H100/login-server 共享。每个 H200
 目标配置在 `4x4090`：
 
 ```text
-/home/sunny/bimanual-vla/server_4090/config.simulation.json
+$REMOTE_ROOT/server_4090/config.simulation.json
 ```
 
 关键字段：
@@ -522,11 +522,11 @@ H200 节点存储互相独立，也不和 H100/login-server 共享。每个 H200
       "partition": "h100",
       "node": "h100-ksy-01",
       "gpu_type": "h100",
-      "workdir": "/DATA/sync/sunny/bimanual-vla",
-      "openpi_python": "/DATA/sync/sunny/miniconda3/envs/openpi/bin/python",
-      "dataset_root": "/DATA/sync/sunny/.cache/huggingface/lerobot",
-      "assets_base_dir": "/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/assets",
-      "checkpoint_base_dir": "/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/checkpoints"
+      "workdir": "/DATA/sync/${USER}/bimanual-vla",
+      "openpi_python": "/DATA/sync/${USER}/miniconda3/envs/openpi/bin/python",
+      "dataset_root": "/DATA/sync/${USER}/.cache/huggingface/lerobot",
+      "assets_base_dir": "/DATA/sync/${USER}/robotwin_ws/RoboTwin/policy/pi05/assets",
+      "checkpoint_base_dir": "/DATA/sync/${USER}/robotwin_ws/RoboTwin/policy/pi05/checkpoints"
     }
   }
 }
@@ -571,11 +571,11 @@ curl -sS -H "Authorization: Bearer $SIM_TOKEN" \
 
 - SSH alias 不存在或不能非交互登录。
 - H200 被当成 Slurm-only 节点，不要要求 Dashboard 直接 SSH H200；检查 `submit_host=login-server`、`partition=h200`、`node=h200-ali-01/02`。
-- 远端没有 `/DATA/sync/sunny/bimanual-vla` 或代码版本不一致。
+- 远端没有 `/DATA/sync/${USER}/bimanual-vla` 或代码版本不一致。
 - 远端没有数据集、base checkpoint、训练 checkpoint。
 - 远端 conda env 路径不对。
 - Slurm quota 不足：`myquota`。
-- 资源不足或优先级低：`resources` / `squeue -u sunny`。
+- 资源不足或优先级低：`resources` / `squeue -u ${USER}`。
 
 ### 11.3 本地 4×4090 训练 OOM
 
@@ -719,7 +719,7 @@ curl -sS -H "Authorization: Bearer $SIM_TOKEN" \
       "locations": [
         {
           "target": "local_4090",
-          "path": "/home/sunny/.cache/huggingface/lerobot/pick_cube_piper_v1",
+          "path": "${HOME}/.cache/huggingface/lerobot/pick_cube_piper_v1",
           "origin": "simulation",
           "episodes": 100,
           "frames": 20000
@@ -919,7 +919,7 @@ curl -sS -X POST "$SIM_DASHBOARD/api/eval-videos/sync" \
   -H 'Content-Type: application/json' \
   -d '{
     "source": "h100",
-    "root": "/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/outputs",
+    "root": "/DATA/sync/${USER}/robotwin_ws/RoboTwin/policy/pi05/outputs",
     "relative_path": "my_eval/video.mp4",
     "overwrite": false
   }' | jq .
@@ -961,7 +961,7 @@ curl -X POST "$SIM_DASHBOARD/api/datasets/my_sim_dataset/sync" \
 
 curl -X POST "$SIM_DASHBOARD/api/eval-videos/sync" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"source":"h100","root":"/DATA/sync/sunny/robotwin_ws/RoboTwin/policy/pi05/outputs","relative_path":"eval/run.mp4","parallelism":8}'
+  -d '{"source":"h100","root":"/DATA/sync/${USER}/robotwin_ws/RoboTwin/policy/pi05/outputs","relative_path":"eval/run.mp4","parallelism":8}'
 ```
 
 并行度上限为 16。若源/目标是 H200 Slurm-only，接口不会直连 H200 计算节点，而是通过 login-server 提交 Slurm staging/copy 作业；不会在 H200 上启动任何监听服务。
@@ -977,21 +977,21 @@ curl -X POST "$SIM_DASHBOARD/api/eval-videos/sync" \
 
 ## 18. 当前已探测的数据集位置（2026-08-05）
 
-按 `SERVER_PATHS_ENV_TRAIN_EVAL.md` 重新核验后，仿真 Dashboard 的远端路径应使用 `/DATA/disk0/sunny`，不是旧模板里的 `/DATA/sync/sunny`。
+按 `SERVER_PATHS_ENV_TRAIN_EVAL.md` 重新核验后，仿真 Dashboard 的远端路径应使用 `/DATA/disk0/${USER}`，不是旧模板里的 `/DATA/sync/${USER}`。
 
 ### 18.1 H100 / login-server 共享路径
 
 Dashboard 可在 `login-server` 轻量扫描：
 
 ```text
-/DATA/disk0/sunny/.cache/huggingface/lerobot
+/DATA/disk0/${USER}/.cache/huggingface/lerobot
 ```
 
 当前探测到：
 
 | dataset_id | episodes | frames | fps | root |
 |---|---:|---:|---:|---|
-| `lift_pot_piper` | 150 | 12385 | 50 | `/DATA/disk0/sunny/.cache/huggingface/lerobot` |
+| `lift_pot_piper` | 150 | 12385 | 50 | `/DATA/disk0/${USER}/.cache/huggingface/lerobot` |
 
 文档中的 Put Bottles v3 norm_stats 已在 H100 assets 下存在，但 H100 的 LeRobot dataset root 当前未探测到该 dataset 目录；训练前需按准备脚本重新 staging 数据。
 
@@ -1000,27 +1000,27 @@ Dashboard 可在 `login-server` 轻量扫描：
 H200 不由 Dashboard 直接 SSH 扫描；通过 login-server 提交 CPU-only Slurm probe，并把 inventory 写入：
 
 ```text
-/DATA/NAS/GPUServer/sunny/dashboard_probe/h200-ali-01_inventory.json
+/DATA/NAS/GPUServer/${USER}/dashboard_probe/h200-ali-01_inventory.json
 ```
 
 当前探测到：
 
 | dataset_id | episodes | frames | fps | root |
 |---|---:|---:|---:|---|
-| `lift_pot_piper` | 150 | 12385 | 50 | `/DATA/disk0/sunny/.cache/huggingface/lerobot` |
-| `put_bottles_dustbin_piper_100_25hz_realqpos_v2` | 100 | 59798 | 25 | `/DATA/disk0/sunny/.cache/huggingface/lerobot` |
-| `put_bottles_dustbin_piper_100_25hz_realqpos_v3_order_aligned` | 100 | 59798 | 25 | `/DATA/disk0/sunny/.cache/huggingface/lerobot` |
-| `put_single_bottle_dustbin_piper_200` | 200 | 42489 | 50 | `/DATA/disk0/sunny/.cache/huggingface/lerobot` |
+| `lift_pot_piper` | 150 | 12385 | 50 | `/DATA/disk0/${USER}/.cache/huggingface/lerobot` |
+| `put_bottles_dustbin_piper_100_25hz_realqpos_v2` | 100 | 59798 | 25 | `/DATA/disk0/${USER}/.cache/huggingface/lerobot` |
+| `put_bottles_dustbin_piper_100_25hz_realqpos_v3_order_aligned` | 100 | 59798 | 25 | `/DATA/disk0/${USER}/.cache/huggingface/lerobot` |
+| `put_single_bottle_dustbin_piper_200` | 200 | 42489 | 50 | `/DATA/disk0/${USER}/.cache/huggingface/lerobot` |
 
 ### 18.3 H200-ali-02 Slurm 探测结果
 
 Inventory cache：
 
 ```text
-/DATA/NAS/GPUServer/sunny/dashboard_probe/h200-ali-02_inventory.json
+/DATA/NAS/GPUServer/${USER}/dashboard_probe/h200-ali-02_inventory.json
 ```
 
-当前探测结果：`/DATA/disk0/sunny/.cache/huggingface/lerobot` 不存在或无 LeRobot 数据集。若要在 h200-ali-02 训练，需要先单独 staging 数据、项目、环境和 checkpoint。
+当前探测结果：`/DATA/disk0/${USER}/.cache/huggingface/lerobot` 不存在或无 LeRobot 数据集。若要在 h200-ali-02 训练，需要先单独 staging 数据、项目、环境和 checkpoint。
 
 ## 19. 数据集位置显示、同步与视频懒加载（2026-08-05 更新）
 
@@ -1028,10 +1028,10 @@ Inventory cache：
 
 仿真 Dashboard 的数据集表现在会合并 `/api/status` 本地清单和 `/api/dataset-locations?origin=simulation` 跨服务器清单，并在“位置 / 同步”列显示：
 
-- `4×4090`：`/home/sunny/.cache/huggingface/lerobot`，也是上传默认安装位置；
-- `H100`：通过 `login-server` 轻量扫描 `/DATA/disk0/sunny/.cache/huggingface/lerobot`；
+- `4×4090`：`${HOME}/.cache/huggingface/lerobot`，也是上传默认安装位置；
+- `H100`：通过 `login-server` 轻量扫描 `/DATA/disk0/${USER}/.cache/huggingface/lerobot`；
 - `H200 ali-01 / ali-02`：不直接 SSH 扫描计算节点，读取 4×4090 本地镜像 inventory：
-  `/home/sunny/.local/share/bimanual-vla-sim-dashboard/cluster_inventory/*_inventory.json`。
+  `${HOME}/.local/share/bimanual-vla-sim-dashboard/cluster_inventory/*_inventory.json`。
 
 刷新位置：
 
@@ -1063,7 +1063,7 @@ curl -X POST "$SIM_DASHBOARD/api/datasets/my_sim_dataset/sync" \
 ```
 
 H100 走 4×4090 ↔ login-server 的并行 tar 流。H200 仍遵守 Slurm-only 规则：Dashboard 先把数据并行 staging 到 NAS
-`/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync`，然后通过 `login-server` 提交 CPU-only Slurm copy job 到目标 H200 节点，复制到 `/DATA/disk0/sunny/.cache/huggingface/lerobot`，不会在 H200 上开端口或绕过 Slurm。
+`/DATA/NAS/GPUServer/${USER}/dashboard_dataset_sync`，然后通过 `login-server` 提交 CPU-only Slurm copy job 到目标 H200 节点，复制到 `/DATA/disk0/${USER}/.cache/huggingface/lerobot`，不会在 H200 上开端口或绕过 Slurm。
 
 ### 19.3 评估视频
 

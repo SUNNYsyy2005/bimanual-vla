@@ -6,7 +6,10 @@ import numpy as np
 import pandas as pd
 import yaml
 
-PROJECT = Path(os.environ.get("ROBOTWIN_PROJECT", "/home/sunny/robotwin_ws/RoboTwin"))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PROJECT = Path(
+    os.environ.get("ROBOTWIN_PROJECT", REPO_ROOT.parent / "RoboTwin")
+).expanduser().resolve()
 os.chdir(PROJECT)
 sys.path.append(str(PROJECT))
 sys.path.append(str(PROJECT / "policy"))
@@ -94,7 +97,10 @@ def main():
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--instruction", default=None)
     ap.add_argument("--video", action="store_true")
-    ap.add_argument("--out-dir", default="/home/sunny/replay_lerobot_actions_out")
+    ap.add_argument(
+        "--out-dir",
+        default=str(REPO_ROOT / "outputs" / "replay_lerobot_actions"),
+    )
     args_ns = ap.parse_args()
 
     parquet = Path(args_ns.dataset) / "data" / "chunk-000" / f"episode_{args_ns.episode:06d}.parquet"

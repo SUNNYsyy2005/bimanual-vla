@@ -2,13 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_BIN="/home/user/miniconda3/envs/dual_arm/bin/python"
-
-if [[ ! -x "$PYTHON_BIN" ]]; then
-    PYTHON_BIN="python3"
-fi
-
-PIPER_CAN_HELPER="/home/user/dual_ARM_project/piper_sdk/piper_sdk/can_activate.sh"
+PIPER_CAN_HELPER="${BIMANUAL_VLA_CAN_ACTIVATE_SCRIPT:-$SCRIPT_DIR/piper_sdk/piper_sdk/can_activate.sh}"
 
 for can_name in can0 can1; do
     if [[ ! -d "/sys/class/net/$can_name" ]]; then
@@ -31,5 +25,5 @@ for can_name in can0 can1; do
 done
 
 cd "$SCRIPT_DIR"
-export BIMANUAL_VLA_PYTHON="$PYTHON_BIN"
+export BIMANUAL_VLA_CAN_ACTIVATE_SCRIPT="$PIPER_CAN_HELPER"
 exec "$SCRIPT_DIR/bin/bimanual-vla" collect-gui "$@"

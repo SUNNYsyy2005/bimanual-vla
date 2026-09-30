@@ -10,6 +10,7 @@
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -19,9 +20,13 @@ if sys.stdout.encoding is None or sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-SSH_HOST = "picluster"
+SSH_HOST = os.environ.get("BIMANUAL_VLA_MONITOR_SSH_HOST", "picluster")
+SLURM_USER = os.environ.get("BIMANUAL_VLA_CLUSTER_USER", os.environ.get("USER", ""))
 STATE_FILE = Path(__file__).resolve().parent / ".monitor_jobs.json"
-LOG_DIR = "/DATA/NAS/GPUServer/sunny/setup_jobs/logs"
+LOG_DIR = os.environ.get(
+    "BIMANUAL_VLA_SLURM_LOG_DIR",
+    f"/DATA/NAS/GPUServer/{SLURM_USER}/setup_jobs/logs",
+)
 
 
 def run_ssh(remote_cmd, timeout=30):
@@ -71,8 +76,8 @@ def cmd_untrack(jobid):
 
 
 def cmd_status():
-    print("=== 当前队列 (squeue -u sunny) ===")
-    out, err, _ = run_ssh("squeue -u sunny")
+    print(f"=== 当前队列 (squeue -u {SLURM_USER}) ===")
+    out, err, _ = run_ssh(f"squeue -u {SLURM_USER}")
     print(out.strip() or "(队列为空)")
     if err.strip():
         print("[stderr]", err.strip())
@@ -109,7 +114,7 @@ def cmd_logs(jobid, lines=40, wait_timeout=120):
     wrap_cmd = (
         f"for f in {LOG_DIR}/*_{jobid}.out {LOG_DIR}/*_{jobid}.err; do "
         f'[ -f "$f" ] && echo "--- $f ---" && tail -c 2000 "$f"; done; '
-        f'echo "---PS---"; ps -u sunny -o pid,etime,pcpu,args | grep -E "uv|python" | grep -v grep'
+        f'echo "---PS---"; ps -u {SLURM_USER} -o pid,etime,pcpu,args | grep -E "uv|python" | grep -v grep'
     )
     submit_cmd = (
         f"sbatch -p h200 -w h200-ali-02 --job-name=monitor_logs "

@@ -39,7 +39,7 @@ server_4090/SIMULATION_DASHBOARD.md
 bash deploy_4090_server.sh
 ```
 
-脚本只同步本服务需要的文件到 `4x4090:/home/sunny/bimanual-vla`，安装并启用用户级 systemd 服务 `bimanual-vla-dashboard.service`。Dashboard 会随 4×4090 开机自动启动，并在异常退出后自动重启；重启 Dashboard 本身不会停止页面管理的 Policy、训练任务或服务器上已有的其他 GPU 进程。首次启动会生成随机 Token，Dashboard 地址为：
+脚本只同步本服务需要的文件到远端用户主目录下的 `bimanual-vla`（默认 `$HOME/bimanual-vla`，可通过 `REMOTE_ROOT` 覆盖），安装并启用用户级 systemd 服务 `bimanual-vla-dashboard.service`。Dashboard 会随 4×4090 开机自动启动，并在异常退出后自动重启；重启 Dashboard 本身不会停止页面管理的 Policy、训练任务或服务器上已有的其他 GPU 进程。首次启动会生成随机 Token，Dashboard 地址为：
 
 ```text
 http://192.168.101.9:8090
@@ -87,7 +87,7 @@ ssh 4x4090 'systemctl --user stop bimanual-vla-dashboard.service && rm -f ~/.con
 自定义路径、端口或 JAX 显存比例时修改服务器上的：
 
 ```text
-/home/sunny/bimanual-vla/server_4090/config.json
+$REMOTE_ROOT/server_4090/config.json
 ```
 
 管理 Dashboard 自启动服务：
@@ -99,7 +99,7 @@ ssh 4x4090 'journalctl --user -u bimanual-vla-dashboard.service -n 100 --no-page
 ssh 4x4090 'tail -n 100 ~/.local/share/bimanual-vla-server/dashboard.log'
 ```
 
-部署脚本会尝试为当前用户开启 systemd linger，使用户尚未登录时服务也能随系统启动。可用 `loginctl show-user sunny -p Linger` 验证；如果服务器策略拒绝无管理员授权开启 linger，用户服务仍会在 `sunny` 登录后自动启动，但需要管理员执行 `loginctl enable-linger sunny` 才能实现完全无人登录的开机自启动。
+部署脚本会尝试为当前用户开启 systemd linger，使用户尚未登录时服务也能随系统启动。可用 `ssh 4x4090 'loginctl show-user "$(id -un)" -p Linger'` 验证；如果服务器策略拒绝无管理员授权开启 linger，用户服务仍会在该账号登录后自动启动，但需要管理员执行 `ssh 4x4090 'sudo loginctl enable-linger "$(id -un)"'` 才能实现完全无人登录的开机自启动。
 
 ## 上传数据集
 
@@ -208,8 +208,11 @@ LeRobot 数据集的 `meta/info.json` 中 `total_videos: 0` 只表示没有编�
 Dashboard 训练表单支持动态选择 `π0.5` 或 `π0` 模型系列，并会扫描 `checkpoint_allowed_roots` 下所有包含完整 `params/` 的预训练权重和训练 checkpoint。首次使用时至少准备一个与所选模型系列匹配的基座；例如下载 `pi05_base`：
 
 ```bash
-cd /home/sunny/bimanual-vla
-/home/sunny/miniconda3/envs/openpi/bin/python -m scripts.models.download_openpi_checkpoint \
+REMOTE_ROOT="${REMOTE_ROOT:-$HOME/bimanual-vla}"
+cd "$REMOTE_ROOT"
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate openpi
+python -m scripts.models.download_openpi_checkpoint \
   --checkpoint gs://openpi-assets/checkpoints/pi05_base \
   --source auto \
   --workers 16 \
@@ -219,7 +222,7 @@ cd /home/sunny/bimanual-vla
 默认保存到：
 
 ```text
-/home/sunny/.cache/openpi/openpi-assets/checkpoints/pi05_base
+${HOME}/.cache/openpi/openpi-assets/checkpoints/pi05_base
 ```
 
 ## 页面工作流

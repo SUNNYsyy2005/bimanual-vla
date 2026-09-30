@@ -133,7 +133,8 @@ The repository can also use the Piper SDK activation helper when that SDK
 checkout is available:
 
 ```bash
-bash ~/dual_ARM_project/piper_sdk/piper_sdk/can_activate.sh can0 1000000
+export BIMANUAL_VLA_CAN_ACTIVATE_SCRIPT="/path/to/piper_sdk/piper_sdk/can_activate.sh"
+bash start_gui.sh
 ```
 
 ## 6. Camera Setup
@@ -165,6 +166,12 @@ numbers. Depth and grayscale nodes are not valid RGB inputs.
 conda activate dual_arm
 bash start_gui.sh
 ```
+
+The launcher uses the active environment first. If that Python lacks Tk, it
+checks the conventional Conda `dual_arm` environment under the current home
+directory. You can select another interpreter with
+`BIMANUAL_VLA_PYTHON`; that interpreter must include Tk support (`tk` in Conda
+or `python3-tk` for the matching Ubuntu system Python).
 
 The GUI can be opened without connected hardware, but collection requires fresh
 CAN feedback and valid camera frames. See
