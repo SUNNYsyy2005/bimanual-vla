@@ -806,6 +806,10 @@ let settingsBrowsePath = '';
 let settingsBrowseData = null;
 let settingsBrowseEditIndex = null;
 let latestDatasetLocations = null;
+let datasetLocationsRequest = null;
+let datasetLocationsFetchedAt = 0;
+let clusterResourcesRequest = null;
+let clusterResourcesQueriedAt = 0;
 let latestTelemetryKey = null;
 let previewUrls = new Map();
 let episodeMediaPlayers = [];
@@ -1826,23 +1830,34 @@ function renderDatasetLocations(d) {
 
 async function loadDatasetLocations(forceRender = false) {
   if (!tokenInput.value) return null;
+  if (!forceRender && Date.now() - datasetLocationsFetchedAt < 60000) {
+    return latestDatasetLocations;
+  }
+  if (datasetLocationsRequest) return datasetLocationsRequest;
   const origin = DASHBOARD_PROFILE === 'simulation' ? 'simulation' : '';
   const suffix = origin ? `?origin=${encodeURIComponent(origin)}` : '';
-  try {
-    latestDatasetLocations = await api(`/api/dataset-locations${suffix}`);
-    if (latestDatasetLocations.errors && Object.keys(latestDatasetLocations.errors).length) {
-      console.warn('dataset location errors', latestDatasetLocations.errors);
+  datasetLocationsRequest = (async () => {
+    try {
+      latestDatasetLocations = await api(`/api/dataset-locations${suffix}`);
+      datasetLocationsFetchedAt = Date.now();
+      if (latestDatasetLocations.errors && Object.keys(latestDatasetLocations.errors).length) {
+        console.warn('dataset location errors', latestDatasetLocations.errors);
+      }
+      if (latestStatus) {
+        latestStatus.datasets = mergeDatasetLocationInfo(latestStatus.datasets || [], latestDatasetLocations);
+        fillDatasets(latestStatus.datasets || []);
+      }
+      return latestDatasetLocations;
+    } catch (error) {
+      datasetLocationsFetchedAt = Date.now();
+      console.warn('dataset locations failed', error);
+      if (forceRender) show(`数据集位置刷新失败：${error.message}`);
+      return null;
+    } finally {
+      datasetLocationsRequest = null;
     }
-    if (forceRender && latestStatus) {
-      latestStatus.datasets = mergeDatasetLocationInfo(latestStatus.datasets || [], latestDatasetLocations);
-      fillDatasets(latestStatus.datasets || []);
-    }
-    return latestDatasetLocations;
-  } catch (error) {
-    console.warn('dataset locations failed', error);
-    if (forceRender) show(`数据集位置刷新失败：${error.message}`);
-    return null;
-  }
+  })();
+  return datasetLocationsRequest;
 }
 
 async function syncDatasetTo(datasetId, selectId, source) {
@@ -3881,14 +3896,22 @@ function fillEvalCheckpoints(items) {
 async function loadClusterResources(options = {}) {
   const output = document.getElementById('clusterResources');
   if (!output || !tokenInput.value) return;
+  if (clusterResourcesRequest) return clusterResourcesRequest;
+  if (options.quiet && Date.now() - clusterResourcesQueriedAt < 60000) return;
+  clusterResourcesQueriedAt = Date.now();
   if (!options.quiet) output.textContent = '正在通过 SSH/Slurm 查询 H100/H200 资源…';
-  try {
-    const data = await api('/api/cluster-resources');
-    output.textContent = data.output || '(empty output)';
-    if (!data.ok) output.textContent = `查询失败 rc=${data.returncode}\n` + output.textContent;
-  } catch (error) {
-    output.textContent = `H100/H200 资源查询失败：${error.message}`;
-  }
+  clusterResourcesRequest = (async () => {
+    try {
+      const data = await api('/api/cluster-resources');
+      output.textContent = data.output || '(empty output)';
+      if (!data.ok) output.textContent = `查询失败 rc=${data.returncode}\n` + output.textContent;
+    } catch (error) {
+      output.textContent = `H100/H200 资源查询失败：${error.message}`;
+    } finally {
+      clusterResourcesRequest = null;
+    }
+  })();
+  return clusterResourcesRequest;
 }
 
 function fillGpus(items) {
@@ -5384,26 +5407,26 @@ async function refreshAll() {
       return;
     }
     latestStatus = data;
-    const locationData = await loadDatasetLocations(false);
-    if (locationData) latestStatus.datasets = mergeDatasetLocationInfo(data.datasets || [], locationData);
+    fillGpus(data.gpus || []);
+    updateSummaries(data);
+    if (latestDatasetLocations) latestStatus.datasets = mergeDatasetLocationInfo(data.datasets || [], latestDatasetLocations);
     fillDatasets(latestStatus.datasets || []);
     fillTrainingExperiments(data.experiments || []);
     fillBaseModels(data.base_models || []);
     fillExecutionTargets(data.config || {});
     fillCheckpoints(data.checkpoints || []);
-    fillGpus(data.gpus || []);
-    loadClusterResources({quiet: true});
     fillTasks(data.tasks || []);
     fillTrainingTasks(data.tasks || []);
     fillTransferTasks(data.tasks || []);
     refreshSelectedLogs();
     fillObservation(data.robot_observation);
-    updateSummaries(data);
     if (!episodeDatasetData && document.getElementById('editorDataset').value) loadDatasetEpisodes(0);
     const evalVideoModule = document.getElementById('module-eval-videos');
     if (evalVideoModule && !evalVideoModule.hidden) loadEvalVideos(evalVideoIncludeRemote);
     const trainingVisible = !document.getElementById('module-training').hidden;
     if (trainingVisible && document.getElementById('trainMetricsTask').value) loadTrainingMetrics({quiet: true});
+    loadDatasetLocations(false);
+    loadClusterResources({quiet: true});
   } catch (error) {
     show(error.message);
   }
