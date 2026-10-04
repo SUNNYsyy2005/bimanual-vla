@@ -74,6 +74,7 @@ from bimanual_vla.deployment.trajectory import (
     TrajectoryTrackingError,
     rate_limit_grippers,
     smootherstep,
+    suppress_local_joint_spikes,
 )
 
 
@@ -4402,6 +4403,34 @@ class ExecutionController:
             retime_from_arrival = skip_steps < future_index
         self.inference_skip_steps = skip_steps
         fresh_actions = decoded[skip_steps:]
+        if (
+            bool(getattr(self.args, "trajectory_spike_suppression", False))
+            and protocol.schema == "joint"
+            and len(fresh_actions) >= 5
+        ):
+            # Reuse the GUI/client RTC execution horizon. Do not let the remote
+            # tail of a 50-step chunk affect commands that will be replaced by
+            # the next receding-horizon inference.
+            spike_horizon = int(
+                getattr(
+                    self.args,
+                    "rtc_execution_horizon",
+                    DEFAULT_RTC_EXECUTION_HORIZON,
+                )
+            )
+            absolute = np.stack(
+                [item.absolute_target for item in fresh_actions], axis=0
+            ).astype(np.float32, copy=False)
+            suppressed = suppress_local_joint_spikes(
+                absolute,
+                action_hz=self.policy_action_hz,
+                horizon_steps=spike_horizon,
+            )
+            if np.any(np.abs(suppressed - absolute) > 1e-7):
+                fresh_actions = [
+                    replace(item, absolute_target=suppressed[index].copy())
+                    for index, item in enumerate(fresh_actions)
+                ]
         if retime_from_arrival:
             fresh_actions = self._retime_actions_from(
                 fresh_actions, arrived_monotonic
@@ -6897,6 +6926,15 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="apply velocity/acceleration/jerk-limited joint trajectory shaping",
+    )
+    parser.add_argument(
+        "--trajectory-spike-suppression",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "suppress isolated joint acceleration spikes inside the short RTC "
+            "execution horizon (default: disabled)"
+        ),
     )
     for option, description in (
         ("trajectory-lowpass", "joint reference low-pass filter"),

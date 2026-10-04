@@ -206,6 +206,139 @@ class JerkLimitedJointTrajectory:
         }
 
 
+
+def suppress_local_joint_spikes(
+    positions: np.ndarray,
+    *,
+    action_hz: float,
+    horizon_steps: int,
+    accel_floor_rad_s2: float = 1.2,
+    outlier_sigma: float = 1.5,
+    max_correction_rad: float = 0.03,
+    joint_indices: Iterable[int] | None = None,
+    passes: int = 2,
+) -> np.ndarray:
+    """Suppress isolated second-difference spikes in the executable prefix.
+
+    This is deliberately not a low-pass filter and not a full-chunk optimizer.
+    Only the first ``horizon_steps`` rows are inspected, so predictions that are
+    unlikely to execute before the next receding-horizon update cannot pull the
+    current command. A sample is changed only when its discrete acceleration is
+    a robust local outlier and is not supported by same-sign neighboring
+    curvature. Sustained intentional acceleration is therefore preserved.
+
+    Piper gripper dimensions are excluded by default (every seventh value).
+    The first/last row of the short horizon and all rows after it remain exact.
+    """
+    values = np.asarray(positions, dtype=np.float32)
+    if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] == 0:
+        raise ValueError("positions must have shape (T,A) with T,A > 0")
+    if not np.isfinite(values).all():
+        raise ValueError("positions must be finite")
+    hz = float(action_hz)
+    if not math.isfinite(hz) or hz <= 0:
+        raise ValueError("action_hz must be positive")
+    horizon = int(horizon_steps)
+    if horizon <= 0:
+        raise ValueError("horizon_steps must be positive")
+    if not math.isfinite(float(accel_floor_rad_s2)) or accel_floor_rad_s2 <= 0:
+        raise ValueError("accel_floor_rad_s2 must be positive")
+    if not math.isfinite(float(outlier_sigma)) or outlier_sigma <= 0:
+        raise ValueError("outlier_sigma must be positive")
+    if not math.isfinite(float(max_correction_rad)) or max_correction_rad <= 0:
+        raise ValueError("max_correction_rad must be positive")
+    if passes <= 0:
+        raise ValueError("passes must be positive")
+
+    result = values.copy()
+    prefix = min(len(result), horizon)
+    if prefix < 5:
+        return result
+    if joint_indices is None:
+        if result.shape[1] % 7 != 0:
+            raise ValueError(
+                "joint_indices are required when action dimension is not Piper 7D blocks"
+            )
+        joint_indices = [
+            index
+            for arm_start in range(0, result.shape[1], 7)
+            for index in range(arm_start, arm_start + 6)
+        ]
+    indices = np.asarray(list(joint_indices), dtype=np.int64)
+    if indices.ndim != 1 or not len(indices):
+        raise ValueError("joint_indices must contain at least one index")
+    if np.any(indices < 0) or np.any(indices >= result.shape[1]):
+        raise ValueError("joint_indices contain an out-of-range index")
+
+    hz2 = hz * hz
+    for _ in range(int(passes)):
+        # Use a snapshot per pass so neighboring decisions cannot cascade within
+        # a single sweep. The second pass can clean a remaining two-point spike.
+        source = result.copy()
+        acceleration = (
+            source[2:prefix, indices]
+            - 2.0 * source[1 : prefix - 1, indices]
+            + source[: prefix - 2, indices]
+        ) * hz2
+        updates: list[tuple[int, int, float]] = []
+        for local_joint, joint_index in enumerate(indices):
+            series = acceleration[:, local_joint]
+            for accel_index in range(1, len(series) - 1):
+                center = float(series[accel_index])
+                left = float(series[accel_index - 1])
+                right = float(series[accel_index + 1])
+                start = max(0, accel_index - 2)
+                stop = min(len(series), accel_index + 3)
+                neighborhood = np.abs(series[start:stop])
+                if neighborhood.size <= 1:
+                    continue
+                neighborhood = np.delete(neighborhood, accel_index - start)
+                baseline = float(np.median(neighborhood)) if neighborhood.size else 0.0
+                mad = (
+                    float(np.median(np.abs(neighborhood - baseline)))
+                    if neighborhood.size
+                    else 0.0
+                )
+                threshold = max(
+                    float(accel_floor_rad_s2),
+                    baseline + float(outlier_sigma) * 1.4826 * mad,
+                )
+                if abs(center) <= threshold:
+                    continue
+
+                # Preserve real sustained acceleration. An isolated position
+                # glitch usually produces + / - / + curvature (or the opposite).
+                same_sign_support = (
+                    center * left > 0.0 and abs(left) >= 0.5 * threshold
+                ) or (
+                    center * right > 0.0 and abs(right) >= 0.5 * threshold
+                )
+                if same_sign_support:
+                    continue
+
+                row = accel_index + 1
+                desired_accel = math.copysign(threshold, center)
+                candidate = 0.5 * (
+                    float(source[row - 1, joint_index])
+                    + float(source[row + 1, joint_index])
+                    - desired_accel / hz2
+                )
+                correction = float(
+                    np.clip(
+                        candidate - float(source[row, joint_index]),
+                        -float(max_correction_rad),
+                        float(max_correction_rad),
+                    )
+                )
+                if abs(correction) > 1e-7:
+                    updates.append((row, int(joint_index), correction))
+        if not updates:
+            break
+        for row, joint_index, correction in updates:
+            result[row, joint_index] = source[row, joint_index] + correction
+    return result
+
+
 def smootherstep(value: float) -> float:
     """Quintic interpolation with zero slope and curvature at both ends."""
     x = float(np.clip(value, 0.0, 1.0))
