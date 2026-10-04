@@ -532,6 +532,7 @@ def build_inference_bridge_command(
     joint_tracking_enabled: bool = True,
     joint_speed_limit_enabled: bool = True,
     joint_acceleration_limit_enabled: bool = True,
+    joint_spike_suppression_enabled: bool = False,
     joint_jerk_limit_enabled: bool = True,
     joint_lookahead_enabled: bool = True,
     joint_max_speed_rad_s: float = 0.30,
@@ -719,6 +720,7 @@ def build_inference_bridge_command(
         "trajectory-tracking": joint_tracking_enabled,
         "trajectory-speed-limit": joint_speed_limit_enabled,
         "trajectory-acceleration-limit": joint_acceleration_limit_enabled,
+        "trajectory-spike-suppression": joint_spike_suppression_enabled,
         "trajectory-jerk-limit": joint_jerk_limit_enabled,
         "trajectory-lookahead": joint_lookahead_enabled,
         "gripper-lowpass": gripper_lowpass,
@@ -1069,6 +1071,9 @@ class CollectorGUI:
         )
         self.inference_joint_acceleration_limit_var = tk.BooleanVar(
             value=bool(preferences.get("inference_joint_acceleration_limit_enabled", True))
+        )
+        self.inference_joint_spike_suppression_var = tk.BooleanVar(
+            value=bool(preferences.get("inference_joint_spike_suppression_enabled", False))
         )
         self.inference_joint_jerk_limit_var = tk.BooleanVar(
             value=bool(preferences.get("inference_joint_jerk_limit_enabled", True))
@@ -2012,6 +2017,7 @@ class CollectorGUI:
             ("Second-order tracking", self.inference_joint_tracking_var, self.inference_joint_tracking_time_var, "Time s"),
             ("Speed limit", self.inference_joint_speed_limit_var, self.inference_joint_max_speed_var, "rad/s"),
             ("Acceleration limit", self.inference_joint_acceleration_limit_var, self.inference_joint_max_acceleration_var, "rad/s²"),
+            ("Short-horizon spike suppression", self.inference_joint_spike_suppression_var, self.inference_rtc_horizon_var, "RTC steps"),
             ("Jerk limit", self.inference_joint_jerk_limit_var, self.inference_joint_max_jerk_var, "rad/s³"),
             ("Velocity lookahead", self.inference_joint_lookahead_var, self.inference_joint_lookahead_rad_var, "rad"),
             ("Delivery IK step limit", self.inference_ik_rate_limit_var, self.inference_ik_max_step_var, "rad/step"),
@@ -2446,6 +2452,7 @@ class CollectorGUI:
             "inference_joint_tracking_enabled": self.inference_joint_tracking_var.get(),
             "inference_joint_speed_limit_enabled": self.inference_joint_speed_limit_var.get(),
             "inference_joint_acceleration_limit_enabled": self.inference_joint_acceleration_limit_var.get(),
+            "inference_joint_spike_suppression_enabled": self.inference_joint_spike_suppression_var.get(),
             "inference_joint_jerk_limit_enabled": self.inference_joint_jerk_limit_var.get(),
             "inference_joint_lookahead_enabled": self.inference_joint_lookahead_var.get(),
             "inference_joint_tracking_time_constant_s": self.inference_joint_tracking_time_var.get().strip(),
@@ -2997,7 +3004,12 @@ class CollectorGUI:
                 self.inference_async_enabled_var.get() and trigger_mode == "chunk_step",
                 10, int,
             )
-            rtc_horizon = numeric_setting(self.inference_rtc_horizon_var, self.inference_rtc_enabled_var.get(), 8, int)
+            rtc_horizon = numeric_setting(
+                self.inference_rtc_horizon_var,
+                self.inference_rtc_enabled_var.get()
+                or self.inference_joint_spike_suppression_var.get(),
+                8, int,
+            )
             rtc_weight = numeric_setting(self.inference_rtc_weight_var, self.inference_rtc_enabled_var.get(), 5.0, float)
             rtc_blend_steps = numeric_setting(self.inference_rtc_blend_steps_var,
                 self.inference_rtc_enabled_var.get() and self.inference_rtc_blend_enabled_var.get(), 3, int)
@@ -3079,6 +3091,7 @@ class CollectorGUI:
             joint_tracking_enabled=self.inference_joint_tracking_var.get(),
             joint_speed_limit_enabled=self.inference_joint_speed_limit_var.get(),
             joint_acceleration_limit_enabled=self.inference_joint_acceleration_limit_var.get(),
+            joint_spike_suppression_enabled=self.inference_joint_spike_suppression_var.get(),
             joint_jerk_limit_enabled=self.inference_joint_jerk_limit_var.get(),
             joint_lookahead_enabled=self.inference_joint_lookahead_var.get(),
             joint_max_speed_rad_s=joint_max_speed,

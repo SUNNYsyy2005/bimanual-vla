@@ -16,6 +16,7 @@ from bimanual_vla.deployment.trajectory import (
     gripper_open_lookahead,
     rate_limit_grippers,
     smootherstep,
+    suppress_local_joint_spikes,
 )
 
 
@@ -103,6 +104,30 @@ class TrajectoryShapingTest(unittest.TestCase):
         )
         ahead_command, _ = ahead.update(initial, target, 0.05)
         self.assertAlmostEqual(float(ahead_command[0]), 0.035, places=5)
+
+    def test_short_horizon_spike_suppression_removes_isolated_curvature(self):
+        trajectory = np.zeros((12, 7), dtype=np.float32)
+        trajectory[:, 0] = np.linspace(0.0, 0.11, len(trajectory))
+        trajectory[3, 0] += 0.025
+        original = trajectory.copy()
+        filtered = suppress_local_joint_spikes(
+            trajectory, action_hz=20.0, horizon_steps=8, accel_floor_rad_s2=1.2
+        )
+        self.assertLess(
+            abs(float(filtered[3, 0] - 0.03)),
+            abs(float(original[3, 0] - 0.03)),
+        )
+        np.testing.assert_array_equal(filtered[8:], original[8:])
+        np.testing.assert_array_equal(filtered[:, 6], original[:, 6])
+
+    def test_short_horizon_spike_suppression_preserves_sustained_acceleration(self):
+        t = np.arange(10, dtype=np.float32) / 20.0
+        trajectory = np.zeros((10, 7), dtype=np.float32)
+        trajectory[:, 0] = 0.5 * 2.0 * t * t
+        filtered = suppress_local_joint_spikes(
+            trajectory, action_hz=20.0, horizon_steps=8, accel_floor_rad_s2=1.2
+        )
+        np.testing.assert_allclose(filtered, trajectory, atol=1e-7)
 
     def test_smootherstep_has_zero_endpoint_slope(self):
         self.assertEqual(smootherstep(0.0), 0.0)
