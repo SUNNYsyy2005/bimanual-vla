@@ -3724,7 +3724,7 @@ def process_owner_map(pids: Iterable[int]) -> dict[int, str]:
     return owners
 
 
-def gpu_inventory() -> list[dict[str, Any]]:
+def gpu_inventory(*, strict: bool = False) -> list[dict[str, Any]]:
     gpu_cmd = [
         "nvidia-smi",
         "--query-gpu=index,uuid,name,memory.total,memory.used",
@@ -3737,9 +3737,18 @@ def gpu_inventory() -> list[dict[str, Any]]:
     ]
     try:
         gpu_lines = subprocess.check_output(gpu_cmd, text=True, timeout=10).splitlines()
-        process_lines = subprocess.check_output(proc_cmd, text=True, timeout=10).splitlines()
-    except (FileNotFoundError, subprocess.SubprocessError):
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        logging.getLogger(__name__).warning("GPU inventory query failed: %s", exc)
+        if strict:
+            raise RuntimeError(f"GPU inventory query failed: {exc}") from exc
         return []
+    process_query_error = None
+    try:
+        process_lines = subprocess.check_output(proc_cmd, text=True, timeout=10).splitlines()
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        process_lines = []
+        process_query_error = f"GPU process query failed: {exc}"
+        logging.getLogger(__name__).warning("%s", process_query_error)
     raw_processes: list[tuple[str, int, str | None, int | None]] = []
     unavailable_uuids: set[str] = set()
     for line in process_lines:
@@ -3788,8 +3797,8 @@ def gpu_inventory() -> list[dict[str, Any]]:
                 "memory_total_mib": _nvidia_int(parts[3]) or 0,
                 "memory_used_mib": _nvidia_int(parts[4]) or 0,
                 "processes": processes.get(parts[1], []),
-                "compute_available": parts[1] not in unavailable_uuids,
-                "health_issue": (
+                "compute_available": process_query_error is None and parts[1] not in unavailable_uuids,
+                "health_issue": process_query_error or (
                     None
                     if parts[1] not in unavailable_uuids
                     else "nvidia-smi reports an unavailable compute context ([N/A])"
@@ -5143,6 +5152,15 @@ def create_app(config_path: Path) -> Flask:
                 break
             current = current.parent
 
+
+    @app.get("/api/gpus")
+    def local_gpu_resources():
+        gpus = gpu_inventory(strict=True)
+        if not gpus:
+            raise RuntimeError("nvidia-smi returned no GPU records")
+        response = jsonify({"gpus": gpus})
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/api/status")
     def status():

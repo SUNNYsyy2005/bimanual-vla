@@ -810,6 +810,8 @@ let datasetLocationsRequest = null;
 let datasetLocationsFetchedAt = 0;
 let clusterResourcesRequest = null;
 let clusterResourcesQueriedAt = 0;
+let gpuResourcesRequest = null;
+let latestGpuInventory = null;
 let latestTelemetryKey = null;
 let previewUrls = new Map();
 let episodeMediaPlayers = [];
@@ -3914,11 +3916,34 @@ async function loadClusterResources(options = {}) {
   return clusterResourcesRequest;
 }
 
-function fillGpus(items) {
+async function loadGpuResources() {
+  if (!tokenInput.value) return;
+  if (gpuResourcesRequest) return gpuResourcesRequest;
+  gpuResourcesRequest = (async () => {
+    try {
+      const data = await api('/api/gpus', {cache: 'no-store'});
+      if (!Array.isArray(data.gpus) || !data.gpus.length) throw new Error('GPU 接口未返回显卡数据');
+      latestGpuInventory = data.gpus;
+      fillGpus(latestGpuInventory);
+      if (latestStatus) {
+        latestStatus.gpus = latestGpuInventory;
+        updateSummaries(latestStatus);
+      }
+    } catch (error) {
+      fillGpus(latestGpuInventory || [], `GPU 查询失败：${error.message}${latestGpuInventory ? '；以下为上次成功查询的结果' : ''}`);
+    } finally {
+      gpuResourcesRequest = null;
+    }
+  })();
+  return gpuResourcesRequest;
+}
+
+function fillGpus(items, error = '') {
   document.getElementById('gpuList').innerHTML = items.map(g => `
     <div><span class="pill">GPU ${g.index}</span> ${esc(g.name)} · ${g.memory_used_mib}/${g.memory_total_mib} MiB · ${g.compute_available === false ? '<span class="bad">CUDA unavailable</span>' : g.processes.length ? '<span class="warn">busy</span>' : '<span class="ok">free</span>'}
     ${g.health_issue ? `<div class="bad">${esc(g.health_issue)}</div>` : ''}
-    ${g.processes.map(p => `<div class="muted">PID ${esc(p.pid)} · 用户 ${esc(p.user || 'unknown')} · ${esc(p.name || '-')} · ${esc(p.memory_mib == null ? '-' : p.memory_mib)} MiB</div>`).join('')}</div>`).join('') || '<div class="bad">nvidia-smi 不可用</div>';
+    ${g.processes.map(p => `<div class="muted">PID ${esc(p.pid)} · 用户 ${esc(p.user || 'unknown')} · ${esc(p.name || '-')} · ${esc(p.memory_mib == null ? '-' : p.memory_mib)} MiB</div>`).join('')}</div>`).join('') || '<div class="muted">尚未获取 GPU 数据</div>';
+  if (error) document.getElementById('gpuList').insertAdjacentHTML('afterbegin', `<div class="warn">${esc(error)}</div>`);
 }
 
 function fillReplacePolicies(items) {
@@ -5397,6 +5422,7 @@ async function refreshAll() {
     show('请先输入 Dashboard API Token。');
     return;
   }
+  loadGpuResources();
   try {
     const data = await api('/api/status');
     const serverBuild = String(((data || {}).config || {}).dashboard_build || '');
@@ -5407,7 +5433,7 @@ async function refreshAll() {
       return;
     }
     latestStatus = data;
-    fillGpus(data.gpus || []);
+    if (latestGpuInventory) latestStatus.gpus = latestGpuInventory;
     updateSummaries(data);
     if (latestDatasetLocations) latestStatus.datasets = mergeDatasetLocationInfo(data.datasets || [], latestDatasetLocations);
     fillDatasets(latestStatus.datasets || []);
