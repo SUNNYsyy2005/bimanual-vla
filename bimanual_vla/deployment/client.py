@@ -5961,6 +5961,8 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                 "camera_checks": camera_checks,
                 "control_hz": float(args.control_hz),
                 "inference_hz": float(args.hz),
+                "rtc_execution_horizon": int(args.rtc_execution_horizon),
+                "trajectory_spike_suppression": bool(args.trajectory_spike_suppression),
                 "recording_video_source": "camera_stream",
                 "camera_capture_fps": float(args.camera_fps),
             }

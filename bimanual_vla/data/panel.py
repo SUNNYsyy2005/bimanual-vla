@@ -608,6 +608,10 @@ class DataProcessPanel(ttk.Frame):
             model_x, current_values, older_values, _ = policy_trajectory_series(
                 data, start, end, order=order, joint_index=joint_index,
             )
+            smooth_x, smooth_values, _, _ = policy_trajectory_series(
+                data, start, end, order=order, joint_index=joint_index,
+                smoothed=True,
+            )
             sent_x, sent_values, _ = trajectory_motion_series(
                 data, start, end, stream="command_sent", order=order, joint_index=joint_index,
             )
@@ -618,10 +622,11 @@ class DataProcessPanel(ttk.Frame):
                 self.chart_series_dash_patterns.append((4, 3))
             series.extend((
                 ("Policy output", current_values, "#1a73e8"),
+                ("Smoothed policy", smooth_values, "#0f9d8a"),
                 ("Command sent", sent_values, "#e76f51"),
             ))
-            self.chart_series_x.extend((model_x, sent_x))
-            self.chart_series_dash_patterns.extend((None, None))
+            self.chart_series_x.extend((model_x, smooth_x, sent_x))
+            self.chart_series_dash_patterns.extend((None, None, None))
             return series, np.concatenate(self.chart_series_x), unit
         if plot in CHUNK_VIEWS:
             metric, unit = CHUNK_VIEWS[plot]
@@ -671,6 +676,10 @@ class DataProcessPanel(ttk.Frame):
             model_x, current, older, _ = policy_trajectory_series(
                 data, start, end, order=0, joint_index=model_joint_index,
             )
+            smooth_x, smooth_current, _, _ = policy_trajectory_series(
+                data, start, end, order=0, joint_index=model_joint_index,
+                smoothed=True,
+            )
             if np.isfinite(older).any():
                 series.append(("Earlier prediction", older, "#8ab4f8"))
                 self.chart_series_x.append(model_x)
@@ -678,6 +687,10 @@ class DataProcessPanel(ttk.Frame):
             if np.isfinite(current).any():
                 series.append(("Policy output", current, "#1a73e8"))
                 self.chart_series_x.append(model_x)
+                self.chart_series_dash_patterns.append(None)
+            if np.isfinite(smooth_current).any():
+                series.append(("Smoothed policy", smooth_current, "#0f9d8a"))
+                self.chart_series_x.append(smooth_x)
                 self.chart_series_dash_patterns.append(None)
         return series, np.concatenate(self.chart_series_x), "joint position (rad)"
 
