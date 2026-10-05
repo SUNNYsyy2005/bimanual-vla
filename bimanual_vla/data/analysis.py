@@ -22,6 +22,7 @@ from bimanual_vla.data.arm_geometry import (
 )
 from bimanual_vla.data.episode_analysis import compute_eef_trajectory
 from bimanual_vla.deployment.jitter import TrajectoryJitterMonitor, model_joint_positions
+from bimanual_vla.deployment.trajectory import suppress_local_joint_spikes
 
 
 DEFAULT_NAMES = tuple(
@@ -597,10 +598,85 @@ def trajectory_chunk_switch_times(
     sent_switches = data.timestamps[sent_rows] - origin
     return np.asarray(model_switches), np.asarray(sent_switches)
 
+def _analysis_spike_horizon_steps(
+    data: AnalysisData, record: dict[str, Any]
+) -> int:
+    """Return the recorded RTC execution horizon used by spike suppression."""
+    candidates = (
+        record.get("execution_control"),
+        record.get("_client_transport_timing"),
+        record.get("transport_timing"),
+        data.metadata,
+    )
+    for source in candidates:
+        if not isinstance(source, dict):
+            continue
+        for key in (
+            "rtc_execution_horizon",
+            "execution_horizon",
+            "client_execution_horizon",
+        ):
+            try:
+                value = int(source.get(key))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if value > 0:
+                return value
+    return 8
+
+
+def _analysis_skipped_prefix(record: dict[str, Any]) -> int:
+    """Recover the client prefix skip when it was recorded; otherwise use zero."""
+    candidates = (
+        record.get("_client_transport_timing"),
+        record.get("transport_timing"),
+        record.get("execution_control"),
+    )
+    for source in candidates:
+        if not isinstance(source, dict):
+            continue
+        for key in (
+            "client_skipped_prefix",
+            "inference_skip_steps",
+            "skipped_prefix_steps",
+            "skip_prefix_steps",
+        ):
+            try:
+                value = int(source.get(key))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if value >= 0:
+                return value
+    return 0
+
+
+def _smoothed_model_chunk_joints(
+    data: AnalysisData,
+    record: dict[str, Any],
+    joints: np.ndarray,
+    action_hz: float,
+) -> np.ndarray:
+    """Replay the client short-horizon spike suppression for dashboard plots."""
+    values = np.asarray(joints, dtype=np.float64)
+    if values.ndim != 2 or not len(values) or not np.isfinite(values).all():
+        return values.copy()
+    skip = min(_analysis_skipped_prefix(record), len(values))
+    if len(values) - skip < 5:
+        return values.copy()
+    output = values.copy()
+    output[skip:] = suppress_local_joint_spikes(
+        output[skip:].astype(np.float32),
+        action_hz=float(action_hz),
+        horizon_steps=_analysis_spike_horizon_steps(data, record),
+        joint_indices=range(output.shape[1]),
+    ).astype(np.float64)
+    return output
+
+
 
 def policy_trajectory_series(
     data: AnalysisData, start_index: int, end_index: int, *,
-    order: int, joint_index: int | None = None,
+    order: int, joint_index: int | None = None, smoothed: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return times, current forecast, superseded forecast and switch times.
 
@@ -642,6 +718,8 @@ def policy_trajectory_series(
             continue
         joints = _model_chunk_joints(data, record)
         if joints is not None:
+            if smoothed:
+                joints = _smoothed_model_chunk_joints(data, record, joints, hz)
             records.append((arrived, generation, hz, joints))
     records.sort(key=lambda item: item[0])
 

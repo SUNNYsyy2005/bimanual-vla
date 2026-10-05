@@ -14,6 +14,7 @@ from bimanual_vla.data.analysis import (
     compute_end_effector_positions,
     end_effector_source_context,
     load_analysis_data,
+    policy_trajectory_series,
     scan_analysis_sources,
     selection_indices,
     sent_chunk_switch_indices,
@@ -108,7 +109,10 @@ class DataProcessAnalysisTest(unittest.TestCase):
             )
             chart_series, chart_x, unit = DataProcessPanel._make_series(panel, 0, 10)
             self.assertEqual(unit, "rad/s")
-            self.assertEqual([item[0] for item in chart_series], ["Policy output", "Command sent"])
+            self.assertEqual(
+                [item[0] for item in chart_series],
+                ["Policy output", "Smoothed policy", "Command sent"],
+            )
             np.testing.assert_allclose(panel.chart_markers[0][1], [.25])
             np.testing.assert_allclose(panel.chart_markers[1][1], [.2])
             self.assertEqual(len(chart_series[0][1]), len(panel.chart_series_x[0]))
@@ -116,7 +120,11 @@ class DataProcessAnalysisTest(unittest.TestCase):
             self.assertEqual(len(chart_x), sum(map(len, panel.chart_series_x)))
             np.testing.assert_allclose(chart_series[0][1][np.isfinite(chart_series[0][1])],
                                        model_norm[np.isfinite(model_norm)])
-            np.testing.assert_allclose(chart_series[1][1][np.isfinite(chart_series[1][1])],
+            np.testing.assert_allclose(
+                chart_series[1][1][np.isfinite(chart_series[1][1])],
+                chart_series[0][1][np.isfinite(chart_series[0][1])],
+            )
+            np.testing.assert_allclose(chart_series[2][1][np.isfinite(chart_series[2][1])],
                                        sent_velocity[np.isfinite(sent_velocity)])
 
             class Canvas:
@@ -170,7 +178,7 @@ class DataProcessAnalysisTest(unittest.TestCase):
             np.testing.assert_allclose(panel.chart_markers[0][1], [.25])
             np.testing.assert_allclose(panel.chart_markers[1][1], [.2])
             self.assertEqual(panel.chart_y_label, "rad/s²")
-            self.assertEqual(len(panel.chart_series), 2)
+            self.assertEqual(len(panel.chart_series), 3)
 
             groups = available_plot_groups(data)
             self.assertEqual(groups["Trajectory"], ("Position", "Velocity", "Acceleration", "Tracking error"))
@@ -181,6 +189,7 @@ class DataProcessAnalysisTest(unittest.TestCase):
             positions_series, positions_x, positions_unit = DataProcessPanel._make_series(panel, 0, 10)
             self.assertEqual([name for name, *_ in positions_series[:2]], ["Measured", "Recorded target"])
             self.assertIn("Policy output", [name for name, *_ in positions_series])
+            self.assertIn("Smoothed policy", [name for name, *_ in positions_series])
             self.assertEqual([item[0] for item in panel.chart_markers], ["New prediction", "Sent chunk switch"])
             panel.chart_series, panel.chart_x, panel.chart_y_label = positions_series, positions_x, positions_unit
             canvas.dashed.clear()
@@ -199,6 +208,55 @@ class DataProcessAnalysisTest(unittest.TestCase):
             panel.eef_yaw, panel.eef_pitch, panel.eef_zoom = 0, .45, 1
             DataProcessPanel._draw_chart(panel)
             self.assertEqual(sum(bool(kwargs.get("dash")) for _coords, kwargs in canvas.ovals), 1)
+
+    def test_smoothed_policy_curve_reduces_short_horizon_acceleration_spike(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            chunks = root / "model_commands"
+            chunks.mkdir(parents=True)
+            timestamps = 100.0 + np.arange(8) * 0.05
+            np.savez(
+                root / "trajectory.npz",
+                timestamp=timestamps,
+                qpos=np.zeros((8, 7)),
+                command_action=np.zeros((8, 7)),
+                command_sent=np.ones(8, dtype=bool),
+                command_hold=np.zeros(8, dtype=bool),
+                command_generation=np.ones(8, dtype=np.int64),
+                command_queue_index=np.arange(8),
+                command_joints_rad=np.zeros((8, 6)),
+                command_monotonic_timestamp=20.0 + np.arange(8) * 0.05,
+            )
+            (root / "metadata.json").write_text(
+                json.dumps({"control_hz": 20, "rtc_execution_horizon": 8}),
+                encoding="utf-8",
+            )
+            actions = np.zeros((8, 7), dtype=np.float32)
+            actions[:, 0] = np.arange(8, dtype=np.float32) * 0.01
+            actions[3, 0] += 0.025
+            filename = "model_commands/1.npz"
+            np.savez(root / filename, raw_actions=actions)
+            (root / "model_commands.jsonl").write_text(
+                json.dumps({
+                    "accepted": True,
+                    "generation": 1,
+                    "arrived_at": 100.0,
+                    "captured_at": 99.95,
+                    "action_file": filename,
+                    "protocol": {"schema": "joint", "arm_mode": "single", "action_hz": 20},
+                }),
+                encoding="utf-8",
+            )
+            data = load_analysis_data(root)
+            _, raw_accel, _, _ = policy_trajectory_series(
+                data, 0, 7, order=2, joint_index=0,
+            )
+            _, smooth_accel, _, _ = policy_trajectory_series(
+                data, 0, 7, order=2, joint_index=0, smoothed=True,
+            )
+            raw_peak = np.nanmax(np.abs(raw_accel))
+            smooth_peak = np.nanmax(np.abs(smooth_accel))
+            self.assertLess(smooth_peak, raw_peak)
 
     def test_loads_episode_and_computes_selection_metrics(self):
         with TemporaryDirectory() as tmp:
