@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from bimanual_vla.deployment.jitter import TrajectoryJitterMonitor
+from bimanual_vla.deployment.jitter import TrajectoryJitterMonitor, model_joint_positions
 
 
 LOGGER = logging.getLogger(__name__)
@@ -130,6 +130,11 @@ class DeploymentRunRecorder:
         self._jitter_file: Any | None = None
         self._jitter_monitor: TrajectoryJitterMonitor | None = None
         self._jitter_snapshot: dict[str, Any] | None = None
+        self._model_jitter_monitor: TrajectoryJitterMonitor | None = None
+        self._model_jitter_snapshot: dict[str, Any] | None = None
+        self._model_jitter_tick = 0
+        self._last_model_jitter_timestamp: float | None = None
+        self._last_sent_jitter_timestamp: float | None = None
         self._video_writers: dict[str, Any] = {}
         self._video_paths: dict[str, Path] = {}
         self._video_frame_fallback_dirs: dict[str, Path] = {}
@@ -195,6 +200,11 @@ class DeploymentRunRecorder:
             float(self._metadata.get("control_hz", 20.0))
         )
         self._jitter_snapshot = self._jitter_monitor.summary()
+        self._model_jitter_monitor = None
+        self._model_jitter_snapshot = None
+        self._model_jitter_tick = 0
+        self._last_model_jitter_timestamp = None
+        self._last_sent_jitter_timestamp = None
         self._queue = Queue(maxsize=self.queue_size)
         self._video_queue = Queue(maxsize=min(64, max(8, self.queue_size // 64)))
         self._closed = False
@@ -224,6 +234,12 @@ class DeploymentRunRecorder:
     def jitter_snapshot(self) -> dict[str, Any] | None:
         """Latest complete worker snapshot; reading it never waits for disk I/O."""
         snapshot = self._jitter_snapshot
+        return None if snapshot is None else dict(snapshot)
+
+    @property
+    def model_jitter_snapshot(self) -> dict[str, Any] | None:
+        """Latest raw-model chunk metrics, including during shadow inference."""
+        snapshot = self._model_jitter_snapshot
         return None if snapshot is None else dict(snapshot)
 
     def record_control_tick(
@@ -435,7 +451,13 @@ class DeploymentRunRecorder:
         if self._worker is not None and not self._worker.is_alive() and self._jitter_monitor is not None:
             final_chunk = self._jitter_monitor.finish()
             if final_chunk is not None and self._jitter_file is not None:
+                final_chunk.update(stream="command_sent", timestamp=self._last_sent_jitter_timestamp)
                 self._jitter_file.write(json.dumps(final_chunk, ensure_ascii=False) + "\n")
+        if self._worker is not None and not self._worker.is_alive() and self._model_jitter_monitor is not None:
+            final_model_chunk = self._model_jitter_monitor.finish()
+            if final_model_chunk is not None and self._jitter_file is not None:
+                final_model_chunk.update(stream="model_raw", timestamp=self._last_model_jitter_timestamp)
+                self._jitter_file.write(json.dumps(final_model_chunk, ensure_ascii=False) + "\n")
         for writer in self._video_writers.values():
             try:
                 writer.release()
@@ -454,6 +476,7 @@ class DeploymentRunRecorder:
                 "video_cameras": sorted(self._video_paths),
                 "video_fallback_cameras": sorted(self._video_frame_fallback_dirs),
                 "trajectory_jitter": self.jitter_snapshot,
+                "model_trajectory_jitter": self.model_jitter_snapshot,
             }
         )
         self._write_metadata()
@@ -630,6 +653,7 @@ class DeploymentRunRecorder:
                 elif kind == "trajectory_chunk":
                     self._write_trajectory_chunk(event[1])
                 elif kind == "model":
+                    self._observe_model_jitter(event[1], event[2])
                     self._write_model(event[1], event[2])
                 elif kind == "metadata":
                     self._metadata.update(_json_safe(event[1]))
@@ -683,7 +707,57 @@ class DeploymentRunRecorder:
         self._jitter_snapshot = monitor.summary()
         if self._jitter_file is not None:
             for event in events:
+                event_timestamp = (
+                    self._last_sent_jitter_timestamp
+                    if event["event"] == "chunk_completed" and self._last_sent_jitter_timestamp is not None
+                    else float(row["timestamp"])
+                )
+                event.update(stream="command_sent", timestamp=event_timestamp)
                 self._jitter_file.write(json.dumps(event, ensure_ascii=False) + "\n")
+        if valid:
+            self._last_sent_jitter_timestamp = float(row["timestamp"])
+
+    def _observe_model_jitter(
+        self, payload: Mapping[str, Any], arrays: Mapping[str, np.ndarray]
+    ) -> None:
+        """Measure accepted absolute joint chunks on the recorder worker."""
+        if payload.get("accepted") is not True:
+            return
+        protocol = payload.get("protocol") or {}
+        joints_chunk = model_joint_positions(
+            arrays.get("raw_actions"),
+            schema=str(protocol.get("schema") or ""),
+            arm_mode=str(protocol.get("arm_mode") or ""),
+        )
+        if joints_chunk is None:
+            return
+        if self._model_jitter_monitor is None:
+            action_hz = float(protocol.get("action_hz") or self._metadata.get("control_hz", 20.0))
+            self._model_jitter_monitor = TrajectoryJitterMonitor(
+                action_hz, basis="accepted_raw_model_full_horizon_joint_targets_excluding_gripper"
+            )
+        monitor = self._model_jitter_monitor
+        captured_at = float(payload["captured_at"])
+        generation = int(payload["generation"])
+        for index, joints in enumerate(joints_chunk):
+            self._model_jitter_tick += 1
+            events = monitor.observe(
+                joints_rad=joints,
+                generation=generation,
+                queue_index=index,
+                command_at=self._model_jitter_tick / monitor.control_hz,
+            )
+            if self._jitter_file is not None:
+                for event in events:
+                    event_timestamp = (
+                        self._last_model_jitter_timestamp
+                        if event["event"] == "chunk_completed" and self._last_model_jitter_timestamp is not None
+                        else captured_at
+                    )
+                    event.update(stream="model_raw", timestamp=event_timestamp)
+                    self._jitter_file.write(json.dumps(event, ensure_ascii=False) + "\n")
+        self._last_model_jitter_timestamp = captured_at
+        self._model_jitter_snapshot = monitor.summary()
 
     def _write_model(self, payload: dict[str, Any], arrays: dict[str, np.ndarray]) -> None:
         if self.run_dir is None or self._model_file is None:

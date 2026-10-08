@@ -17,7 +17,7 @@
 默认只读反馈、采集相机并请求 Policy，不向机械臂发送动作：
 
 ```bash
-cd /home/user/dual_ARM_project/arm_collect/bimanual-vla
+cd /path/to/bimanual-vla
 bin/bimanual-vla rtc-client \
   --host 192.168.101.9 \
   --port 8000 \
@@ -41,6 +41,15 @@ bin/bimanual-vla rtc-client \
 - `--rtc-prefix-attention-schedule linear`：可选 `zeros`、`ones`、`linear`、`exp`；
 - `--rtc-client-blend-steps 0`：默认关闭额外的客户端 old/new blend，避免把延迟重新加回来；
 - `--no-rtc-enabled`：显式关闭客户端 RTC 协议。服务端也必须发布 `rtc_enabled=false` 才会完全关闭。
+
+## 推理图像预缩放
+
+GUI 的 **Devices → Pre-resize policy images to 224 px** 对应
+`--preresize-policy-images`，默认关闭。启用后，相机后台线程仍先生成并记录
+256×256 图像，再按服务端 OpenPI 使用的 PIL 双线性算法生成独立的 224×224
+策略图像；服务端收到 224×224 后跳过重复缩放。录像与本地预览继续使用原图。
+这个选项需要重新启动推理客户端才能生效。比较性能时同时检查模型耗时、
+端到端延迟和相机帧龄；服务端模型耗时下降不等于整体观察到动作的延迟必然下降。
 
 ## 实际执行模式
 
@@ -97,11 +106,55 @@ telemetry 断开或任一逐周期安全检查失败时，客户端只会保持�
 `trajectory.npz` 的 `command_joints_rad` 和 `command_monotonic_timestamp`。
 使用 `--no-recording` 时不生成这些抖动统计。
 
+客户端 **Data Process** 页按 **Trajectory / Chunk boundaries / Timing / End effector**
+分组选择图表。Position 显示单个关节的测量值和录制目标，部署记录还叠加原始模型预测；
+Velocity 和 Acceleration 分别叠加模型输出与实际下发曲线；Tracking error 显示目标与测量值之差。
+Chunk boundaries 保留位置跳变和速度方向两张边界图；chunk 内平均加速度仍在指标表中，
+无需再用每个 chunk 的平均值曲线重复展示。Timing 收纳推理延迟和
+控制间隔。End effector 的 **3D trajectory** 参考 Dashboard 的数据集末端位姿视图：
+显示所选时间范围内的左右臂空间轨迹、末端最新点、基座和世界坐标轴；拖拽旋转、滚轮缩放，
+可选单臂或双臂并重置视角。10D/20D 录制末端状态直接使用 XYZ，关节状态通过 FK 计算。
+旧部署记录若省略机器人类型，会按实机 Piper 解释右臂坐标轴；缺少双臂基座偏移时，
+左右轨迹分屏显示在各自对齐的坐标系里，不用虚构的共同基座位置叠画。
+Episode 来源只提供有记录数据的视图。
+
+两套 chunk 指标分别是：
+
+- **Policy output**：统计客户端收到且已接受的完整、等间隔绝对关节目标 chunk（即服务端输出变换后的 `actions`）；边界使用上一预测的最后一行与下一预测的第一行。它可在关闭动作执行的影子推理中记录，但完整 horizon 的边界不代表机器人实际切换点。
+- **Command sent**：统计通过安全检查、轨迹整形后实际下发的关节命令；边界使用真实发送顺序。关闭动作执行时该列为空。两列均排除单位不同的夹爪维度；非 joint schema 不计算这些关节指标。
+
+两套逐 chunk/边界事件写入同一个 `trajectory_jitter.jsonl`，通过 `stream` 区分；`metadata.json` 分别保存 `model_trajectory_jitter` 和 `trajectory_jitter` 汇总。Data Process 也可从旧运行记录保存的模型 NPZ 和命令轨迹补算两套指标。
+
+Data Process 的 **Velocity** 和 **Acceleration** 两张图均叠加 **Policy output**
+与 **Command sent** 曲线，展示逐关节或关节向量 L2 范数，单位分别为 `rad/s`、`rad/s²`；
+`Signal` 可切换具体关节。蓝色竖向虚线表示新预测到达，橙色竖向虚线表示实际下发命令
+切换 generation。这两种分隔线也显示在 Position 和 Tracking error 图上；
+3D 末端轨迹以黄色虚线圆圈标出实际下发 chunk 的切换点。
+模型曲线以预测到达时刻为起点，按该预测的 `action_hz` 展开完整 horizon。多次预测
+覆盖相同未来时间时，较新的预测用实线，较早预测被后续结果覆盖的部分仍保留并改用浅蓝虚线；
+这表示模型对同一时刻的不同预测，不代表机器人同时执行多个速度。位置图也显示这些预测，
+所以可以直接对照实测、记录目标和各代模型输出。模型预测曲线不是机器人的实际执行轨迹。
+Sent 曲线按实际命令时间戳求导，hold、漏发/跳步、不规则控制间隔以及 chunk 边界均断线，
+不会把这些间隔的变化误算为 chunk 内加速度。两张图均只使用弧度制关节目标，
+排除夹爪；影子推理仅显示 Policy 曲线。逐行 Action delta 不具备上述边界和时间戳语义，
+因此不再作为独立曲线入口。
+
 - **Mean intra-chunk acceleration magnitude**：同一 chunk 内，连续且接近固定控制周期的已下发关节命令，其二阶差分 L2 范数的均值，单位 `rad/step²`。跳步、未下发命令和保持命令不参与计算；此指标只在固定采样频率下有意义。
 - **Position jump at chunk boundary**：上一 chunk 最后一条实际下发关节命令与下一 chunk 第一条之间的位置 L2 距离均值，单位 `rad`。
 - **Cosine similarity of velocity direction at chunk boundary**：用上一 chunk 最后两个连续命令及下一 chunk 最前两个连续命令计算方向余弦均值。存在保持、漏周期或零速度时，该边界不纳入余弦均值；Dashboard 同时显示有效样本数。
 
 监控 JSONL 写盘、运行记录与视频编码均在后台线程执行；GUI 控制台日志通过有界队列输出，队列满时丢弃控制台日志以保护控制周期。日志不通过动作 WebSocket 传输。Dashboard 图像预览最多每秒更新一次，浏览器只在新图像序号出现时重新下载。
+
+GUI 左侧 **Policy and task → Policy request diagnostics** 的开关对应客户端的
+`--send-policy-telemetry` / `--no-send-policy-telemetry`（默认开启）。关闭后，
+客户端不再为主推理请求构造执行队列、设备、相机时间戳及 jitter 等详细诊断字段；
+模型状态、相机图像、RTC、会话标识、请求时间戳和本地执行授权仍会发送。
+本地异步监控与录制继续工作，但 Dashboard 的客户端执行细节可能显示为未知。
+每次切换都需重新启动推理客户端；可在相同策略、相机及请求频率下，对比
+`monitoring_data/<session>/events.jsonl` 中 `inference_result.execution`
+的 `observation_upload_ms`、`round_trip_ms` 和 `model_inference_ms`。
+`observation_upload_ms` 包含客户端打包、上行传输及服务端接收解包时间，
+并依赖两台机器的时钟同步；`round_trip_ms` 使用客户端单机单调时钟。
 
 ### 重要约束
 

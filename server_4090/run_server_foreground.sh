@@ -3,7 +3,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${1:-$SCRIPT_DIR/config.json}"
-PYTHON_DEFAULT="${BIMANUAL_VLA_BOOTSTRAP_PYTHON:-/home/sunny/miniconda3/envs/openpi/bin/python}"
+if [[ -n "${BIMANUAL_VLA_BOOTSTRAP_PYTHON:-}" ]]; then
+  PYTHON_DEFAULT="$BIMANUAL_VLA_BOOTSTRAP_PYTHON"
+elif [[ -n "${CONDA_PREFIX:-}" && -x "$CONDA_PREFIX/bin/python" ]]; then
+  PYTHON_DEFAULT="$CONDA_PREFIX/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_DEFAULT="$(command -v python3)"
+else
+  echo "Set BIMANUAL_VLA_BOOTSTRAP_PYTHON or activate a Python environment." >&2
+  exit 1
+fi
 TOKEN_DIR="${BIMANUAL_VLA_TOKEN_DIR:-${HOME}/.config/bimanual-vla}"
 TOKEN_FILE="${TOKEN_DIR}/server.env"
 STATE_DIR="${BIMANUAL_VLA_STATE_DIR:-${HOME}/.local/share/bimanual-vla-server}"
@@ -25,7 +34,7 @@ fi
 
 if [[ ! -f "$TOKEN_FILE" ]]; then
   TOKEN="$($PYTHON_DEFAULT -c 'import secrets; print(secrets.token_urlsafe(36))')"
-  LOGIN_USER="${BIMANUAL_VLA_LOGIN_USER:-${USER:-sunny}}"
+  LOGIN_USER="${BIMANUAL_VLA_LOGIN_USER:-${USER:-$(id -un)}}"
   LOGIN_PASSWORD="${BIMANUAL_VLA_LOGIN_PASSWORD:-$($PYTHON_DEFAULT -c 'import secrets; print(secrets.token_urlsafe(24))')}"
   {
     printf 'export BIMANUAL_VLA_SERVER_TOKEN=%q\n' "$TOKEN"
@@ -47,7 +56,7 @@ if [[ -z "${BIMANUAL_VLA_SERVER_TOKEN:-}" ]]; then
   exit 1
 fi
 if [[ -z "${BIMANUAL_VLA_LOGIN_USER:-}" ]]; then
-  export BIMANUAL_VLA_LOGIN_USER="${USER:-sunny}"
+  export BIMANUAL_VLA_LOGIN_USER="${USER:-$(id -un)}"
   printf 'export BIMANUAL_VLA_LOGIN_USER=%q\n' "$BIMANUAL_VLA_LOGIN_USER" >> "$TOKEN_FILE"
 fi
 if [[ -z "${BIMANUAL_VLA_LOGIN_PASSWORD:-}" ]]; then
@@ -58,10 +67,12 @@ chmod 600 "$TOKEN_FILE"
 
 PYTHON="$($PYTHON_DEFAULT - "$CONFIG" <<'PY'
 import json
+import os
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
-    print(json.load(handle)["openpi_python"])
+    value = json.load(handle)["openpi_python"]
+print(os.path.expandvars(os.path.expanduser(str(value))))
 PY
 )"
 if [[ ! -x "$PYTHON" ]]; then

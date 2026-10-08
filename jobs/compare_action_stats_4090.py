@@ -13,7 +13,9 @@ from typing import Any
 import importlib.util
 
 REPO_ROOT = Path(os.environ.get('BIMANUAL_VLA_REPO', Path(__file__).resolve().parents[1])).expanduser().resolve()
-PROJECT = Path(os.environ.get('ROBOTWIN_PROJECT', '/home/sunny/robotwin_ws/RoboTwin')).expanduser().resolve()
+PROJECT = Path(
+    os.environ.get('ROBOTWIN_PROJECT', REPO_ROOT.parent / 'RoboTwin')
+).expanduser().resolve()
 HELPER_DIR = REPO_ROOT / 'server_4090'
 sys.path[:0] = [
     str(HELPER_DIR),

@@ -122,6 +122,100 @@ def _load_openpi_helper():
 HELPER = _load_openpi_helper()
 
 
+class PolicyWarmupTest(unittest.TestCase):
+    def test_warmup_runs_inference_with_contract_shaped_synthetic_observation(self):
+        class FakePolicy:
+            def __init__(self):
+                self.observation = None
+                self.reset_called = False
+
+            def infer(self, observation):
+                self.observation = observation
+                return {"actions": np.zeros((50, 14), dtype=np.float32)}
+
+            def reset(self):
+                self.reset_called = True
+
+        policy = FakePolicy()
+        HELPER.warmup_policy(policy, {
+            "state_dim": 14,
+            "action_dim": 14,
+            "camera_keys": ["cam_high", "cam_left_wrist", "cam_right_wrist"],
+        }, "pick up")
+        self.assertEqual(policy.observation["state"].shape, (14,))
+        self.assertEqual(set(policy.observation["images"]),
+                         {"cam_high", "cam_left_wrist", "cam_right_wrist"})
+        self.assertEqual(policy.observation["prompt"], "pick up")
+        self.assertTrue(policy.reset_called)
+
+    def test_warmup_compiles_guided_rtc_path_before_reset(self):
+        class FakeRTCPolicy:
+            def __init__(self):
+                self.requests = []
+                self.reset_called = False
+
+            def infer(self, observation):
+                rtc = observation["client_metadata"]["rtc"]
+                self.requests.append(dict(rtc))
+                guided = rtc.get("previous_chunk_generation") == 1
+                return {
+                    "actions": np.zeros((50, 14), dtype=np.float32),
+                    "rtc": {"enabled": guided},
+                }
+
+            def reset(self):
+                self.reset_called = True
+
+        policy = FakeRTCPolicy()
+        HELPER.warmup_policy(policy, {
+            "state_dim": 14,
+            "action_dim": 14,
+            "camera_keys": ["cam_high", "cam_left_wrist", "cam_right_wrist"],
+            "rtc_supported": True,
+        }, "pick up")
+        self.assertEqual(len(policy.requests), 2)
+        self.assertTrue(policy.requests[0]["config"]["enabled"])
+        self.assertEqual(policy.requests[1]["previous_chunk_generation"], 1)
+        self.assertTrue(policy.reset_called)
+
+
+class InferenceDiagnosticsTransportTest(unittest.TestCase):
+    def test_phase_timing_reaches_existing_transport_log_field(self):
+        class FakePolicy:
+            def infer(self, observation):
+                return {
+                    "actions": np.zeros((2, 7), dtype=np.float32),
+                    "rtc": {"denoising_steps": 5},
+                    "model_phase_timing": {"sampler_wall_ms": 42.0},
+                }
+
+        class FakeTelemetry:
+            metadata = {
+                "inference_diagnostics_enabled": True,
+                "policy_instance_id": "test-instance",
+                "policy_instance_started_at": 123.0,
+            }
+
+            def inference_started(self):
+                pass
+
+            def inference_finished(self):
+                pass
+
+            def enqueue_publish(self, observation, result, elapsed_s):
+                return True
+
+        result = HELPER.TelemetryPolicy(FakePolicy(), FakeTelemetry()).infer(
+            {"client_metadata": {"inference_generation": 3}}
+        )
+        self.assertNotIn("model_phase_timing", result)
+        self.assertEqual(result["transport_timing"]["policy_instance_id"], "test-instance")
+        self.assertEqual(
+            result["transport_timing"]["model_phase_timing"]["sampler_wall_ms"],
+            42.0,
+        )
+
+
 def _rotation6d(matrix: np.ndarray) -> np.ndarray:
     return np.concatenate((matrix[:, 0], matrix[:, 1])).astype(np.float32)
 

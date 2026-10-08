@@ -171,8 +171,9 @@
 ## 测试命令
 
 ```bash
-cd /home/user/project/bimanual-vla
-source /home/user/miniconda3/bin/activate dual_arm
+cd /path/to/bimanual-vla
+# 可选：激活已安装项目依赖的 Python 环境
+conda activate <your-environment>
 python test_policy_simple.py
 ```
 

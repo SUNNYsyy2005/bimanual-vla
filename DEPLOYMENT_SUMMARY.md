@@ -9,13 +9,13 @@
 ## 已完成的配置
 
 ### 1. 基础环境
-- ✅ Miniconda 安装在 `/home/user/miniconda3`
+- ✅ 已配置 Conda Python 环境 `dual_arm`
 - ✅ Python 3.10.20 conda环境 `dual_arm` 已创建
 - ✅ 所有依赖包已安装（requirements.txt）
 - ✅ 依赖完整性检查通过
 
 ### 2. 项目设置
-- ✅ 仓库克隆到 `/home/user/project/bimanual-vla`
+- ✅ 仓库已克隆并完成 CLI 初始化
 - ✅ CLI工具验证通过 (`bin/bimanual-vla --help`)
 - ✅ 关键Python模块导入测试通过
 
@@ -33,11 +33,12 @@
 ## 环境激活方式
 
 ```bash
-# 激活conda环境
-source /home/user/miniconda3/bin/activate dual_arm
+# 初始化并激活 Conda 环境
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate dual_arm
 
 # 进入项目目录
-cd /home/user/project/bimanual-vla
+cd /path/to/bimanual-vla
 
 # 测试CLI
 bin/bimanual-vla --help
@@ -64,25 +65,25 @@ ssh h200-ali-02
 
 ### 4x4090
 - IP: 192.168.101.9
-- 用户: sunny
+- 用户: `<configured account>`
 - 认证: SSH密钥（已配置）
 - 反向连接: ✅ 已配置
 
 ### login-server
 - IP: 36.103.167.186
-- 用户: sunny
+- 用户: `<configured account>`
 - 认证: SSH密钥（已配置）
 - 反向连接: ⚠️ 网络超时（可能需要进一步调试）
 
 ### H100-ksy-01
 - 通过: login-server跳板
-- 用户: sunny
+- 用户: `<configured account>`
 - 认证: 继承login-server密钥
 
 ### H200节点
 - h200-ali-01: 47.116.14.100
 - h200-ali-02: 120.55.15.209
-- 用户: sunny
+- 用户: `<configured account>`
 - 认证: 密码认证（非密钥）
 
 ## 下一步建议
@@ -122,11 +123,12 @@ ssh h200-ali-02
 
 ```bash
 # 验证Python环境
-source /home/user/miniconda3/bin/activate dual_arm
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate dual_arm
 python -c "import cv2, flask, numpy, pandas, pyarrow, scipy; from PIL import Image; from openpi_client import websocket_client_policy; from piper_sdk import C_PiperInterface_V2; print('所有依赖OK')"
 
 # 运行测试
-cd /home/user/project/bimanual-vla
+cd /path/to/bimanual-vla
 python -m unittest discover -s tests -v
 
 # 测试SSH连接

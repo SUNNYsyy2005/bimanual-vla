@@ -10,10 +10,10 @@
 
 ### 1. 官方piper_sdk仓库克隆
 - **仓库地址**: https://github.com/agilexrobotics/piper_sdk.git
-- **本地路径**: `/home/user/dual_ARM_project/piper_sdk`
-- **集成方式**: 通过软链接集成到bimanual-vla项目
+- **SDK 来源**: https://github.com/agilexrobotics/piper_sdk.git
+- **集成方式**: SDK 可检出到仓库内 `piper_sdk`，也可放在仓库外并通过环境变量指定
   ```
-  /home/user/project/bimanual-vla/piper_sdk -> /home/user/dual_ARM_project/piper_sdk
+  <仓库根目录>/piper_sdk -> <PIPER_SDK_ROOT>
   ```
 
 ### 2. 系统依赖安装
@@ -25,7 +25,8 @@
 
 #### 主要脚本
 - **can_activate.sh** - 单CAN口激活（已集成到GUI）
-  - 路径: `/home/user/dual_ARM_project/piper_sdk/piper_sdk/can_activate.sh`
+  - 默认路径: `<仓库根目录>/piper_sdk/piper_sdk/can_activate.sh`
+  - 外部 SDK 路径: 设置 `BIMANUAL_VLA_CAN_ACTIVATE_SCRIPT`
   - 功能: 激活单个CAN接口，自动检测USB地址
   - 用法: `sudo bash can_activate.sh <interface_name> <bitrate> [usb_address]`
 
@@ -48,17 +49,24 @@
 ### 4. 与bimanual-vla的集成
 
 #### GUI中的路径配置
-文件: `/home/user/project/bimanual-vla/bimanual_vla/collection/gui.py`
+文件: `bimanual_vla/collection/gui.py`
 ```python
-CAN_ACTIVATE_SCRIPT = pathlib.Path(
-    "/home/user/dual_ARM_project/piper_sdk/piper_sdk/can_activate.sh"
+_can_helper_config = pathlib.Path(
+    os.environ.get(
+        "BIMANUAL_VLA_CAN_ACTIVATE_SCRIPT",
+        str(PROJECT_ROOT / "piper_sdk" / "piper_sdk" / "can_activate.sh"),
+    )
+).expanduser()
+CAN_ACTIVATE_SCRIPT = (
+    _can_helper_config if _can_helper_config.is_absolute()
+    else (PROJECT_ROOT / _can_helper_config).resolve()
 )
 ```
 
-#### 启动脚本中的配置
-文件: `/home/user/project/bimanual-vla/start_gui.sh`
+#### 通过环境变量指定外部 SDK
 ```bash
-PIPER_CAN_HELPER="/home/user/dual_ARM_project/piper_sdk/piper_sdk/can_activate.sh"
+export BIMANUAL_VLA_CAN_ACTIVATE_SCRIPT="${PIPER_SDK_ROOT}/piper_sdk/can_activate.sh"
+bash start_gui.sh
 ```
 
 ### 5. Python SDK
@@ -76,21 +84,24 @@ piper_sdk还包含Python API（已通过pip安装）：
 
 ### 单臂CAN激活（命令行）
 ```bash
+PIPER_SDK_ROOT=/path/to/piper_sdk
+export BIMANUAL_VLA_CAN_ACTIVATE_SCRIPT="${PIPER_SDK_ROOT}/piper_sdk/can_activate.sh"
+
 # 自动检测（只有一个CAN设备时）
-sudo bash /home/user/dual_ARM_project/piper_sdk/piper_sdk/can_activate.sh can0 1000000
+sudo bash "${PIPER_SDK_ROOT}/piper_sdk/can_activate.sh" can0 1000000
 
 # 指定USB地址（多个CAN设备时）
-sudo bash /home/user/dual_ARM_project/piper_sdk/piper_sdk/can_activate.sh can0 1000000 1-2:1.0
+sudo bash "${PIPER_SDK_ROOT}/piper_sdk/can_activate.sh" can0 1000000 1-2:1.0
 ```
 
 ### 双臂CAN激活（命令行）
 ```bash
-sudo bash /home/user/dual_ARM_project/piper_sdk/piper_sdk/can_muti_activate.sh
+sudo bash "${PIPER_SDK_ROOT}/piper_sdk/can_muti_activate.sh"
 ```
 
 ### 查找所有CAN端口
 ```bash
-bash /home/user/dual_ARM_project/piper_sdk/piper_sdk/find_all_can_port.sh
+bash "${PIPER_SDK_ROOT}/piper_sdk/find_all_can_port.sh"
 ```
 
 ### 在GUI中使用
@@ -103,9 +114,9 @@ bash /home/user/dual_ARM_project/piper_sdk/piper_sdk/find_all_can_port.sh
 ## 目录结构
 
 ```
-/home/user/
-├── dual_ARM_project/
-│   └── piper_sdk/                    # 官方仓库
+<工作目录>/
+├── piper_sdk/                        # 可选：指向官方仓库的软链接
+│   └── piper_sdk/
 │       ├── piper_sdk/
 │       │   ├── __init__.py
 │       │   ├── can_activate.sh       ✓ CAN激活脚本
@@ -118,7 +129,7 @@ bash /home/user/dual_ARM_project/piper_sdk/piper_sdk/find_all_can_port.sh
 │
 └── project/
     └── bimanual-vla/
-        ├── piper_sdk -> /home/user/dual_ARM_project/piper_sdk  # 软链接
+        ├── piper_sdk -> <PIPER_SDK_ROOT>  # 可选软链接
         ├── bimanual_vla/
         │   └── collection/
         │       └── gui.py            # 使用CAN_ACTIVATE_SCRIPT
@@ -128,7 +139,7 @@ bash /home/user/dual_ARM_project/piper_sdk/piper_sdk/find_all_can_port.sh
 ## 依赖关系
 
 ### Python包（通过pip）
-- ✅ piper_sdk==0.6.1 (已安装在conda环境dual_arm中)
+- ✅ piper_sdk==0.6.1 (需安装在项目使用的Python环境中)
 - ✅ python-can==4.6.1
 
 ### 系统工具
@@ -158,7 +169,7 @@ dmesg | grep -i "gs_usb\|can"
 使用USB地址参数：
 ```bash
 # 先列出所有CAN端口及其USB地址
-bash /home/user/dual_ARM_project/piper_sdk/piper_sdk/find_all_can_port.sh
+bash "${PIPER_SDK_ROOT}/piper_sdk/find_all_can_port.sh"
 
 # 为每个CAN指定USB地址
 sudo bash can_activate.sh can0 1000000 1-2:1.0
@@ -190,7 +201,7 @@ sudo bash can_activate.sh can0 1000000
 
 ## 相关文档
 
-- piper_sdk官方文档: `/home/user/dual_ARM_project/piper_sdk/README.md`
+- piper_sdk官方文档: `${PIPER_SDK_ROOT}/README.md`
 - bimanual-vla安装指南: `docs/INSTALLATION.md`
 - GUI操作指南: `docs/collection/GUI_OPERATION_GUIDE.md`
 - GUI改进计划: `GUI_IMPROVEMENT_PLAN.md`

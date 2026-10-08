@@ -22,6 +22,7 @@ import signal
 import socket
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import threading
 import time
@@ -1409,6 +1410,11 @@ def normalize_ssh_host(value: Any) -> str:
     return str(value or "").strip()
 
 
+def expand_config_path(value: Any) -> str:
+    """Expand home and environment references in configurable filesystem paths."""
+    return os.path.expandvars(os.path.expanduser(str(value)))
+
+
 def load_config(path: Path) -> dict[str, Any]:
     config = read_json(path)
     if not isinstance(config, dict):
@@ -1434,6 +1440,7 @@ def load_config(path: Path) -> dict[str, Any]:
         # selected by each robot client and can change without restarting the
         # Policy process.
         "policy_rtc_enabled": True,
+        "policy_inference_diagnostics_enabled": True,
         "policy_rtc_max_execution_horizon": 8,
         "policy_rtc_max_guidance_weight": 5.0,
         "max_upload_gib": 500,
@@ -1458,8 +1465,8 @@ def load_config(path: Path) -> dict[str, Any]:
         "cluster_resources_script": str(REPO_DIR / "scripts" / "query_h100_h200_resources.sh"),
         "transfer_parallelism": 4,
         "auto_sync_cluster_dataset": True,
-        "nas_dataset_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync",
-        "nas_checkpoint_staging_root": "/DATA/NAS/GPUServer/sunny/dashboard_checkpoint_sync",
+        "nas_dataset_staging_root": str(Path.home() / "nas" / "dashboard_dataset_sync"),
+        "nas_checkpoint_staging_root": str(Path.home() / "nas" / "dashboard_checkpoint_sync"),
     }
     defaults.update(config)
     profile = str(defaults.get("dashboard_profile") or "real").lower()
@@ -1481,12 +1488,12 @@ def load_config(path: Path) -> dict[str, Any]:
         "checkpoint_base_dir",
         "base_checkpoint",
     ):
-        defaults[key] = str(Path(defaults[key]).expanduser().resolve())
+        defaults[key] = str(Path(expand_config_path(defaults[key])).resolve())
     raw_dataset_read_roots = defaults.get("dataset_read_roots", [])
     if isinstance(raw_dataset_read_roots, str):
         raw_dataset_read_roots = [raw_dataset_read_roots]
     dataset_read_roots = [
-        str(Path(item).expanduser().resolve())
+        str(Path(expand_config_path(item)).resolve())
         for item in raw_dataset_read_roots
         if str(item).strip()
     ]
@@ -1494,7 +1501,7 @@ def load_config(path: Path) -> dict[str, Any]:
         dataset_read_roots.insert(0, defaults["dataset_root"])
     defaults["dataset_read_roots"] = list(dict.fromkeys(dataset_read_roots))
     checkpoint_allowed_roots = [
-        str(Path(item).expanduser().resolve()) for item in defaults.get("checkpoint_allowed_roots", [])
+        str(Path(expand_config_path(item)).resolve()) for item in defaults.get("checkpoint_allowed_roots", [])
     ]
     # Keep configured paths usable after symlink resolution.  A common layout
     # keeps ~/.cache/openpi on one NVMe mount while pi05_base is a symlink to a
@@ -1505,15 +1512,15 @@ def load_config(path: Path) -> dict[str, Any]:
             checkpoint_allowed_roots.append(required_root)
     defaults["checkpoint_allowed_roots"] = checkpoint_allowed_roots
     defaults["eval_video_roots"] = [
-        str(Path(item).expanduser().resolve()) for item in defaults.get("eval_video_roots", [])
+        str(Path(expand_config_path(item)).resolve()) for item in defaults.get("eval_video_roots", [])
     ]
     defaults["cluster_resources_script"] = str(
-        Path(defaults["cluster_resources_script"]).expanduser().resolve()
+        Path(expand_config_path(defaults["cluster_resources_script"])).resolve()
     )
     if defaults.get("nas_dataset_staging_root"):
-        defaults["nas_dataset_staging_root"] = str(defaults["nas_dataset_staging_root"])
+        defaults["nas_dataset_staging_root"] = expand_config_path(defaults["nas_dataset_staging_root"])
     if defaults.get("nas_checkpoint_staging_root"):
-        defaults["nas_checkpoint_staging_root"] = str(defaults["nas_checkpoint_staging_root"])
+        defaults["nas_checkpoint_staging_root"] = expand_config_path(defaults["nas_checkpoint_staging_root"])
     try:
         defaults["transfer_parallelism"] = max(1, min(16, int(defaults.get("transfer_parallelism", 4))))
     except (TypeError, ValueError):
@@ -1525,7 +1532,7 @@ def load_config(path: Path) -> dict[str, Any]:
         item = dict(storage)
         for path_key in ("dataset_root", "checkpoint_base_dir"):
             if item.get(path_key):
-                item[path_key] = str(Path(item[path_key]).expanduser().resolve())
+                item[path_key] = str(Path(expand_config_path(item[path_key])).resolve())
         item["kind"] = str(item.get("kind") or "local_archive")
         item["available"] = bool(item.get("available", True))
         normalized_local_storage[str(name)] = item
@@ -1552,12 +1559,20 @@ def load_config(path: Path) -> dict[str, Any]:
             "inventory_cache_path",
             "inventory_source_path",
             "nas_dataset_staging_root",
+            "nas_checkpoint_staging_root",
+            "cache_root",
+            "log_dir",
+            "remote_job_dir",
+            "conda_sh",
         ):
             if item.get(path_key):
                 if path_key in {"eval_video_roots", "dataset_read_roots"} and isinstance(item[path_key], list):
-                    item[path_key] = [str(value) for value in item[path_key]]
+                    item[path_key] = [expand_config_path(value) for value in item[path_key]]
                 else:
-                    item[path_key] = str(item[path_key])
+                    item[path_key] = expand_config_path(item[path_key])
+        for path_key in ("openpi_python",):
+            if item.get(path_key):
+                item[path_key] = expand_config_path(item[path_key])
         normalized_targets[str(name)] = item
     defaults["cluster_targets"] = normalized_targets
     return defaults
@@ -3517,7 +3532,6 @@ class PolicyTelemetryStore:
         payload = payload if isinstance(payload, dict) else {}
         connections = connections if isinstance(connections, dict) else {}
         runtime = runtime if isinstance(runtime, dict) else {}
-        control = self.control_for_task(task)
         received_at = payload.get("received_at")
         now = time.time()
         age_s = max(0.0, now - float(received_at)) if received_at is not None else None
@@ -3563,16 +3577,6 @@ class PolicyTelemetryStore:
         )
         horizon_status = policy_horizon_status(payload, metadata)
         time_contract_status = policy_time_contract_status(payload, metadata)
-        dual_gate_open = bool(
-            process_active
-            and client_connected
-            and age_s is not None
-            and age_s <= self.max_age_s
-            and control["mode"] == "execute"
-            and client_allow
-            and horizon_status["horizon_execution_ready"]
-            and time_contract_status["time_contract_ready"]
-        )
         return {
             **payload,
             "task_id": task["id"],
@@ -3596,7 +3600,6 @@ class PolicyTelemetryStore:
             "client_addresses": connections.get("client_addresses", []) if process_active else [],
             "connection_event": connections.get("event"),
             "connection_updated_at": connections.get("updated_at"),
-            "execution_control": control,
             "client_allow_execution": client_allow,
             "client_execution_state": client_state,
             "client_in_flight": client_in_flight,
@@ -3606,7 +3609,6 @@ class PolicyTelemetryStore:
             "policy_inference_finished_at": runtime.get("last_inference_finished_at"),
             **horizon_status,
             **time_contract_status,
-            "dual_gate_open": dual_gate_open,
         }
 
     def latest(self, task_list: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -3722,7 +3724,7 @@ def process_owner_map(pids: Iterable[int]) -> dict[int, str]:
     return owners
 
 
-def gpu_inventory() -> list[dict[str, Any]]:
+def gpu_inventory(*, strict: bool = False) -> list[dict[str, Any]]:
     gpu_cmd = [
         "nvidia-smi",
         "--query-gpu=index,uuid,name,memory.total,memory.used",
@@ -3735,9 +3737,18 @@ def gpu_inventory() -> list[dict[str, Any]]:
     ]
     try:
         gpu_lines = subprocess.check_output(gpu_cmd, text=True, timeout=10).splitlines()
-        process_lines = subprocess.check_output(proc_cmd, text=True, timeout=10).splitlines()
-    except (FileNotFoundError, subprocess.SubprocessError):
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        logging.getLogger(__name__).warning("GPU inventory query failed: %s", exc)
+        if strict:
+            raise RuntimeError(f"GPU inventory query failed: {exc}") from exc
         return []
+    process_query_error = None
+    try:
+        process_lines = subprocess.check_output(proc_cmd, text=True, timeout=10).splitlines()
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        process_lines = []
+        process_query_error = f"GPU process query failed: {exc}"
+        logging.getLogger(__name__).warning("%s", process_query_error)
     raw_processes: list[tuple[str, int, str | None, int | None]] = []
     unavailable_uuids: set[str] = set()
     for line in process_lines:
@@ -3786,8 +3797,8 @@ def gpu_inventory() -> list[dict[str, Any]]:
                 "memory_total_mib": _nvidia_int(parts[3]) or 0,
                 "memory_used_mib": _nvidia_int(parts[4]) or 0,
                 "processes": processes.get(parts[1], []),
-                "compute_available": parts[1] not in unavailable_uuids,
-                "health_issue": (
+                "compute_available": process_query_error is None and parts[1] not in unavailable_uuids,
+                "health_issue": process_query_error or (
                     None
                     if parts[1] not in unavailable_uuids
                     else "nvidia-smi reports an unavailable compute context ([N/A])"
@@ -3996,7 +4007,13 @@ def _compatible_nccl_preload_path(config: dict[str, Any]) -> str | None:
     candidate_paths.extend(
         sorted(Path.home().glob(".cache/uv/archive-v0/*/nvidia/nccl/lib/libnccl.so.2"))
     )
-    candidate_paths.append(Path("/usr/local/lib/python3.10/dist-packages/nvidia/nccl/lib/libnccl.so.2"))
+    system_site_paths = sysconfig.get_paths()
+    for site_key in ("platlib", "purelib"):
+        site_path = system_site_paths.get(site_key)
+        if site_path:
+            candidate_paths.append(
+                Path(site_path) / "nvidia" / "nccl" / "lib" / "libnccl.so.2"
+            )
 
     candidates: list[tuple[int, int, Path]] = []
     seen: set[Path] = set()
@@ -5135,6 +5152,15 @@ def create_app(config_path: Path) -> Flask:
                 break
             current = current.parent
 
+
+    @app.get("/api/gpus")
+    def local_gpu_resources():
+        gpus = gpu_inventory(strict=True)
+        if not gpus:
+            raise RuntimeError("nvidia-smi returned no GPU records")
+        response = jsonify({"gpus": gpus})
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/api/status")
     def status():
@@ -8013,6 +8039,9 @@ print(json.dumps(rows, ensure_ascii=False))
         # their selected values at runtime and can change them without
         # restarting this process.
         rtc_enabled = bool(config.get("policy_rtc_enabled", True))
+        inference_diagnostics_enabled = bool(
+            config.get("policy_inference_diagnostics_enabled", True)
+        )
         rtc_execution_horizon = safe_int(
             config.get("policy_rtc_max_execution_horizon", 8),
             "policy_rtc_max_execution_horizon",
@@ -8221,6 +8250,7 @@ print(json.dumps(rows, ensure_ascii=False))
             "--port", str(port),
             "--telemetry-dir", str(telemetry_dir),
             "--rtc-enabled" if rtc_enabled else "--no-rtc-enabled",
+            "--inference-diagnostics" if inference_diagnostics_enabled else "--no-inference-diagnostics",
             "--rtc-execution-horizon", str(rtc_execution_horizon),
             "--rtc-max-guidance-weight", str(rtc_max_guidance_weight),
         ] + action_contract_command_args(model_contract)
@@ -8258,6 +8288,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 "telemetry_session": telemetry_session,
                 "telemetry_dir": str(telemetry_dir),
                 "rtc_server_enabled": rtc_enabled,
+                "inference_diagnostics_enabled": inference_diagnostics_enabled,
                 "rtc_server_max_execution_horizon": rtc_execution_horizon,
                 "rtc_server_max_guidance_weight": rtc_max_guidance_weight,
                 "replaced_task_id": replace_task_id or None,
@@ -8269,31 +8300,12 @@ print(json.dumps(rows, ensure_ascii=False))
     @app.get("/api/tasks/<task_id>/execution-control")
     def get_execution_control(task_id: str):
         task = tasks.get(task_id)
-        return jsonify({"task_id": task["id"], "execution_control": observations.control_for_task(task)})
+        return jsonify({"task_id": task["id"], "owner": "client", "execution_control": None})
 
     @app.post("/api/tasks/<task_id>/execution-control")
     def set_execution_control(task_id: str):
-        task = tasks.get(task_id)
-        payload = request.get_json(force=True)
-        mode = str(payload.get("mode", "")).strip().lower()
-        if mode == "execute" and str(payload.get("confirm_task_id", "")) != task["id"]:
-            raise ValueError("confirm_task_id must exactly match the policy task id")
-        if mode == "execute":
-            telemetry = observations.summary_for_task(task)
-            if telemetry is None or not telemetry.get("client_connected"):
-                raise ValueError("execution requires a connected robot client")
-            if not telemetry.get("fresh"):
-                raise ValueError("execution requires fresh robot telemetry")
-            if not telemetry.get("client_allow_execution"):
-                raise ValueError("robot client was not started with --allow-execution")
-            require_policy_execution_horizon(telemetry)
-            require_policy_execution_time_contract(telemetry)
-        control = observations.set_control(
-            task,
-            mode=mode,
-            expires_in_s=payload.get("expires_in_s"),
-        )
-        return jsonify({"task_id": task["id"], "execution_control": control})
+        tasks.get(task_id)
+        return jsonify({"error": "execution is controlled by the robot client"}), 410
 
     @app.post("/api/tasks/<task_id>/stop")
     def stop_task(task_id: str):

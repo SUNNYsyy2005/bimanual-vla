@@ -76,11 +76,18 @@ ADD_DATASET_OPTION = "Add new dataset..."
 EPISODE_FILE_RE = re.compile(r"ep_\d+\.npz")
 CAN_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+")
 CAN_BITRATE = 1_000_000
-CAN_ACTIVATE_SCRIPT = pathlib.Path(
-    "/home/user/dual_ARM_project/piper_sdk/piper_sdk/can_activate.sh"
-)
 GUI_PREFERENCES_PATH = pathlib.Path("~/.config/bimanual-vla/collect_gui_preferences.json").expanduser()
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_can_helper_config = pathlib.Path(
+    os.environ.get(
+        "BIMANUAL_VLA_CAN_ACTIVATE_SCRIPT",
+        str(PROJECT_ROOT / "piper_sdk" / "piper_sdk" / "can_activate.sh"),
+    )
+).expanduser()
+CAN_ACTIVATE_SCRIPT = (
+    _can_helper_config if _can_helper_config.is_absolute()
+    else (PROJECT_ROOT / _can_helper_config).resolve()
+)
 RTC_CLIENT_MODULE = "bimanual_vla.deployment.client"
 DATA_UPLOAD_MODULE = "bimanual_vla.data.upload"
 EPISODE_VIEWER_MODULE = "bimanual_vla.data.viewer"
@@ -504,7 +511,10 @@ def build_inference_bridge_command(
     cam_right_wrist_device: str,
     instruction: str,
     allow_execution: bool,
+    send_policy_telemetry: bool = True,
+    preresize_policy_images: bool = False,
     control_hz: float = 20.0,
+    camera_fps: int = 30,  # This rig negotiates a 20 FPS request down to 15.
     inference_trigger_mode: str = "periodic",
     inference_trigger_step: int = 10,
     camera_preview: bool = False,
@@ -523,6 +533,7 @@ def build_inference_bridge_command(
     joint_tracking_enabled: bool = True,
     joint_speed_limit_enabled: bool = True,
     joint_acceleration_limit_enabled: bool = True,
+    joint_spike_suppression_enabled: bool = False,
     joint_jerk_limit_enabled: bool = True,
     joint_lookahead_enabled: bool = True,
     joint_max_speed_rad_s: float = 0.30,
@@ -600,6 +611,8 @@ def build_inference_bridge_command(
         raise ValueError("gripper hysteresis must be in (0, 0.5)")
     if int(gripper_confirm_steps) < 1 or int(gripper_open_lookahead_steps) < 0:
         raise ValueError("gripper confirmation must be positive; lookahead must be non-negative")
+    if not 1 <= int(camera_fps) <= 60:
+        raise ValueError("inference camera FPS must be in [1, 60]")
     if float(ik_max_joint_step_rad) > 0.30:
         raise ValueError("IK max joint step must not exceed the 0.30 rad search radius")
     if arm_mode not in {SINGLE_ARM, BIMANUAL}:
@@ -632,6 +645,8 @@ def build_inference_bridge_command(
         str(float(hz)),
         "--control-hz",
         str(float(control_hz)),
+        "--camera-fps",
+        str(int(camera_fps)),
         "--inference-trigger-mode",
         inference_trigger_mode if async_inference else "periodic",
         "--inference-trigger-step",
@@ -661,6 +676,14 @@ def build_inference_bridge_command(
         command.append("--camera-preview")
     if allow_execution:
         command.append("--allow-execution")
+    command.append(
+        "--send-policy-telemetry" if send_policy_telemetry
+        else "--no-send-policy-telemetry"
+    )
+    command.append(
+        "--preresize-policy-images" if preresize_policy_images
+        else "--no-preresize-policy-images"
+    )
     command.append("--rtc-enabled" if rtc_enabled else "--no-rtc-enabled")
     rtc_blend_steps = (
         int(rtc_client_blend_steps)
@@ -698,6 +721,7 @@ def build_inference_bridge_command(
         "trajectory-tracking": joint_tracking_enabled,
         "trajectory-speed-limit": joint_speed_limit_enabled,
         "trajectory-acceleration-limit": joint_acceleration_limit_enabled,
+        "trajectory-spike-suppression": joint_spike_suppression_enabled,
         "trajectory-jerk-limit": joint_jerk_limit_enabled,
         "trajectory-lookahead": joint_lookahead_enabled,
         "gripper-lowpass": gripper_lowpass,
@@ -992,11 +1016,16 @@ class CollectorGUI:
         self.inference_trigger_step_var = tk.StringVar(
             value=str(self.gui_preferences.get("inference_trigger_step") or "10")
         )
-        self.inference_allow_execution_var = tk.BooleanVar(
-            value=bool(self.gui_preferences.get("inference_allow_execution", True))
-        )
+        # Execution is authorized locally for this GUI session only.
+        self.inference_allow_execution_var = tk.BooleanVar(value=False)
         self.inference_camera_preview_var = tk.BooleanVar(
             value=bool(self.gui_preferences.get("inference_camera_preview", False))
+        )
+        self.inference_send_policy_telemetry_var = tk.BooleanVar(
+            value=bool(self.gui_preferences.get("inference_send_policy_telemetry", True))
+        )
+        self.inference_preresize_policy_images_var = tk.BooleanVar(
+            value=bool(self.gui_preferences.get("inference_preresize_policy_images", False))
         )
         self.inference_rtc_enabled_var = tk.BooleanVar(
             value=bool(self.gui_preferences.get("inference_rtc_enabled", True))
@@ -1049,6 +1078,9 @@ class CollectorGUI:
         )
         self.inference_joint_acceleration_limit_var = tk.BooleanVar(
             value=bool(preferences.get("inference_joint_acceleration_limit_enabled", True))
+        )
+        self.inference_joint_spike_suppression_var = tk.BooleanVar(
+            value=bool(preferences.get("inference_joint_spike_suppression_enabled", False))
         )
         self.inference_joint_jerk_limit_var = tk.BooleanVar(
             value=bool(preferences.get("inference_joint_jerk_limit_enabled", True))
@@ -1790,6 +1822,21 @@ class CollectorGUI:
             text="Camera preview",
             variable=self.inference_camera_preview_var,
         ).pack(side="left", padx=(18, 0))
+        request_diagnostics = ttk.LabelFrame(
+            config, text="Policy request diagnostics", padding=(10, 6)
+        )
+        request_diagnostics.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Checkbutton(
+            request_diagnostics,
+            text="Send detailed client diagnostics",
+            variable=self.inference_send_policy_telemetry_var,
+        ).pack(anchor="w")
+        ttk.Label(
+            request_diagnostics,
+            text="Local monitoring continues when off. Restart inference to compare latency.",
+            foreground="#68707d",
+            wraplength=310,
+        ).pack(anchor="w", pady=(3, 0))
         right_panel = ttk.Frame(frame)
         right_panel.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 8))
         right_panel.columnconfigure(0, weight=1)
@@ -1835,6 +1882,11 @@ class CollectorGUI:
             takefocus=False,
         )
         self.inference_swap_camera_button.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(
+            devices,
+            text="Pre-resize policy images to 224 px",
+            variable=self.inference_preresize_policy_images_var,
+        ).grid(row=3, column=0, sticky="w", pady=(5, 0))
         motion = ttk.LabelFrame(right_panel, text="Action continuity settings", padding=10)
         motion.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         motion.columnconfigure(0, weight=1)
@@ -1972,6 +2024,7 @@ class CollectorGUI:
             ("Second-order tracking", self.inference_joint_tracking_var, self.inference_joint_tracking_time_var, "Time s"),
             ("Speed limit", self.inference_joint_speed_limit_var, self.inference_joint_max_speed_var, "rad/s"),
             ("Acceleration limit", self.inference_joint_acceleration_limit_var, self.inference_joint_max_acceleration_var, "rad/s²"),
+            ("Short-horizon spike suppression", self.inference_joint_spike_suppression_var, self.inference_rtc_horizon_var, "RTC steps"),
             ("Jerk limit", self.inference_joint_jerk_limit_var, self.inference_joint_max_jerk_var, "rad/s³"),
             ("Velocity lookahead", self.inference_joint_lookahead_var, self.inference_joint_lookahead_rad_var, "rad"),
             ("Delivery IK step limit", self.inference_ik_rate_limit_var, self.inference_ik_max_step_var, "rad/step"),
@@ -2383,8 +2436,13 @@ class CollectorGUI:
             "inference_control_hz": self.inference_control_hz_var.get().strip(),
             "inference_trigger_mode": self.inference_trigger_mode_var.get().strip(),
             "inference_trigger_step": self.inference_trigger_step_var.get().strip(),
-            "inference_allow_execution": bool(self.inference_allow_execution_var.get()),
             "inference_camera_preview": bool(self.inference_camera_preview_var.get()),
+            "inference_send_policy_telemetry": bool(
+                self.inference_send_policy_telemetry_var.get()
+            ),
+            "inference_preresize_policy_images": bool(
+                self.inference_preresize_policy_images_var.get()
+            ),
             "inference_rtc_enabled": bool(self.inference_rtc_enabled_var.get()),
             "inference_rtc_horizon": self.inference_rtc_horizon_var.get().strip(),
             "inference_rtc_weight": self.inference_rtc_weight_var.get().strip(),
@@ -2401,6 +2459,7 @@ class CollectorGUI:
             "inference_joint_tracking_enabled": self.inference_joint_tracking_var.get(),
             "inference_joint_speed_limit_enabled": self.inference_joint_speed_limit_var.get(),
             "inference_joint_acceleration_limit_enabled": self.inference_joint_acceleration_limit_var.get(),
+            "inference_joint_spike_suppression_enabled": self.inference_joint_spike_suppression_var.get(),
             "inference_joint_jerk_limit_enabled": self.inference_joint_jerk_limit_var.get(),
             "inference_joint_lookahead_enabled": self.inference_joint_lookahead_var.get(),
             "inference_joint_tracking_time_constant_s": self.inference_joint_tracking_time_var.get().strip(),
@@ -2497,7 +2556,7 @@ class CollectorGUI:
                     dialog,
                     "Restart inference",
                     "The bridge received the instruction at startup. Restart inference now to apply the new instruction?\n\n"
-                    "The current bridge will stop gracefully; Dashboard EXECUTE authorization may need to be confirmed again.",
+                    "The current bridge will stop gracefully. The client execution setting will apply when inference restarts.",
                 )
                 if restart:
                     self.inference_restart_requested = True
@@ -2688,7 +2747,7 @@ class CollectorGUI:
                 self.root,
                 "Restart inference",
                 "Swap the wrist camera roles and restart inference now?\n\n"
-                "The current bridge will stop gracefully; Dashboard EXECUTE authorization may need to be confirmed again.",
+                "The current bridge will stop gracefully. The client execution setting will apply when inference restarts.",
             )
             if restart:
                 self.inference_restart_requested = True
@@ -2954,7 +3013,12 @@ class CollectorGUI:
                 self.inference_async_enabled_var.get() and trigger_mode == "chunk_step",
                 10, int,
             )
-            rtc_horizon = numeric_setting(self.inference_rtc_horizon_var, self.inference_rtc_enabled_var.get(), 8, int)
+            rtc_horizon = numeric_setting(
+                self.inference_rtc_horizon_var,
+                self.inference_rtc_enabled_var.get()
+                or self.inference_joint_spike_suppression_var.get(),
+                8, int,
+            )
             rtc_weight = numeric_setting(self.inference_rtc_weight_var, self.inference_rtc_enabled_var.get(), 5.0, float)
             rtc_blend_steps = numeric_setting(self.inference_rtc_blend_steps_var,
                 self.inference_rtc_enabled_var.get() and self.inference_rtc_blend_enabled_var.get(), 3, int)
@@ -3015,6 +3079,8 @@ class CollectorGUI:
             cam_right_wrist_device=self.right_wrist_var.get(),
             instruction=self.instruction_var.get(),
             allow_execution=bool(self.inference_allow_execution_var.get()),
+            send_policy_telemetry=bool(self.inference_send_policy_telemetry_var.get()),
+            preresize_policy_images=bool(self.inference_preresize_policy_images_var.get()),
             camera_preview=bool(self.inference_camera_preview_var.get()),
             rtc_enabled=bool(self.inference_rtc_enabled_var.get()),
             rtc_execution_horizon=rtc_horizon,
@@ -3034,6 +3100,7 @@ class CollectorGUI:
             joint_tracking_enabled=self.inference_joint_tracking_var.get(),
             joint_speed_limit_enabled=self.inference_joint_speed_limit_var.get(),
             joint_acceleration_limit_enabled=self.inference_joint_acceleration_limit_var.get(),
+            joint_spike_suppression_enabled=self.inference_joint_spike_suppression_var.get(),
             joint_jerk_limit_enabled=self.inference_joint_jerk_limit_var.get(),
             joint_lookahead_enabled=self.inference_joint_lookahead_var.get(),
             joint_max_speed_rad_s=joint_max_speed,

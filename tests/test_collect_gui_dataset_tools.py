@@ -244,11 +244,24 @@ class InferenceCommandTest(unittest.TestCase):
         )
         self.assertIn("--allow-execution", command)
         self.assertIn("--rtc-enabled", command)
+        self.assertEqual(command[command.index("--camera-fps") + 1], "30")
         self.assertEqual(command[command.index("--left-can") + 1], "can0")
         self.assertEqual(command[command.index("--right-can") + 1], "can1")
 
     def test_execution_flag_can_be_disabled(self):
         self.assertNotIn("--allow-execution", self._command(allow_execution=False))
+
+    def test_policy_request_diagnostics_switch_reaches_client(self):
+        self.assertIn("--send-policy-telemetry", self._command())
+        minimal_command = self._command(send_policy_telemetry=False)
+        self.assertIn("--no-send-policy-telemetry", minimal_command)
+        self.assertNotIn("--send-policy-telemetry", minimal_command)
+
+    def test_policy_image_preresize_switch_reaches_client(self):
+        self.assertIn("--no-preresize-policy-images", self._command())
+        command = self._command(preresize_policy_images=True)
+        self.assertIn("--preresize-policy-images", command)
+        self.assertNotIn("--no-preresize-policy-images", command)
 
     def test_rtc_can_be_disabled(self):
         command = self._command(rtc_enabled=False)
