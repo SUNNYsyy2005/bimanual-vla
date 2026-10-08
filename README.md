@@ -27,8 +27,9 @@ Piper + RGB Cameras  ->  Robot Demonstrations  ->  LeRobot Dataset
         ->  Real-Time Chunking  ->  Safety Layer  ->  Piper Execution
 ```
 
-The same workflow supports a single 6-DoF arm or a bimanual system, joint-space
-and end-effector-space policies, and both GUI-driven and command-line operation.
+The workflow supports single-arm and bimanual Piper operation, joint-space and
+end-effector (`delivery`) data contracts, and GUI/CLI workflows. Deployment
+behavior depends on the active Policy contract and hardware configuration.
 
 ## Highlights
 
@@ -36,7 +37,7 @@ and end-effector-space policies, and both GUI-driven and command-line operation.
 - **Multi-camera Piper collection** with GUI operation, teleoperation, replay, and episode management.
 - **LeRobot-compatible data** with versioned contracts, validation, conversion, and upload tools.
 - **OpenPI training stack** for `pi0` / `pi0.5` LoRA fine-tuning and optional multi-GPU FSDP.
-- **Real-time, safety-aware deployment** with model-side RTC, 20 Hz control, and fail-closed execution.
+- **Real-time, safety-aware deployment** with model-side RTC, configurable inference scheduling, 20 Hz robot control, and fail-closed execution.
 
 ## System Overview
 
@@ -52,7 +53,7 @@ validation rules, transport fields, and server operations live in
 |---|---|---|---|
 | Data collection | Piper feedback, RGB views, language instruction | GUI or teleoperation, synchronized recording, episode validation | Raw robot episodes and LeRobot v2.1 datasets |
 | VLA training | Images, robot state, actions, task text | OpenPI `pi0` / `pi0.5`, LoRA, optional FSDP | Versioned Policy checkpoints |
-| Real-time deployment | Live observation and Policy checkpoint | WebSocket inference, RTC, action queue, safety gates | 20 Hz Piper commands |
+| Real-time deployment | Live observation and Policy checkpoint | Asynchronous WebSocket inference, model-side RTC, action queues, safety gates | Validated Piper commands at the configured control rate |
 
 ## Hardware Setup
 
@@ -181,7 +182,7 @@ Input:
 
 Output:
   Action chunk: 50 x 7D or 50 x 14D
-  Execution target: decoded joint/gripper command after safety checks
+  Execution target: schema-dependent decoded action with safety checks
 ```
 
 Download an OpenPI base checkpoint with the repository helper:
@@ -243,33 +244,50 @@ gripper changes, IK feasibility, Piper state, and authorization on every control
 cycle. RTC is applied inside model denoising; it is not client-side interpolation.
 See the [RTC deployment guide](docs/deployment/RTC_CLIENT_GUIDE.md).
 
-### Smooth and fail-closed Piper execution
+### Inference timing and execution controls
 
-The client now includes the execution-side techniques used by the Piper
-reference client:
+Policy inference is asynchronous and separate from the robot's 20 Hz control
+loop. The client supports two scheduling modes:
 
-- `--trajectory-shaping` (enabled by default) applies a shared 7D/14D
-  velocity-, acceleration-, and jerk-limited trajectory state to both arms.
-  `--no-trajectory-shaping` is available for controlled A/B comparisons.
-- `--blend-profile smootherstep` gives action-chunk boundaries zero endpoint
-  slope. With RTC enabled, the extra client blend is disabled by default; use
-  `--rtc-client-blend-steps 2|3|4` only when an additional boundary blend is
-  wanted.
-- `--gripper-open-lookahead-steps 30` anticipates opening requests in the
-  accepted chunk while never anticipating a closing request. Grippers still
-  pass the independent low-pass, hysteresis, and rate limits.
-- `--reject-external-control-streams` refuses to start or resume when Piper
-  reports another high-rate `JointCtrl`/`GripperCtrl` stream.
-- `--auto-return` (enabled by default) records the startup pose and performs a
-  bounded, monitored return before disconnecting. Use `--no-auto-return` for a
-  deliberate exception.
+- `--inference-trigger-mode periodic` (default): attempt a new inference at
+  `--hz` (default 4 Hz), with at most one request in flight. Actual throughput
+  depends on end-to-end latency.
+- `--inference-trigger-mode chunk_step --inference-trigger-step 10`: launch
+  the next request when the accepted chunk reaches the specified source step.
+  In this mode `--hz` governs initialization/recovery retries rather than
+  the normal per-chunk trigger.
 
-Useful tuning knobs are `--trajectory-max-speed-rad-s`,
-`--trajectory-max-acceleration-rad-s2`, `--trajectory-max-jerk-rad-s3`,
-`--trajectory-smoothing-cutoff-hz`, `--trajectory-tracking-time-constant-s`,
-and `--trajectory-command-lookahead-rad`. The active shaper state,
-interlock status, return result, and tracking errors are recorded in
-`monitoring_data/<session>/events.jsonl` and deployment recordings.
+The server performs RTC prefix guidance during model denoising. Additional
+client-side blending is separate and should be tuned deliberately, not treated
+as equivalent to model-side RTC.
+
+The execution path includes configurable joint trajectory shaping and safety
+interlocks:
+
+- `--trajectory-shaping` is enabled by default, with independently
+  configurable low-pass, tracking, speed, acceleration, jerk and lookahead
+  stages. Use `--no-trajectory-shaping` for controlled comparisons.
+- `--trajectory-spike-suppression` is **disabled by default**; it targets
+  isolated acceleration spikes in short execution horizons and can be tested
+  separately from trajectory shaping.
+- `--blend-profile smootherstep` controls the optional action-boundary blend.
+- `--gripper-open-lookahead-steps` can anticipate opening while keeping
+  gripper filtering and safety checks active.
+- `--reject-external-control-streams` guards against simultaneous
+  high-rate Piper control; `--auto-return` is enabled by default for a
+  monitored return to the startup pose on normal shutdown.
+
+**Important:** smoothing and motion limits trade tracking responsiveness for
+command continuity. Aggressive filtering or lookahead can cause lag or
+overshoot; disabling shaping can expose high-frequency joint jitter. Validate
+settings in shadow mode and then in a supervised, low-risk hardware test before
+normal deployment. Neither mode guarantees the absence of overshoot.
+
+Monitoring and deployment recordings can distinguish raw Policy predictions
+from commands actually sent to the robot, including velocity, acceleration,
+tracking error, chunk boundaries, and timing. See the
+[RTC deployment guide](docs/deployment/RTC_CLIENT_GUIDE.md) for parameters,
+diagnostic definitions, and safety prerequisites.
 
 ## Demo
 
@@ -277,7 +295,7 @@ interlock status, return result, and tracking errors are recorded in
   <img src="assets/demo.gif" width="720" alt="Bimanual Piper real-robot demonstration">
 </p>
 
-The demo presents the bimanual Piper platform during a real manipulation run.
+Real-robot manipulation demonstration. Playback is accelerated for README viewing; it does not represent the live robot control rate.
 
 ## Dashboard
 
@@ -285,9 +303,11 @@ The demo presents the bimanual Piper platform during a real manipulation run.
   <img src="assets/dashboard.png" width="100%" alt="Training and deployment Dashboard">
 </p>
 
-The web and desktop interfaces cover dataset/episode management, normalization,
-LoRA/FSDP training, checkpoint and Policy lifecycle, live telemetry, action
-accounting, trajectory inspection, and evaluation video management.
+The Dashboard supports dataset/episode management, normalization, LoRA/FSDP
+training workflows, Policy lifecycle controls, live telemetry, and trajectory
+analysis. Diagnostics distinguish Policy output from executed commands, and
+include chunk-boundary and timing views when the underlying recordings contain
+the required signals.
 
 ## Installation
 
