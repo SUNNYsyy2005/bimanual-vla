@@ -55,6 +55,7 @@ class CameraFrameSet:
     timestamps: dict[str, float]
     monotonic_timestamps: dict[str, float]
     captured_monotonic: float
+    policy_images: dict[str, np.ndarray] | None = None
 
     def copied(self) -> "CameraFrameSet":
         return CameraFrameSet(
@@ -62,6 +63,10 @@ class CameraFrameSet:
             timestamps=dict(self.timestamps),
             monotonic_timestamps=dict(self.monotonic_timestamps),
             captured_monotonic=float(self.captured_monotonic),
+            policy_images=(
+                {key: frame.copy() for key, frame in self.policy_images.items()}
+                if self.policy_images is not None else None
+            ),
         )
 
 # Camera roles used by the current collection rig. Device numbers can change
@@ -365,6 +370,7 @@ class CameraCapture:
         capture_hw: tuple[int, int] | None = None,
         parallel_reads: bool = False,
         strict_selectors: bool = False,
+        policy_image_hw: tuple[int, int] | None = None,
     ):
         self._ids = cam_ids or dict(DEFAULT_CAM_IDS)
         self._configured_ids = dict(self._ids)
@@ -373,6 +379,14 @@ class CameraCapture:
         self._capture_hw = tuple(capture_hw or image_hw)
         self._parallel_reads = parallel_reads
         self._strict_selectors = strict_selectors
+        self._policy_image_hw = (
+            tuple(int(value) for value in policy_image_hw)
+            if policy_image_hw is not None else None
+        )
+        if self._policy_image_hw is not None and (
+            len(self._policy_image_hw) != 2 or min(self._policy_image_hw) <= 0
+        ):
+            raise ValueError("policy_image_hw must be a positive (height, width) pair")
         self._caps: dict[str, cv2.VideoCapture] = {}
         self._executor: ThreadPoolExecutor | None = None
         self._read_lock = threading.Lock()
@@ -513,6 +527,22 @@ class CameraCapture:
         self._last_direct_monotonic_timestamps = monotonic_timestamps
         return images, timestamps
 
+    def _prepare_policy_images(
+        self, images: dict[str, np.ndarray]
+    ) -> dict[str, np.ndarray] | None:
+        """Precompute exactly the server's PIL resize on the camera thread."""
+        if self._policy_image_hw is None:
+            return None
+        from openpi_client import image_tools
+
+        height, width = self._policy_image_hw
+        return {
+            key: image_tools.resize_with_pad(
+                np.transpose(frame, (1, 2, 0)), height, width
+            ).transpose(2, 0, 1)
+            for key, frame in images.items()
+        }
+
     def read(self) -> tuple[dict, dict]:
         """Return (images, timestamps).
 
@@ -620,6 +650,7 @@ class CameraCapture:
                 try:
                     with self._read_lock:
                         images, timestamps = self._read_direct()
+                    policy_images = self._prepare_policy_images(images)
                     completed = time.monotonic()
                     monotonic_timestamps = dict(self._last_direct_monotonic_timestamps)
                     if set(monotonic_timestamps) != set(images):
@@ -636,6 +667,9 @@ class CameraCapture:
                     frozen_images = dict(images)
                     for frame in frozen_images.values():
                         frame.setflags(write=False)
+                    if policy_images is not None:
+                        for frame in policy_images.values():
+                            frame.setflags(write=False)
                     frame_set = CameraFrameSet(
                         images=frozen_images,
                         timestamps={key: float(value) for key, value in timestamps.items()},
@@ -644,6 +678,7 @@ class CameraCapture:
                             for key, value in monotonic_timestamps.items()
                         },
                         captured_monotonic=captured_monotonic,
+                        policy_images=policy_images,
                     )
                     with self._latest_condition:
                         # Frame sets are immutable after publication, so the

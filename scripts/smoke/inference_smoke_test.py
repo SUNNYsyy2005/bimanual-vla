@@ -4,19 +4,28 @@ Runs on the 4090 server (no simulation, no real robot needed).
 Verifies: model loads, shapes correct, action values in range, timing.
 
 Usage:
-    ssh 4x4090
-    conda activate openpi
-    export LD_LIBRARY_PATH=/home/sunny/miniconda3/envs/openpi/lib:$LD_LIBRARY_PATH
-    cd /home/sunny/robotwin_ws/RoboTwin/policy/pi05
+    Activate the environment containing OpenPI, then set
+    BIMANUAL_VLA_OPENPI_REPO and BIMANUAL_VLA_PI05_CHECKPOINT if they are not
+    in the default sibling RoboTwin / ~/checkpoints locations.
     python -m scripts.smoke.inference_smoke_test
 """
 
+import os
 import sys, time, pathlib
 import numpy as np
 
-OPENPI = "/home/sunny/robotwin_ws/RoboTwin/policy/pi05/src"
-CKPT   = "/home/sunny/checkpoints/pi05-piper-bimanual-v1"
-sys.path.insert(0, OPENPI)
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+OPENPI_REPO = pathlib.Path(
+    os.environ.get("BIMANUAL_VLA_OPENPI_REPO", REPO_ROOT.parent / "RoboTwin" / "policy" / "pi05")
+).expanduser().resolve()
+OPENPI = OPENPI_REPO / "src"
+CKPT = pathlib.Path(
+    os.environ.get(
+        "BIMANUAL_VLA_PI05_CHECKPOINT",
+        pathlib.Path.home() / "checkpoints" / "pi05-piper-bimanual-v1",
+    )
+).expanduser().resolve()
+sys.path.insert(0, str(OPENPI))
 
 # Verify norm stats conversion used by the Dashboard policy server.
 from openpi.shared import normalize as _normalize

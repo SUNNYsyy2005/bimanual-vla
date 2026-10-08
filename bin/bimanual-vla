@@ -2,11 +2,12 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-LOCAL_PYTHON="/home/user/miniconda3/envs/dual_arm/bin/python"
 if [[ -n "${BIMANUAL_VLA_PYTHON:-}" ]]; then
   PYTHON_BIN="$BIMANUAL_VLA_PYTHON"
-elif [[ -x "$LOCAL_PYTHON" ]]; then
-  PYTHON_BIN="$LOCAL_PYTHON"
+elif [[ -n "${CONDA_PREFIX:-}" && -x "$CONDA_PREFIX/bin/python" ]]; then
+  PYTHON_BIN="$CONDA_PREFIX/bin/python"
+elif [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
+  PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
 else
   PYTHON_BIN="python3"
 fi
@@ -66,6 +67,31 @@ case "$command_name" in
     exit 2
     ;;
 esac
+
+if [[ "$module" == "bimanual_vla.collection.gui" ]] && ! "$PYTHON_BIN" -c 'import tkinter' >/dev/null 2>&1; then
+  if [[ -z "${BIMANUAL_VLA_PYTHON:-}" ]]; then
+    for conda_root in \
+      "${HOME}/miniconda3" \
+      "${HOME}/anaconda3" \
+      "${HOME}/mambaforge" \
+      "${HOME}/miniforge3" \
+      "${HOME}/.conda"; do
+      candidate="$conda_root/envs/dual_arm/bin/python"
+      if [[ -x "$candidate" ]] && "$candidate" -c 'import tkinter' >/dev/null 2>&1; then
+        PYTHON_BIN="$candidate"
+        break
+      fi
+    done
+  fi
+  if ! "$PYTHON_BIN" -c 'import tkinter' >/dev/null 2>&1; then
+    printf 'The selected Python (%s) cannot import tkinter.\n' "$PYTHON_BIN" >&2
+    printf '%s\n' \
+      'Install Tk for this Python (Ubuntu: sudo apt install python3-tk; Conda: conda install tk),' \
+      'activate the project environment, or set BIMANUAL_VLA_PYTHON to a Python with Tk support.' \
+      >&2
+    exit 1
+  fi
+fi
 
 cd "$REPO_ROOT"
 exec "$PYTHON_BIN" -m "$module" "$@"

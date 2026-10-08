@@ -132,7 +132,7 @@ def build_script(target: dict[str, Any], job_name: str, commands: list[list[str]
         f"export XLA_PYTHON_CLIENT_MEM_FRACTION={target.get('xla_memory_fraction', 0.90)}",
     ]
     # Some cluster compute nodes expose only the configured environment
-    # executable (for example /home/sunny/miniconda3/envs/openpi/bin/python)
+    # executable (for example ~/miniconda3/envs/openpi/bin/python)
     # and do not mount the Conda root's profile.d/conda.sh.  The workload
     # commands already use target["openpi_python"] directly, so activation is
     # optional; never let a missing init script abort an otherwise valid job.

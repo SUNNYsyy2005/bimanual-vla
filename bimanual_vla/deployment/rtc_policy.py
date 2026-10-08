@@ -20,16 +20,66 @@ timing and queue progress never become VLA input features.
 
 from __future__ import annotations
 
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import hashlib
+import inspect
 import logging
 import threading
+import time
 import types
 from typing import Any
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+DEFAULT_DENOISING_STEPS = 5
+
+# Observation.from_dict is called after JAX has batched and dispatched the
+# input arrays. A context variable keeps timing attached to the current
+# inference even if the server handles other requests on separate threads.
+_observation_timing_owner: contextvars.ContextVar["RTCAwarePolicy | None"] = (
+    contextvars.ContextVar("rtc_observation_timing_owner", default=None)
+)
+_observation_timing_install_lock = threading.Lock()
+
+
+def _install_observation_conversion() -> None:
+    """Fuse JAX image normalization while preserving OpenPI's input pixels."""
+    from openpi.models.model import Observation
+    import jax
+    import jax.numpy as jnp
+
+    @jax.jit
+    def normalize_images(images: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: image.astype(jnp.float32) / 255.0 * 2.0 - 1.0
+            if image.dtype == np.uint8 else image
+            for key, image in images.items()
+        }
+
+    with _observation_timing_install_lock:
+        original = Observation.from_dict
+        if getattr(original.__func__, "_rtc_timed", False):
+            return
+
+        def timed_from_dict(cls: type, data: Any) -> Any:
+            owner = _observation_timing_owner.get()
+            if owner is None:
+                return original(data)
+            if owner._diagnostics_enabled:
+                owner._last_observation_from_dict_started_at = time.monotonic()
+            try:
+                if owner._fused_image_normalization_enabled:
+                    data["image"] = normalize_images(data["image"])
+                return original(data)
+            finally:
+                if owner._diagnostics_enabled:
+                    owner._last_observation_from_dict_finished_at = time.monotonic()
+
+        timed_from_dict._rtc_timed = True
+        Observation.from_dict = classmethod(timed_from_dict)
 
 
 @dataclass(frozen=True)
@@ -44,6 +94,9 @@ class RTCConfig:
     reanchor_action_mask: tuple[bool, ...] | None = None
     temporal_consistency: bool = True
     temporal_seed: int = 0
+    inference_diagnostics_enabled: bool = True
+    fused_image_normalization_enabled: bool = True
+    parallel_image_resize_enabled: bool = True
 
     def __post_init__(self) -> None:
         if self.execution_horizon <= 0:
@@ -87,6 +140,43 @@ def _physical_action_mask_numpy(config: RTCConfig, action_dim: int) -> np.ndarra
     return mask
 
 
+def _action_only_reanchor_encoding(
+    policy: Any, observation: dict[str, Any], actions: np.ndarray
+) -> np.ndarray | None:
+    """Run the known action transforms without resizing images or tokenizing text.
+
+    The first guided request compares this result against OpenPI's complete
+    input transform. Unknown transform pipelines always use the complete path.
+    """
+    pipeline = getattr(getattr(policy, "_input_transform", None), "transforms", None)
+    if not isinstance(pipeline, (list, tuple)):
+        return None
+    names = [type(transform).__name__ for transform in pipeline]
+    action_names = {
+        "PiperInputs", "JointGripperMetersToFraction", "DeltaActions",
+        "Normalize", "PadStatesAndActions",
+    }
+    ignored_names = {
+        "RepackTransform", "InjectDefaultPrompt", "ResizeImages",
+        "_ParallelResizeImages", "TokenizePrompt",
+    }
+    if any(name not in action_names | ignored_names for name in names):
+        return None
+    if any(names.count(name) != 1 for name in ("PiperInputs", "DeltaActions", "Normalize", "PadStatesAndActions")):
+        return None
+
+    data = dict(observation)
+    data["actions"] = np.asarray(actions, dtype=np.float32).copy()
+    for transform, name in zip(pipeline, names):
+        if name not in action_names:
+            continue
+        data = transform(data)
+        if name == "PiperInputs":
+            # Normalize only the state/actions, not the three image arrays.
+            data = {"state": data["state"], "actions": data["actions"]}
+    return np.asarray(data["actions"], dtype=np.float32)
+
+
 def _reanchor_normalized_actions(
     policy: Any,
     observation: dict[str, Any],
@@ -126,12 +216,26 @@ def _reanchor_normalized_actions(
     if not callable(input_transform):
         raise TypeError("OpenPI Policy does not expose its input transform for RTC re-anchoring")
 
-    rtc_input = dict(observation)
-    rtc_input["actions"] = previous_absolute.copy()
-    transformed = input_transform(rtc_input)
-    if not isinstance(transformed, dict) or "actions" not in transformed:
-        raise ValueError("OpenPI input transform did not return encoded RTC actions")
-    encoded = np.asarray(transformed["actions"], dtype=np.float32)
+    fast_encoded = None
+    try:
+        fast_encoded = _action_only_reanchor_encoding(policy, observation, previous_absolute)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        # A changed upstream transform must fall back to its complete path.
+        pass
+    if fast_encoded is not None and not np.all(np.isfinite(fast_encoded)):
+        fast_encoded = None
+    if fast_encoded is not None and getattr(policy, "_rtc_action_only_reanchor_validated", False):
+        encoded = fast_encoded
+    else:
+        rtc_input = dict(observation)
+        rtc_input["actions"] = previous_absolute.copy()
+        transformed = input_transform(rtc_input)
+        if not isinstance(transformed, dict) or "actions" not in transformed:
+            raise ValueError("OpenPI input transform did not return encoded RTC actions")
+        encoded = np.asarray(transformed["actions"], dtype=np.float32)
+        if fast_encoded is not None and fast_encoded.shape == encoded.shape:
+            if np.allclose(fast_encoded, encoded, rtol=0.0, atol=1e-5):
+                policy._rtc_action_only_reanchor_validated = True
     if encoded.ndim != 2 or encoded.shape != previous_normalized.shape:
         raise ValueError(
             "RTC re-encoded action shape does not match normalized model actions: "
@@ -329,7 +433,7 @@ def _rtc_sample_actions_pytorch(
     device,
     observation,
     noise=None,
-    num_steps=10,
+    num_steps=DEFAULT_DENOISING_STEPS,
     **kwargs,
 ):
     """Patched ``PI0Pytorch.sample_actions`` with the RTC denoising hook."""
@@ -475,7 +579,7 @@ def _rtc_sample_actions_jax(
     rng,
     observation,
     *,
-    num_steps=10,
+    num_steps=DEFAULT_DENOISING_STEPS,
     noise=None,
     prev_chunk_left_over=None,
     inference_delay=None,
@@ -676,16 +780,121 @@ class _RTCSession:
     temporal_rng: Any | None = None
 
 
+class _TimedInputTransform:
+    """Time OpenPI's input pipeline without changing its transform members."""
+
+    def __init__(self, transform: Any, owner: "RTCAwarePolicy") -> None:
+        self._transform = transform
+        self._owner = owner
+        # The action-only RTC reanchor inspects these original members to
+        # avoid a second image resize/tokenization pass.
+        self.transforms = getattr(transform, "transforms", None)
+
+    def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
+        try:
+            if (
+                type(self._transform).__module__ == "openpi.transforms"
+                and type(self._transform).__name__ == "CompositeTransform"
+                and isinstance(self.transforms, (list, tuple))
+            ):
+                step_ms: dict[str, float] = {}
+                for index, transform in enumerate(self.transforms):
+                    step_started = time.monotonic()
+                    data = transform(data)
+                    step_ms[f"{index}:{type(transform).__name__}"] = (
+                        time.monotonic() - step_started
+                    ) * 1000.0
+                self._owner._last_input_transform_step_ms = step_ms
+                return data
+            return self._transform(data)
+        finally:
+            finished = time.monotonic()
+            self._owner._last_input_transform_finished_at = finished
+            self._owner._last_input_transform_ms = (finished - started) * 1000.0
+
+
+class _ParallelResizeImages:
+    """Apply the same OpenPI Client PIL resize to independent views in parallel."""
+
+    def __init__(self, original: Any) -> None:
+        from openpi_client import image_tools
+
+        self._original = original
+        self._height = int(original.height)
+        self._width = int(original.width)
+        self._resize_with_pad = image_tools.resize_with_pad
+        self._executor = ThreadPoolExecutor(
+            max_workers=3, thread_name_prefix="policy-image-resize"
+        )
+
+    def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
+        images = data.get("image")
+        if not isinstance(images, dict) or len(images) < 2:
+            return self._original(data)
+        if all(image.shape[-3:-1] == (self._height, self._width) for image in images.values()):
+            return data
+
+        def resize_item(item: tuple[str, Any]) -> tuple[str, Any]:
+            key, image = item
+            return key, self._resize_with_pad(image, self._height, self._width)
+
+        data["image"] = dict(self._executor.map(resize_item, images.items()))
+        return data
+
+
 class RTCAwarePolicy:
     """Adapter that feeds per-client RTC state into an upstream OpenPI Policy."""
 
     def __init__(self, policy: Any, config: RTCConfig):
         self.policy = policy
         self.config = config
+        self._diagnostics_enabled = bool(config.inference_diagnostics_enabled)
+        self._is_pytorch = bool(getattr(policy, "_is_pytorch_model", False))
+        self._fused_image_normalization_enabled = bool(
+            config.fused_image_normalization_enabled and not self._is_pytorch
+        )
         self._sessions: dict[str, _RTCSession] = {}
         self._lock = threading.Lock()
         self._last_normalized_actions: np.ndarray | None = None
-        self._is_pytorch = bool(getattr(policy, "_is_pytorch_model", False))
+        self._last_denoising_steps: int | None = None
+        self._last_denoising_steps_source = "unknown"
+        self._last_sampler_wall_ms: float | None = None
+        self._last_sampler_started_at: float | None = None
+        self._last_sampler_finished_at: float | None = None
+        self._last_input_transform_ms: float | None = None
+        self._last_input_transform_step_ms: dict[str, float] | None = None
+        self._last_input_transform_finished_at: float | None = None
+        self._last_observation_from_dict_started_at: float | None = None
+        self._last_observation_from_dict_finished_at: float | None = None
+        if (
+            config.parallel_image_resize_enabled
+            and type(policy).__module__.startswith("openpi.")
+        ):
+            from openpi import transforms as openpi_transforms
+
+            input_transform = getattr(policy, "_input_transform", None)
+            if isinstance(input_transform, openpi_transforms.CompositeTransform):
+                steps = list(input_transform.transforms)
+                resize_indices = [
+                    index for index, step in enumerate(steps)
+                    if isinstance(step, openpi_transforms.ResizeImages)
+                ]
+                if len(resize_indices) == 1:
+                    index = resize_indices[0]
+                    steps[index] = _ParallelResizeImages(steps[index])
+                    policy._input_transform = replace(
+                        input_transform, transforms=tuple(steps)
+                    )
+        if self._diagnostics_enabled:
+            input_transform = getattr(policy, "_input_transform", None)
+            if callable(input_transform):
+                policy._input_transform = _TimedInputTransform(input_transform, self)
+        if (
+            type(policy).__module__.startswith("openpi.")
+            and (self._diagnostics_enabled or self._fused_image_normalization_enabled)
+        ):
+            _install_observation_conversion()
         model = getattr(policy, "_model", None)
         if model is None:
             raise TypeError("OpenPI Policy does not expose its model")
@@ -705,13 +914,50 @@ class RTCAwarePolicy:
             except ImportError as exc:  # pragma: no cover - deployment-only path
                 raise RuntimeError("RTC JAX adapter requires OpenPI's nnx_utils") from exc
 
+        # Inspect the patched Python sampler, not the JAX jit wrapper, so an
+        # upstream explicit num_steps override is visible in each result.
+        sampler_signature = (
+            inspect.signature(model.sample_actions) if self._diagnostics_enabled else None
+        )
+        steps_parameter = (
+            sampler_signature.parameters.get("num_steps")
+            if sampler_signature is not None else None
+        )
+
         def capture_normalized_actions(*args: Any, **kwargs: Any):
             self._last_normalized_actions = None
+            if self._diagnostics_enabled and steps_parameter is not None:
+                try:
+                    bound = sampler_signature.bind_partial(*args, **kwargs)
+                    explicit = "num_steps" in bound.arguments
+                    raw_steps = (
+                        bound.arguments["num_steps"]
+                        if explicit
+                        else steps_parameter.default
+                    )
+                    if raw_steps is not inspect.Parameter.empty:
+                        self._last_denoising_steps = int(raw_steps)
+                        self._last_denoising_steps_source = (
+                            "explicit" if explicit else "sampler_default"
+                        )
+                except (TypeError, ValueError, OverflowError):
+                    # Diagnostics must never prevent an otherwise valid infer.
+                    pass
+            sampler_started = time.monotonic() if self._diagnostics_enabled else None
+            if sampler_started is not None:
+                self._last_sampler_started_at = sampler_started
             output = sample_actions(*args, **kwargs)
             raw_output = output
             if hasattr(raw_output, "detach"):
                 raw_output = raw_output.detach().float().cpu().numpy()
             self._last_normalized_actions = np.asarray(raw_output, dtype=np.float32)
+            # The existing host conversion above already waits for JAX/PyTorch
+            # output. This timer adds no GPU synchronization of its own.
+            if sampler_started is not None:
+                self._last_sampler_finished_at = time.monotonic()
+                self._last_sampler_wall_ms = (
+                    self._last_sampler_finished_at - sampler_started
+                ) * 1000.0
             return output
 
         # Policy.__init__ cached the old bound method in _sample_actions.
@@ -791,6 +1037,7 @@ class RTCAwarePolicy:
             model._rtc_prefix_attention_schedule = str(config["prefix_attention_schedule"])
 
     def infer(self, observation: dict[str, Any]) -> dict[str, Any]:
+        adapter_started = time.monotonic() if self._diagnostics_enabled else None
         client = observation.get("client_metadata")
         client = client if isinstance(client, dict) else {}
         rtc = client.get("rtc")
@@ -824,7 +1071,9 @@ class RTCAwarePolicy:
         reanchored = False
         reanchor_error = None
 
+        lock_requested = time.monotonic() if self._diagnostics_enabled else None
         with self._lock:
+            lock_acquired = time.monotonic() if self._diagnostics_enabled else None
             session = self._sessions.setdefault(session_id, _RTCSession())
             raw_rtc_config = rtc.get("config")
             if isinstance(raw_rtc_config, dict):
@@ -860,6 +1109,14 @@ class RTCAwarePolicy:
                 observation = dict(observation)
                 observation["prompt"] = session.prompt
 
+            # RTC and transport metadata are consumed above. OpenPI's input
+            # transform walks every observation leaf twice (once for prefix
+            # re-anchoring and once for inference), although client_metadata
+            # is not a model feature. Keep the image/state/prompt payload intact
+            # while excluding that potentially large telemetry tree.
+            model_observation = dict(observation)
+            model_observation.pop("client_metadata", None)
+
             previous = session.normalized_actions
             previous_absolute = session.absolute_actions
             old_generation = session.generation
@@ -887,7 +1144,7 @@ class RTCAwarePolicy:
                             raise ValueError("previous absolute overlap does not match RTC offset")
                         previous_left_over = _reanchor_normalized_actions(
                             self.policy,
-                            observation,
+                            model_observation,
                             previous_left_over,
                             remaining_absolute,
                             self.config.reanchor_action_mask,
@@ -951,10 +1208,37 @@ class RTCAwarePolicy:
                 # temporal-consistency wrapper without sharing keys between
                 # independent robot sessions.
                 self.policy._rng = temporal_rng
+            self._last_denoising_steps = None
+            self._last_denoising_steps_source = "unknown"
+            self._last_sampler_wall_ms = None
+            self._last_sampler_started_at = None
+            self._last_sampler_finished_at = None
+            self._last_input_transform_ms = None
+            self._last_input_transform_step_ms = None
+            self._last_input_transform_finished_at = None
+            self._last_observation_from_dict_started_at = None
+            self._last_observation_from_dict_finished_at = None
+            openpi_started = time.monotonic() if self._diagnostics_enabled else None
+            timing_token = _observation_timing_owner.set(self) if (
+                self._diagnostics_enabled or self._fused_image_normalization_enabled
+            ) else None
             try:
-                result = dict(self.policy.infer(observation))
+                result = dict(self.policy.infer(model_observation))
             finally:
+                if timing_token is not None:
+                    _observation_timing_owner.reset(timing_token)
                 self.policy._sample_kwargs = old_kwargs
+            openpi_finished = time.monotonic() if self._diagnostics_enabled else None
+            denoising_steps = self._last_denoising_steps
+            denoising_steps_source = self._last_denoising_steps_source
+            sampler_wall_ms = self._last_sampler_wall_ms
+            sampler_started = self._last_sampler_started_at
+            sampler_finished = self._last_sampler_finished_at
+            input_transform_ms = self._last_input_transform_ms
+            input_transform_step_ms = self._last_input_transform_step_ms
+            input_transform_finished = self._last_input_transform_finished_at
+            observation_started = self._last_observation_from_dict_started_at
+            observation_finished = self._last_observation_from_dict_finished_at
 
             normalized = self._last_normalized_actions
             if normalized is None:
@@ -1079,8 +1363,53 @@ class RTCAwarePolicy:
                 "seed": int(self.config.temporal_seed),
             },
         }
+        if self._diagnostics_enabled:
+            result["rtc"].update(
+                denoising_steps=denoising_steps,
+                denoising_steps_source=denoising_steps_source,
+                sampler_wall_ms=sampler_wall_ms,
+            )
         result["prompt"] = session.prompt
         result["prompt_revision"] = session.prompt_revision
+        if self._diagnostics_enabled:
+            finalized = time.monotonic()
+            result["model_phase_timing"] = {
+                "rtc_request_parse_ms": (lock_requested - adapter_started) * 1000.0,
+                "rtc_lock_wait_ms": (lock_acquired - lock_requested) * 1000.0,
+                "rtc_prepare_ms": (openpi_started - lock_acquired) * 1000.0,
+                "openpi_infer_ms": (openpi_finished - openpi_started) * 1000.0,
+                "openpi_pre_sampler_ms": (
+                    (sampler_started - openpi_started) * 1000.0
+                    if sampler_started is not None else None
+                ),
+                "sampler_wall_ms": sampler_wall_ms,
+                "openpi_post_sampler_ms": (
+                    (openpi_finished - sampler_finished) * 1000.0
+                    if sampler_finished is not None else None
+                ),
+                "rtc_finalize_ms": (finalized - openpi_finished) * 1000.0,
+                "rtc_total_ms": (finalized - adapter_started) * 1000.0,
+            }
+            if input_transform_ms is not None:
+                result["model_phase_timing"]["openpi_input_transform_ms"] = input_transform_ms
+            if input_transform_step_ms is not None:
+                result["model_phase_timing"]["openpi_input_transform_steps_ms"] = (
+                    input_transform_step_ms
+                )
+            if input_transform_finished is not None and observation_started is not None:
+                # JAX device transfer can finish asynchronously; this is the
+                # host-side batching and transfer dispatch time, not a GPU sync.
+                result["model_phase_timing"]["openpi_batch_dispatch_ms"] = (
+                    observation_started - input_transform_finished
+                ) * 1000.0
+            if observation_started is not None and observation_finished is not None:
+                result["model_phase_timing"]["openpi_observation_from_dict_ms"] = (
+                    observation_finished - observation_started
+                ) * 1000.0
+            if observation_finished is not None and sampler_started is not None:
+                result["model_phase_timing"]["openpi_sampler_setup_ms"] = (
+                    sampler_started - observation_finished
+                ) * 1000.0
         return result
 
     def reset(self) -> None:

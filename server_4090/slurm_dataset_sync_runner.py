@@ -11,12 +11,13 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import shlex
 import subprocess
 import sys
 import textwrap
 import time
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 APP_DIR = __import__("pathlib").Path(__file__).resolve().parent
@@ -191,7 +192,13 @@ def main() -> int:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--skip-existing", action="store_true", help="Return success without copying when target already exists")
     parser.add_argument("--parallelism", type=int, default=4)
-    parser.add_argument("--nas-staging-root", default="/DATA/NAS/GPUServer/sunny/dashboard_dataset_sync")
+    parser.add_argument(
+        "--nas-staging-root",
+        default=os.environ.get(
+            "BIMANUAL_VLA_NAS_DATASET_STAGING_ROOT",
+            str(Path.home() / "nas" / "dashboard_dataset_sync"),
+        ),
+    )
     args = parser.parse_args()
 
     source = b64_json(args.source_json)

@@ -15,6 +15,12 @@
       --heading:#f7faff; --control-text:#edf3fb; --code:#a9e4ff;
       --blue:#69b6ff; --blue-strong:#3b82f6; --green:#4ed9ac; --yellow:#f4c66d;
       --red:#fb7185; --purple:#b794f4; --button-start:#347fb8; --button-end:#245a91; --button-border:#468fc2; --danger-bg:#8d2c49; --danger-border:#c95a75; --nav-height:112px;
+      --nav-count-text:#bfeaff; --nav-count-bg:#153f5d; --telemetry-badge-text:#d6e4f2; --telemetry-badge-bg:#0b1a2d; --telemetry-badge-border:#2f4966;
+      --origin-real-text:#bfffe5; --origin-real-bg:#103529; --origin-real-border:#217a5f;
+      --origin-simulation-text:#d9ccff; --origin-simulation-bg:#261f46; --origin-simulation-border:#624ca8;
+      --origin-unknown-text:#ffe5a3; --origin-unknown-bg:#392d14; --origin-unknown-border:#8d6c22;
+      --message-error-text:#ffe4e6; --message-error-bg:#3b1725; --message-error-border:#fb7185;
+      --message-success-text:#d1fae5; --message-success-bg:#123228; --message-success-border:#4ed9ac;
       --shadow:0 18px 50px rgba(0,0,0,.24); --shadow-soft:0 8px 24px rgba(0,0,0,.16);
     }
     html[data-theme="light"] {
@@ -27,6 +33,12 @@
       --heading:#10243c; --control-text:#203247; --code:#1d6e9c;
       --blue:#2b7de9; --blue-strong:#2563d3; --green:#159b79; --yellow:#b7791f;
       --red:#d94b68; --purple:#7657c5; --button-start:#3f86dc; --button-end:#2866c4; --button-border:#3578ca; --danger-bg:#c44a68; --danger-border:#b93b5b;
+      --nav-count-text:#47647e; --nav-count-bg:#e7eff8; --telemetry-badge-text:#34495e; --telemetry-badge-bg:#eef4fa; --telemetry-badge-border:#cbd8e6;
+      --origin-real-text:#126b52; --origin-real-bg:#e4f6ef; --origin-real-border:#87cbb1;
+      --origin-simulation-text:#5b4599; --origin-simulation-bg:#f0ecff; --origin-simulation-border:#b6a9e2;
+      --origin-unknown-text:#815b0d; --origin-unknown-bg:#fff5d6; --origin-unknown-border:#e3c46e;
+      --message-error-text:#9f1239; --message-error-bg:#fff1f2; --message-error-border:#e11d48;
+      --message-success-text:#065f46; --message-success-bg:#ecfdf5; --message-success-border:#059669;
       --shadow:0 18px 45px rgba(52,83,112,.13); --shadow-soft:0 8px 24px rgba(52,83,112,.1);
     }
     * { box-sizing:border-box; }
@@ -51,7 +63,7 @@
     .nav-button { width:auto; flex:0 0 auto; display:flex; align-items:center; gap:8px; padding:9px 14px; border:1px solid transparent; border-radius:11px; color:var(--muted); background:transparent; font-weight:750; transition:background .18s ease,border-color .18s ease,color .18s ease,transform .18s ease; }
     .nav-button:hover { color:var(--heading); border-color:var(--line); background:var(--surface-raised); transform:translateY(-1px); }
     .nav-button.active { color:var(--heading); border-color:rgba(66,199,255,.65); background:linear-gradient(180deg,rgba(18,53,84,.98),rgba(16,40,62,.98)); box-shadow:inset 0 0 0 1px rgba(66,199,255,.08),0 6px 16px rgba(14,165,233,.12); }
-    .nav-count { min-width:21px; padding:1px 6px; border-radius:999px; color:#bfeaff; background:#153f5d; font-size:11px; text-align:center; }
+    .nav-count { min-width:21px; padding:1px 6px; border-radius:999px; color:var(--nav-count-text); background:var(--nav-count-bg); font-size:11px; text-align:center; }
     main { max-width:1640px; margin:auto; padding:28px 28px 48px; }
     .dashboard-module[hidden],.toolbar[hidden],.auth-status[hidden] { display:none !important; }
     .module-heading { display:flex; justify-content:space-between; gap:16px; align-items:flex-end; margin:2px 0 20px; }
@@ -116,7 +128,8 @@
     .architecture { display:grid; grid-template-columns:1fr auto 1fr auto 1fr; gap:8px; align-items:center; text-align:center; }
     .architecture > span { padding:10px; border:1px solid var(--line); border-radius:11px; background:var(--surface-inset); }
     .path { max-width:460px; overflow-wrap:anywhere; }
-    #message { position:sticky; top:calc(var(--nav-height) + 8px); z-index:40; display:none; margin-bottom:16px; padding:11px 15px; border:1px solid #3b82f6; border-radius:11px; background:#172554; box-shadow:var(--shadow-soft); }
+    #message { position:sticky; top:calc(var(--nav-height) + 8px); z-index:40; display:none; margin-bottom:16px; padding:11px 15px; border:1px solid var(--message-error-border); border-radius:11px; color:var(--message-error-text); background:var(--message-error-bg); box-shadow:var(--shadow-soft); }
+    #message[data-kind="success"] { border-color:var(--message-success-border); color:var(--message-success-text); background:var(--message-success-bg); }
     .episode-editor-grid { display:grid; grid-template-columns:minmax(0,1fr); gap:14px; margin-top:14px; }
     .episode-panel { padding:12px; border:1px solid #334c69; border-radius:11px; background:#091727; }
     #episodeEditorPanel { scroll-margin-top:calc(var(--nav-height) + 18px); }
@@ -146,7 +159,7 @@
     .metric-toggle { width:auto; padding:5px 9px; border-color:#3c5878; background:#12233a; font-size:12px; }
     .policy-telemetry { min-width:340px; max-width:620px; }
     .telemetry-badges { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:7px; }
-    .telemetry-badges > span { padding:2px 7px; border:1px solid #2f4966; border-radius:999px; background:#0b1a2d; font-size:11px; }
+    .telemetry-badges > span { padding:2px 7px; border:1px solid var(--telemetry-badge-border); border-radius:999px; color:var(--telemetry-badge-text); background:var(--telemetry-badge-bg); font-size:11px; }
     .telemetry-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:5px 12px; }
     .telemetry-item { min-width:0; padding:4px 0; border-bottom:1px solid rgba(48,75,104,.45); }
     .telemetry-item-label { display:block; color:var(--muted); font-size:11px; }
@@ -187,9 +200,9 @@
     .policy-workspace { grid-template-columns:minmax(0,1fr); }
     .policy-workspace > .card { grid-column:1; }
     .section-note { padding:10px 12px; border-left:3px solid var(--blue); border-radius:7px; background:#0b1b2e; color:#aac0d8; }
-    .dataset-origin-real { color:#bfffe5; border-color:#217a5f !important; background:#103529 !important; }
-    .dataset-origin-simulation { color:#d9ccff; border-color:#624ca8 !important; background:#261f46 !important; }
-    .dataset-origin-unknown { color:#ffe5a3; border-color:#8d6c22 !important; background:#392d14 !important; }
+    .dataset-origin-real { color:var(--origin-real-text); border-color:var(--origin-real-border) !important; background:var(--origin-real-bg) !important; }
+    .dataset-origin-simulation { color:var(--origin-simulation-text); border-color:var(--origin-simulation-border) !important; background:var(--origin-simulation-bg) !important; }
+    .dataset-origin-unknown { color:var(--origin-unknown-text); border-color:var(--origin-unknown-border) !important; background:var(--origin-unknown-bg) !important; }
     .dataset-group-row td { padding:9px 12px; background:var(--table-head); color:var(--table-head-text); border-top:2px solid var(--table-head-border); font-weight:800; }
     .dataset-origin-select,.dataset-sync-select { width:auto; min-width:104px; display:inline-block; padding:6px 8px; margin:2px; }
     .location-list { display:flex; flex-wrap:wrap; gap:5px; margin-top:5px; }
@@ -692,7 +705,7 @@
       <div class="module-heading"><div><h2>Policy 管理</h2><p>从 checkpoint 启动、切换、健康检测和实机执行授权。</p></div></div>
       <div class="grid policy-workspace">
         <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm" class="compact-submission"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><input type="hidden" name="model_variant" id="policyModelVariant" value="pi05"><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div></div><p class="muted">Prompt 与 RTC 运行参数由机械臂客户端配置；Policy 仅提供服务器能力上限。客户端改动后无需重启 Policy。</p><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
-        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">EXECUTE 必须同时满足服务端短时授权、客户端 <code>--allow-execution</code>、<code>action_horizon &gt;= 16</code> 和本地逐 20 Hz command 安全检查。异步客户端默认 4 Hz 启动推理（推理+传输通常约 200 ms），旧 chunk 在推理期间持续执行；新 chunk 到达后按实时 arrival 延迟动态过期 prefix，融合 2~4 步后切换 generation。已结束的历史进程可删除记录和日志。</p><div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('policy')" disabled data-bulk-delete-scope="policy">批量删除已选日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束 Policy；不会删除模型或其他输出。</span></div><div class="table-wrap"><table><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="policy" onchange="toggleTaskSelection('policy', this.checked)" aria-label="全选当前页 Policy 历史任务"></th><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端状态 / 延迟摘要</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div><div id="policyTasksPagination"></div></div>
+        <div class="card two-third"><h2>Policy 进程</h2><p class="muted">动作执行由客户端 <code>--allow-execution</code> 控制，并要求 <code>action_horizon &gt;= 16</code> 和本地逐 20 Hz command 安全检查。异步客户端按所选固定频率或 chunk 步数触发推理，旧 chunk 在推理期间持续执行；新 chunk 到达后按实际延迟过期 prefix，再融合切换 generation。已结束的历史进程可删除记录和日志。</p><div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('policy')" disabled data-bulk-delete-scope="policy">批量删除已选日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束 Policy；不会删除模型或其他输出。</span></div><div class="table-wrap"><table><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="policy" onchange="toggleTaskSelection('policy', this.checked)" aria-label="全选当前页 Policy 历史任务"></th><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端状态 / 延迟摘要</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div><div id="policyTasksPagination"></div></div>
         <div class="card" id="policyTaskLogCard"><h2>Policy 进程日志</h2><p class="muted">从 Policy 进程表点击“日志”查看最近输出。</p><pre id="policyTaskLog">尚未选择 Policy 进程。</pre></div>
         <div class="card"><h2>机械臂客户端命令</h2><p class="muted">以下只生成连接/设备示例；prompt 和 RTC 运行参数属于客户端。连接后以 telemetry 中的 client prompt/RTC 为准。</p><pre id="policyClientCommand">bin/bimanual-vla rtc-client --host 192.168.101.9 --port 8000 --hz 4 --arm-mode single --arm-side right --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16</pre></div>
       </div>
@@ -701,14 +714,14 @@
     <section id="module-telemetry" class="dashboard-module" data-module="telemetry" hidden>
       <div class="module-heading"><div><h2>实时遥测</h2><p>按 Policy 合同动态展示单臂两路或双臂三路相机、分臂 state、首条预测 action 和异步 chunk 生命周期。Delivery 模式使用 EEF/workspace 安全阈值；Joint 模式展示绝对关节目标及客户端逐周期关节/夹爪安全检查。</p></div></div>
       <div class="stat-grid telemetry-latency-grid" aria-label="异步链路延迟">
-        <div class="stat-card"><div class="stat-label">客户端测量：上传</div><div id="telemetryUpload" class="stat-value">-</div><div id="telemetryUploadDetail" class="stat-detail">client report · one-way wall-clock</div></div>
+        <div class="stat-card"><div class="stat-label">上行：跨机时间差</div><div id="telemetryUpload" class="stat-value">-</div><div id="telemetryUploadDetail" class="stat-detail">含两机时钟偏移</div></div>
         <div class="stat-card"><div class="stat-label">模型推理（实测）</div><div id="telemetryModel" class="stat-value">-</div><div class="stat-detail">server model execution</div></div>
-        <div class="stat-card"><div class="stat-label">客户端测量：下行</div><div id="telemetryDownload" class="stat-value">-</div><div id="telemetryDownloadDetail" class="stat-detail">client report · one-way wall-clock</div></div>
-        <div class="stat-card"><div class="stat-label">网络总传输 / RTT</div><div id="telemetryTransport" class="stat-value">-</div><div id="telemetryTransportDetail" class="stat-detail">client report · RTT monotonic measured</div></div>
+        <div class="stat-card"><div class="stat-label">下行：跨机时间差</div><div id="telemetryDownload" class="stat-value">-</div><div id="telemetryDownloadDetail" class="stat-detail">含两机时钟偏移</div></div>
+        <div class="stat-card"><div class="stat-label">非模型开销 / RTT</div><div id="telemetryTransport" class="stat-value">-</div><div id="telemetryTransportDetail" class="stat-detail">同次请求 RTT 减模型时间，含序列化和网络</div></div>
         <div class="stat-card"><div class="stat-label">结果 → 首条命令</div><div id="telemetryFirstCommand" class="stat-value">-</div><div class="stat-detail">client response → 20 Hz command</div></div>
         <div class="stat-card"><div class="stat-label">当前动作时间误差</div><div id="telemetryActionError" class="stat-value">-</div><div class="stat-detail">now - target time（带符号）</div></div>
       </div>
-      <p class="muted">说明：上传/下行由客户端根据本次请求的服务端时间戳回显计算并汇报；单向值仍需两端 wall-clock 基本同步。RTT 和“结果→首条命令”由客户端 monotonic clock 实测，模型推理由服务端 monotonic clock 实测。</p>
+      <p class="muted">说明：上行/下行显示上一请求两机时间戳的原始差，包含时钟偏移；负值表示时钟偏差，不能解释为负延迟。数百毫秒的尖峰仍可定位传输方向。非模型开销是同次请求的 RTT 减模型耗时，包含编解码、网络和服务端发送；RTT 由客户端单调时钟实测。</p>
       <div class="grid">
         <div class="card"><h2>Policy 实时观测</h2><div id="robotObservation" class="warn">尚未收到 telemetry。</div><div id="telemetryContractBadges" class="telemetry-badges"></div><div class="telemetry-vector-grid"><div class="telemetry-vector-card"><h3 id="robotStateTitle">Policy state</h3><pre id="robotState">state: -</pre></div><div class="telemetry-vector-card"><h3 id="policyFirstActionTitle">首条预测 action</h3><pre id="policyFirstAction">action: -</pre></div></div><details class="telemetry-details" open><summary>Prompt / 合同 / Chunk 与安全状态</summary><pre id="policyAction">action: -</pre></details><h3>Trajectory jitter（实际下发关节命令）</h3><pre id="trajectoryJitter">等待命令样本。</pre><h3>模型 → IK → Piper 命令 → 下一周期反馈</h3><pre id="actuatorTrace">actuator trace: -</pre><div class="telemetry-camera-heading"><h3 style="margin:0">Policy 实际收到的相机</h3><span id="robotCameraSummary" class="muted">等待 telemetry。</span></div><div id="robotImages" class="telemetry-camera-grid"><div class="muted">尚无相机帧。</div></div></div>
       </div>
@@ -793,6 +806,12 @@ let settingsBrowsePath = '';
 let settingsBrowseData = null;
 let settingsBrowseEditIndex = null;
 let latestDatasetLocations = null;
+let datasetLocationsRequest = null;
+let datasetLocationsFetchedAt = 0;
+let clusterResourcesRequest = null;
+let clusterResourcesQueriedAt = 0;
+let gpuResourcesRequest = null;
+let latestGpuInventory = null;
 let latestTelemetryKey = null;
 let previewUrls = new Map();
 let episodeMediaPlayers = [];
@@ -924,8 +943,8 @@ function saveToken() {
 function show(text, bad = true) {
   const el = document.getElementById('message');
   el.textContent = text;
+  el.dataset.kind = bad ? 'error' : 'success';
   el.style.display = 'block';
-  el.style.borderColor = bad ? '#e11d48' : '#10b981';
   setTimeout(() => { el.style.display = 'none'; }, 6000);
 }
 
@@ -1813,23 +1832,34 @@ function renderDatasetLocations(d) {
 
 async function loadDatasetLocations(forceRender = false) {
   if (!tokenInput.value) return null;
+  if (!forceRender && Date.now() - datasetLocationsFetchedAt < 60000) {
+    return latestDatasetLocations;
+  }
+  if (datasetLocationsRequest) return datasetLocationsRequest;
   const origin = DASHBOARD_PROFILE === 'simulation' ? 'simulation' : '';
   const suffix = origin ? `?origin=${encodeURIComponent(origin)}` : '';
-  try {
-    latestDatasetLocations = await api(`/api/dataset-locations${suffix}`);
-    if (latestDatasetLocations.errors && Object.keys(latestDatasetLocations.errors).length) {
-      console.warn('dataset location errors', latestDatasetLocations.errors);
+  datasetLocationsRequest = (async () => {
+    try {
+      latestDatasetLocations = await api(`/api/dataset-locations${suffix}`);
+      datasetLocationsFetchedAt = Date.now();
+      if (latestDatasetLocations.errors && Object.keys(latestDatasetLocations.errors).length) {
+        console.warn('dataset location errors', latestDatasetLocations.errors);
+      }
+      if (latestStatus) {
+        latestStatus.datasets = mergeDatasetLocationInfo(latestStatus.datasets || [], latestDatasetLocations);
+        fillDatasets(latestStatus.datasets || []);
+      }
+      return latestDatasetLocations;
+    } catch (error) {
+      datasetLocationsFetchedAt = Date.now();
+      console.warn('dataset locations failed', error);
+      if (forceRender) show(`数据集位置刷新失败：${error.message}`);
+      return null;
+    } finally {
+      datasetLocationsRequest = null;
     }
-    if (forceRender && latestStatus) {
-      latestStatus.datasets = mergeDatasetLocationInfo(latestStatus.datasets || [], latestDatasetLocations);
-      fillDatasets(latestStatus.datasets || []);
-    }
-    return latestDatasetLocations;
-  } catch (error) {
-    console.warn('dataset locations failed', error);
-    if (forceRender) show(`数据集位置刷新失败：${error.message}`);
-    return null;
-  }
+  })();
+  return datasetLocationsRequest;
 }
 
 async function syncDatasetTo(datasetId, selectId, source) {
@@ -3868,21 +3898,52 @@ function fillEvalCheckpoints(items) {
 async function loadClusterResources(options = {}) {
   const output = document.getElementById('clusterResources');
   if (!output || !tokenInput.value) return;
+  if (clusterResourcesRequest) return clusterResourcesRequest;
+  if (options.quiet && Date.now() - clusterResourcesQueriedAt < 60000) return;
+  clusterResourcesQueriedAt = Date.now();
   if (!options.quiet) output.textContent = '正在通过 SSH/Slurm 查询 H100/H200 资源…';
-  try {
-    const data = await api('/api/cluster-resources');
-    output.textContent = data.output || '(empty output)';
-    if (!data.ok) output.textContent = `查询失败 rc=${data.returncode}\n` + output.textContent;
-  } catch (error) {
-    output.textContent = `H100/H200 资源查询失败：${error.message}`;
-  }
+  clusterResourcesRequest = (async () => {
+    try {
+      const data = await api('/api/cluster-resources');
+      output.textContent = data.output || '(empty output)';
+      if (!data.ok) output.textContent = `查询失败 rc=${data.returncode}\n` + output.textContent;
+    } catch (error) {
+      output.textContent = `H100/H200 资源查询失败：${error.message}`;
+    } finally {
+      clusterResourcesRequest = null;
+    }
+  })();
+  return clusterResourcesRequest;
 }
 
-function fillGpus(items) {
+async function loadGpuResources() {
+  if (!tokenInput.value) return;
+  if (gpuResourcesRequest) return gpuResourcesRequest;
+  gpuResourcesRequest = (async () => {
+    try {
+      const data = await api('/api/gpus', {cache: 'no-store'});
+      if (!Array.isArray(data.gpus) || !data.gpus.length) throw new Error('GPU 接口未返回显卡数据');
+      latestGpuInventory = data.gpus;
+      fillGpus(latestGpuInventory);
+      if (latestStatus) {
+        latestStatus.gpus = latestGpuInventory;
+        updateSummaries(latestStatus);
+      }
+    } catch (error) {
+      fillGpus(latestGpuInventory || [], `GPU 查询失败：${error.message}${latestGpuInventory ? '；以下为上次成功查询的结果' : ''}`);
+    } finally {
+      gpuResourcesRequest = null;
+    }
+  })();
+  return gpuResourcesRequest;
+}
+
+function fillGpus(items, error = '') {
   document.getElementById('gpuList').innerHTML = items.map(g => `
     <div><span class="pill">GPU ${g.index}</span> ${esc(g.name)} · ${g.memory_used_mib}/${g.memory_total_mib} MiB · ${g.compute_available === false ? '<span class="bad">CUDA unavailable</span>' : g.processes.length ? '<span class="warn">busy</span>' : '<span class="ok">free</span>'}
     ${g.health_issue ? `<div class="bad">${esc(g.health_issue)}</div>` : ''}
-    ${g.processes.map(p => `<div class="muted">PID ${esc(p.pid)} · 用户 ${esc(p.user || 'unknown')} · ${esc(p.name || '-')} · ${esc(p.memory_mib == null ? '-' : p.memory_mib)} MiB</div>`).join('')}</div>`).join('') || '<div class="bad">nvidia-smi 不可用</div>';
+    ${g.processes.map(p => `<div class="muted">PID ${esc(p.pid)} · 用户 ${esc(p.user || 'unknown')} · ${esc(p.name || '-')} · ${esc(p.memory_mib == null ? '-' : p.memory_mib)} MiB</div>`).join('')}</div>`).join('') || '<div class="muted">尚未获取 GPU 数据</div>';
+  if (error) document.getElementById('gpuList').insertAdjacentHTML('afterbegin', `<div class="warn">${esc(error)}</div>`);
 }
 
 function fillReplacePolicies(items) {
@@ -4406,6 +4467,7 @@ function fmtTime(epoch) {
 }
 
 function finiteMetric(value) {
+  if (value == null || value === '' || typeof value === 'boolean') return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
@@ -4413,6 +4475,21 @@ function finiteMetric(value) {
 function metricMs(value) {
   const number = finiteMetric(value);
   return number == null ? '-' : `${number.toFixed(1)} ms`;
+}
+
+function oneWayClockDisplay(reportedMs, endAt, startAt) {
+  const reported = finiteMetric(reportedMs);
+  const end = finiteMetric(endAt);
+  const start = finiteMetric(startAt);
+  const raw = end == null || start == null ? null : (end - start) * 1000;
+  if (reported != null) return {value: metricMs(reported), detail: '上一请求跨机墙钟原始差 · 含时钟偏移'};
+  if (raw != null) return {
+    value: signedMetricMs(raw),
+    detail: raw < 0
+      ? '负值是时钟偏差，不是实际负延迟'
+      : '上一请求跨机墙钟原始差 · 含时钟偏移',
+  };
+  return {value: '-', detail: '尚无客户端时间戳'};
 }
 
 function clientTimingMetric(clientValue, fallbackValue) {
@@ -4578,7 +4655,6 @@ function queueDropInfo(t) {
 
 function telemetrySummary(t) {
   if (!t) return '<span class="muted">客户端未连接，尚无 telemetry</span>';
-  const control = t.execution_control || {};
   const age = finiteMetric(t.age_s);
   const configuredHz = t.client_configured_inference_hz ?? t.client_inference_hz ?? t.recommended_inference_launch_hz ?? 4;
   const launchHz = t.client_inference_launch_hz;
@@ -4595,8 +4671,9 @@ function telemetrySummary(t) {
   const targetAge = t.client_target_age_s ?? target.target_age_s ?? '-';
   const targetTimes = Array.isArray(t.client_plan_target_times) ? JSON.stringify(t.client_plan_target_times) : '-';
   const targetError = actionTimeErrorMs(t);
-  const uploadTiming = clientTimingMetric(t.client_observation_upload_ms, t.server_observation_upload_ms);
-  const downloadTiming = clientTimingMetric(t.client_result_download_ms, null);
+  const clockTiming = t.client_transport_timing || {};
+  const uploadTiming = oneWayClockDisplay(t.client_observation_upload_ms, clockTiming.server_request_received_at, clockTiming.request_sent_at).value;
+  const downloadTiming = oneWayClockDisplay(t.client_result_download_ms, clockTiming.response_received_at, clockTiming.server_response_ready_at).value;
   const transportTiming = clientTimingMetric(t.client_network_transport_total_ms, null);
   const activeGeneration = t.client_active_plan_generation ?? t.client_queue_generation ?? '-';
   const activeIndex = t.client_active_plan_index ?? '-';
@@ -4614,15 +4691,9 @@ function telemetrySummary(t) {
     : t.fresh
       ? `<span class="ok">近期推理 · age=${esc(age == null ? '-' : age.toFixed(1))}s</span>`
       : `<span class="warn">推理已过期 · age=${esc(age == null ? '-' : age.toFixed(1))}s</span>`;
-  const serverGate = control.mode === 'execute'
-    ? `<span class="warn">服务端 EXECUTE · 到期 ${esc(fmtTime(control.expires_at))}</span>`
-    : '<span class="muted">服务端 SHADOW</span>';
   const clientGate = t.client_allow_execution
     ? '<span class="warn">客户端允许执行</span>'
     : '<span class="muted">客户端禁止执行</span>';
-  const dualGate = t.dual_gate_open
-    ? '<span class="bad">双重门 OPEN</span>'
-    : '<span class="ok">双重门 CLOSED</span>';
   const drop = queueDropInfo(t);
   const clientRtc = t.client_rtc && typeof t.client_rtc === 'object' ? t.client_rtc : {};
   const clientRtcText = Object.keys(clientRtc).length
@@ -4656,7 +4727,7 @@ function telemetrySummary(t) {
     <div>gripper=${esc(t.raw_gripper_semantics || '-')} → ${esc(t.wire_gripper_semantics || '-')} · source=${esc(t.source_name || '-')} · action=${esc(JSON.stringify(t.actions_shape || []))}</div>
   `;
   return `<div class="policy-telemetry">
-    <div class="telemetry-badges">${connection}${freshness}${serverGate}${clientGate}${dualGate}${safetyBadge}</div>
+    <div class="telemetry-badges">${connection}${freshness}${clientGate}${safetyBadge}</div>
     <div class="telemetry-grid">
       ${item('实际状态', `<code>${esc(t.client_execution_state || 'unknown')}</code>`, t.client_execution_state === 'ready' || t.client_execution_state === 'executing' ? 'ok' : '')}
       ${item('推理频率（配置/启动/完成）', `${esc(configuredHz)} / ${esc(launchHz ?? '-')} / ${esc(resultHz ?? '-')} Hz`)}
@@ -4678,18 +4749,7 @@ function telemetrySummary(t) {
 }
 
 function policyControlButtons(task) {
-  const metadata = task.metadata || {};
-  if (!metadata.telemetry_session) return '<span class="muted">外部/旧版 Policy：可停止或切换；执行控制需切换为 Dashboard 启动的进程后可用。</span>';
-  const t = task.telemetry || {};
-  const control = t.execution_control || {};
-  const running = task.state === 'running';
-  const horizonReady = t.horizon_execution_ready === true;
-  const timeReady = t.time_contract_ready === true;
-  const canArm = running && t.client_connected && t.fresh && t.client_allow_execution && horizonReady && timeReady;
-  const why = !running ? 'Policy 未运行' : !t.client_connected ? '机械臂客户端未连接' : !t.fresh ? 'telemetry 不新鲜' : !t.client_allow_execution ? '客户端未使用 --allow-execution' : !horizonReady ? (t.horizon_error || 'action_horizon 必须至少为 16') : t.time_contract_ready !== true ? (t.time_contract_error || 'action timing contract is invalid') : '';
-  const shadow = `<button class="inline secondary" onclick="setPolicyShadow('${esc(task.id)}')" ${control.mode === 'shadow' ? 'disabled' : ''}>只推理 / SHADOW</button>`;
-  const execute = `<button class="inline danger" onclick="armPolicy('${esc(task.id)}')" ${canArm && control.mode !== 'execute' ? '' : `disabled title="${esc(why || '已经授权执行')}"`}>授权执行 5 分钟</button>`;
-  return `${shadow}${execute}`;
+  return '<span class="muted">执行由机械臂客户端控制</span>';
 }
 
 function jobDependencySummary(task) {
@@ -5180,7 +5240,6 @@ function telemetryJointDeltaSummary(obs, action) {
 function renderTelemetryContractBadges(obs) {
   const cameraCount = telemetryCameraKeys(obs).length;
   const chunkRows = obs.client_chunk_rows ?? ((obs.actions_shape || [])[0] ?? '-');
-  const control = obs.execution_control || {};
   const badges = [
     obs.arm_mode === 'bimanual' ? '双臂' : `单臂 ${obs.arm_side || '-'}`,
     `${obs.schema || '-'} schema`,
@@ -5188,7 +5247,7 @@ function renderTelemetryContractBadges(obs) {
     `action ${obs.model_action_dim || '?'}D × ${chunkRows}`,
     `camera ${cameraCount}`,
     `${obs.action_hz ?? '-'} Hz`,
-    String(control.mode || 'shadow').toUpperCase(),
+    obs.client_allow_execution ? 'CLIENT EXECUTION ENABLED' : 'CLIENT OBSERVE ONLY',
     obs.fresh ? 'telemetry fresh' : 'telemetry stale',
   ];
   document.getElementById('telemetryContractBadges').innerHTML = badges.map(value => `<span>${esc(value)}</span>`).join('');
@@ -5214,41 +5273,33 @@ function fillObservation(obs) {
     ['telemetryUploadDetail', 'telemetryDownloadDetail', 'telemetryTransportDetail'].forEach(id => { document.getElementById(id).textContent = '尚无客户端汇报'; });
     return;
   }
-  const control = obs.execution_control || {};
-  status.className = obs.dual_gate_open ? 'bad' : obs.fresh ? 'ok' : 'warn';
+  status.className = obs.fresh ? 'ok' : 'warn';
   const captured = fmtTime(obs.client_capture_at ?? obs.captured_at);
   const currentTargetErrorMs = actionTimeErrorMs(obs);
-  // Client upload/download/transport values are reported asynchronously with
-  // the next request. Keep the server-side upload boundary as an explicitly
-  // labelled diagnostic fallback instead of presenting it as a client measure.
+  // The previous request's four timestamps arrive with the next request.
+  // Keep signed raw differences visible for diagnosing spikes; they include
+  // inter-host clock offset and are not calibrated one-way network latency.
+  const clockTiming = obs.client_transport_timing || {};
   const clientUploadMs = obs.client_observation_upload_ms;
-  const serverUploadMs = obs.server_observation_upload_ms;
-  const uploadMs = clientUploadMs ?? serverUploadMs;
   const modelMs = obs.server_model_inference_ms ?? obs.client_model_inference_ms;
   const clientDownloadMs = obs.client_result_download_ms;
-  const clientTransportMs = obs.client_network_transport_total_ms;
+  const uploadDisplay = oneWayClockDisplay(clientUploadMs, clockTiming.server_request_received_at, clockTiming.request_sent_at);
+  const downloadDisplay = oneWayClockDisplay(clientDownloadMs, clockTiming.response_received_at, clockTiming.server_response_ready_at);
   const roundTripMs = obs.client_round_trip_ms;
+  const nonModelMs = obs.client_transport_timing?.non_model_rtt_ms;
   const drop = queueDropInfo(obs);
   const cameraKeys = telemetryCameraKeys(obs);
   renderTelemetryContractBadges(obs);
-  document.getElementById('telemetryUpload').textContent = metricMs(uploadMs);
-  document.getElementById('telemetryUploadDetail').textContent = clientUploadMs != null
-    ? '客户端汇报 · wall-clock 单向测量'
-    : serverUploadMs != null
-      ? '无客户端汇报 · 服务端请求入口诊断'
-      : '尚无客户端汇报';
+  document.getElementById('telemetryUpload').textContent = uploadDisplay.value;
+  document.getElementById('telemetryUploadDetail').textContent = uploadDisplay.detail;
   document.getElementById('telemetryModel').textContent = metricMs(modelMs);
-  document.getElementById('telemetryDownload').textContent = metricMs(clientDownloadMs);
-  document.getElementById('telemetryDownloadDetail').textContent = clientDownloadMs != null
-    ? '客户端汇报 · wall-clock 单向测量'
-    : '尚无客户端汇报';
-  document.getElementById('telemetryTransport').textContent = `${metricMs(clientTransportMs)} / ${metricMs(roundTripMs)}`;
-  document.getElementById('telemetryTransportDetail').textContent = clientTransportMs != null
-    ? '总传输为客户端汇报 · RTT 为客户端 monotonic 实测'
-    : '尚无客户端总传输汇报 · RTT 为客户端 monotonic 实测';
+  document.getElementById('telemetryDownload').textContent = downloadDisplay.value;
+  document.getElementById('telemetryDownloadDetail').textContent = downloadDisplay.detail;
+  document.getElementById('telemetryTransport').textContent = `${metricMs(nonModelMs)} / ${metricMs(roundTripMs)}`;
+  document.getElementById('telemetryTransportDetail').textContent = '上次请求的非模型开销含编解码、网络和服务端发送；RTT 为客户端单调时钟实测';
   document.getElementById('telemetryFirstCommand').textContent = metricMs(obs.client_result_to_first_command_ms);
   document.getElementById('telemetryActionError').textContent = signedMetricMs(currentTargetErrorMs);
-  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · ${obs.arm_mode === 'bimanual' ? '双臂' : '单臂'} ${obs.schema || '-'} · state/action=${obs.state_dim || '?'}D/${obs.model_action_dim || '?'}D · camera=${cameraKeys.length} · 服务端=${control.mode || 'shadow'} · 客户端允许=${Boolean(obs.client_allow_execution)} · 双重门=${obs.dual_gate_open ? 'OPEN' : 'CLOSED'} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · 上传=${clientTimingMetric(clientUploadMs, serverUploadMs)} · 推理实测=${metricMs(modelMs)} · 下行=${clientTimingMetric(clientDownloadMs, null)} · 当前动作时间误差=${signedMetricMs(currentTargetErrorMs)} · 安全=${drop.unsafeLabel} · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
+  status.textContent = `${obs.fresh ? '官方链路近期有真实推理' : 'Policy 正常，但最近 telemetry 已过期'} · ${obs.arm_mode === 'bimanual' ? '双臂' : '单臂'} ${obs.schema || '-'} · state/action=${obs.state_dim || '?'}D/${obs.model_action_dim || '?'}D · camera=${cameraKeys.length} · 客户端允许=${Boolean(obs.client_allow_execution)} · 实际=${obs.client_execution_state || 'unknown'} · task=${obs.task_id} · port=${obs.policy_port} · age=${Number(obs.age_s).toFixed(2)}s · 上行原始差=${uploadDisplay.value} · 推理实测=${metricMs(modelMs)} · 下行原始差=${downloadDisplay.value} · 当前动作时间误差=${signedMetricMs(currentTargetErrorMs)} · 安全=${drop.unsafeLabel} · source=${obs.source_name || '-'} · captured=${captured} · transport=${obs.transport}`;
   const joint = obs.schema === 'joint';
   const state = obs.state || [];
   document.getElementById('robotStateTitle').textContent = `${obs.state_dim}D ${obs.arm_mode === 'bimanual' ? 'bimanual ' : ''}${obs.schema} state`;
@@ -5309,7 +5360,7 @@ time contract: offset=${obs.action_offset ?? '-'} · model/wire start=${obs.mode
 in-flight: ${obs.client_in_flight ?? '-'} · actuator delay=${obs.client_actuator_delay_ms ?? '-'} ms / ${obs.client_actuator_delay_steps ?? '-'} steps
 launch / capture / arrival: ${fmtTime(obs.client_launch_at)} / ${fmtTime(obs.client_capture_at ?? obs.captured_at)} / ${fmtTime(obs.client_arrival_at)}
 latency (capture→result): ${metricMs(obs.client_latency_ms)} / ${obs.client_latency_steps ?? '-'} steps
-async latency breakdown: camera=${metricMs(obs.client_camera_capture_ms)} · upload=${clientTimingMetric(obs.client_observation_upload_ms, obs.server_observation_upload_ms)} · model=${metricMs(obs.server_model_inference_ms ?? obs.client_model_inference_ms)} · result→client=${clientTimingMetric(obs.client_result_download_ms, null)} · transport total=${clientTimingMetric(obs.client_network_transport_total_ms, null)} · RTT=${metricMs(obs.client_round_trip_ms)}
+async latency breakdown: camera=${metricMs(obs.client_camera_capture_ms)} · upload raw=${uploadDisplay.value} · model=${metricMs(obs.server_model_inference_ms ?? obs.client_model_inference_ms)} · result→client raw=${downloadDisplay.value} · transport total=${clientTimingMetric(obs.client_network_transport_total_ms, null)} · RTT=${metricMs(obs.client_round_trip_ms)}
 result→first command: ${metricMs(obs.client_result_to_first_command_ms)} · observation→first command=${metricMs(obs.client_observation_to_first_command_ms)}
 server timing: request received=${fmtTime(obs.client_server_request_received_at ?? obs.server_request_received_at)} · model done=${fmtTime(obs.client_server_model_completed_at ?? obs.server_model_completed_at)} · response ready=${fmtTime(obs.client_server_response_ready_at ?? obs.server_response_ready_at)} · client received=${fmtTime(obs.client_response_received_at)}
 expired prefix / skipped prefix / blend: ${obs.client_expired_prefix ?? '-'} / ${obs.client_skipped_prefix ?? '-'} / ${obs.client_blend_steps ?? '-'} steps
@@ -5339,7 +5390,7 @@ async switch: old chunk keeps executing during inference; returned chunk expires
 last feedback: ${fmtTime(obs.client_last_feedback_at)}
 min/max: ${obs.action_min} / ${obs.action_max}
 policy elapsed: ${Number(obs.policy_elapsed_s || 0).toFixed(4)}s
-server gate: ${control.mode || 'shadow'} (revision ${control.revision || 0})
+execution authority: robot client
 client allow: ${Boolean(obs.client_allow_execution)}
 client state: ${obs.client_execution_state || 'unknown'}
 bridge reason (raw): ${obs.client_blocked_reason || '-'}
@@ -5371,6 +5422,7 @@ async function refreshAll() {
     show('请先输入 Dashboard API Token。');
     return;
   }
+  loadGpuResources();
   try {
     const data = await api('/api/status');
     const serverBuild = String(((data || {}).config || {}).dashboard_build || '');
@@ -5381,57 +5433,26 @@ async function refreshAll() {
       return;
     }
     latestStatus = data;
-    const locationData = await loadDatasetLocations(false);
-    if (locationData) latestStatus.datasets = mergeDatasetLocationInfo(data.datasets || [], locationData);
+    if (latestGpuInventory) latestStatus.gpus = latestGpuInventory;
+    updateSummaries(data);
+    if (latestDatasetLocations) latestStatus.datasets = mergeDatasetLocationInfo(data.datasets || [], latestDatasetLocations);
     fillDatasets(latestStatus.datasets || []);
     fillTrainingExperiments(data.experiments || []);
     fillBaseModels(data.base_models || []);
     fillExecutionTargets(data.config || {});
     fillCheckpoints(data.checkpoints || []);
-    fillGpus(data.gpus || []);
-    loadClusterResources({quiet: true});
     fillTasks(data.tasks || []);
     fillTrainingTasks(data.tasks || []);
     fillTransferTasks(data.tasks || []);
     refreshSelectedLogs();
     fillObservation(data.robot_observation);
-    updateSummaries(data);
     if (!episodeDatasetData && document.getElementById('editorDataset').value) loadDatasetEpisodes(0);
     const evalVideoModule = document.getElementById('module-eval-videos');
     if (evalVideoModule && !evalVideoModule.hidden) loadEvalVideos(evalVideoIncludeRemote);
     const trainingVisible = !document.getElementById('module-training').hidden;
     if (trainingVisible && document.getElementById('trainMetricsTask').value) loadTrainingMetrics({quiet: true});
-  } catch (error) {
-    show(error.message);
-  }
-}
-
-async function armPolicy(id) {
-  const typed = prompt(`这是实机动作授权。请输入完整 Policy task id 以确认：\n${id}`, '');
-  if (typed !== id) {
-    if (typed !== null) show('task id 不匹配，未授权执行。');
-    return;
-  }
-  try {
-    await api(`/api/tasks/${encodeURIComponent(id)}/execution-control`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({mode: 'execute', expires_in_s: 300, confirm_task_id: typed}),
-    });
-    show('已授权执行 5 分钟；客户端本地安全门仍独立生效。', false);
-    await refreshAll();
-  } catch (error) {
-    show(error.message);
-  }
-}
-
-async function setPolicyShadow(id) {
-  try {
-    await api(`/api/tasks/${encodeURIComponent(id)}/execution-control`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({mode: 'shadow'}),
-    });
-    show('已切回只推理 / SHADOW。', false);
-    await refreshAll();
+    loadDatasetLocations(false);
+    loadClusterResources({quiet: true});
   } catch (error) {
     show(error.message);
   }

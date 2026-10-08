@@ -28,7 +28,7 @@ server_4090/SIMULATION_DASHBOARD.md
 - 页面顶部按“总览 / 数据集 / 训练 / Policy / 实时遥测”分模块导航；总览集中显示 GPU、数据量和活动任务。
 - Dashboard 可以新建、健康检测、停止、强制结束 Policy，并用新 checkpoint 替换运行中的 Policy。
 - 已完成、失败、丢失或停止的训练 / Policy 历史任务可从对应模块删除任务记录和日志；checkpoint、模型与训练输出不会被删除。
-- 机械臂客户端默认是 shadow-only；只有显式添加 `--allow-execution`、Dashboard 对同一 Policy 给出未过期的 EXECUTE 授权、telemetry 新鲜、`action_horizon >= 16` 且本地安全检查全部通过时，才会发布异步 chunk 命令。
+- 机械臂客户端默认只推理；只有显式添加 `--allow-execution` 且本地逐条安全检查通过时，才会发布异步 chunk 命令。Policy 启动后会先用合成观测预热模型，再开放 WebSocket 服务。
 - 机械臂客户端默认把本地监测轨迹追加保存到 `./monitoring_data/<session>/events.jsonl`；可用 `--monitoring-dir` 指定其他目录。记录器在后台线程写盘，控制台日志也经有界后台队列输出。监控日志不走动作 WebSocket；原始图像不写入 JSONL，只保留相机设备和时间戳。Dashboard 图像预览最多每秒更新一次，减小与动作传输共享网络时的流量。
 
 ## 部署并启动 Dashboard
@@ -39,7 +39,7 @@ server_4090/SIMULATION_DASHBOARD.md
 bash deploy_4090_server.sh
 ```
 
-脚本只同步本服务需要的文件到 `4x4090:/home/sunny/bimanual-vla`，安装并启用用户级 systemd 服务 `bimanual-vla-dashboard.service`。Dashboard 会随 4×4090 开机自动启动，并在异常退出后自动重启；重启 Dashboard 本身不会停止页面管理的 Policy、训练任务或服务器上已有的其他 GPU 进程。首次启动会生成随机 Token，Dashboard 地址为：
+脚本只同步本服务需要的文件到远端用户主目录下的 `bimanual-vla`（默认 `$HOME/bimanual-vla`，可通过 `REMOTE_ROOT` 覆盖），安装并启用用户级 systemd 服务 `bimanual-vla-dashboard.service`。Dashboard 会随 4×4090 开机自动启动，并在异常退出后自动重启；重启 Dashboard 本身不会停止页面管理的 Policy、训练任务或服务器上已有的其他 GPU 进程。首次启动会生成随机 Token，Dashboard 地址为：
 
 ```text
 http://192.168.101.9:8090
@@ -87,7 +87,7 @@ ssh 4x4090 'systemctl --user stop bimanual-vla-dashboard.service && rm -f ~/.con
 自定义路径、端口或 JAX 显存比例时修改服务器上的：
 
 ```text
-/home/sunny/bimanual-vla/server_4090/config.json
+$REMOTE_ROOT/server_4090/config.json
 ```
 
 管理 Dashboard 自启动服务：
@@ -99,7 +99,7 @@ ssh 4x4090 'journalctl --user -u bimanual-vla-dashboard.service -n 100 --no-page
 ssh 4x4090 'tail -n 100 ~/.local/share/bimanual-vla-server/dashboard.log'
 ```
 
-部署脚本会尝试为当前用户开启 systemd linger，使用户尚未登录时服务也能随系统启动。可用 `loginctl show-user sunny -p Linger` 验证；如果服务器策略拒绝无管理员授权开启 linger，用户服务仍会在 `sunny` 登录后自动启动，但需要管理员执行 `loginctl enable-linger sunny` 才能实现完全无人登录的开机自启动。
+部署脚本会尝试为当前用户开启 systemd linger，使用户尚未登录时服务也能随系统启动。可用 `ssh 4x4090 'loginctl show-user "$(id -un)" -p Linger'` 验证；如果服务器策略拒绝无管理员授权开启 linger，用户服务仍会在该账号登录后自动启动，但需要管理员执行 `ssh 4x4090 'sudo loginctl enable-linger "$(id -un)"'` 才能实现完全无人登录的开机自启动。
 
 ## 上传数据集
 
@@ -208,8 +208,11 @@ LeRobot 数据集的 `meta/info.json` 中 `total_videos: 0` 只表示没有编�
 Dashboard 训练表单支持动态选择 `π0.5` 或 `π0` 模型系列，并会扫描 `checkpoint_allowed_roots` 下所有包含完整 `params/` 的预训练权重和训练 checkpoint。首次使用时至少准备一个与所选模型系列匹配的基座；例如下载 `pi05_base`：
 
 ```bash
-cd /home/sunny/bimanual-vla
-/home/sunny/miniconda3/envs/openpi/bin/python -m scripts.models.download_openpi_checkpoint \
+REMOTE_ROOT="${REMOTE_ROOT:-$HOME/bimanual-vla}"
+cd "$REMOTE_ROOT"
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate openpi
+python -m scripts.models.download_openpi_checkpoint \
   --checkpoint gs://openpi-assets/checkpoints/pi05_base \
   --source auto \
   --workers 16 \
@@ -219,7 +222,7 @@ cd /home/sunny/bimanual-vla
 默认保存到：
 
 ```text
-/home/sunny/.cache/openpi/openpi-assets/checkpoints/pi05_base
+${HOME}/.cache/openpi/openpi-assets/checkpoints/pi05_base
 ```
 
 ## 页面工作流
@@ -283,6 +286,21 @@ checkpoint 都走模型侧 RTC。API 还可设置 `rtc_execution_horizon`、
 `linear` / `exp`）。客户端只传 session、generation、offset 和 latency 估计，
 默认关闭额外的客户端 old/new blend；服务端按真实剩余步数填充固定 shape，避免
 JAX 因不同 offset 反复重新编译。
+
+推理诊断由 `server_4090/config.json` 的
+`policy_inference_diagnostics_enabled` 控制，默认 `true`；修改后重启 Dashboard，
+再启动 Policy 时生效。客户端 `monitoring_data/<session>/events.jsonl` 的
+`inference_result.result_summary.rtc` 记录实际传给采样器的
+`denoising_steps`、来源（默认值或显式覆盖）和 `sampler_wall_ms`；同一事件的
+`result_summary.transport_timing.model_phase_timing` 记录 RTC 准备、OpenPI 采样前处理、采样器及 CPU 回读、
+OpenPI 后处理、RTC 收尾等阶段。`transport_timing.policy_instance_id`
+用于确认两次会话是否来自同一个 Policy 进程。Dashboard 的 Policy 最新观测
+JSON 也保存这些字段。设为 `false` 后不执行这些额外的参数解析和阶段计时，
+基础 `model_inference_ms` 和客户端 RTT 仍会记录。JAX sampler 内的 prefix
+与每一步去噪同属一段 JIT 计算，常规日志不再拆开，以免逐步同步改变延迟。
+`openpi_input_transform_ms` 进一步量出采样前的完整输入变换；它只在该
+阶段实际执行且诊断开启时出现。用 `openpi_pre_sampler_ms` 减去它，可以估计
+批处理、JAX 数据上卡和 Observation 构造等剩余准备时间。
 
 脚本必须运行在物理连接 Piper CAN 和相机的电脑，而不是 4×4090；单臂使用一个 CAN 和两路相机：
 
@@ -408,13 +426,13 @@ WebSocket 和独立 20 Hz 控制循环。旧的 `bin/bimanual-vla legacy-bridge`
 4. 在所选 checkpoint 上创建新 Policy 任务；
 5. 机械臂客户端自动重连。
 
-切换会先把旧 Policy 强制切回 SHADOW，再中断已有 WebSocket 连接；替代 Policy 默认也是 SHADOW，必须重新满足双重门条件后才能执行。
+切换会中断旧 Policy 的 WebSocket 连接；替代 Policy 先完成模型预热，再接收客户端请求。是否执行由机械臂客户端的 `--allow-execution` 决定。
 
 ## 安全边界
 
 - Dashboard 管理接口需要 Token，并只接受白名单参数，不接受任意 shell。
 - 真实观测不经过 Dashboard HTTP API。
 - Dashboard telemetry 是 Policy 收到数据后的只读镜像。
-- 服务端 EXECUTE 授权最长 1 小时，网页默认 5 分钟；Dashboard 重启、Policy 停止或模型切换都会回到 SHADOW。
-- 客户端没有 `--allow-execution` 时永远不会发布动作；即使双重门打开，动作新鲜度、每条 20 Hz command 的位移/旋转/夹爪变化、workspace、`action_horizon` 和 Piper 状态仍会在本地逐次检查。
+- Dashboard 不再授予执行权限；旧的执行控制 POST API 返回 HTTP 410。
+- 客户端没有 `--allow-execution` 时永远不会发布动作；启用后，动作新鲜度、每条 20 Hz command 的位移/旋转/夹爪变化、workspace、`action_horizon` 和 Piper 状态仍会在本地逐次检查。
 - 训练和 heldout eval 默认拒绝已有计算进程，并继续使用 `allow_busy_gpus` 与各自的空闲显存阈值。Policy 单独使用 `policy_allow_busy_gpus`（默认 `true`）和 `policy_min_free_gpu_mib`（默认 `12000`）；只应与显存占用稳定的小型任务共享，不能与后续还会持续增长显存的训练任务抢卡。

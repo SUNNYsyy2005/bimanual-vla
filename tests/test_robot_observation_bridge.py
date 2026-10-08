@@ -27,7 +27,7 @@ from bimanual_vla.data.contract import (
     GRIPPER_MAX_M,
     LEGACY_GRIPPER_OPENING_METRES_SEMANTICS,
 )
-from bimanual_vla.collection.camera import CameraFrameSet
+from bimanual_vla.collection.camera import CameraCapture, CameraFrameSet
 from bimanual_vla.deployment.client import (
     AsyncPolicyInference,
     DEFAULT_BLEND_STEPS,
@@ -65,6 +65,7 @@ from bimanual_vla.deployment.client import (
     make_observation_snapshot,
     policy_observation_state,
     read_output_qpos,
+    request_metadata_for_inference,
     resolve_action_chunk_steps,
     rotation_from_state,
     validate_policy_metadata,
@@ -158,18 +159,7 @@ def execution_args(**overrides):
 
 
 def execution_result(actions: np.ndarray) -> dict:
-    now = time.time()
-    return {
-        "actions": np.asarray(actions, dtype=np.float64),
-        "execution_control": {
-            "mode": "execute",
-            "task_id": "policy-test",
-            "session_id": "session-test",
-            "server_time": now,
-            "expires_at": now + 30.0,
-            "revision": 7,
-        },
-    }
+    return {"actions": np.asarray(actions, dtype=np.float64)}
 
 
 def inference_launch(
@@ -844,6 +834,48 @@ class ActionQueueDecodeTest(unittest.TestCase):
 
 
 class ObservationConventionTest(unittest.TestCase):
+    def test_policy_preresize_uses_exact_pixels_without_changing_recorded_frames(self):
+        from openpi_client import image_tools
+
+        rng = np.random.default_rng(41)
+        images = {
+            key: rng.integers(0, 256, (3, 256, 256), dtype=np.uint8)
+            for key in ("cam_high", "cam_wrist")
+        }
+        original = {key: frame.copy() for key, frame in images.items()}
+        camera = CameraCapture(policy_image_hw=(224, 224))
+        policy_images = camera._prepare_policy_images(images)
+        self.assertIsNotNone(policy_images)
+        for key, frame in images.items():
+            np.testing.assert_array_equal(frame, original[key])
+            expected = image_tools.resize_with_pad(
+                frame.transpose(1, 2, 0), 224, 224
+            ).transpose(2, 0, 1)
+            np.testing.assert_array_equal(policy_images[key], expected)
+
+        now, monotonic_now = time.time(), time.monotonic()
+        frame_set = CameraFrameSet(
+            images=images,
+            timestamps={key: now for key in images},
+            monotonic_timestamps={key: monotonic_now for key in images},
+            captured_monotonic=monotonic_now,
+            policy_images=policy_images,
+        )
+        snapshot = make_observation_snapshot(
+            generation=1,
+            raw_delivery_state=delivery_state(opening_fraction=0.5),
+            qpos_m=np.array([0, 1, -1, 0, 0, 0, 0.035]),
+            protocol=validate_policy_metadata(DELIVERY_METADATA, "right"),
+            captured_at=now,
+            captured_monotonic=monotonic_now,
+            frame_set=frame_set,
+            rtc_metadata={},
+            execution_metadata={},
+            executed_plan_command_count=0,
+        )
+        self.assertEqual(snapshot.images["cam_high"].shape, (3, 224, 224))
+        self.assertEqual(frame_set.images["cam_high"].shape, (3, 256, 256))
+
     def test_policy_state_selects_delivery_closed_or_opening(self):
         raw = delivery_state(opening_fraction=0.8)
         qpos = np.array([0, 1, -1, 0, 0, 0, 0.8 * GRIPPER_MAX_M])
@@ -936,6 +968,48 @@ class ObservationConventionTest(unittest.TestCase):
             observation["client_metadata"]["execution_state"], "client_disabled"
         )
         self.assertAlmostEqual(observation["client_metadata"]["image_state_skew_ms"], 0.0)
+        args.send_policy_telemetry = False
+        minimal_observation = build_observation(
+            snapshot=snapshot,
+            protocol=validate_policy_metadata(DELIVERY_METADATA, "right"),
+            instruction="pick",
+            source_name="robot",
+            args=args,
+        )
+        minimal = minimal_observation["client_metadata"]
+        self.assertEqual(
+            set(minimal), {"captured_at", "source_name", "allow_execution", "rtc"}
+        )
+        self.assertEqual(minimal["rtc"], observation["client_metadata"]["rtc"])
+        self.assertNotIn("execution_state", minimal)
+        self.assertNotIn("image_captured_at", minimal)
+        request_fields = dict(
+            prompt_revision=3,
+            request_sent_at=now + 0.01,
+            inference_generation=4,
+            camera_capture_started_at=now - 0.03,
+            camera_capture_finished_at=now - 0.01,
+            camera_selection_started_monotonic=monotonic_now - 0.03,
+            camera_selection_finished_monotonic=monotonic_now - 0.01,
+        )
+        minimal.update(request_metadata_for_inference(
+            send_policy_telemetry=False, **request_fields
+        ))
+        self.assertEqual(set(minimal), {
+            "captured_at", "source_name", "allow_execution", "rtc",
+            "prompt_revision", "request_sent_at", "inference_generation",
+        })
+        self.assertEqual(minimal["inference_generation"], 4)
+        self.assertNotIn("camera_capture_started_at", minimal)
+        self.assertIn(
+            "camera_capture_started_at",
+            request_metadata_for_inference(send_policy_telemetry=True, **request_fields),
+        )
+        np.testing.assert_array_equal(minimal_observation["state"], observation["state"])
+        for key in observation["images"]:
+            np.testing.assert_array_equal(
+                minimal_observation["images"][key], observation["images"][key]
+            )
         with self.assertRaises(ValueError):
             snapshot.state[0] = 123.0
         with self.assertRaises(ValueError):
@@ -1154,6 +1228,41 @@ class ClientTransportTimingTest(unittest.TestCase):
         self.assertIsNone(timing["model_inference_ms"])
         self.assertIsNone(timing["network_transport_total_ms"])
         self.assertEqual(timing["inference_generation"], 8)
+
+    def test_clock_skew_invalidates_both_one_way_legs_but_preserves_rtt(self):
+        timing = build_client_transport_timing(
+            request_sent_at=100.300,
+            request_sent_monotonic=10.0,
+            response_received_at=100.600,
+            response_received_monotonic=10.3,
+            server_timing={
+                "server_request_received_at": 100.100,
+                "server_response_ready_at": 100.330,
+                "model_inference_ms": 220.0,
+            },
+            camera_capture_ms=1.0,
+            inference_generation=9,
+        )
+        self.assertIsNone(timing["observation_upload_ms"])
+        self.assertIsNone(timing["result_download_ms"])
+        self.assertIsNone(timing["network_transport_total_ms"])
+        self.assertAlmostEqual(timing["round_trip_ms"], 300.0)
+        self.assertAlmostEqual(timing["non_model_rtt_ms"], 80.0)
+
+    def test_compact_observation_carries_previous_request_timing(self):
+        execution = ExecutionController(FakePiper(), execution_args())
+        execution._record_client_transport_timing({
+            "_client_transport_timing": {
+                "round_trip_ms": 270.0,
+                "model_inference_ms": 220.0,
+                "non_model_rtt_ms": 50.0,
+                "timing_source": "client_wall_clock_echo",
+            }
+        }, generation=4)
+        compact = execution.metadata(compact=True)
+        self.assertEqual(compact["round_trip_ms"], 270.0)
+        self.assertEqual(compact["timing_generation"], 4)
+        self.assertEqual(compact["client_transport_timing"]["non_model_rtt_ms"], 50.0)
 
 
 class AsyncInferencePipelineTest(unittest.TestCase):
@@ -1415,40 +1524,26 @@ class AsyncInferencePipelineTest(unittest.TestCase):
             np.rint(self.qpos[:6] * RAD_FACTOR).astype(np.int64),
         )
 
-    def test_authorization_expiry_cancels_staged_plan_and_refreshes_hold(self):
-        base = time.monotonic()
-        execution, piper = self.settled_enable_hold(base=base)
+    def test_legacy_server_authorization_does_not_gate_client_execution(self):
+        execution, _ = self.configured_execution()
         safe = self.joint_chunk(20, 0.02)
         launch, _ = inference_launch(
-            self.raw_state, self.qpos, generation=21, captured_monotonic=base + 0.01
+            self.raw_state, self.qpos, generation=21
         )
+        result = execution_result(safe)
+        result["execution_control"] = {"mode": "shadow", "expired": True}
         self.assertTrue(
             execution.accept_inference_result(
-                execution_result(safe),
+                result,
                 launch,
                 self.joint_protocol,
                 arrived_at=time.time(),
-                arrived_monotonic=base + 0.01,
+                arrived_monotonic=time.monotonic(),
             )
         )
-        execution.authorization_deadline_monotonic = base + 0.015
-        with patch(
-            "bimanual_vla.deployment.client.time.monotonic", return_value=base + 0.02
-        ):
-            self.assertFalse(
-                execution.execute_next(
-                    self.raw_state, self.qpos, self.joint_protocol,
-                    feedback_captured_at=time.time(),
-                )
-            )
-        self.assertIsNone(execution.enable_staged_generation)
-        self.assertTrue(execution.waiting_fresh_after_enable)
-        self.assertIn("right", execution.arm_hold_targets)
-        joint_call = [c for c in piper.calls if c[0] == "JointCtrl"][-1]
-        np.testing.assert_array_equal(
-            np.asarray(joint_call[1:]),
-            np.rint(self.qpos[:6] * RAD_FACTOR).astype(np.int64),
-        )
+        self.assertEqual(execution.state, "ready")
+        self.assertGreater(execution.pending_action_count, 0)
+        self.assertFalse(hasattr(execution, "authorization_deadline_monotonic"))
 
     def test_blocked_policy_state_streams_last_safe_target_after_commit(self):
         execution, piper = self.configured_execution()
@@ -2191,6 +2286,27 @@ class AsyncInferencePipelineTest(unittest.TestCase):
         due_at = [tick * 0.05 for tick in range(20) if schedule.due(tick * 0.05)]
         np.testing.assert_allclose(due_at, [0.0, 0.25, 0.50, 0.75], atol=1e-12)
         self.assertAlmostEqual(schedule.period_s, 0.25)
+
+    def test_periodic_inference_coalesces_missed_slots_and_uses_latest_tick(self):
+        execution, _ = self.configured_execution(
+            hz=4.0, control_hz=20.0, inference_trigger_mode="periodic"
+        )
+        schedule = PeriodicSchedule(4.0, next_at=0.0)
+        self.assertTrue(execution.async_launch_due(schedule, 0.0, in_flight=False))
+        schedule.mark_launched(0.0)
+
+        # Three scheduled slots pass while one model request remains in flight.
+        for tick in (0.25, 0.50, 0.75):
+            self.assertFalse(execution.async_launch_due(schedule, tick, in_flight=True))
+        self.assertTrue(schedule.pending_latest)
+        self.assertEqual(execution.inference_launch_deferred_count, 3)
+
+        # The next free control tick sends one fresh observation immediately.
+        self.assertTrue(execution.async_launch_due(schedule, 0.80, in_flight=False))
+        schedule.mark_launched(0.80)
+        self.assertFalse(schedule.pending_latest)
+        self.assertFalse(execution.async_launch_due(schedule, 1.00, in_flight=False))
+        self.assertTrue(execution.async_launch_due(schedule, 1.05, in_flight=False))
 
     def test_chunk_step_trigger_uses_published_source_index_once_per_generation(self):
         execution, _ = self.configured_execution(

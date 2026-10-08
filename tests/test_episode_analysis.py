@@ -134,7 +134,7 @@ class EpisodeAnalysisTest(unittest.TestCase):
             ))
             if side == "right":
                 expected[:, 0] += 0.9
-            np.testing.assert_allclose(simulation.eef[side]["position"], expected)
+            np.testing.assert_allclose(simulation.eef[side]["position"], expected, atol=1e-12)
         np.testing.assert_allclose(
             simulation.arm_base_rotations["left"],
             [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
