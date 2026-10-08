@@ -64,9 +64,9 @@ class CameraFrameSet:
             captured_monotonic=float(self.captured_monotonic),
         )
 
-# Camera roles used by the current collection rig.  Device numbers and USB
-# paths can change after reconnecting a hub, but these model names and serial
-# backed udev properties remain stable.
+# Camera roles used by the current collection rig. Device numbers can change
+# after reconnecting a hub, so auto-selection combines model metadata with
+# reviewed USB-topology bindings for otherwise identical wrist cameras.
 CAMERA_MODEL_HINTS = {
     # Current physical installation: D435i is the overhead view. Both wrist
     # roles are D405 units. Their default USB topology bindings are required
@@ -80,8 +80,10 @@ CAMERA_MODEL_HINTS = {
 # identical, so model matching alone cannot tell left from right. These USB
 # topology fragments are stable across normal video-node renumbering.
 CAMERA_ROLE_PATH_HINTS = {
-    "cam_left_wrist": ("usb-0:6.2:",),
-    "cam_right_wrist": ("usb-0:5.2:",),
+    # Include the topology observed in this validation and the previous hub
+    # topology retained for compatibility with the original installation.
+    "cam_left_wrist": ("usb-0:13.2:", "usb-0:6.2:"),
+    "cam_right_wrist": ("usb-0:2.2:", "usb-0:5.2:"),
 }
 COLOR_FORMAT_SCORES = {
     "MJPG": 40,
@@ -298,6 +300,24 @@ def select_video_devices(
                 f"Cannot auto-discover a distinct RGB device for {camera_key} "
                 f"(expected {expected}). Check camera connections or choose devices "
                 "in Device settings."
+            )
+        role_path_hints = CAMERA_ROLE_PATH_HINTS.get(camera_key, ())
+        topology_matches = [
+            candidate
+            for candidate in available
+            if any(
+                hint in _stable_video_selector(candidate.device)
+                for hint in role_path_hints
+            )
+        ]
+        if role_path_hints and topology_matches:
+            available = topology_matches
+        elif role_path_hints and len(available) > 1:
+            raise RuntimeError(
+                f"Cannot safely distinguish {camera_key}: {len(available)} matching "
+                "cameras were found, but none matched its reviewed USB topology. "
+                "Choose an explicit stable /dev/v4l/by-path selector in Device "
+                "settings instead of relying on /dev/videoN order."
             )
         candidate = available[0]
         selected[camera_key] = _stable_video_selector(candidate.device)
