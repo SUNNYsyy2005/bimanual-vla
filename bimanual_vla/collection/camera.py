@@ -80,10 +80,8 @@ CAMERA_MODEL_HINTS = {
 # identical, so model matching alone cannot tell left from right. These USB
 # topology fragments are stable across normal video-node renumbering.
 CAMERA_ROLE_PATH_HINTS = {
-    # Include the topology observed in this validation and the previous hub
-    # topology retained for compatibility with the original installation.
-    "cam_left_wrist": ("usb-0:13.2:", "usb-0:6.2:"),
-    "cam_right_wrist": ("usb-0:2.2:", "usb-0:5.2:"),
+    "cam_left_wrist": ("usb-0:6.2:",),
+    "cam_right_wrist": ("usb-0:5.2:",),
 }
 COLOR_FORMAT_SCORES = {
     "MJPG": 40,
