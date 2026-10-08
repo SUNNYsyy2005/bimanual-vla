@@ -21,7 +21,7 @@ class JointCameraSelectionTest(unittest.TestCase):
             format_score=score,
         )
 
-    def test_two_identical_wrist_roles_receive_distinct_devices(self):
+    def test_two_identical_wrist_roles_without_topology_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             left = root / "video12"
@@ -33,13 +33,11 @@ class JointCameraSelectionTest(unittest.TestCase):
                 self._candidate(right, "depth_camera_405"),
             ]
             with mock.patch("bimanual_vla.collection.camera._enumerate_video_candidates", return_value=candidates):
-                selected = select_video_devices(
-                    {"cam_left_wrist": "auto", "cam_right_wrist": "auto"},
-                    device_root=root,
-                )
-
-            self.assertEqual(selected["cam_left_wrist"], str(left))
-            self.assertEqual(selected["cam_right_wrist"], str(right))
+                with self.assertRaisesRegex(RuntimeError, "Cannot safely distinguish"):
+                    select_video_devices(
+                        {"cam_left_wrist": "auto", "cam_right_wrist": "auto"},
+                        device_root=root,
+                    )
 
     def test_current_usb_topology_keeps_left_and_right_physical_roles(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -71,7 +69,41 @@ class JointCameraSelectionTest(unittest.TestCase):
             self.assertEqual(selected["cam_left_wrist"], "usb-0:6.2:1.0-video-index4")
             self.assertEqual(selected["cam_right_wrist"], "usb-0:5.2:1.0-video-index4")
 
-    def test_stale_paths_fall_back_without_collision(self):
+    def test_updated_workstation_topology_keeps_left_and_right_physical_roles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            port_22 = root / "video10"
+            port_132 = root / "video22"
+            port_22.touch()
+            port_132.touch()
+            candidates = [
+                self._candidate(port_22, "depth_camera_405"),
+                self._candidate(port_132, "depth_camera_405"),
+            ]
+
+            def selector(path: Path) -> str:
+                return (
+                    "usb-0:2.2:1.0-video-index4"
+                    if path == port_22
+                    else "usb-0:13.2:1.0-video-index4"
+                )
+
+            with mock.patch(
+                "bimanual_vla.collection.camera._enumerate_video_candidates",
+                return_value=candidates,
+            ), mock.patch(
+                "bimanual_vla.collection.camera._stable_video_selector",
+                side_effect=selector,
+            ):
+                selected = select_video_devices(
+                    {"cam_left_wrist": "auto", "cam_right_wrist": "auto"},
+                    device_root=root,
+                )
+
+            self.assertEqual(selected["cam_left_wrist"], "usb-0:13.2:1.0-video-index4")
+            self.assertEqual(selected["cam_right_wrist"], "usb-0:2.2:1.0-video-index4")
+
+    def test_stale_paths_do_not_fall_back_to_ambiguous_order(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             first = root / "video12"
@@ -83,15 +115,14 @@ class JointCameraSelectionTest(unittest.TestCase):
                 self._candidate(second, "depth_camera_405"),
             ]
             with mock.patch("bimanual_vla.collection.camera._enumerate_video_candidates", return_value=candidates):
-                selected = select_video_devices(
-                    {
-                        "cam_left_wrist": root / "missing-left",
-                        "cam_right_wrist": root / "missing-right",
-                    },
-                    device_root=root,
-                )
-
-            self.assertEqual(set(selected.values()), {str(first), str(second)})
+                with self.assertRaisesRegex(RuntimeError, "Cannot safely distinguish"):
+                    select_video_devices(
+                        {
+                            "cam_left_wrist": root / "missing-left",
+                            "cam_right_wrist": root / "missing-right",
+                        },
+                        device_root=root,
+                    )
 
     def test_reviewed_selector_never_falls_back_after_disappearing(self):
         with tempfile.TemporaryDirectory() as directory:
