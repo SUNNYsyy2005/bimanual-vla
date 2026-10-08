@@ -69,7 +69,7 @@ class JointCameraSelectionTest(unittest.TestCase):
             self.assertEqual(selected["cam_left_wrist"], "usb-0:6.2:1.0-video-index4")
             self.assertEqual(selected["cam_right_wrist"], "usb-0:5.2:1.0-video-index4")
 
-    def test_updated_workstation_topology_keeps_left_and_right_physical_roles(self):
+    def test_unreviewed_workstation_topology_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             port_22 = root / "video10"
@@ -95,13 +95,11 @@ class JointCameraSelectionTest(unittest.TestCase):
                 "bimanual_vla.collection.camera._stable_video_selector",
                 side_effect=selector,
             ):
-                selected = select_video_devices(
-                    {"cam_left_wrist": "auto", "cam_right_wrist": "auto"},
-                    device_root=root,
-                )
-
-            self.assertEqual(selected["cam_left_wrist"], "usb-0:13.2:1.0-video-index4")
-            self.assertEqual(selected["cam_right_wrist"], "usb-0:2.2:1.0-video-index4")
+                with self.assertRaisesRegex(RuntimeError, "Cannot safely distinguish"):
+                    select_video_devices(
+                        {"cam_left_wrist": "auto", "cam_right_wrist": "auto"},
+                        device_root=root,
+                    )
 
     def test_stale_paths_do_not_fall_back_to_ambiguous_order(self):
         with tempfile.TemporaryDirectory() as directory:
