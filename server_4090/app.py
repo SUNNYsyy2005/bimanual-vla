@@ -5392,6 +5392,12 @@ def create_app(config_path: Path) -> Flask:
     def dataset_main_list():
         return jsonify({"datasets": list_datasets()})
 
+    @app.get("/api/transfers")
+    def transfer_task_list():
+        # This table must not wait for GPU discovery, checkpoint inventories,
+        # or legacy destination-directory scans in the full status endpoint.
+        return jsonify({"tasks": [task for task in tasks.list() if task.get("type") == "transfer"]})
+
     @app.get("/api/datasets/<dataset_id>/episodes/<int:episode_index>/video/<video_key>")
     def dataset_episode_video(dataset_id: str, episode_index: int, video_key: str):
         dataset_id = safe_name(dataset_id, "dataset id")
@@ -8445,6 +8451,8 @@ print(json.dumps(rows, ensure_ascii=False))
         if cached and now - cached[0] < 4.0:
             return cached[1]
         metadata = task.get("metadata", {}) if isinstance(task.get("metadata"), dict) else {}
+        if metadata.get("transfer_kind") == "dataset_delete":
+            return {"stage": "delete_dataset", "progress": 1.0 if task.get("state") == "completed" else None}
         total_bytes = 0
         total_files = 0
         total_shards = 0
@@ -8461,7 +8469,7 @@ print(json.dumps(rows, ensure_ascii=False))
         completed_bytes = 0
         completed_files = 0
         scan_error = None
-        if target_path:
+        if target_path and task.get("state") not in TERMINAL_STATES and target_cfg.get("kind") != "slurm_only":
             command = f"test -d {shlex.quote(target_path)} && cd {shlex.quote(target_path)} && find . -type f -printf '%s\\t%P\\0' | sort -z"
             host = target_cfg.get("host") or target_cfg.get("submit_host")
             try:

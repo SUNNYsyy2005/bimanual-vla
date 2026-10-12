@@ -36,6 +36,13 @@ class DatasetCopyDeletionTest(RlinfDashboardTest):
         self.assertFalse(rows['archive_ds']['remote_only'])
         self.assertEqual(rows['archive_ds']['locations'][0]['target'],'local_4090_hdd')
 
+    def test_transfer_endpoint_does_not_scan_gpu_or_remote_storage(self):
+        client=self.make_app()
+        with mock.patch.object(TaskManager,'list',return_value=[{'id':'copy','type':'transfer','state':'running'}]), mock.patch('server_4090.app.subprocess.run',side_effect=AssertionError('unexpected inventory scan')):
+            response=self.request(client,'get','/api/transfers')
+            self.assertEqual(response.status_code,200,response.json)
+            self.assertEqual(response.json['tasks'][0]['id'],'copy')
+
     def test_copy_delete_confirmation_and_target_are_required(self):
         client=self.make_app()
         for payload in [{"target":"local_4090"}, {"target":"/etc","confirm_dataset_id":"local_ds"}]:
