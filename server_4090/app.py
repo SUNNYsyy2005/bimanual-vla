@@ -119,6 +119,7 @@ try:
         normalize_contract_fingerprint,
         resolve_episode_split,
     )
+    from .rlinf_dashboard import build_launch_spec, checkpoints_for_run, evaluation_profile, metrics_for_run, native_gpu_placement, public_launch_config, public_runs, scan_runs, upgrade_native_profiles
 except ImportError:  # app.py is normally executed directly by start_server.sh
     from dataset_editor import (
         DATASET_ORIGINS,
@@ -138,6 +139,7 @@ except ImportError:  # app.py is normally executed directly by start_server.sh
         normalize_contract_fingerprint,
         resolve_episode_split,
     )
+    from rlinf_dashboard import build_launch_spec, checkpoints_for_run, evaluation_profile, metrics_for_run, native_gpu_placement, public_launch_config, public_runs, scan_runs, upgrade_native_profiles
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -4102,7 +4104,7 @@ def build_environment(
 
 def create_app(config_path: Path) -> Flask:
     config_file = Path(config_path).expanduser().resolve()
-    config = load_config(config_file)
+    config = upgrade_native_profiles(load_config(config_file))
     token = os.environ.get("BIMANUAL_VLA_SERVER_TOKEN", "")
     if len(token) < 20:
         raise RuntimeError("set BIMANUAL_VLA_SERVER_TOKEN to a random value of at least 20 characters")
@@ -4113,6 +4115,33 @@ def create_app(config_path: Path) -> Flask:
     dashboard_build_id = hashlib.sha256(dashboard_template_path.read_bytes()).hexdigest()[:12]
     app.config["MAX_CONTENT_LENGTH"] = int(config["max_chunk_mib"] * 1024**2) + 1024 * 1024
     tasks = TaskManager(config)
+    rlinf_history_path = Path(config["workspace_root"]) / "rlinf_deleted_runs.json"
+
+    def visible_rlinf_runs():
+        with tasks.lock:
+            deleted = set(read_json(rlinf_history_path, []) or [])
+            task_list = tasks.list()
+        return [run for run in scan_runs(config, task_list) if run["id"] not in deleted]
+
+    def delete_rlinf_records(run_ids):
+        if not isinstance(run_ids, list) or not run_ids or len(run_ids) > 200:
+            raise ValueError("run_ids must contain between 1 and 200 run IDs")
+        if any(not isinstance(item, str) or not item for item in run_ids):
+            raise ValueError("run_ids must contain nonempty strings")
+        runs = {run["id"]: run for run in visible_rlinf_runs()}
+        ids = list(dict.fromkeys(run_ids))
+        if any(item not in runs or runs[item].get("state") == "unavailable" for item in ids):
+            raise ValueError("unknown or unavailable RLinf run")
+        with tasks.lock:
+            if any(task.get("type") == "eval" and task.get("state") not in TERMINAL_STATES and task.get("metadata", {}).get("run_id") in ids for task in tasks.list()):
+                raise ValueError("该运行仍有正在执行的 rollout 评测，请先停止评测")
+            task_ids = list(dict.fromkeys(runs[item]["task_id"] for item in ids if runs[item].get("task_id")))
+            # Reuse process/dependency checks and delete only dashboard-owned logs.
+            if task_ids:
+                tasks.delete_many(task_ids)
+            deleted = set(read_json(rlinf_history_path, []) or [])
+            atomic_json(rlinf_history_path, sorted(deleted | set(ids)))
+        return {"deleted": True, "run_ids": ids, "task_ids": task_ids}
     dataset_root = Path(config["dataset_root"])
     dataset_root.mkdir(parents=True, exist_ok=True)
     dataset_read_roots = [Path(item) for item in config.get("dataset_read_roots", [])]
@@ -8642,6 +8671,221 @@ print(json.dumps(rows, ensure_ascii=False))
             }
         )
         return jsonify(result)
+
+    @app.get("/api/rlinf/config")
+    def rlinf_dashboard_config():
+        return jsonify(public_launch_config(config))
+
+    @app.get("/api/rlinf/runs")
+    def rlinf_dashboard_runs():
+        # Run roots may live on the 4x4090 host, H100's shared filesystem, or
+        # a NAS-backed H200 export.  The source map is server-owned; clients
+        # can select a run but can never submit an arbitrary filesystem path.
+        return jsonify({"runs": public_runs(visible_rlinf_runs())})
+
+    @app.get("/api/rlinf/runs/<run_id>/metrics")
+    def rlinf_dashboard_run_metrics(run_id: str):
+        return jsonify(metrics_for_run(visible_rlinf_runs(), run_id))
+
+    @app.get("/api/rlinf/runs/<run_id>/checkpoints")
+    def rlinf_run_checkpoints(run_id: str):
+        run = next((item for item in visible_rlinf_runs() if item["id"] == run_id), None)
+        if not run or run.get("state") == "unavailable":
+            raise ValueError("unknown or unavailable RLInf run")
+        try:
+            target_id, _, profile_id, _ = evaluation_profile(config, run)
+        except ValueError as exc:
+            return jsonify({"checkpoints": [], "error": str(exc)})
+        return jsonify({"checkpoints": checkpoints_for_run(run), "target": target_id, "profile": profile_id})
+
+    @app.get("/api/rlinf/evaluations")
+    def rlinf_evaluation_tasks():
+        return jsonify({"tasks": [task for task in tasks.list() if task.get("type") == "eval" and task.get("metadata", {}).get("framework") == "RLinf"]})
+
+    @app.post("/api/rlinf/evaluate")
+    def evaluate_rlinf_checkpoint():
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        run = next((item for item in visible_rlinf_runs() if item["id"] == payload.get("run_id")), None)
+        if not run or run.get("state") == "unavailable":
+            raise ValueError("unknown or unavailable RLInf run")
+        target_id, target, profile_id, profile = evaluation_profile(config, run)
+        checkpoint = next((item for item in checkpoints_for_run(run) if item["id"] == payload.get("checkpoint_id")), None)
+        if not checkpoint:
+            raise ValueError("请选择实际存在且权重完整的 RLInf checkpoint")
+        episodes = safe_int(payload.get("episodes", 5), "episodes", 1, 1000)
+        horizon = safe_int(payload.get("max_steps", 512), "max_steps", 1, 2000)
+        seed = safe_int(payload.get("seed", 43), "seed", 0, 2147483647)
+        record_video = payload.get("record_video", False)
+        if not isinstance(record_video, bool):
+            raise ValueError("record_video must be a boolean")
+        roots = eval_video_roots()
+        if not roots:
+            raise ValueError("no evaluation artifact/video root configured")
+        eval_name = f"step_{checkpoint['step']}_{uuid.uuid4().hex[:12]}"
+        local_output = roots[0] / "rlinf" / target_id / eval_name
+        kind = target.get("kind", "local")
+        output = str(local_output) if kind == "local" else str(PurePosixPath(profile["run_root"]) / "dashboard_evaluations" / eval_name)
+        settings = profile["evaluation"]
+        project = str(target["project_root"])
+        entrypoint = settings.get("entrypoint", project + "/third_party/wovr/evaluations/eval_embodied_agent.py")
+        runner = str(APP_DIR / "rlinf_eval_runner.py") if kind == "local" else str(PurePosixPath(target.get("dashboard_repo", "/DATA/disk0/" + os.environ.get("USER", "sunny") + "/bimanual-vla")) / "server_4090/rlinf_eval_runner.py")
+        inner = [str(target.get("python", "python3")), runner, "--entrypoint", str(entrypoint),
+                 "--config-path", str(settings.get("config_path", project + "/configs/rlinf")),
+                 "--config-name", str(settings.get("config_name", "libero_safety_grpo_pi05_smoke")),
+                 "--checkpoint", checkpoint["path"], "--step", str(checkpoint["step"]),
+                 "--output", output, "--episodes", str(episodes), "--max-steps", str(horizon),
+                 "--seed", str(seed), "--record-video", str(record_video).lower(),
+                 *[str(item) for item in settings.get("overrides", [])]]
+        profile_env = {str(key): str(value) for key, value in profile.get("environment", {}).items()}
+        if kind == "local":
+            gpu_ids = parse_gpus(payload, one_only=True, minimum_free_mib=int(target.get("minimum_free_gpu_mib", 18000)), allow_busy=bool(target.get("allow_busy_gpus", False)))
+            env = build_environment(config, gpu_ids)
+            env.update(profile_env)
+            env.pop("CUDA_VISIBLE_DEVICES", None)
+            inner.extend(native_gpu_placement(gpu_ids, evaluation=True))
+            command = ["bash", "-lc", "cd " + shlex.quote(project) + " && exec " + shlex.join(inner)]
+        elif kind == "slurm":
+            exports = " ".join(f"export {key}={shlex.quote(value)};" for key, value in profile_env.items() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key))
+            cluster = {**target, "gpu_count": 1, "workdir": project, "openpi_python": config["openpi_python"]}
+            slurm = slurm_runner_command(target_name=target_id, target_config=cluster,
+                commands=[["bash", "-lc", exports + " exec " + shlex.join(inner)]], labels=["rlinf_eval"], job_name="rlinf_eval_" + eval_name)
+            command = [config["openpi_python"], str(APP_DIR / "rlinf_eval_collect.py"), "--command-json", json_arg(slurm),
+                       "--host", str(target["submit_host"]), "--remote-output", output, "--local-output", str(local_output)]
+            env = build_environment(config, None)
+            gpu_ids = []
+        else:
+            raise ValueError("unknown RLInf evaluation target kind")
+        return jsonify(tasks.start("eval", command, env=env, metadata={
+            "framework": "RLinf", "eval_kind": "rollout", "execution_target": target_id,
+            "runtime": "local_4090" if kind == "local" else "slurm", "cluster_target": target_id if kind == "slurm" else None,
+            "launch_profile": profile_id, "run_id": run["id"], "run_name": run["name"],
+            "parent_train_task_id": run.get("task_id"), "checkpoint": checkpoint["path"], "checkpoint_step": checkpoint["step"],
+            "episodes": episodes, "max_steps": horizon, "seed": seed, "record_video": record_video,
+            "gpu_ids": gpu_ids, "result_path": str(local_output / "result.json"), "video_dir": str(local_output),
+        })), 201
+
+    @app.delete("/api/rlinf/runs/<run_id>")
+    def delete_rlinf_run(run_id: str):
+        return jsonify(delete_rlinf_records([run_id]))
+
+    @app.post("/api/rlinf/runs/batch-delete")
+    def delete_rlinf_runs_batch():
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        return jsonify(delete_rlinf_records(payload.get("run_ids")))
+
+    @app.post("/api/rlinf/launch")
+    def launch_rlinf_training():
+        payload = request.get_json(force=True)
+        spec = build_launch_spec(config, payload)
+        target = spec["target"]
+        profile = spec["profile"]
+        output_dir = spec["output_dir"]
+        kind = str(target.get("kind", "local"))
+        if kind == "local":
+            # Refuse to overwrite any run.  The parent is created here while
+            # the method-specific directory remains absent for the trainer's
+            # own exist_ok=False guard.
+            output_path = Path(output_dir).expanduser()
+            if output_path.exists():
+                raise FileExistsError(f"RLinf output already exists: {output_dir}")
+            gpu_ids = parse_gpus(
+                {"gpu_ids": payload.get("gpu_ids", target.get("default_gpu_ids", []))},
+                minimum_free_mib=int(target.get("minimum_free_gpu_mib", 0)),
+                allow_busy=bool(target.get("allow_busy_gpus", False)),
+            )
+            env = build_environment(config, gpu_ids)
+            env.update(spec["environment"])
+            env["SAFE_RL_WM_DASHBOARD_RUN_DIR"] = output_dir
+            if profile.get("backend") == "rlinf":
+                if int(spec["values"]["total_envs"]) % len(gpu_ids):
+                    raise ValueError("采样环境总数（每组个数 × 组数）必须能被 GPU 数量整除")
+                env.pop("CUDA_VISIBLE_DEVICES", None)
+                placement = native_gpu_placement(gpu_ids)
+                # Hydra overrides belong inside the existing bash profile command.
+                if spec["command"][:2] == ["bash", "-lc"]:
+                    spec["command"][2] += " " + shlex.join(placement)
+                else:
+                    spec["command"].extend(placement)
+            shell = "cd " + shlex.quote(spec["project_root"]) + " && exec " + shlex.join(spec["command"])
+            command = ["bash", "-lc", shell]
+            runtime = "local_4090"
+            metadata_gpu_ids = gpu_ids
+            target_config = None
+        elif kind == "slurm":
+            required = ("submit_host", "partition", "project_root", "run_root")
+            missing = [key for key in required if not target.get(key)]
+            if missing:
+                raise ValueError(f"Slurm RLinf target is missing {missing}")
+            gpu_count = safe_int(payload.get("gpu_count", target.get("gpu_count", 1)), "gpu_count", 1, 8)
+            shell_env = {
+                **{str(k): str(v) for k, v in target.get("environment", {}).items()},
+                **spec["environment"],
+                "SAFE_RL_WM_DASHBOARD_RUN_DIR": output_dir,
+            }
+            exports = " ".join(
+                f"export {key}={shlex.quote(value)};"
+                for key, value in sorted(shell_env.items())
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+            )
+            remote_shell = (
+                "mkdir -p " + shlex.quote(str(PurePosixPath(output_dir).parent)) + " && "
+                "(set -o noclobber; : > " + shlex.quote(
+                    str(PurePosixPath(output_dir).parent / f".dashboard-reserved-{spec['algorithm']}")
+                ) + ") && test ! -e " + shlex.quote(output_dir) + " && cd "
+                + shlex.quote(spec["project_root"]) + " && "
+                + exports + " exec " + shlex.join(spec["command"])
+            )
+            cluster = dict(target)
+            cluster.update({
+                "workdir": str(target["project_root"]),
+                "gpu_count": gpu_count,
+                "openpi_python": config["openpi_python"],
+                "dataset_root": target.get("dataset_root", target.get("cache_root", "/tmp")),
+                "cache_root": target.get("cache_root", "/tmp"),
+            })
+            labels = ["rlinf"]
+            command = slurm_runner_command(
+                target_name=str(payload.get("target")),
+                target_config=cluster,
+                commands=[["bash", "-lc", remote_shell]],
+                labels=labels,
+                job_name=f"rlinf_{spec['algorithm']}_{spec['run_name']}",
+            )
+            env = build_environment(config, None)
+            runtime = "slurm"
+            metadata_gpu_ids = []
+            target_config = cluster
+        else:
+            raise ValueError("RLinf target kind must be local or slurm")
+
+        metadata = {
+            "framework": "RLinf",
+            "algorithm": spec["algorithm"],
+            "launch_profile": spec["profile_id"],
+            "run_name": spec["run_name"],
+            "rlinf_output_dir": output_dir,
+            "rlinf_run_root": spec["run_root"],
+            "execution_target": payload.get("target"),
+            "runtime": runtime,
+            "gpu_ids": metadata_gpu_ids,
+            "cluster_target": payload.get("target") if kind == "slurm" else None,
+            "cluster_gpu_count": target_config.get("gpu_count") if target_config else None,
+            "test_episodes": 0,
+            "auto_eval": {"enabled": False},
+        }
+        if kind == "local":
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            reservation = output_path.parent / f".dashboard-reserved-{spec['algorithm']}"
+            try:
+                with reservation.open("x", encoding="utf-8") as handle:
+                    handle.write(f"{now_iso()}\n")
+            except FileExistsError as exc:
+                raise FileExistsError(f"RLinf run already reserved: {output_dir}") from exc
+        return jsonify(tasks.start("train", command, env=env, metadata=metadata)), 201
 
 
     return app

@@ -13,6 +13,10 @@ LOCAL_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_ROOT/server_4090/templates'"
 rsync -av --relative --exclude='__pycache__/' --exclude='*.py[cod]' \
   "$LOCAL_ROOT/./server_4090/app.py" \
+  "$LOCAL_ROOT/./server_4090/rlinf_dashboard.py" \
+  "$LOCAL_ROOT/./server_4090/rlinf_eval_runner.py" \
+  "$LOCAL_ROOT/./server_4090/rlinf_eval_collect.py" \
+  "$LOCAL_ROOT/./server_4090/configure_rlinf_native.py" \
   "$LOCAL_ROOT/./server_4090/dataset_editor.py" \
   "$LOCAL_ROOT/./server_4090/episode_split.py" \
   "$LOCAL_ROOT/./server_4090/openpi_single_arm.py" \
