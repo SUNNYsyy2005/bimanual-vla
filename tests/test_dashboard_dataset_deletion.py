@@ -80,6 +80,14 @@ class DatasetCopyDeletionTest(RlinfDashboardTest):
         self.assertFalse((self.archive/'archive_ds').exists())
         self.assertTrue((self.root/'datasets/local_ds').exists())
 
+    def test_runner_refuses_changed_episode_count_and_handles_stale_absent_copy(self):
+        result=subprocess.run([sys.executable,'-c',DELETE_SCRIPT,str(self.archive),'archive_ds','1'],capture_output=True)
+        self.assertNotEqual(result.returncode,0)
+        self.assertTrue((self.archive/'archive_ds').exists())
+        result=subprocess.run([sys.executable,'-c',DELETE_SCRIPT,str(self.archive),'already_gone','1'],capture_output=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertTrue(json.loads(result.stdout)['already_absent'])
+
     def test_active_deletion_blocks_new_dataset_jobs(self):
         manager=TaskManager(self.config)
         self.addCleanup(manager.close)

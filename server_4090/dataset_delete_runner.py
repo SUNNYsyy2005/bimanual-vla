@@ -24,7 +24,14 @@ if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}',dataset_id): raise Value
 if root==pathlib.Path(root.anchor): raise ValueError('dataset root cannot be filesystem root')
 target=root/dataset_id
 if target.is_symlink() or target.resolve().parent!=root: raise ValueError('dataset path escapes configured root or is a symlink')
+if not root.is_dir(): raise FileNotFoundError('configured dataset root is unavailable')
+if not target.exists():
+  print(json.dumps({'dataset_deleted':False,'already_absent':True,'dataset_id':dataset_id,'path':str(target)}),flush=True)
+  sys.exit(0)
 if not target.is_dir() or not (target/'meta/info.json').is_file(): raise FileNotFoundError('dataset copy not found: '+str(target))
+if len(sys.argv)>3:
+  actual=json.loads((target/'meta/info.json').read_text(encoding='utf-8')).get('total_episodes')
+  if actual!=int(sys.argv[3]): raise ValueError('episode count changed; expected '+sys.argv[3]+', got '+str(actual))
 if hasattr(os,'getuid'):
   uid=os.getuid()
   for current,dirs,files in os.walk(target,followlinks=False):
@@ -53,14 +60,17 @@ def encoded(value):
     return base64.urlsafe_b64encode(json.dumps(value).encode()).decode()
 
 
-def deletion_command(location, dataset_id):
+def deletion_command(location, dataset_id, expected_episodes=None):
     python = location.get("openpi_python") or (sys.executable if location.get("kind") in {"local", "local_archive"} else None)
     if not python:
         raise ValueError("remote deletion requires a configured Conda Python")
-    return [str(python), "-c", DELETE_SCRIPT, str(location["dataset_root"]), dataset_id]
+    command = [str(python), "-c", DELETE_SCRIPT, str(location["dataset_root"]), dataset_id]
+    if expected_episodes is not None:
+        command.append(str(int(expected_episodes)))
+    return command
 
 
-def slurm_deletion_command(location, dataset_id):
+def slurm_deletion_command(location, dataset_id, expected_episodes=None):
     target = {key: value for key, value in location.items() if value is not None}
     target.update(gpu_count=0, cpus_per_task=2, mem="8G", time="02:00:00", workdir=str(location["dataset_root"]))
     target.setdefault("remote_job_dir", str(__import__("pathlib").PurePosixPath(location["dataset_root"]).parent / ".dashboard_delete_jobs"))
@@ -68,7 +78,7 @@ def slurm_deletion_command(location, dataset_id):
     target.pop("conda_env", None)
     target.pop("conda_sh", None)
     refresh = inventory_refresh_snippet(location).replace("python3 - <<'PY'", shlex.quote(str(location["openpi_python"])) + " - <<'PY'")
-    command = "set -euo pipefail\n" + shlex.join(deletion_command(location, dataset_id)) + "\n(\n" + refresh + "\n) || echo '[dashboard] node inventory refresh failed; local cache will be updated'"
+    command = "set -euo pipefail\n" + shlex.join(deletion_command(location, dataset_id, expected_episodes)) + "\n(\n" + refresh + "\n) || echo '[dashboard] node inventory refresh failed; local cache will be updated'"
     return [sys.executable, str(Path(__file__).with_name("slurm_job_runner.py")),
             "--target-json", encoded(target), "--commands-json", encoded([["bash", "-lc", command]]),
             "--command-labels-json", encoded(["delete_dataset_copy"]),
@@ -98,14 +108,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-id", required=True)
     parser.add_argument("--location-json", required=True)
+    parser.add_argument("--expected-episodes", type=int)
     args = parser.parse_args()
     location = json.loads(base64.urlsafe_b64decode(args.location_json))
     if location.get("kind") in {"local", "local_archive"}:
-        command = deletion_command(location, args.dataset_id)
+        command = deletion_command(location, args.dataset_id, args.expected_episodes)
     else:
         if not location.get("submit_host") or not location.get("partition") or not location.get("node"):
             raise ValueError("cluster deletion requires a configured Slurm target")
-        command = slurm_deletion_command(location, args.dataset_id)
+        command = slurm_deletion_command(location, args.dataset_id, args.expected_episodes)
     status = subprocess.call(command)
     if status == 0:
         refresh_local_cache(location, args.dataset_id)
