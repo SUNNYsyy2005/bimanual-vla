@@ -119,7 +119,7 @@ try:
         normalize_contract_fingerprint,
         resolve_episode_split,
     )
-    from .rlinf_dashboard import build_launch_spec, checkpoints_for_run, evaluation_profile, metrics_for_run, native_gpu_placement, public_launch_config, public_runs, scan_runs, upgrade_native_profiles
+    from .rlinf_dashboard import build_launch_spec, checkpoints_for_run, evaluation_profile, metrics_for_run, native_gpu_placement, native_log_for_run, public_launch_config, public_runs, scan_runs, upgrade_native_profiles
 except ImportError:  # app.py is normally executed directly by start_server.sh
     from dataset_editor import (
         DATASET_ORIGINS,
@@ -139,7 +139,7 @@ except ImportError:  # app.py is normally executed directly by start_server.sh
         normalize_contract_fingerprint,
         resolve_episode_split,
     )
-    from rlinf_dashboard import build_launch_spec, checkpoints_for_run, evaluation_profile, metrics_for_run, native_gpu_placement, public_launch_config, public_runs, scan_runs, upgrade_native_profiles
+    from rlinf_dashboard import build_launch_spec, checkpoints_for_run, evaluation_profile, metrics_for_run, native_gpu_placement, native_log_for_run, public_launch_config, public_runs, scan_runs, upgrade_native_profiles
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -1637,6 +1637,15 @@ class TaskManager:
         *,
         state: str,
     ) -> dict[str, Any]:
+        dataset_id = metadata.get("dataset_id")
+        if dataset_id:
+            deleting = metadata.get("transfer_kind") == "dataset_delete"
+            for path in self.root.glob("*/task.json"):
+                other = read_json(path, {}) or {}
+                other_metadata = other.get("metadata", {})
+                if other.get("state") not in TERMINAL_STATES and other_metadata.get("dataset_id") == dataset_id:
+                    if deleting or other_metadata.get("transfer_kind") == "dataset_delete":
+                        raise ValueError(f"dataset {dataset_id} is in use by active task {other.get('id')}")
         if task_type not in TASK_TYPES:
             raise ValueError("unsupported task type")
         task_id = f"{task_type}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
@@ -4145,9 +4154,10 @@ def create_app(config_path: Path) -> Flask:
     dataset_root = Path(config["dataset_root"])
     dataset_root.mkdir(parents=True, exist_ok=True)
     dataset_read_roots = [Path(item) for item in config.get("dataset_read_roots", [])]
+    dataset_read_roots.extend(Path(item["dataset_root"]) for item in config.get("local_storage_locations", {}).values() if item.get("available", True) and item.get("dataset_root"))
     if dataset_root not in dataset_read_roots:
         dataset_read_roots.insert(0, dataset_root)
-    dataset_read_roots = list(dict.fromkeys(dataset_read_roots))
+    dataset_read_roots = [dataset_root, *[item for item in dict.fromkeys(dataset_read_roots) if item != dataset_root]]
 
     def assert_dataset_idle(dataset_id: str) -> None:
         active = [
@@ -4298,9 +4308,9 @@ def create_app(config_path: Path) -> Flask:
     def dataset_path_for_id(dataset_id: str) -> Path:
         dataset_id = safe_name(dataset_id, "dataset id")
         roots = [Path(item) for item in config.get("dataset_read_roots", [])]
+        roots.extend(Path(item["dataset_root"]) for item in config.get("local_storage_locations", {}).values() if item.get("available", True) and item.get("dataset_root"))
         storage = Path(config["dataset_root"])
-        if storage not in roots:
-            roots.insert(0, storage)
+        roots = [storage, *[root for root in roots if root != storage]]
         for root in roots:
             candidate = root / dataset_id
             if candidate.is_dir() and (candidate / "meta" / "info.json").is_file():
@@ -4753,8 +4763,9 @@ def create_app(config_path: Path) -> Flask:
         datasets = []
         storage_root = Path(config["dataset_root"]).expanduser().resolve()
         roots = [Path(item).expanduser().resolve() for item in config.get("dataset_read_roots", [])]
-        if storage_root not in roots:
-            roots.insert(0, storage_root)
+        roots.extend(Path(item["dataset_root"]).expanduser().resolve() for item in config.get("local_storage_locations", {}).values() if item.get("available", True) and item.get("dataset_root"))
+        roots = list(dict.fromkeys(roots))
+        roots = [storage_root, *[root for root in roots if root != storage_root]]
         selected: dict[str, tuple[Path, bool]] = {}
         for root in roots:
             for directory in sorted(root.iterdir() if root.exists() else []):
@@ -4815,6 +4826,8 @@ def create_app(config_path: Path) -> Flask:
                         )
                     )
             default_model_variant = infer_model_variant(Path(config["base_checkpoint"])) or "pi05"
+            local_location = next((item for item in dataset_location_configs().values() if item.get("kind") in {"local", "local_archive"} and Path(item["dataset_root"]).expanduser().resolve() == directory.parent.resolve()), {})
+            local_target = local_location.get("name", "local_4090_read")
             datasets.append(
                 {
                     "id": directory.name,
@@ -4822,6 +4835,7 @@ def create_app(config_path: Path) -> Flask:
                     "root": str(directory.parent),
                     "storage": writable,
                     "read_only": not writable,
+                    "remote_only": False,
                     "episodes": info.get("total_episodes"),
                     "frames": info.get("total_frames"),
                     "fps": info.get("fps"),
@@ -4840,9 +4854,10 @@ def create_app(config_path: Path) -> Flask:
                     "mtime": directory.stat().st_mtime,
                     "locations": [
                         {
-                            "target": "local_4090",
-                            "label": "4×4090",
-                            "kind": "local",
+                            "target": local_target,
+                            "label": local_location.get("label", "4×4090 本机读取目录"),
+                            "kind": local_location.get("kind", "local"),
+                            "host": None,
                             "path": str(directory),
                             "root": str(directory.parent),
                             "read_only": not writable,
@@ -4853,7 +4868,7 @@ def create_app(config_path: Path) -> Flask:
                             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(directory.stat().st_mtime)),
                         }
                     ],
-                    "targets": ["local_4090"],
+                    "targets": [local_target],
                 }
             )
         return datasets
@@ -5372,6 +5387,10 @@ def create_app(config_path: Path) -> Flask:
         if confirmation != dataset_id:
             raise ValueError("confirm_dataset_id must exactly match the dataset id")
         return jsonify(dataset_editor.delete_dataset(dataset_id))
+
+    @app.get("/api/datasets")
+    def dataset_main_list():
+        return jsonify({"datasets": list_datasets()})
 
     @app.get("/api/datasets/<dataset_id>/episodes/<int:episode_index>/video/<video_key>")
     def dataset_episode_video(dataset_id: str, episode_index: int, video_key: str):
@@ -6699,6 +6718,11 @@ print(json.dumps(rows, ensure_ascii=False))
                 "node": target.get("node"),
                 "gpu_type": target.get("gpu_type"),
                 "dataset_root": target.get("dataset_root"),
+                "openpi_python": target.get("openpi_python"),
+                "workdir": target.get("workdir"),
+                "log_dir": target.get("log_dir"),
+                "remote_job_dir": target.get("remote_job_dir"),
+                "cache_root": target.get("cache_root"),
                 "available": True,
             }
         return locations
@@ -6972,7 +6996,7 @@ print(json.dumps(rows, ensure_ascii=False))
             item["targets"] = sorted({loc.get("target") for loc in item["locations"] if loc.get("target")})
             datasets.append(item)
         datasets.sort(key=lambda item: item["id"])
-        return {"datasets": datasets, "locations": locations, "errors": errors}
+        return {"datasets": datasets, "local_datasets": list_datasets(), "locations": locations, "errors": errors}
 
     @app.get("/api/dataset-locations")
     def dataset_locations():
@@ -6980,6 +7004,39 @@ print(json.dumps(rows, ensure_ascii=False))
         if origin:
             origin = normalize_dataset_origin(origin)
         return jsonify(grouped_dataset_locations(origin_filter=origin))
+
+    @app.post("/api/datasets/<dataset_id>/delete-copy")
+    def delete_dataset_copy(dataset_id: str):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict) or payload.get("confirm_dataset_id") != dataset_id:
+            raise ValueError("confirm_dataset_id must exactly match the dataset id")
+        target_name = str(payload.get("target", ""))
+        location = dataset_location_configs().get(target_name)
+        if not location or not location.get("available", True):
+            raise ValueError("unknown or unavailable dataset location")
+        with tasks.lock:
+            assert_dataset_idle(dataset_id)
+            if target_name == "local_4090":
+                # Explicitly delete the storage copy even if another read root
+                # with the same ID happens to appear earlier in the config.
+                target_path = Path(config["dataset_root"]) / dataset_id
+                if target_path.is_symlink() or target_path.resolve().parent != Path(config["dataset_root"]).resolve():
+                    raise ValueError("dataset path escapes configured storage root")
+                if not (target_path / "meta/info.json").is_file():
+                    raise FileNotFoundError("local dataset copy is not installed")
+                return jsonify({**dataset_editor.delete_dataset(dataset_id), "target": target_name})
+            if location.get("kind") not in {"local", "local_archive"}:
+                if not location.get("openpi_python") or not location.get("partition") or not location.get("node"):
+                    raise ValueError("remote dataset deletion requires a configured Slurm target and Conda Python")
+            command = [config["openpi_python"], str(APP_DIR / "dataset_delete_runner.py"),
+                       "--dataset-id", dataset_id, "--location-json", json_arg(location)]
+            task = tasks.start("transfer", command, env=build_environment(config, None), metadata={
+                "dataset_id": dataset_id, "transfer_kind": "dataset_delete", "target": target_name,
+                "target_path": str(Path(location["dataset_root"]) / dataset_id) if location.get("kind") in {"local", "local_archive"} else str(PurePosixPath(location["dataset_root"]) / dataset_id),
+                "execution_target": target_name, "runtime": "local_4090", "source": target_name,
+            })
+        return jsonify({"task": task, "dataset_id": dataset_id, "target": target_name}), 202
 
     @app.get("/api/cluster-resources")
     def cluster_resources():
@@ -8686,6 +8743,17 @@ print(json.dumps(rows, ensure_ascii=False))
     @app.get("/api/rlinf/runs/<run_id>/metrics")
     def rlinf_dashboard_run_metrics(run_id: str):
         return jsonify(metrics_for_run(visible_rlinf_runs(), run_id))
+
+    @app.get("/api/rlinf/runs/<run_id>/log")
+    def rlinf_run_log(run_id: str):
+        run = next((item for item in visible_rlinf_runs() if item["id"] == run_id), None)
+        if not run or run.get("state") == "unavailable":
+            raise ValueError("unknown or unavailable RLInf run")
+        if run.get("task_id"):
+            result = {"log": tasks.log_tail(run["task_id"], 131072, include_remote_slurm=True)}
+        else:
+            result = native_log_for_run(run)
+        return jsonify({"run": public_runs([run])[0], **result})
 
     @app.get("/api/rlinf/runs/<run_id>/checkpoints")
     def rlinf_run_checkpoints(run_id: str):

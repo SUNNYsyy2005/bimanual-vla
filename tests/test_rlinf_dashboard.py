@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import zipfile
 from unittest import mock
 
 from server_4090.app import create_app, TaskManager
@@ -36,7 +37,8 @@ class RlinfDashboardTest(unittest.TestCase):
         (self.output / "training_curve.json").write_text(json.dumps([{"actor_updates": 1, "loss": .4}]))
         weight = self.output / "checkpoints/global_step_1/actor/model_state_dict/full_weights.pt"
         weight.parent.mkdir(parents=True)
-        weight.write_bytes(b"fake-weights")
+        with zipfile.ZipFile(weight, "w") as archive:
+            archive.writestr("archive/data.pkl", b"fake-weights")
         self.weight = weight
 
     def make_app(self):
@@ -71,6 +73,14 @@ class RlinfDashboardTest(unittest.TestCase):
     def test_native_upgrade_is_idempotent(self):
         config = {"rlinf_dashboard": {"targets": {"h100": {"profiles": {"native": {"command_template": ["bash", "-lc", "python train_embodied_agent.py runner.max_steps={updates}"], "overrides": {}}}}}}}
         self.assertEqual(upgrade_native_profiles(config), upgrade_native_profiles(upgrade_native_profiles(config)))
+
+    def test_observed_native_run_can_read_its_metrics_log(self):
+        (self.output / "metrics.log").write_text("RLInf step=1 loss=0.4", encoding="utf-8")
+        client = self.make_app()
+        run = self.request(client, "get", "/api/rlinf/runs").json["runs"][0]
+        response = self.request(client, "get", f"/api/rlinf/runs/{run['id']}/log")
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertIn("step=1", response.json["log"])
 
     def test_checkpoints_exclude_missing_empty_and_outside_weights(self):
         run = scan_runs(self.config)[0]

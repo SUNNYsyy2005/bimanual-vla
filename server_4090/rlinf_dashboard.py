@@ -322,7 +322,7 @@ def public_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{key: value for key, value in run.items() if not key.startswith("_")} for run in runs]
 
 
-CHECKPOINT_SCAN = r'''import base64,json,os,pathlib,re,sys
+CHECKPOINT_SCAN = r'''import base64,json,os,pathlib,re,sys,zipfile
 root=pathlib.Path(sys.argv[1]).resolve(); rows=[]
 if root.is_dir():
   for current,dirs,files in os.walk(root):
@@ -332,7 +332,7 @@ if root.is_dir():
     match=re.fullmatch(r'global_step_(\d+)',pathlib.Path(current).name)
     if not match: continue
     weight=pathlib.Path(current)/'actor/model_state_dict/full_weights.pt'
-    if not weight.is_file() or weight.stat().st_size==0: continue
+    if not weight.is_file() or weight.stat().st_size==0 or not zipfile.is_zipfile(weight): continue
     resolved=weight.resolve()
     if root not in resolved.parents: continue
     relative=weight.relative_to(root).as_posix()
@@ -350,6 +350,37 @@ def checkpoints_for_run(run: dict[str, Any]) -> list[dict[str, Any]]:
     result = subprocess.run(args, capture_output=True, text=True, timeout=35, check=False)
     if result.returncode:
         raise RuntimeError((result.stderr or "checkpoint scan failed")[-1200:])
+    return json.loads(result.stdout)
+
+
+NATIVE_LOG_READ = r'''import json,os,pathlib,sys
+root=pathlib.Path(sys.argv[1]).resolve(); candidates=[]
+if root.is_dir():
+  for current,dirs,files in os.walk(root):
+    rel=pathlib.Path(current).relative_to(root)
+    if len(rel.parts)>=3: dirs[:]=[]
+    dirs[:]=[name for name in dirs if not name.startswith('.') and name not in ('checkpoints','video','tensorboard')]
+    for name in files:
+      path=pathlib.Path(current)/name
+      if path.suffix.lower() not in ('.log','.out','.err') or path.is_symlink() or root not in path.resolve().parents: continue
+      candidates.append(path)
+files=sorted(candidates,key=lambda path:path.stat().st_mtime,reverse=True)[:5]; chunks=[]
+for path in files:
+  with path.open('rb') as stream:
+    stream.seek(max(0,path.stat().st_size-131072//max(1,len(files))))
+    chunks.append('=== '+path.relative_to(root).as_posix()+' ===\n'+stream.read().decode('utf-8',errors='replace'))
+print(json.dumps({'log':'\n\n'.join(chunks),'files':[path.relative_to(root).as_posix() for path in files]}))
+'''
+
+
+def native_log_for_run(run: dict[str, Any]) -> dict[str, Any]:
+    source = run.get("_source", {})
+    args = [str(source.get("python") or sys.executable), "-c", NATIVE_LOG_READ, run["path"]]
+    if source.get("ssh_host"):
+        args = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", str(source["ssh_host"]), shlex.join(args)]
+    result = subprocess.run(args, capture_output=True, text=True, timeout=35, check=False)
+    if result.returncode:
+        raise RuntimeError((result.stderr or "native RLInf log read failed")[-1200:])
     return json.loads(result.stdout)
 
 
