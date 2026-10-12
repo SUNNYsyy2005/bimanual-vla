@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import os
 from pathlib import Path
 import sys
@@ -12,7 +13,7 @@ from unittest import mock
 from server_4090.app import create_app, TaskManager
 from server_4090.configure_rlinf_native import configure_native
 from server_4090.rlinf_dashboard import build_launch_spec, checkpoints_for_run, scan_runs, upgrade_native_profiles
-from server_4090.rlinf_eval_runner import evaluation_overrides, write_results
+from server_4090.rlinf_eval_runner import evaluation_overrides, hydra_argv, write_results
 
 
 class RlinfDashboardTest(unittest.TestCase):
@@ -131,11 +132,33 @@ class RlinfDashboardTest(unittest.TestCase):
     def test_eval_result_and_override_contract(self):
         args = mock.Mock(checkpoint="/models/full_weights.pt", output="/eval", episodes=5, seed=43, max_steps=512, record_video=False)
         overrides = evaluation_overrides(args)
+        self.assertIn("rollout.model=${actor.model}", overrides)
         self.assertIn("runner.ckpt_path=/models/full_weights.pt", overrides)
         self.assertIn("env.eval.video_cfg.save_video=false", overrides)
         write_results(self.root / "result", {"success_once": .8, "bad": float("nan")}, step=50, checkpoint="weights.pt")
         curve = json.loads((self.root / "result/evaluation_curve.json").read_text())
         self.assertEqual(curve, [{"actor_updates": 50, "success_once": .8}])
+
+    def test_slurm_eval_embeds_current_helper_in_batch_command(self):
+        self.config['rlinf_dashboard']['targets']['4x4090'].update(kind='slurm',submit_host='login-server',partition='h100',node='h100-test')
+        client = self.make_app()
+        run = self.request(client,'get','/api/rlinf/runs').json['runs'][0]
+        checkpoint = self.request(client,'get',f"/api/rlinf/runs/{run['id']}/checkpoints").json['checkpoints'][0]
+        with mock.patch.object(TaskManager,'start',return_value={'id':'eval-slurm'}) as start:
+            response = self.request(client,'post','/api/rlinf/evaluate',json={'run_id':run['id'],'checkpoint_id':checkpoint['id'],'record_video':False})
+            self.assertEqual(response.status_code,201,response.json)
+            command = start.call_args.args[1]
+            slurm = json.loads(base64.urlsafe_b64decode(command[command.index('--command-json')+1]))
+            batch = json.loads(base64.urlsafe_b64decode(slurm[slurm.index('--commands-json')+1]))
+            self.assertIn('DashboardEvalRunner',batch[0][2])
+            self.assertIn('rollout.model=${actor.model}',batch[0][2])
+
+    def test_eval_wrapper_places_hydra_flags_before_overrides(self):
+        args = mock.Mock(entrypoint="eval.py", config_path="/configs", config_name="eval",
+                         checkpoint="weights.pt", output="/eval", episodes=5, seed=43, max_steps=512, record_video=False)
+        argv = hydra_argv(args, ["actor.model.model_path=/models", "--cfg", "job", "--resolve"])
+        self.assertLess(argv.index("--cfg"), argv.index("actor.model.model_path=/models"))
+        self.assertLess(argv.index("--resolve"), argv.index("rollout.model=${actor.model}"))
 
 
 if __name__ == "__main__":

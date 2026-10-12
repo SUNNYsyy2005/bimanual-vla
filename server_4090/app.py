@@ -8798,7 +8798,7 @@ print(json.dumps(rows, ensure_ascii=False))
         settings = profile["evaluation"]
         project = str(target["project_root"])
         entrypoint = settings.get("entrypoint", project + "/third_party/wovr/evaluations/eval_embodied_agent.py")
-        runner = str(APP_DIR / "rlinf_eval_runner.py") if kind == "local" else str(PurePosixPath(target.get("dashboard_repo", "/DATA/disk0/" + os.environ.get("USER", "sunny") + "/bimanual-vla")) / "server_4090/rlinf_eval_runner.py")
+        runner = str(APP_DIR / "rlinf_eval_runner.py")
         inner = [str(target.get("python", "python3")), runner, "--entrypoint", str(entrypoint),
                  "--config-path", str(settings.get("config_path", project + "/configs/rlinf")),
                  "--config-name", str(settings.get("config_name", "libero_safety_grpo_pi05_smoke")),
@@ -8815,6 +8815,10 @@ print(json.dumps(rows, ensure_ascii=False))
             inner.extend(native_gpu_placement(gpu_ids, evaluation=True))
             command = ["bash", "-lc", "cd " + shlex.quote(project) + " && exec " + shlex.join(inner)]
         elif kind == "slurm":
+            # Ship this exact helper in the generated batch command so H200
+            # node-local checkouts do not need another deployment or NAS mount
+            # just to obtain the small dashboard evaluation wrapper.
+            inner = [str(target.get("python", "python3")), "-c", (APP_DIR / "rlinf_eval_runner.py").read_text(encoding="utf-8"), *inner[2:]]
             exports = " ".join(f"export {key}={shlex.quote(value)};" for key, value in profile_env.items() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key))
             cluster = {**target, "gpu_count": 1, "workdir": project, "openpi_python": config["openpi_python"]}
             slurm = slurm_runner_command(target_name=target_id, target_config=cluster,

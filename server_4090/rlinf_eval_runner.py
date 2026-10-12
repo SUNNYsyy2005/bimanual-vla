@@ -12,6 +12,10 @@ import sys
 
 def evaluation_overrides(args) -> list[str]:
     return [
+        # Rollout workers use actor.model during training but rollout.model in
+        # eval-only mode. Keep the architecture (including any auxiliary heads)
+        # identical so exported actor state_dict weights load strictly.
+        "rollout.model=${actor.model}",
         "runner.only_eval=true", f"runner.ckpt_path={args.checkpoint}",
         f"runner.logger.log_path={args.output}",
         "env.eval.total_num_envs=1", f"env.eval.rollout_epoch={args.episodes}",
@@ -21,6 +25,21 @@ def evaluation_overrides(args) -> list[str]:
         f"env.eval.video_cfg.save_video={str(args.record_video).lower()}",
         f"env.eval.video_cfg.video_base_dir={Path(args.output) / 'video'}",
     ]
+
+
+def hydra_argv(args, extra: list[str]) -> list[str]:
+    options, overrides = [], []
+    tokens = iter(extra)
+    for token in tokens:
+        if token.startswith("--"):
+            options.append(token)
+            if token in {"--cfg", "--info", "--package", "--config-dir"}:
+                options.append(next(tokens))
+        else:
+            overrides.append(token)
+    # Hydra's positional override parser requires its CLI flags first.
+    return [args.entrypoint, "--config-path", args.config_path, "--config-name", args.config_name,
+            *options, *overrides, *evaluation_overrides(args)]
 
 
 def write_results(output: Path, metrics: dict, *, step: int, checkpoint: str) -> None:
@@ -63,8 +82,7 @@ def main() -> None:
             return metrics
 
     embodied_eval_runner.EmbodiedEvalRunner = DashboardEvalRunner
-    sys.argv = [args.entrypoint, "--config-path", args.config_path, "--config-name", args.config_name,
-                *extra, *evaluation_overrides(args)]
+    sys.argv = hydra_argv(args, extra)
     runpy.run_path(args.entrypoint, run_name="__main__")
 
 
