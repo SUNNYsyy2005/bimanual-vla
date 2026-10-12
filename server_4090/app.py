@@ -7015,6 +7015,9 @@ print(json.dumps(rows, ensure_ascii=False))
         location = dataset_location_configs().get(target_name)
         if not location or not location.get("available", True):
             raise ValueError("unknown or unavailable dataset location")
+        expected_episodes = payload.get("expected_episodes")
+        if expected_episodes is not None:
+            expected_episodes = safe_int(expected_episodes, "expected_episodes", 1, 1000000)
         with tasks.lock:
             assert_dataset_idle(dataset_id)
             if target_name == "local_4090":
@@ -7025,12 +7028,16 @@ print(json.dumps(rows, ensure_ascii=False))
                     raise ValueError("dataset path escapes configured storage root")
                 if not (target_path / "meta/info.json").is_file():
                     raise FileNotFoundError("local dataset copy is not installed")
+                if expected_episodes is not None and read_json(target_path / "meta/info.json", {}).get("total_episodes") != expected_episodes:
+                    raise ValueError("dataset episode count changed; deletion refused")
                 return jsonify({**dataset_editor.delete_dataset(dataset_id), "target": target_name})
             if location.get("kind") not in {"local", "local_archive"}:
                 if not location.get("openpi_python") or not location.get("partition") or not location.get("node"):
                     raise ValueError("remote dataset deletion requires a configured Slurm target and Conda Python")
             command = [config["openpi_python"], str(APP_DIR / "dataset_delete_runner.py"),
                        "--dataset-id", dataset_id, "--location-json", json_arg(location)]
+            if expected_episodes is not None:
+                command.extend(["--expected-episodes", str(expected_episodes)])
             task = tasks.start("transfer", command, env=build_environment(config, None), metadata={
                 "dataset_id": dataset_id, "transfer_kind": "dataset_delete", "target": target_name,
                 "target_path": str(Path(location["dataset_root"]) / dataset_id) if location.get("kind") in {"local", "local_archive"} else str(PurePosixPath(location["dataset_root"]) / dataset_id),
