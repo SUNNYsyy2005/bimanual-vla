@@ -60,6 +60,7 @@ function dashboard(remoteFailure = false) {
     'fillDatasets', 'fillTrainingExperiments', 'fillBaseModels',
     'fillExecutionTargets', 'fillCheckpoints', 'fillTasks', 'fillTrainingTasks',
     'fillTransferTasks', 'refreshSelectedLogs', 'fillObservation',
+    'loadTransferTasks',
     'loadDatasetEpisodes', 'loadEvalVideos', 'loadTrainingMetrics',
   ]) context[name] = () => {};
   vm.createContext(context);

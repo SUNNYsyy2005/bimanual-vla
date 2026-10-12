@@ -431,8 +431,8 @@
         <div class="card half"><h2>格式与媒体说明</h2><div class="section-note">Dashboard 可识别单臂 7D / 10D、双臂 14D / 20D 和其他自定义维度，并显示所有 <code>dtype: video</code> / <code>dtype: image</code> 相机。{{ "这里只呈现仿真数据集；可从本页面统一提交 4×4090 本地训练/评测或 H100/H200 Slurm 训练/评测。" if dashboard_profile == "simulation" else "这里只呈现真机和未分类数据集；将来源标记为仿真后，该数据集会从 Dashboard 隐藏，但数据集 ID 和底层训练加载路径不会改变。" }}</div></div>
         <div class="card"><h2>{{ "已接收仿真数据集" if dashboard_profile == "simulation" else "已接收真机数据集" }}</h2><div class="toolbar"><label style="margin:0">来源筛选</label><select id="datasetOriginFilter" class="dataset-origin-select"><option value="all">全部</option>{% for origin in visible_dataset_origins %}<option value="{{ origin }}">{{ "真机" if origin == "real" else "仿真" if origin == "simulation" else "未分类" }}</option>{% endfor %}</select><button class="inline secondary" type="button" onclick="loadDatasetLocations(true)">刷新 4×4090/H100/H200 位置</button><span id="datasetOriginSummary" class="muted">等待状态数据。</span></div><div class="table-wrap"><table class="dataset-table"><thead><tr><th>ID / 来源</th><th>位置 / 同步</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div><div id="datasetsPagination"></div></div>
         <div class="card">
-          <h2>数据传输任务</h2>
-          <p class="muted">显示数据集、checkpoint 和评估视频 transfer 的实时状态；进度来自传输 runner 的 sidecar，旧任务会用目标目录清单做保守估算。</p>
+          <div class="training-output-heading"><h2>数据传输与删除任务</h2><div class="toolbar"><span id="transferTasksSummary" class="muted">等待加载</span><button class="inline secondary" type="button" onclick="loadTransferTasks()">刷新任务</button></div></div>
+          <p class="muted">独立刷新数据集、checkpoint、评估视频的传输任务与数据集删除任务。删除任务不显示字节传输进度。</p>
           <div class="toolbar task-bulk-toolbar"><label style="margin:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" class="task-select-all" data-task-scope="transfer" onchange="toggleTaskSelection('transfer', this.checked)" aria-label="全选当前页数据传输任务">全选本页</label><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('transfer')" disabled data-bulk-delete-scope="transfer">批量删除已选任务（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束传输任务；不会删除数据集、checkpoint 或评估视频。</span></div><div class="table-wrap"><table><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="transfer" onchange="toggleTaskSelection('transfer', this.checked)" aria-label="全选当前页数据传输任务"></th><th>任务</th><th>方向 / 路径</th><th>进度</th><th>状态 / 详情</th><th>操作</th></tr></thead><tbody id="transferJobs"></tbody></table></div><div id="transferTasksPagination"></div>
         </div>
         <div class="card">
@@ -914,6 +914,8 @@ const expandedEvalVideoIds = new Set();
 let evalVideoDataById = new Map();
 const selectedCheckpointPaths = new Set();
 const pendingDatasetDeleteTasks = new Set();
+let latestTransferTasks = null;
+let transferTasksRequest = null;
 let episodeLimit = 100;
 const LIST_PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
 const listPageStates = {
@@ -960,7 +962,7 @@ function resetListPage(key) {
 function rerenderPaginatedList(key) {
   const items = (latestStatus && latestStatus.tasks) || [];
   if (key === 'datasets') fillDatasets((latestStatus && latestStatus.datasets) || []);
-  else if (key === 'transferTasks') fillTransferTasks(items);
+  else if (key === 'transferTasks') fillTransferTasks(latestTransferTasks || items);
   else if (key === 'trainingTasks' || key === 'policyTasks' || key === 'evaluationTasks') fillTasks(items);
   else if (key === 'checkpoints') fillCheckpoints((latestStatus && latestStatus.checkpoints) || []);
   else if (key === 'baseModels') fillBaseModels((latestStatus && latestStatus.base_models) || []);
@@ -4985,6 +4987,7 @@ function formatDuration(seconds) {
 
 function transferProgressValue(task) {
   const p = task.progress || {};
+  if (task.state === 'completed') return 1;
   const direct = Number(p.progress);
   if (Number.isFinite(direct)) return Math.max(0, Math.min(1, direct));
   const done = Number(p.completed_bytes);
@@ -4993,6 +4996,7 @@ function transferProgressValue(task) {
 }
 
 function fillTransferTasks(items) {
+  if (latestTransferTasks !== null) items = latestTransferTasks;
   const target = document.getElementById('transferJobs');
   if (!target) return;
   const transfers = items.filter(task => task.type === 'transfer');
@@ -5010,6 +5014,7 @@ function fillTransferTasks(items) {
     const terminal = TERMINAL_STATES.has(task.state);
     const checkbox = `<input type="checkbox" class="task-select" data-task-scope="transfer" data-task-id="${esc(task.id)}" onchange="onTaskSelectionChange(this)" ${terminal ? '' : 'disabled title="运行中的传输任务不能批量删除"'} ${selectedTaskIds.has(task.id) ? 'checked' : ''} aria-label="选择数据传输任务 ${esc(task.id)}">`;
     const kind = metadata.transfer_kind || 'dataset';
+    const deleting = kind === 'dataset_delete';
     const source = metadata.source || progress.source || '-';
     const targetName = metadata.target || progress.target || '-';
     const path = metadata.dataset_id || metadata.exp_name || progress.dataset_id || '-';
@@ -5017,15 +5022,32 @@ function fillTransferTasks(items) {
     const files = progress.total_files ? `${progress.completed_files || 0}/${progress.total_files} files` : 'files -';
     const shards = progress.total_shards ? `${progress.completed_shards || 0}/${progress.total_shards} lanes` : 'lanes -';
     const error = progress.error || progress.scan_error || task.start_error || '';
+    const progressCell = deleting ? `<span class="${stateClass(task.state)}">${task.state === 'completed' ? '删除已完成' : terminal ? '删除未完成，请查看日志' : '删除任务执行中'}</span>` : `<div class="transfer-progress-meta"><span>${esc(percent)}</span><span>${esc(done)} / ${esc(total)}</span></div><div class="progress-track"><div class="progress-bar" style="width:${width.toFixed(3)}%"></div></div><div class="transfer-detail">${esc(files)} · ${esc(shards)} · ${esc(speed)} · ETA ${esc(eta)}</div>`;
     return `<tr><td class="task-selection-cell">${checkbox}</td><td><code class="task-ref" title="${esc(task.id)}">${esc(shortTaskId(task.id))}</code><br><span class="pill">${esc(kind)}</span><br><span class="muted">${esc(path)}</span></td>`
       + `<td><strong>${esc(source)} → ${esc(targetName)}</strong><br><code class="path" title="${esc(metadata.target_path || progress.target_path || '')}">${esc(shortPath(metadata.target_path || progress.target_path || '-'))}</code></td>`
-      + `<td class="transfer-progress-cell"><div class="transfer-progress-meta"><span>${esc(percent)}</span><span>${esc(done)} / ${esc(total)}</span></div><div class="progress-track"><div class="progress-bar" style="width:${width.toFixed(3)}%"></div></div><div class="transfer-detail">${esc(files)} · ${esc(shards)} · ${esc(speed)} · ETA ${esc(eta)}</div></td>`
+      + `<td class="transfer-progress-cell">${progressCell}</td>`
       + `<td class="${stateClass(task.state)}">${esc(task.state)}${progress.updated_at ? `<br><span class="muted">${esc(progress.updated_at)}</span>` : ''}${error ? `<br><span class="bad">${esc(error)}</span>` : ''}</td>`
       + `<td><button class="inline secondary" onclick="loadLog('${esc(task.id)}','training')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(task.id)}',false)">停止</button>` : ''}${terminal ? `<button class="inline danger" onclick="deleteTask('${esc(task.id)}','training')">删除记录</button>` : ''}</td></tr>`;
-  }).join('') || '<tr><td colspan="6" class="muted">暂无 transfer 任务</td></tr>';
+  }).join('') || '<tr><td colspan="6" class="muted">暂无传输或删除任务</td></tr>';
+  document.getElementById('transferTasksSummary').textContent = `${transfers.length} 条 · ${transfers.filter(task => ACTIVE_STATES.has(task.state)).length} 执行中`;
   const pagination = document.getElementById('transferTasksPagination');
   if (pagination) pagination.innerHTML = renderListPagination('transferTasks', transfers.length);
   updateTaskBulkControls();
+}
+
+async function loadTransferTasks(quiet = false) {
+  if (!tokenInput.value || transferTasksRequest) return transferTasksRequest;
+  transferTasksRequest = (async () => {
+    try {
+      const data = await api('/api/transfers');
+      latestTransferTasks = data.tasks || [];
+      fillTransferTasks(latestTransferTasks);
+    } catch (error) {
+      if (latestTransferTasks === null) document.getElementById('transferJobs').innerHTML = `<tr><td colspan="6" class="bad">任务加载失败：${esc(error.message)}；点击刷新重试。</td></tr>`;
+      if (!quiet) show(`传输任务刷新失败：${error.message}`);
+    } finally { transferTasksRequest = null; }
+  })();
+  return transferTasksRequest;
 }
 
 function filteredEvaluationTasks(items) {
@@ -5547,6 +5569,7 @@ async function refreshAll() {
     return;
   }
   loadGpuResources();
+  loadTransferTasks(true);
   try {
     const data = await api('/api/status');
     const serverBuild = String(((data || {}).config || {}).dashboard_build || '');
@@ -5673,7 +5696,8 @@ function taskMatchesScope(task, scope) {
 }
 
 function selectedTaskIdsForScope(scope) {
-  const tasks = ((latestStatus && latestStatus.tasks) || []).filter(task => taskMatchesScope(task, scope) && TERMINAL_STATES.has(task.state));
+  const source = scope === 'transfer' && latestTransferTasks !== null ? latestTransferTasks : ((latestStatus && latestStatus.tasks) || []);
+  const tasks = source.filter(task => taskMatchesScope(task, scope) && TERMINAL_STATES.has(task.state));
   const eligible = new Set(tasks.map(task => task.id));
   return [...selectedTaskIds].filter(taskId => eligible.has(taskId));
 }
