@@ -642,7 +642,7 @@
           <p class="muted">勾选“对比”可跨页比较曲线；“删除”清理运行记录及已结束任务的 Dashboard 日志，保留原始曲线文件、模型和 checkpoint。</p>
           <div class="table-wrap"><table><thead><tr><th>对比</th><th>目标 / 运行</th><th>状态</th><th>指标点数</th><th>成功率 / 风险率</th><th>更新时间</th><th><label><input id="rlinfDeletePage" type="checkbox" aria-label="选择本页可删除记录">删除</label></th><th>操作</th></tr></thead><tbody id="rlinfRuns"></tbody></table></div>
           <div id="rlinfRunsPagination"></div>
-          <div id="rlinfLogPanel" hidden><div class="toolbar"><strong id="rlinfLogTitle">训练日志</strong><button class="inline secondary" type="button" onclick="loadRlinfLog(rlinfLogTaskId)">刷新日志</button><button class="inline secondary" type="button" onclick="document.getElementById('rlinfLogPanel').hidden = true">收起</button></div><pre id="rlinfLog"></pre></div>
+          <div id="rlinfLogPanel" hidden><div class="toolbar"><strong id="rlinfLogTitle">训练日志</strong><button class="inline secondary" type="button" onclick="rlinfLogRunId ? loadRlinfRunLog(rlinfLogRunId) : loadRlinfLog(rlinfLogTaskId)">刷新日志</button><button class="inline secondary" type="button" onclick="document.getElementById('rlinfLogPanel').hidden = true">收起</button></div><pre id="rlinfLog"></pre></div>
           <div class="chart-toolbar"><div><label for="rlinfMetric">指标</label><select id="rlinfMetric"></select></div><div><label for="rlinfXAxis">横坐标</label><select id="rlinfXAxis"><option value="actor_updates">Actor updates</option><option value="round">训练轮次（round）</option></select></div></div>
           <p id="rlinfMetricSummary" class="muted"></p>
           <div class="chart-shell"><canvas id="rlinfChart" aria-label="RLinf multi-run metric chart"></canvas></div><div id="rlinfLegend" class="metric-legend"></div>
@@ -913,6 +913,7 @@ const selectedEvalVideoIds = new Set();
 const expandedEvalVideoIds = new Set();
 let evalVideoDataById = new Map();
 const selectedCheckpointPaths = new Set();
+const pendingDatasetDeleteTasks = new Set();
 let episodeLimit = 100;
 const LIST_PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
 const listPageStates = {
@@ -1868,27 +1869,36 @@ function datasetLocationOptions() {
 
 function mergeDatasetLocationInfo(items, locationData) {
   if (!locationData || !Array.isArray(locationData.datasets)) return items;
-  const byId = new Map(items.map(item => [item.id, item]));
+  // Rebuild inventory-derived rows on every snapshot so removed copies do not linger.
+  const byId = new Map(items.filter(item => !item.inventory_only).map(item => [item.id, {...item}]));
+  for (const local of locationData.local_datasets || []) {
+    const existing = byId.get(local.id);
+    if (!existing || existing.remote_only) byId.set(local.id, {...local, remote_only:false, inventory_only:true});
+  }
   for (const remote of locationData.datasets) {
     const existing = byId.get(remote.id);
     const locations = (remote.locations || []).map(loc => ({...loc, label: loc.label || datasetLocationLabel(loc.target)}));
+    const local = locations.find(loc => ['local','local_archive'].includes(loc.kind) && !loc.host);
     if (existing) {
       existing.locations = locations;
       existing.targets = remote.targets || locations.map(loc => loc.target);
       existing.duplicate_count = remote.duplicate_count || locations.length;
+      if (local) existing.remote_only = false;
       continue;
     }
-    const first = locations[0] || {};
+    const first = local || locations[0] || {};
     const origin = (remote.origins && remote.origins[0]) || first.origin || 'unknown';
     if (!VISIBLE_DATASET_ORIGINS.has(origin)) continue;
     byId.set(remote.id, {
       id: remote.id,
       dataset_origin: origin,
-      dataset_origin_source: 'remote_inventory',
-      remote_only: true,
+      dataset_origin_source: local ? 'local_inventory' : 'remote_inventory',
+      remote_only: !local,
+      inventory_only: true,
+      read_only: Boolean(local),
       training_supported: false,
-      training_error: '仅在远端发现；同步到 4×4090 后可本地编辑/校验，或用于对应集群训练。',
-      schema_label: 'remote only', schema: 'remote', arm_mode: '-', dataset_layout: '-', contract_version: '-',
+      training_error: local ? '本机数据集信息正在加载，请刷新主列表。' : '仅在远端发现；同步到 4×4090 后可本地编辑/校验，或用于对应集群训练。',
+      schema_label: local ? '本机数据集（待加载）' : 'remote only', schema: 'remote', arm_mode: '-', dataset_layout: '-', contract_version: '-',
       state_key: 'state?', state_shape: null, action_key: 'action?', action_shape: null,
       state_dim: null, raw_action_dim: null, model_action_dim: null, arm_side: '-', media: [],
       raw_action_semantics: '-', raw_action_convention: '-', model_action_semantics: '-', model_action_convention: '-',
@@ -1906,7 +1916,34 @@ function renderDatasetLocations(d) {
   const selectId = `syncTarget_${d.id.replace(/[^A-Za-z0-9_-]/g, '_')}`;
   const source = (locations.some(loc => loc.target === 'local_4090') ? 'local_4090' : (locations[0] && locations[0].target) || 'local_4090');
   const options = datasetLocationOptions().filter(loc => loc.id !== source).map(loc => `<option value="${esc(loc.id)}">${esc(loc.label)}${loc.kind === 'slurm_only' ? ' · Slurm' : ''}</option>`).join('');
-  return `<div class="location-list">${pills}</div><div style="margin-top:7px"><select id="${esc(selectId)}" class="dataset-sync-select">${options}</select><button class="inline secondary" type="button" onclick="syncDatasetTo('${esc(d.id)}','${esc(selectId)}','${esc(source)}')">同步</button></div>`;
+  const deleteId = `deleteLocation_${d.id.replace(/[^A-Za-z0-9_-]/g, '_')}`;
+  const deleteOptions = locations.filter(loc => ['local','local_archive','ssh','slurm_only'].includes(loc.kind)).map(loc => `<option value="${esc(loc.target)}">${esc(loc.label || datasetLocationLabel(loc.target))}</option>`).join('');
+  return `<div class="location-list">${pills}</div><div style="margin-top:7px"><select id="${esc(selectId)}" class="dataset-sync-select">${options}</select><button class="inline secondary" type="button" onclick="syncDatasetTo('${esc(d.id)}','${esc(selectId)}','${esc(source)}')">同步</button></div>${deleteOptions ? `<div style="margin-top:7px"><select id="${esc(deleteId)}" class="dataset-sync-select" aria-label="选择删除的数据集位置">${deleteOptions}</select><button class="inline danger" type="button" onclick="deleteDatasetCopy('${esc(d.id)}','${esc(deleteId)}')">删除此位置副本</button></div>` : ''}`;
+}
+
+async function deleteDatasetCopy(datasetId, selectId) {
+  const select = document.getElementById(selectId);
+  const target = select?.value;
+  if (!target) { show('请选择要删除的数据集位置。'); return; }
+  const label = select.selectedOptions[0].textContent;
+  const confirmation = prompt(`永久删除 ${label} 上的数据集 ${datasetId}。\n只删除选中位置的副本，其他服务器副本、checkpoint 和模型保留。\n请输入完整数据集 ID 确认：`, '');
+  if (confirmation == null) return;
+  if (confirmation !== datasetId) { show('数据集 ID 不匹配，已取消删除。'); return; }
+  try {
+    const result = await api(`/api/datasets/${encodeURIComponent(datasetId)}/delete-copy`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({target,confirm_dataset_id:confirmation}),
+    });
+    if (result.task) {
+      pendingDatasetDeleteTasks.add(result.task.id);
+      show(`已提交 ${label} 数据集删除任务：${result.task.id}。可在传输任务中查看状态。`, false);
+      await refreshAll();
+    } else {
+      latestDatasetLocations = null; datasetLocationsFetchedAt = 0;
+      episodeDatasetData = null; clearEpisodeMedia();
+      await refreshAll(); await loadDatasetLocations(true);
+      show(`已删除 ${label} 上的数据集 ${datasetId}。`, false);
+    }
+  } catch (error) { show(error.message); }
 }
 
 async function loadDatasetLocations(forceRender = false) {
@@ -5520,6 +5557,13 @@ async function refreshAll() {
       return;
     }
     latestStatus = data;
+    for (const id of pendingDatasetDeleteTasks) {
+      const task = (data.tasks || []).find(item => item.id === id);
+      if (task && ['completed','failed','lost','stopped','skipped'].includes(task.state)) {
+        pendingDatasetDeleteTasks.delete(id);
+        latestDatasetLocations = null; datasetLocationsFetchedAt = 0;
+      }
+    }
     if (latestGpuInventory) latestStatus.gpus = latestGpuInventory;
     updateSummaries(data);
     if (latestDatasetLocations) latestStatus.datasets = mergeDatasetLocationInfo(data.datasets || [], latestDatasetLocations);
@@ -5962,6 +6006,7 @@ let rlinfRunsLoading = false;
 let rlinfDeleteSelection = new Set();
 let rlinfDeleting = false;
 let rlinfLogTaskId = null;
+let rlinfLogRunId = null;
 let rlinfEvaluations = [];
 let rlinfCheckpointRequest = 0;
 let rlinfEvalSubmitting = false;
@@ -6061,8 +6106,9 @@ async function deleteRlinfRuns(ids) {
       rlinfSelected.delete(id); rlinfDeleteSelection.delete(id); rlinfMetricData.delete(id);
     }
     rlinfRuns = rlinfRuns.filter(run => !result.run_ids.includes(run.id));
-    if (result.task_ids.includes(rlinfLogTaskId)) {
+    if (result.task_ids.includes(rlinfLogTaskId) || result.run_ids.includes(rlinfLogRunId)) {
       rlinfLogTaskId = null;
+      rlinfLogRunId = null;
       document.getElementById('rlinfLogPanel').hidden = true;
       document.getElementById('rlinfLog').textContent = '';
     }
@@ -6075,6 +6121,7 @@ async function deleteRlinfRuns(ids) {
 async function loadRlinfLog(taskId) {
   if (!taskId) return;
   rlinfLogTaskId = taskId;
+  rlinfLogRunId = null;
   document.getElementById('rlinfLogPanel').hidden = false;
   document.getElementById('rlinfLogTitle').textContent = `训练日志 · ${taskId}`;
   document.getElementById('rlinfLog').textContent = '加载中…';
@@ -6083,6 +6130,18 @@ async function loadRlinfLog(taskId) {
     if (rlinfLogTaskId === taskId) document.getElementById('rlinfLog').textContent = data.log || '暂无日志';
   } catch (error) {
     if (rlinfLogTaskId === taskId) document.getElementById('rlinfLog').textContent = `日志读取失败：${error.message}`;
+  }
+}
+async function loadRlinfRunLog(runId) {
+  rlinfLogRunId = runId; rlinfLogTaskId = null;
+  document.getElementById('rlinfLogPanel').hidden = false;
+  document.getElementById('rlinfLog').textContent = '加载中…';
+  document.getElementById('rlinfLogTitle').textContent = `RLInf 日志 · ${rlinfRuns.find(run => run.id === runId)?.name || runId}`;
+  try {
+    const data = await api(`/api/rlinf/runs/${encodeURIComponent(runId)}/log`);
+    if (rlinfLogRunId === runId) document.getElementById('rlinfLog').textContent = data.log || '该运行目录没有文本日志；可在曲线区查看 TensorBoard 指标。';
+  } catch (error) {
+    if (rlinfLogRunId === runId) document.getElementById('rlinfLog').textContent = `日志读取失败：${error.message}`;
   }
 }
 
@@ -6172,7 +6231,7 @@ function renderRlinfRuns() {
     const risk = run.latest?.['eval.risk_rate@ode'] ?? run.latest?.['eval.risk_rate@sde'] ?? run.latest?.['eval.risk_rate'] ?? run.latest?.['train.risk_rate'] ?? run.latest?.['train.rollout/safety/episode_cost_rate'];
     const updated = run.updated_at ? new Date(run.updated_at * 1000).toLocaleString() : '-';
     const disabled = !rlinfCanDelete(run) || rlinfDeleting;
-    return `<tr><td><input type="checkbox" data-rlinf-run="${esc(run.id)}" ${selected} aria-label="Compare ${esc(run.name)}"></td><td><strong>${esc(run.name)}</strong><br><span class="muted">${esc(run.target)} · ${esc(run.method)}</span></td><td><span class="pill">${esc(run.state)}</span></td><td>${roundCount}</td><td>${formatRlinfPercent(sr)} / ${formatRlinfPercent(risk)}</td><td>${esc(updated)}</td><td><input type="checkbox" data-rlinf-delete="${esc(run.id)}" ${rlinfDeleteSelection.has(run.id) ? 'checked' : ''} ${disabled ? 'disabled' : ''} aria-label="选择删除 ${esc(run.name)}"></td><td>${run.task_id ? `<button class="inline secondary" data-rlinf-log="${esc(run.task_id)}">日志</button>` : ''}<button class="inline danger" data-rlinf-remove="${esc(run.id)}" ${disabled ? 'disabled' : ''}>删除</button></td></tr>`;
+    return `<tr><td><input type="checkbox" data-rlinf-run="${esc(run.id)}" ${selected} aria-label="Compare ${esc(run.name)}"></td><td><strong>${esc(run.name)}</strong><br><span class="muted">${esc(run.target)} · ${esc(run.method)}</span></td><td><span class="pill">${esc(run.state)}</span></td><td>${roundCount}</td><td>${formatRlinfPercent(sr)} / ${formatRlinfPercent(risk)}</td><td>${esc(updated)}</td><td><input type="checkbox" data-rlinf-delete="${esc(run.id)}" ${rlinfDeleteSelection.has(run.id) ? 'checked' : ''} ${disabled ? 'disabled' : ''} aria-label="选择删除 ${esc(run.name)}"></td><td><button class="inline secondary" data-rlinf-run-log="${esc(run.id)}">日志</button><button class="inline danger" data-rlinf-remove="${esc(run.id)}" ${disabled ? 'disabled' : ''}>删除</button></td></tr>`;
   }).join('') || '<tr><td colspan="8" class="muted">没有匹配的运行记录。</td></tr>';
   updateRlinfDeleteSelection();
   body.querySelectorAll('[data-rlinf-delete]').forEach(input => input.addEventListener('change', () => {
@@ -6181,6 +6240,7 @@ function renderRlinfRuns() {
   }));
   body.querySelectorAll('[data-rlinf-remove]').forEach(button => button.addEventListener('click', () => deleteRlinfRuns([button.dataset.rlinfRemove])));
   body.querySelectorAll('[data-rlinf-log]').forEach(button => button.addEventListener('click', () => loadRlinfLog(button.dataset.rlinfLog)));
+  body.querySelectorAll('[data-rlinf-run-log]').forEach(button => button.addEventListener('click', () => loadRlinfRunLog(button.dataset.rlinfRunLog)));
   body.querySelectorAll('[data-rlinf-run]').forEach(input => input.addEventListener('change', () => {
     if (input.checked && rlinfSelected.size >= 8) {
       input.checked = false;

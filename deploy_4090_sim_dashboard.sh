@@ -23,6 +23,7 @@ rsync -av --relative --exclude='__pycache__/' --exclude='*.py[cod]' \
   "$LOCAL_ROOT/./server_4090/eval_heldout_loss.py" \
   "$LOCAL_ROOT/./server_4090/slurm_job_runner.py" \
   "$LOCAL_ROOT/./server_4090/dataset_transfer_runner.py" \
+  "$LOCAL_ROOT/./server_4090/dataset_delete_runner.py" \
   "$LOCAL_ROOT/./server_4090/slurm_dataset_sync_runner.py" \
   "$LOCAL_ROOT/./server_4090/video_transfer_runner.py" \
   "$LOCAL_ROOT/./server_4090/validate_lerobot.py" \
