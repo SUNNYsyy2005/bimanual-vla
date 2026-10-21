@@ -50,6 +50,67 @@ class ChunkPlan:
                     source_index=source, queue_index=source)
 
 
+def splice_ready_chunk(prepared: ChunkPlan, initial, velocity, acceleration,
+                       lower, upper, config: ServoConfig, *, start: float) -> ChunkPlan:
+    """Join a prepared curve from the old plan's state at the actual handoff.
+
+    Heavy full-horizon compilation has already finished. A local, analytically
+    checked Ruckig transition matches q/v/a at both ends. The prepared suffix
+    keeps its original observation clock; it is never shifted to hide latency.
+    """
+    initial = np.asarray(initial, dtype=float)
+    joints = np.array([i for i in range(len(initial)) if i % 7 != 6])
+    grippers = np.array([i for i in range(len(initial)) if i % 7 == 6])
+    planner = RuckigJointPlanner(initial[joints], np.asarray(lower)[joints],
+                                 np.asarray(upper)[joints], config)
+    planner.set_state(initial[joints], velocity, acceleration)
+    # Join on an existing sample clock. Continuous duration avoids rounding a
+    # floating point 0.10 s interval up to 0.11 s and missing the suffix clock.
+    planner.input.duration_discretization = planner._ruckig.DurationDiscretization.Continuous
+    index = int(np.searchsorted(prepared.times, start + .05, side="left"))
+    for _ in range(16):
+        if index >= len(prepared.times):
+            break
+        end = float(prepared.times[index])
+        duration = end - start
+        planner.input.target_position = prepared.positions[index, joints].tolist()
+        planner.input.target_velocity = prepared.velocities[index].tolist()
+        planner.input.target_acceleration = prepared.accelerations[index].tolist()
+        planner.input.minimum_duration = duration
+        try:
+            trajectory = planner._check_planned_bounds()
+        except ServoError:
+            index += max(1, round(.05 * config.hz))
+            continue
+        if trajectory.duration > duration + 1e-8:
+            index = max(index + max(1, round(.05 * config.hz)),
+                        int(np.searchsorted(prepared.times, start + trajectory.duration)))
+            continue
+        clocks = start + np.arange(int(np.ceil(duration * config.hz))) / config.hz
+        clocks = clocks[clocks < end - 1e-9]
+        samples = [trajectory.at_time(float(at - start)) for at in clocks]
+        q, v, a = (np.asarray(x) for x in zip(*samples))
+        positions = np.tile(initial, (len(clocks), 1))
+        positions[:, joints] = q
+        # Exact old state at the splice; exact prepared state at the join.
+        positions[0] = initial
+        v[0], a[0] = velocity, acceleration
+        all_clocks = np.concatenate([clocks, prepared.times[index:]])
+        all_positions = np.concatenate([positions, prepared.positions[index:]])
+        # Grippers have their own speed limit, not joint q/v/a synchronization.
+        # Both the prepared curve and this cone are rate bounded; clipping
+        # between the cone bounds preserves the rate bound throughout.
+        desired = np.stack([np.interp(all_clocks, prepared.times, prepared.positions[:, i])
+                            for i in grippers], axis=1)
+        reach = ((all_clocks - start) * config.max_gripper_velocity)[:, None]
+        all_positions[:, grippers] = np.clip(desired, initial[grippers] - reach, initial[grippers] + reach)
+        return ChunkPlan(all_clocks, all_positions,
+                         np.concatenate([v, prepared.velocities[index:]]),
+                         np.concatenate([a, prepared.accelerations[index:]]),
+                         prepared.generation, prepared.source_times, prepared.source_indices)
+    raise ServoError("ready chunk has no bounded q/v/a-continuous splice")
+
+
 def compile_chunk(initial, velocity, acceleration, lower, upper, config: ServoConfig,
                   targets, target_times, source_indices, *, start: float,
                   generation: int) -> ChunkPlan:
@@ -89,7 +150,6 @@ def compile_chunk(initial, velocity, acceleration, lower, upper, config: ServoCo
     if len(smooth) >= 3:
         smooth[1:-1] = (smooth[:-2] + 2 * smooth[1:-1] + smooth[2:]) / 4
     curve = PchipInterpolator(target_times, smooth, axis=0, extrapolate=False)
-    derivative = curve.derivative()
     period = 1 / config.hz
     reference_period = float(np.median(np.diff(target_times)))
     retarget_ticks = max(1, round(reference_period / period))
@@ -98,19 +158,23 @@ def compile_chunk(initial, velocity, acceleration, lower, upper, config: ServoCo
     # Include the starting state, so a splice preserves q/v/a exactly.
     ts, qs, vs, accs = [start], [initial.copy()], [planner.velocity.copy()], [planner.acceleration.copy()]
     grip = initial[grippers].copy()
-    for tick in range(1, count + 1):
-        at = start + tick * period
-        if (tick - 1) % retarget_ticks == 0:
-            future = float(np.clip(at + preview, target_times[0], target_times[-1]))
-            terminal_v = derivative(future) if future < target_times[-1] else np.zeros(len(joints))
-            planner.retarget(curve(future), terminal_v)
-        command = initial.copy()
-        command[joints] = planner.advance()
-        desired_grip = np.array([np.interp(at, target_times, targets[:, i]) for i in grippers])
-        grip += np.clip(desired_grip - grip, -config.max_gripper_velocity * period,
-                        config.max_gripper_velocity * period)
-        command[grippers] = grip
-        ts.append(at); qs.append(command); vs.append(planner.velocity.copy()); accs.append(planner.acceleration.copy())
+    ticks = np.arange(1, count + 1)
+    clocks = start + ticks * period
+    future = np.clip(clocks[::retarget_ticks] + preview, target_times[0], target_times[-1])
+    future_q, future_v = curve(future), curve.derivative()(future)
+    future_v[future >= target_times[-1]] = 0
+    desired_grips = np.stack([np.interp(clocks, target_times, targets[:, i]) for i in grippers], axis=1)
+    for block, begin in enumerate(range(0, count, retarget_ticks)):
+        planner.retarget(future_q[block], future_v[block])
+        end = min(begin + retarget_ticks, count)
+        positions, velocities, accelerations = planner.sample_checked(end - begin)
+        for k, at in enumerate(clocks[begin:end]):
+            command = initial.copy()
+            command[joints] = positions[k]
+            grip += np.clip(desired_grips[begin+k] - grip, -config.max_gripper_velocity * period,
+                            config.max_gripper_velocity * period)
+            command[grippers] = grip
+            ts.append(at); qs.append(command); vs.append(velocities[k]); accs.append(accelerations[k])
     # The finite chunk ends with a bounded stop, never a stale-target timeout
     # while a valid chunk still has references to execute.
     planner.brake()

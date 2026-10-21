@@ -129,7 +129,7 @@ class RuckigJointPlanner:
                              f"bounds=[{self.lower[index]:.9f}, {self.upper[index]:.9f}] "
                              f"numerical_tolerance={tolerance:.1e}rad")
 
-    def _check_planned_bounds(self) -> None:
+    def _check_planned_bounds(self):
         trajectory = self._ruckig.Trajectory(len(self.position))
         try:
             result = self.generator.calculate(self.input, trajectory)
@@ -164,6 +164,7 @@ class RuckigJointPlanner:
                                 maxima[axis] = max(maxima[axis], q)
         self._check_bounds(minima, stage="planned minimum")
         self._check_bounds(maxima, stage="planned maximum")
+        return trajectory
 
     def retarget(self, position: np.ndarray, velocity: np.ndarray | None = None) -> None:
         target = np.asarray(position, dtype=np.float64)
@@ -189,14 +190,29 @@ class RuckigJointPlanner:
         # legal synchronized trajectory: it may first move away from the goal.
         # Check analytic extrema before publishing any part of the new plan.
         try:
-            self._check_planned_bounds()
+            self._checked_trajectory = self._check_planned_bounds()
         except ServoError:
             if not np.any(terminal_velocity):
                 raise
             self.input.target_velocity = [0.0] * len(target)
-            self._check_planned_bounds()
+            self._checked_trajectory = self._check_planned_bounds()
         self.target = target.copy()
         self.braking = False
+
+    def sample_checked(self, ticks: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Sample a just-checked trajectory without solving it again per tick.
+
+        Only offline chunk compilation uses this path. The streaming writer's
+        update API and feedback guards remain unchanged.
+        """
+        samples = [self._checked_trajectory.at_time(i / self.config.hz)
+                   for i in range(1, ticks + 1)]
+        positions, velocities, accelerations = (np.asarray(v) for v in zip(*samples))
+        # at_time can extrapolate beyond the end at nonzero terminal speed.
+        self._check_bounds(positions.min(axis=0))
+        self._check_bounds(positions.max(axis=0))
+        self.set_state(positions[-1], velocities[-1], accelerations[-1])
+        return positions, velocities, accelerations
 
     def brake(self) -> None:
         """Generate a bounded stop from the current velocity and acceleration."""
@@ -304,130 +320,135 @@ class ServoLoop:
         self._prefix_reservations: dict[str, float] = {}
         self._plan_last_index = 0
         self._timing_invalidations = 0
-        self._chunk_prepare_lead_s = .05
         self._plan_timing: dict[str, Any] = {}
         self._thread = threading.Thread(target=self._run, name="piper-ruckig-servo", daemon=True)
         self._thread.start()
 
+    def _chunk_start(self, at: float):
+        """Snapshot a splice state under the writer lock."""
+        if self._closed or self._fault or self._stopping:
+            raise ServoError(self._fault or "planner is unavailable")
+        if self._paused and self._sample_count and not self._stationary():
+            raise ServoError("moving servo was safety-paused; restart after the robot is stationary")
+        old = self._plan
+        boundary = max(at, self._committed_until)
+        index, terminal_gap = 0, False
+        if old is not None:
+            index = int(np.searchsorted(old.times, boundary, side="left"))
+            if index >= len(old.times):
+                index = len(old.times) - 1
+                if (np.max(np.abs(old.velocities[index])) > 1e-6
+                        or np.max(np.abs(old.accelerations[index])) > 1e-6):
+                    raise ServoError("old plan has no stationary terminal state")
+                terminal_gap = True
+            else:
+                boundary = float(old.times[index])
+            initial = old.positions[index].copy()
+            velocity, acceleration = old.velocities[index], old.accelerations[index]
+        else:
+            if not self._stationary():
+                raise ChunkPlanDeferred("chunk initialization is waiting for healthy braking to finish")
+            initial = self._target.copy()
+            initial[self.joint_indices] = self.planner.position
+            initial[self.gripper_indices] = self._grippers
+            velocity, acceleration = self.planner.velocity.copy(), self.planner.acceleration.copy()
+        return old, index, terminal_gap, boundary, initial, velocity, acceleration
+
     def install_chunk(self, targets, target_times, source_indices, *, generation: int) -> None:
-        """Prepare outside the writer lock; preserve the already committed prefix."""
-        from .chunk_planner import ChunkPlan, compile_chunk
+        """Compile first, then join on the actual clock without a duration forecast."""
+        from .chunk_planner import ChunkPlan, compile_chunk, splice_ready_chunk
+        from bimanual_vla.data.contract import GRIPPER_MAX_M
         with self._condition:
-            if self._closed or self._fault or self._stopping:
-                raise ServoError(self._fault or "planner is unavailable")
-            if self._paused and self._sample_count and not self._stationary():
-                raise ServoError("moving servo was safety-paused; restart after the robot is stationary")
+            snapshot = self._chunk_start(time.monotonic())
             if self._plan is not None and self._plan.generation == generation:
                 return
-            old = self._plan
             epoch, revision = self._plan_epoch, self._plan_revision
-            now = time.monotonic()
-            # Preparation is bounded and never blocks the actuator writer.
-            boundary = max(now + self._chunk_prepare_lead_s, self._committed_until)
-            terminal_gap = False
-            if old is not None:
-                index = int(np.searchsorted(old.times, boundary, side="left"))
-                if index >= len(old.times):
-                    # The compiled plan includes a terminal stop. Its final
-                    # pose remains valid while waiting for the next chunk.
-                    index = len(old.times) - 1
-                    if (np.max(np.abs(old.velocities[index])) > 1e-6
-                            or np.max(np.abs(old.accelerations[index])) > 1e-6):
-                        raise ServoError("old plan has no stationary terminal state")
-                    terminal_gap = True
-                else:
-                    boundary = float(old.times[index])
-                initial = old.positions[index].copy()
-                velocity, acceleration = old.velocities[index], old.accelerations[index]
-            else:
-                if not self._stationary():
-                    raise ChunkPlanDeferred("chunk initialization is waiting for healthy braking to finish")
-                initial = self._target.copy()
-                initial[self.joint_indices] = self.planner.position
-                initial[self.gripper_indices] = self._grippers
-                velocity, acceleration = self.planner.velocity.copy(), self.planner.acceleration.copy()
+            _, _, _, seed_time, initial, velocity, acceleration = snapshot
             lower = np.full(len(initial), -np.inf); upper = np.full(len(initial), np.inf)
             lower[self.joint_indices], upper[self.joint_indices] = self.planner.lower, self.planner.upper
-            lower[self.gripper_indices] = 0.0
-            # Gripper units here are metres, as in read_output_qpos/JointCtrl.
-            from bimanual_vla.data.contract import GRIPPER_MAX_M
-            upper[self.gripper_indices] = GRIPPER_MAX_M
-            if len(target_times) and target_times[-1] <= boundary:
+            lower[self.gripper_indices], upper[self.gripper_indices] = 0.0, GRIPPER_MAX_M
+            if not len(target_times) or target_times[-1] <= seed_time:
                 raise ChunkPlanDeferred("timed chunk expired before its splice boundary; waiting for fresh inference")
         prepare_started = time.monotonic()
         try:
-            new = compile_chunk(initial, velocity, acceleration, lower, upper, self.config,
-                                targets, target_times, source_indices, start=boundary, generation=generation)
+            candidate = compile_chunk(initial, velocity, acceleration, lower, upper, self.config,
+                                      targets, target_times, source_indices,
+                                      start=seed_time, generation=generation)
             computed_at = time.monotonic()
+            for retry in range(3):
+                with self._condition:
+                    # One publication cycle for the short local splice, never a
+                    # prediction of the full-horizon compilation duration.
+                    snapshot = self._chunk_start(time.monotonic() + 1.0 / self.config.hz)
+                    old, index, terminal_gap, boundary, initial, velocity, acceleration = snapshot
+                    if epoch != self._plan_epoch or revision != self._plan_revision:
+                        raise ChunkPlanDeferred("planner changed while preparing a chunk; retry with current state")
+                    if target_times[-1] <= boundary:
+                        raise ChunkPlanDeferred("timed chunk expired during preparation; old plan retained")
+                splice_started = time.monotonic()
+                new = splice_ready_chunk(candidate, initial, velocity, acceleration,
+                                         lower, upper, self.config, start=boundary)
+                splice_computed = time.monotonic()
+                with self._condition:
+                    prepared_at = time.monotonic()
+                    self._chunk_start(prepared_at)  # Recheck writer availability.
+                    if epoch != self._plan_epoch or revision != self._plan_revision:
+                        raise ChunkPlanDeferred("planner changed during ready splice; old plan retained")
+                    if prepared_at >= boundary or self._committed_until > boundary + 1e-9:
+                        # Keep the prepared curve; only redo the small bridge
+                        # from a fresh state/clock if publication or a new RTC
+                        # reservation overtook us. Never grow a wait budget.
+                        continue
+                    if old is not None:
+                        keep_from = max(0, self._plan_last_index - 2)
+                        new_start = 0 if terminal_gap else 1
+                        self._plan = ChunkPlan(
+                            np.concatenate([old.times[keep_from:index+1], new.times[new_start:]]),
+                            np.concatenate([old.positions[keep_from:index+1], new.positions[new_start:]]),
+                            np.concatenate([old.velocities[keep_from:index+1], new.velocities[new_start:]]),
+                            np.concatenate([old.accelerations[keep_from:index+1], new.accelerations[new_start:]]),
+                            generation, new.source_times, new.source_indices,
+                            np.concatenate([old.sample_generations[keep_from:index+1], new.sample_generations[new_start:]]),
+                            np.concatenate([old.sample_source_indices[keep_from:index+1], new.sample_source_indices[new_start:]]))
+                        self._plan_last_index -= keep_from
+                    else:
+                        self._plan = new
+                        self._plan_last_index = 0
+                    self._plan_revision += 1
+                    source_index = int(np.clip(np.searchsorted(target_times, boundary, side="left"),
+                                               0, len(source_indices)-1))
+                    self._plan_timing = {
+                        "generation": generation,
+                        "handoff_mode": "ready_then_splice",
+                        "prepare_started_monotonic": prepare_started,
+                        "computed_monotonic": computed_at,
+                        "prepared_monotonic": prepared_at,
+                        "installed_monotonic": time.monotonic(),
+                        "splice_monotonic": boundary,
+                        "committed_until_monotonic": self._committed_until,
+                        "preparation_ms": (prepared_at - prepare_started) * 1000,
+                        "compile_ms": (computed_at - prepare_started) * 1000,
+                        "splice_compute_ms": (splice_computed - splice_started) * 1000,
+                        "splice_retry_count": retry,
+                        "commit_lock_wait_ms": (prepared_at - splice_computed) * 1000,
+                        "source_index_at_splice": int(source_indices[source_index]),
+                        "source_target_monotonic_at_splice": float(target_times[source_index]),
+                        "first_published_monotonic": None,
+                        "first_published_source_index": None,
+                    }
+                    self._paused = False
+                    self._hold = False
+                    self._condition.notify_all()
+                    return
+            raise ChunkPlanDeferred("ready splice missed publication cycles; old plan retained")
+        except ChunkPlanDeferred:
+            raise
         except ServoError as exc:
-            # This computation has not installed or published any candidate
-            # state. A bad candidate is different from a fault in the active
-            # writer. Never downgrade a concurrent hardware/tracking fault.
             with self._condition:
                 if (self._fault or self._closed or self._stopping
                         or (self._paused and self._sample_count and not self._stationary())):
                     raise ServoError(self._fault or "planner unavailable during chunk preparation") from exc
             raise ChunkPlanRejected(f"candidate chunk {generation} rejected: {exc}") from exc
-        with self._condition:
-            # Include lock reacquisition. A past outlier must not permanently
-            # reserve hundreds of milliseconds of obsolete trajectory.
-            prepared_at = time.monotonic()
-            preparation_s = prepared_at - prepare_started
-            self._chunk_prepare_lead_s = min(.5, max(
-                2.0 / self.config.hz,
-                1.25 * preparation_s + 1.0 / self.config.hz,
-                .5 * self._chunk_prepare_lead_s))
-            if self._fault or self._closed or self._stopping:
-                raise ServoError(self._fault or "planner became unavailable during chunk preparation")
-            if self._paused and self._sample_count and not self._stationary():
-                raise ServoError("moving servo was safety-paused; restart after the robot is stationary")
-            if epoch != self._plan_epoch or revision != self._plan_revision:
-                raise ChunkPlanDeferred("planner changed while preparing a chunk; retry with current state")
-            if time.monotonic() >= boundary:
-                raise ChunkPlanDeferred("chunk planning missed its splice deadline; old plan retained")
-            if self._committed_until > boundary + 1e-9:
-                raise ChunkPlanDeferred("new RTC prefix was reserved during chunk planning; old plan retained")
-            if old is not None:
-                # Samples through the boundary are unchanged, including v/a.
-                keep_from = max(0, self._plan_last_index - 2)
-                new_start = 0 if terminal_gap else 1
-                self._plan = ChunkPlan(
-                    np.concatenate([old.times[keep_from:index+1], new.times[new_start:]]),
-                    np.concatenate([old.positions[keep_from:index+1], new.positions[new_start:]]),
-                    np.concatenate([old.velocities[keep_from:index+1], new.velocities[new_start:]]),
-                    np.concatenate([old.accelerations[keep_from:index+1], new.accelerations[new_start:]]),
-                    generation, new.source_times, new.source_indices,
-                    np.concatenate([old.sample_generations[keep_from:index+1], new.sample_generations[new_start:]]),
-                    np.concatenate([old.sample_source_indices[keep_from:index+1], new.sample_source_indices[new_start:]]))
-                self._plan_last_index -= keep_from
-            else:
-                self._plan = new
-                self._plan_last_index = 0
-            self._plan_revision += 1
-            # Source times remain anchored to the original observation. The
-            # splice (including preparation and the reserved RTC prefix), not
-            # result arrival, determines the new trajectory's source index.
-            source_index = int(np.clip(np.searchsorted(target_times, boundary, side="left"),
-                                       0, len(source_indices)-1))
-            self._plan_timing = {
-                "generation": generation,
-                "prepare_started_monotonic": prepare_started,
-                "computed_monotonic": computed_at,
-                "prepared_monotonic": prepared_at,
-                "installed_monotonic": time.monotonic(),
-                "splice_monotonic": boundary,
-                "committed_until_monotonic": self._committed_until,
-                "preparation_ms": preparation_s * 1000,
-                "compile_ms": (computed_at - prepare_started) * 1000,
-                "commit_lock_wait_ms": (prepared_at - computed_at) * 1000,
-                "source_index_at_splice": int(source_indices[source_index]),
-                "source_target_monotonic_at_splice": float(target_times[source_index]),
-                "first_published_monotonic": None,
-                "first_published_source_index": None,
-            }
-            self._paused = False
-            self._hold = False
-            self._condition.notify_all()
 
     def rtc_prefix(self, capture: float, steps: int, action_hz: float) -> dict[str, Any] | None:
         """Reserve samples from the same immutable plan consumed by the writer."""
@@ -583,7 +604,7 @@ class ServoLoop:
                     "chunk_planner": self._plan is not None,
                     "committed_until": self._committed_until,
                     "timing_invalidations": self._timing_invalidations,
-                    "preparation_budget_ms": self._chunk_prepare_lead_s * 1000,
+                    "handoff_mode": "ready_then_splice",
                     "plan_timing": dict(self._plan_timing),
                     "state": self.servo.metrics()}
 
