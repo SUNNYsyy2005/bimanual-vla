@@ -6265,6 +6265,20 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                             if args.once and accepted:
                                 once_result_accepted = True
 
+                    # Install the just-accepted plan BEFORE reserving the next
+                    # request's RTC prefix. When inference exceeds its launch
+                    # period, doing this in reverse pins the old plan for yet
+                    # another delay window (e.g. 7 steps / 350 ms).
+                    # Feedback/camera timestamps remain anchored to the capture
+                    # above; planning time is included in the request latency.
+                    command_sent = execution.execute_next(
+                        delivery_state,
+                        qpos,
+                        protocol,
+                        feedback_captured_at=observation_captured_at,
+                        feedback_snapshot=feedback_snapshot,
+                    )
+
                     if execution.tracking_lag_active and not worker.in_flight:
                         # The lag guard cleared the old suffix.  Retry immediately
                         # rather than waiting for the normal 4 Hz launch cadence.
@@ -6487,14 +6501,6 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                     "Inference snapshot skipped: %s", exc
                                 )
 
-                    # This is the only robot command path and runs every control tick.
-                    command_sent = execution.execute_next(
-                        delivery_state,
-                        qpos,
-                        protocol,
-                        feedback_captured_at=observation_captured_at,
-                        feedback_snapshot=feedback_snapshot,
-                    )
                     # Claim the periodic slot before constructing the
                     # payload.  Otherwise Python evaluates the expensive
                     # ``execution.metadata(...)`` argument on every 20 Hz
