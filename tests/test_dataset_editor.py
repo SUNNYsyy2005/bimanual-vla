@@ -387,6 +387,11 @@ class DatasetEditorTest(unittest.TestCase):
 
     def test_crop_episode_reindexes_parquet_and_raw_payloads(self):
         target = make_dataset(self.datasets, "target", [6])
+        parquet = target / DATA_PATH.format(episode_chunk=0, episode_index=0)
+        original = pq.read_table(parquet)
+        original = original.append_column("timestamp", pa.array(np.arange(6) / 20, type=pa.float32()))
+        original = original.append_column("state_timestamp", pa.array(1000 + np.arange(6) / 20))
+        pq.write_table(original, parquet)
         result = self.editor().crop_episode("target", 0, 2, 4)
         self.assertEqual(result["removed_frames"], 3)
         self.assertEqual(result["frames"], 3)
@@ -394,6 +399,8 @@ class DatasetEditorTest(unittest.TestCase):
         table = pq.read_table(parquet)
         np.testing.assert_array_equal(table["frame_index"].to_numpy(), [0, 1, 2])
         np.testing.assert_array_equal(table["index"].to_numpy(), [0, 1, 2])
+        np.testing.assert_allclose(table["timestamp"].to_numpy(), [0, .05, .1])
+        np.testing.assert_allclose(table["state_timestamp"].to_numpy(), [1000.1, 1000.15, 1000.2])
         np.testing.assert_array_equal(table["observation.state"].to_pylist(), [[0.0] * 7] * 3)
         with np.load(target / "raw" / "episode_000000.npz", allow_pickle=False) as raw:
             np.testing.assert_array_equal(raw["frame_index"], [0, 1, 2])
