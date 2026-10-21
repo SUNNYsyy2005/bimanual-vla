@@ -8,6 +8,7 @@ mirror state to stdout. The actual GPU workload runs under Slurm on the target.
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import json
 import os
@@ -149,6 +150,12 @@ def build_script(target: dict[str, Any], job_name: str, commands: list[list[str]
             "else echo '[dashboard] conda command unavailable; using configured Python'; fi"
         )
     body = []
+    if target.get("access_mode") == "slurm_only" and target.get("base_checkpoint"):
+        params_path = str(Path(target["base_checkpoint"]) / "params")
+        body.append(
+            f"test -d {shlex.quote(params_path)} || "
+            "{ echo '[dashboard] configured cluster base checkpoint has no params directory' >&2; exit 1; }"
+        )
     for idx, command in enumerate(commands):
         label = command_labels[idx] if idx < len(command_labels) else f"command_{idx + 1}"
         body += [
@@ -245,6 +252,45 @@ def parse_job_id(output: str) -> str:
     raise RuntimeError(f"could not parse sbatch job id from: {output}")
 
 
+class StepLogStream:
+    """Attach to workload output when compute-node logs are not shared."""
+
+    def __init__(self, host: str, job_id: str):
+        self.host = host
+        self.job_id = job_id
+        self.processes: dict[str, subprocess.Popen] = {}
+
+    def poll(self) -> None:
+        result = run_ssh(self.host, f"squeue --steps -h -j {shlex.quote(self.job_id)} -o '%i'")
+        if result.returncode:
+            return
+        for step in result.stdout.split():
+            parent, separator, number = step.partition(".")
+            if parent != self.job_id or not separator or not number.isdigit():
+                continue
+            process = self.processes.get(step)
+            if process is not None and process.poll() is None:
+                continue
+            print(f"[dashboard] attaching Slurm output: {step}", flush=True)
+            self.processes[step] = subprocess.Popen(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+                 "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
+                 self.host, f"sattach --quiet {shlex.quote(step)}"],
+                stdin=subprocess.DEVNULL, env=clean_transport_env(),
+            )
+
+    def close(self) -> None:
+        # Disconnecting sattach does not stop the underlying Slurm workload.
+        for process in self.processes.values():
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target-json", required=True, help="urlsafe-base64 encoded target config JSON")
@@ -282,11 +328,20 @@ def main() -> int:
     for label, path in log_paths.items():
         print(f"[dashboard] slurm_{label}_log={path}", flush=True)
     log_offsets = {label: 0 for label in log_paths}
+    step_stream = StepLogStream(host, job_id) if target.get("log_transport") == "sattach" else None
+    if step_stream is not None:
+        atexit.register(step_stream.close)
+
+    def stream_logs() -> None:
+        if step_stream is not None:
+            step_stream.poll()
+        else:
+            stream_remote_logs(host, log_paths, log_offsets)
 
     last_state = None
     transport_failures = 0
     while True:
-        stream_remote_logs(host, log_paths, log_offsets)
+        stream_logs()
         q = run_ssh(host, f"squeue -h -j {shlex.quote(job_id)} -o '%T|%M|%R'", timeout=60)
         qout = q.stdout.strip()
         if q.returncode == 0 and qout:
@@ -329,7 +384,7 @@ def main() -> int:
             transport_failures = 0
             print(f"[dashboard] sacct {job_id}: state={state} exit_code={exit_code}", flush=True)
             if state.startswith("COMPLETED") or state not in {"PENDING", "RUNNING", "CONFIGURING", "COMPLETING"}:
-                stream_remote_logs(host, log_paths, log_offsets)
+                stream_logs()
                 print(f"[dashboard] final_state={state} exit_code={exit_code}", flush=True)
                 return 0 if state.startswith("COMPLETED") else 1
             time.sleep(max(5.0, args.poll_interval))
