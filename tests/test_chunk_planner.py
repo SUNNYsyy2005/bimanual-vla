@@ -5,11 +5,71 @@ from unittest.mock import patch
 import numpy as np
 
 from bimanual_vla.data.contract import GRIPPER_MAX_M
-from bimanual_vla.deployment.chunk_planner import compile_chunk
+from bimanual_vla.deployment.chunk_planner import compile_chunk, splice_ready_chunk
 from bimanual_vla.deployment.servo import ServoConfig, ServoLoop
 
 
 class ChunkPlannerTest(unittest.TestCase):
+    def test_ready_splice_preserves_state_limits_and_original_suffix_clock(self):
+        q, lower, upper, times, targets = self.inputs()
+        config = ServoConfig(max_jerk=60)
+        prepared = compile_chunk(q, np.zeros(12), np.zeros(12), lower, upper, config,
+                                 targets, times, np.arange(len(times)), start=0, generation=7)
+        initial = q.copy(); initial[:6] = .03; initial[6::7] = .001
+        velocity = np.full(12, .1); acceleration = np.full(12, -.2)
+        plan = splice_ready_chunk(prepared, initial, velocity, acceleration,
+                                  lower, upper, config, start=.15)
+        np.testing.assert_array_equal(plan.positions[0], initial)
+        np.testing.assert_array_equal(plan.velocities[0], velocity)
+        np.testing.assert_array_equal(plan.accelerations[0], acceleration)
+        np.testing.assert_array_equal(plan.source_times, prepared.source_times)
+        np.testing.assert_array_equal(plan.source_indices, prepared.source_indices)
+        joints = np.array([i for i in range(14) if i % 7 != 6])
+        np.testing.assert_array_equal(plan.positions[-1, joints], prepared.positions[-1, joints])
+        self.assertEqual(plan.times[-1], prepared.times[-1])
+        self.assertTrue((np.diff(plan.times) > 0).all())
+        self.assertTrue((plan.positions >= lower - 1e-7).all())
+        self.assertTrue((plan.positions <= upper + 1e-7).all())
+        self.assertLessEqual(abs(plan.velocities).max(), config.max_velocity + 1e-7)
+        self.assertLessEqual(abs(plan.accelerations).max(), config.max_acceleration + 1e-7)
+        dt = np.diff(plan.times)[:, None]
+        self.assertLessEqual((abs(np.diff(plan.accelerations, axis=0)) / dt).max(),
+                             config.max_jerk + 1e-5)
+        self.assertLessEqual((abs(np.diff(plan.positions[:, 6::7], axis=0)) / dt).max(),
+                             config.max_gripper_velocity + 1e-8)
+
+    def test_late_short_splice_retries_without_recompiling_full_chunk(self):
+        loop, times, targets, prefix = self.prefix_fixture()
+        calls = []
+        with patch('bimanual_vla.deployment.servo.time.monotonic', return_value=100.5) as clock:
+            def delayed_once(*args, **kwargs):
+                result = splice_ready_chunk(*args, **kwargs)
+                calls.append(kwargs['start'])
+                if len(calls) == 1:
+                    clock.return_value += .03
+                return result
+            with patch('bimanual_vla.deployment.chunk_planner.compile_chunk', wraps=compile_chunk) as full:
+                with patch('bimanual_vla.deployment.chunk_planner.splice_ready_chunk', side_effect=delayed_once):
+                    loop.install_chunk(targets, times, np.arange(len(times)), generation=2)
+        self.assertEqual(full.call_count, 1)
+        self.assertEqual(len(calls), 2)
+        self.assertGreater(calls[1], calls[0])
+        self.assertEqual(loop.metrics()['plan_timing']['splice_retry_count'], 1)
+        self.assertTrue(loop.prefix_is_valid(prefix['plan_id']))
+
+    def test_hold_during_full_compilation_cannot_install_stale_candidate(self):
+        from bimanual_vla.deployment.servo import ChunkPlanDeferred
+        loop, times, targets, prefix = self.prefix_fixture()
+        def concurrent_hold(*args, **kwargs):
+            loop.hold()
+            return compile_chunk(*args, **kwargs)
+        with patch('bimanual_vla.deployment.chunk_planner.compile_chunk', side_effect=concurrent_hold):
+            with self.assertRaises(ChunkPlanDeferred):
+                loop.install_chunk(targets, times, np.arange(len(times)), generation=2)
+        self.assertFalse(loop.prefix_is_valid(prefix['plan_id']))
+        self.assertIsNone(loop._plan)
+        self.assertTrue(loop._hold)
+
     def prefix_fixture(self):
         # Exercise real compilation/merge with a deterministic clock and no
         # actuator thread. Physical publication is covered by the tests below.
@@ -75,7 +135,7 @@ class ChunkPlannerTest(unittest.TestCase):
                 setattr(loop, field, original)
         self.assertTrue(loop.prefix_is_valid(prefix['plan_id']))
 
-    def test_reservation_during_compile_defers_commit_without_revoking_prefix(self):
+    def test_reservation_during_compile_moves_actual_splice_without_revoking_prefix(self):
         from bimanual_vla.deployment.servo import ChunkPlanDeferred
         loop, times, targets, prefix = self.prefix_fixture()
         old = loop._plan
@@ -85,17 +145,18 @@ class ChunkPlannerTest(unittest.TestCase):
             return compile_chunk(*args, **kwargs)
         with patch('bimanual_vla.deployment.chunk_planner.compile_chunk',
                    side_effect=reserve_during_compile):
-            with self.assertRaises(ChunkPlanDeferred):
-                loop.install_chunk(targets, times, np.arange(len(times)), generation=2)
-        self.assertIs(loop._plan, old)
+            loop.install_chunk(targets, times, np.arange(len(times)), generation=2)
+        self.assertIsNot(loop._plan, old)
         self.assertTrue(loop.prefix_is_valid(prefix['plan_id']))
         self.assertTrue(loop.prefix_is_valid(reservations[0]['plan_id']))
-        loop.install_chunk(targets, times, np.arange(len(times)), generation=2)
+        for offset in reservations[0]['sample_offsets_s']:
+            at = 100.1 + offset
+            np.testing.assert_array_equal(loop._plan.positions[loop._plan.index_at(at)],
+                                          old.positions[old.index_at(at)])
         self.assertTrue(loop.prefix_is_valid(prefix['plan_id']))
         self.assertGreaterEqual(loop.metrics()['plan_timing']['splice_monotonic'], 100.6)
 
-    def test_preparation_outlier_does_not_permanently_delay_future_chunks(self):
-        from bimanual_vla.deployment.servo import ChunkPlanDeferred
+    def test_slow_preparation_has_no_forecast_wait_or_future_budget(self):
         q, lower, upper, times, targets = self.inputs(7)
         feedback = q.copy()
         def publish(command):
@@ -107,13 +168,16 @@ class ChunkPlannerTest(unittest.TestCase):
             time.sleep(.10)
             return compile_chunk(*args, **kwargs)
         with patch('bimanual_vla.deployment.chunk_planner.compile_chunk', side_effect=slow_compile):
-            with self.assertRaises(ChunkPlanDeferred):
-                loop.install_chunk(targets, time.monotonic()+times, np.arange(len(times)), generation=1)
-        slow_budget = loop.metrics()['preparation_budget_ms']
-        self.assertGreater(slow_budget, 100)
-        for generation in range(2, 7):
+            loop.install_chunk(targets, time.monotonic()+times, np.arange(len(times)), generation=1)
+        timing = loop.metrics()['plan_timing']
+        self.assertGreater(timing['compile_ms'], 100)
+        self.assertLess(timing['splice_monotonic'] - timing['prepared_monotonic'], .02)
+        for generation in range(2, 5):
             loop.install_chunk(targets, time.monotonic()+times, np.arange(len(times)), generation=generation)
-        self.assertLess(loop.metrics()['preparation_budget_ms'], slow_budget * .75)
+            timing = loop.metrics()['plan_timing']
+            self.assertLess(timing['splice_monotonic'] - timing['prepared_monotonic'], .02)
+        self.assertEqual(loop.metrics()['handoff_mode'], 'ready_then_splice')
+        self.assertNotIn('preparation_budget_ms', loop.metrics())
         self.assertIsNone(loop.metrics()['fault'])
 
     def test_retained_prefix_keeps_old_source_and_records_actual_handoff(self):
@@ -266,10 +330,10 @@ class ChunkPlannerTest(unittest.TestCase):
         now = time.monotonic()
         loop.install_chunk(targets, now+times, np.arange(len(times)), generation=1)
         old = loop._plan
-        def slow_compile(*args, **kwargs):
+        def slow_splice(*args, **kwargs):
             time.sleep(.12)
-            return compile_chunk(*args, **kwargs)
-        with patch('bimanual_vla.deployment.chunk_planner.compile_chunk', side_effect=slow_compile):
+            return splice_ready_chunk(*args, **kwargs)
+        with patch('bimanual_vla.deployment.chunk_planner.splice_ready_chunk', side_effect=slow_splice):
             with self.assertRaises(ChunkPlanDeferred):
                 loop.install_chunk(targets, now+times, np.arange(len(times)), generation=2)
         self.assertIs(loop._plan, old)
@@ -285,7 +349,7 @@ class ChunkPlannerTest(unittest.TestCase):
             loop.install_chunk(targets, time.monotonic()+times, np.arange(len(times)), generation=3)
         self.assertTrue(loop.metrics()['paused'])
 
-    def test_slow_compile_can_retry_without_pausing_the_writer(self):
+    def test_slow_compile_can_install_without_a_deadline_retry(self):
         from bimanual_vla.deployment.servo import ChunkPlanDeferred
         q, lower, upper, times, targets = self.inputs(7)
         feedback = q.copy()
@@ -299,10 +363,9 @@ class ChunkPlannerTest(unittest.TestCase):
             return compile_chunk(*args, **kwargs)
         now = time.monotonic()
         with patch('bimanual_vla.deployment.chunk_planner.compile_chunk', side_effect=slow_compile):
-            with self.assertRaisesRegex(ChunkPlanDeferred, 'deadline'):
-                loop.install_chunk(targets, now+times, np.arange(len(times)), generation=1)
+            loop.install_chunk(targets, now+times, np.arange(len(times)), generation=1)
+            self.assertTrue(loop.has_chunk(1))
             self.assertIsNone(loop.metrics()['fault'])
-            # The next attempt budgets for the observed preparation time.
             loop.install_chunk(targets, now+times, np.arange(len(times)), generation=2)
         self.assertTrue(loop.has_chunk(2))
         self.assertFalse(loop.metrics()['paused'])
