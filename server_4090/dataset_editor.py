@@ -2009,6 +2009,14 @@ class DatasetEditor:
                         mapped_task_ids.append(task_to_index[task_text])
 
                     table = _replace_column(table, "frame_index", np.arange(frame_count, dtype=np.int64))
+                    if "timestamp" in table.column_names and crop_start:
+                        # Video frame zero is now the first retained frame.
+                        # Acquisition timestamps remain unchanged for provenance;
+                        # LeRobot uses this canonical clock to select video frames.
+                        fps = float(info.get("fps", 20))
+                        if not np.isfinite(fps) or fps <= 0:
+                            raise ValueError("cannot rebase cropped video timestamps without a valid fps")
+                        table = _replace_column(table, "timestamp", np.arange(frame_count) / fps)
                     table = _replace_column(
                         table, "episode_index", np.full(frame_count, new_episode_index, dtype=np.int64)
                     )
