@@ -776,6 +776,7 @@ H100/H200 Slurm 示例：
 - `keep_period`：传给 Orbax checkpoint manager，额外保护 step 能被该值整除的 checkpoint；例如 `save_interval=2000` 且 `keep_period=2000` 会保留 `4000/6000/8000/10000` 等 2k 倍数 checkpoint。传 `0`/空值可禁用周期保护（只保留最新 checkpoint）。
 - `eval_interval_steps` 必须能被 `save_interval` 整除，且当前要求是 5000 的倍数；
 - 若 norm 不存在，本地训练会自动先创建 norm task，并在 norm 完成后训练；Slurm 训练会在一个 Slurm job 内先 norm 后 train。
+- H100/H200 重试可显式传 `reuse_norm_stats=true` 跳过 norm，前提是目标节点已有当前数据集的统计结果；训练启动仍检查 split manifest 和动作契约。数据内容变更后应重新计算，不应复用。
 - 独立存储节点（`access_mode=slurm_only`）使用节点配置中的基础模型路径，并在 Slurm 作业内检查 `params`；不要求 4090 同时保存基础模型。NAS 不可用时，可设置节点的 `log_transport=sattach`，通过 Slurm 回传后续训练输出；`log_dir` 仍需是计算节点上已存在的目录。此方式不补传连接前的输出，也不替代数据集或 checkpoint 同步。
 - `execution_target` 为 H100/H200 时，Dashboard 会先根据远端 inventory 判断数据集是否存在；不存在或 inventory 不可用时，默认先执行一次幂等数据集同步（`auto_sync_dataset=true`，目标已存在则跳过），然后再提交 Slurm norm/train。
 - 本地 Dashboard 训练默认使用 `training_task_launch_backend=nohup`：训练 runner 通过 `nohup` 和独立会话脱离 Dashboard/终端生命周期；任务状态仍由 `task_runner.py` 的 `exit.json` 和日志维护。该设置不等价于绕过内核/显存 OOM 或磁盘配额限制。
