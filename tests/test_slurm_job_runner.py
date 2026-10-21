@@ -6,6 +6,17 @@ from server_4090.slurm_job_runner import StepLogStream, build_script
 
 
 class StepLogStreamTest(unittest.TestCase):
+    def test_checkpoint_pacing_is_explicit_and_validated(self):
+        target = {'partition': 'h200', 'workdir': '/project', 'dataset_root': '/datasets'}
+        def script(**options):
+            return build_script({**target, **options}, 'test', [['python', 'train.py']], ['train'])
+        self.assertNotIn('OPENPI_CHECKPOINT_CHUNK_PAUSE_S', script())
+        self.assertIn('export OPENPI_CHECKPOINT_CHUNK_PAUSE_S=0', script(checkpoint_chunk_pause_s=0))
+        self.assertIn('export OPENPI_CHECKPOINT_CHUNK_PAUSE_S=0.5', script(checkpoint_chunk_pause_s=.5))
+        for value in [-1, 61, float('nan'), float('inf'), True, '0;touch /tmp/unsafe']:
+            with self.subTest(value=value), self.assertRaises((ValueError, TypeError)):
+                script(checkpoint_chunk_pause_s=value)
+
     def test_independent_node_validates_base_before_workloads(self):
         script = build_script({
             'partition': 'h200', 'workdir': '/project', 'dataset_root': '/datasets',

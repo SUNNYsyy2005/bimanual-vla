@@ -11,6 +11,7 @@ import argparse
 import atexit
 import base64
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -149,6 +150,13 @@ def build_script(target: dict[str, Any], job_name: str, commands: list[list[str]
             f"conda activate {shlex.quote(conda_env)}; "
             "else echo '[dashboard] conda command unavailable; using configured Python'; fi"
         )
+    # Keep node-specific checkpoint pacing separate from workstation defaults.
+    if "checkpoint_chunk_pause_s" in target:
+        raw_pause = target["checkpoint_chunk_pause_s"]
+        pause = float(raw_pause)
+        if isinstance(raw_pause, bool) or not math.isfinite(pause) or not 0 <= pause <= 60:
+            raise ValueError("checkpoint_chunk_pause_s must be finite and within 0..60")
+        prelude.append(f"export OPENPI_CHECKPOINT_CHUNK_PAUSE_S={pause:g}")
     body = []
     if target.get("access_mode") == "slurm_only" and target.get("base_checkpoint"):
         params_path = str(Path(target["base_checkpoint"]) / "params")
