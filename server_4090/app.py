@@ -4963,8 +4963,28 @@ def create_app(config_path: Path) -> Flask:
 
     def resolve_base_model(payload: dict[str, Any]) -> tuple[Path, str]:
         requested_path = payload.get("base_checkpoint") or config["base_checkpoint"]
-        path = resolve_under(requested_path, checkpoint_roots)
-        if not (path / "params").is_dir():
+        target = runtime_config_for_target(payload.get("execution_target"))
+        # A configured foundation model may exist only on the shared cluster
+        # filesystem. Validate there without requiring a redundant local copy.
+        remote_foundation = bool(
+            target and target.get("access_mode") in {"login_shared_slurm", "slurm_only"}
+            and str(requested_path) == str(config["base_checkpoint"])
+        )
+        path = resolve_under(requested_path, checkpoint_roots, must_exist=not remote_foundation)
+        if remote_foundation and target.get("access_mode") == "slurm_only":
+            # Independent compute-node storage is validated inside the Slurm
+            # allocation before norm/train, never against the Dashboard disk.
+            pass
+        elif remote_foundation:
+            remote_params = str(PurePosixPath(target["base_checkpoint"]) / "params")
+            result = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                 target["submit_host"], "test -d " + shlex.quote(remote_params)],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            if result.returncode:
+                raise ValueError(f"cluster base checkpoint is unavailable: {remote_params}")
+        elif not (path / "params").is_dir():
             raise ValueError(f"base checkpoint has no params directory: {path}")
         inferred = infer_model_variant(path)
         model_variant = str(payload.get("model_variant") or inferred or "pi05")
