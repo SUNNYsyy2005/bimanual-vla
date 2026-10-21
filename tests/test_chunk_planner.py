@@ -10,6 +10,28 @@ from bimanual_vla.deployment.servo import ServoConfig, ServoLoop
 
 
 class ChunkPlannerTest(unittest.TestCase):
+    def test_install_before_next_request_avoids_an_extra_rtc_delay_window(self):
+        waits = []
+        for reserve_first in (True, False):
+            loop, times, targets, _ = self.prefix_fixture()
+            with patch('bimanual_vla.deployment.servo.time.monotonic', return_value=100.5):
+                if reserve_first:
+                    prefix = loop.rtc_prefix(100.5, 7, 20)
+                loop.install_chunk(targets, times, np.arange(len(times)), generation=2)
+                timing = loop.metrics()['plan_timing']
+                waits.append(timing['splice_monotonic'] - 100.5)
+                if not reserve_first:
+                    prefix = loop.rtc_prefix(100.5, 7, 20)
+                    # The next request is now conditioned on the new trajectory
+                    # actually scheduled for publication, not its predecessor.
+                    for offset, position in zip(prefix['sample_offsets_s'], prefix['positions']):
+                        at = 100.5 + offset
+                        self.assertEqual(loop._plan.context_at(at)['generation'], 2)
+                        np.testing.assert_array_equal(position, loop._plan.positions[loop._plan.index_at(at)])
+                self.assertTrue(loop.prefix_is_valid(prefix['plan_id']))
+        self.assertGreaterEqual(waits[0], .35 - 1e-9)
+        self.assertLess(waits[1], .02 + 1e-9)
+
     def test_ready_splice_preserves_state_limits_and_original_suffix_clock(self):
         q, lower, upper, times, targets = self.inputs()
         config = ServoConfig(max_jerk=60)
