@@ -299,6 +299,9 @@ class ServoLoop:
         self._plan_revision = 0
         self._plan_epoch = 0
         self._committed_until = 0.0
+        # Issued prefix reservations survive suffix-only plan revisions.
+        # Bound history by revisions; eviction rejects old requests safely.
+        self._prefix_reservations: dict[str, float] = {}
         self._plan_last_index = 0
         self._timing_invalidations = 0
         self._chunk_prepare_lead_s = .05
@@ -437,16 +440,31 @@ class ServoLoop:
                 return None
             indices = np.searchsorted(self._plan.times, times, side="right") - 1
             self._committed_until = max(self._committed_until, float(times[-1]))
-            return {"plan_id": f"{self._plan_epoch}:{self._plan_revision}",
+            plan_id = f"{self._plan_epoch}:{self._plan_revision}"
+            self._prefix_reservations[plan_id] = max(
+                self._prefix_reservations.get(plan_id, 0.0), float(times[-1]))
+            if len(self._prefix_reservations) > 128:
+                del self._prefix_reservations[next(iter(self._prefix_reservations))]
+            return {"plan_id": plan_id,
                     "sample_offsets_s": ((np.arange(steps)+1)/action_hz).tolist(),
                     "positions": self._plan.positions[indices].copy(),
                     "action_hz": float(action_hz)}
 
     def prefix_is_valid(self, plan_id: str) -> bool:
+        """Validate a reservation, not equality with the latest suffix revision.
+
+        install_chunk copies old q/v/a through _committed_until, and rejects
+        commits that race a newer reservation. Thus issued prefixes remain
+        valid across successful installs, even after published samples have
+        been pruned. Holds, faults and clock gaps revoke all reservations.
+        Merely sharing an epoch is insufficient: the token must be issued.
+        """
         with self._condition:
+            reserved_until = self._prefix_reservations.get(plan_id)
             return bool(self._plan is not None and not self._paused and not self._hold
-                        and not self._fault and not self._stopping
-                        and plan_id == f"{self._plan_epoch}:{self._plan_revision}")
+                        and not self._fault and not self._stopping and not self._closed
+                        and reserved_until is not None
+                        and reserved_until <= self._committed_until)
 
     def has_chunk(self, generation: int) -> bool:
         with self._condition:
@@ -456,8 +474,13 @@ class ServoLoop:
     def _invalidate_plan(self) -> None:
         self._plan = None
         self._plan_timing = {}
+        self._invalidate_prefixes()
+
+    def _invalidate_prefixes(self) -> None:
+        """Revoke promises under the writer lock, optionally retaining the plan."""
         self._plan_epoch += 1
         self._committed_until = 0.0
+        self._prefix_reservations.clear()
 
     def submit(self, target: np.ndarray, *, hold: bool = False,
                context: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -598,8 +621,7 @@ class ServoLoop:
                         if skipped > 1:
                             # A scheduling gap invalidates pending prefix
                             # promises, not the whole healthy actuator writer.
-                            self._plan_epoch += 1
-                            self._committed_until = 0.0
+                            self._invalidate_prefixes()
                             self._timing_invalidations += 1
                             if self._timing_invalidations == 1 or self._timing_invalidations % 50 == 0:
                                 logging.warning("Planner publication skipped %d elapsed ticks; "

@@ -10,6 +10,90 @@ from bimanual_vla.deployment.servo import ServoConfig, ServoLoop
 
 
 class ChunkPlannerTest(unittest.TestCase):
+    def prefix_fixture(self):
+        # Exercise real compilation/merge with a deterministic clock and no
+        # actuator thread. Physical publication is covered by the tests below.
+        q, lower, upper, times, targets = self.inputs(7)
+        with patch('bimanual_vla.deployment.servo.threading.Thread.start'):
+            loop = ServoLoop(q, lower, upper, ServoConfig(), lambda: q.copy(), lambda _: {})
+        clock = patch('bimanual_vla.deployment.servo.time.monotonic', return_value=100.0)
+        clock.start()
+        self.addCleanup(clock.stop)
+        times = 100.0 + times
+        loop.install_chunk(targets, times, np.arange(len(times)), generation=1)
+        prefix = loop.rtc_prefix(100.1, 5, 20)
+        self.assertIsNotNone(prefix)
+        return loop, times, targets, prefix
+
+    def test_reserved_prefix_survives_multiple_revisions_and_history_pruning(self):
+        loop, times, targets, prefix = self.prefix_fixture()
+        old = loop._plan
+        changed = targets.copy()
+        changed[:, :6] *= -1
+        for generation in (2, 3):
+            loop.install_chunk(changed, times, np.arange(len(times)), generation=generation)
+            self.assertNotEqual(prefix['plan_id'], loop.metrics()['plan_id'])
+            self.assertTrue(loop.prefix_is_valid(prefix['plan_id']))
+            for offset in prefix['sample_offsets_s']:
+                at = 100.1 + offset
+                for field in ('positions', 'velocities', 'accelerations'):
+                    np.testing.assert_array_equal(
+                        getattr(old, field)[old.index_at(at)],
+                        getattr(loop._plan, field)[loop._plan.index_at(at)])
+        # Simulate the writer advancing: past samples are legitimately pruned.
+        loop._plan_last_index = loop._plan.index_at(100.3)
+        loop.install_chunk(targets, times, np.arange(len(times)), generation=4)
+        self.assertGreater(loop._plan.times[0], 100.15)
+        self.assertTrue(loop.prefix_is_valid(prefix['plan_id']))
+        # A revision without an issued reservation must not be accepted.
+        self.assertFalse(loop.prefix_is_valid(loop.metrics()['plan_id']))
+        self.assertFalse(loop.prefix_is_valid('0:99999'))
+
+    def test_revoked_prefix_cannot_be_revived_by_recovery(self):
+        for action in ('hold', 'pause', 'clock_gap'):
+            with self.subTest(action=action):
+                loop, times, targets, prefix = self.prefix_fixture()
+                if action == 'clock_gap':
+                    with loop._condition:
+                        loop._invalidate_prefixes()
+                else:
+                    getattr(loop, action)()
+                self.assertFalse(loop.prefix_is_valid(prefix['plan_id']))
+                loop.install_chunk(targets, times, np.arange(len(times)), generation=2)
+                fresh = loop.rtc_prefix(100.1, 5, 20)
+                self.assertTrue(loop.prefix_is_valid(fresh['plan_id']))
+                self.assertFalse(loop.prefix_is_valid(prefix['plan_id']))
+
+    def test_prefix_still_rejected_when_writer_unavailable(self):
+        loop, _, _, prefix = self.prefix_fixture()
+        for field, value in (('_paused', True), ('_hold', True), ('_fault', 'driver fault'),
+                             ('_stopping', True), ('_closed', True)):
+            with self.subTest(field=field):
+                original = getattr(loop, field)
+                setattr(loop, field, value)
+                self.assertFalse(loop.prefix_is_valid(prefix['plan_id']))
+                setattr(loop, field, original)
+        self.assertTrue(loop.prefix_is_valid(prefix['plan_id']))
+
+    def test_reservation_during_compile_defers_commit_without_revoking_prefix(self):
+        from bimanual_vla.deployment.servo import ChunkPlanDeferred
+        loop, times, targets, prefix = self.prefix_fixture()
+        old = loop._plan
+        reservations = []
+        def reserve_during_compile(*args, **kwargs):
+            reservations.append(loop.rtc_prefix(100.1, 10, 20))
+            return compile_chunk(*args, **kwargs)
+        with patch('bimanual_vla.deployment.chunk_planner.compile_chunk',
+                   side_effect=reserve_during_compile):
+            with self.assertRaises(ChunkPlanDeferred):
+                loop.install_chunk(targets, times, np.arange(len(times)), generation=2)
+        self.assertIs(loop._plan, old)
+        self.assertTrue(loop.prefix_is_valid(prefix['plan_id']))
+        self.assertTrue(loop.prefix_is_valid(reservations[0]['plan_id']))
+        loop.install_chunk(targets, times, np.arange(len(times)), generation=2)
+        self.assertTrue(loop.prefix_is_valid(prefix['plan_id']))
+        self.assertGreaterEqual(loop.metrics()['plan_timing']['splice_monotonic'], 100.6)
+
     def test_preparation_outlier_does_not_permanently_delay_future_chunks(self):
         from bimanual_vla.deployment.servo import ChunkPlanDeferred
         q, lower, upper, times, targets = self.inputs(7)
@@ -54,6 +138,7 @@ class ChunkPlannerTest(unittest.TestCase):
         time.sleep(.10)
         loop.install_chunk(changed, capture+times, np.arange(len(times)), generation=2)
         new = loop._plan
+        self.assertTrue(loop.prefix_is_valid(prefix['plan_id']))
         timing = loop.metrics()['plan_timing']
         self.assertGreaterEqual(timing['splice_monotonic'], capture+.25)
         expected = int(np.searchsorted(capture+times, timing['splice_monotonic'], side='left'))
