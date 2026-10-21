@@ -11,7 +11,7 @@ class StepLogStreamTest(unittest.TestCase):
             'partition': 'h200', 'workdir': '/project', 'dataset_root': '/datasets',
             'access_mode': 'slurm_only', 'base_checkpoint': '/models/pi05 base',
         }, 'test', [['/conda/bin/python', 'train.py']], ['train'])
-        check = "test -d '/models/pi05 base/params'"
+        check = "test -f '/models/pi05 base/params/_METADATA'"
         self.assertIn(check, script)
         self.assertLess(script.index(check), script.index('srun '))
 

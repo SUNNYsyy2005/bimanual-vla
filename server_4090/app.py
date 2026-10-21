@@ -7721,8 +7721,11 @@ print(json.dumps(rows, ensure_ascii=False))
                     **cluster_target_config,
                     "xla_memory_fraction": xla_memory_fraction,
                 },
-                commands=[remote_norm_command, remote_train_command],
-                labels=["norm", "train"],
+                # Explicit retry option: run_train still checks the saved split,
+                # normalization manifest and action contract before training.
+                commands=([remote_train_command] if payload.get("reuse_norm_stats") is True
+                          else [remote_norm_command, remote_train_command]),
+                labels=(["train"] if payload.get("reuse_norm_stats") is True else ["norm", "train"]),
                 job_name=f"{'sim' if config.get('dashboard_profile') == 'simulation' else 'real'}_train_{exp_name}",
             )
             if cluster_dataset_sync_command is not None:
@@ -7772,6 +7775,7 @@ print(json.dumps(rows, ensure_ascii=False))
             "resume_step": int(resume_checkpoint.name) if resume_checkpoint is not None and resume_checkpoint.name.isdigit() else None,
             "checkpoint_dir": str(checkpoint_dir),
             "remote_checkpoint_dir": remote_checkpoint_dir,
+            "reuse_norm_stats": bool(is_cluster_target and payload.get("reuse_norm_stats") is True),
             "auto_sync_dataset": bool(cluster_dataset_sync_command is not None),
             "checkpoint_sync_payload": (
                 {

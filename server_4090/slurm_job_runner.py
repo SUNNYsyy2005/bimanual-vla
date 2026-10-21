@@ -153,8 +153,8 @@ def build_script(target: dict[str, Any], job_name: str, commands: list[list[str]
     if target.get("access_mode") == "slurm_only" and target.get("base_checkpoint"):
         params_path = str(Path(target["base_checkpoint"]) / "params")
         body.append(
-            f"test -d {shlex.quote(params_path)} || "
-            "{ echo '[dashboard] configured cluster base checkpoint has no params directory' >&2; exit 1; }"
+            f"test -f {shlex.quote(params_path + '/_METADATA')} || "
+            "{ echo '[dashboard] configured cluster base checkpoint has no Orbax metadata' >&2; exit 1; }"
         )
     for idx, command in enumerate(commands):
         label = command_labels[idx] if idx < len(command_labels) else f"command_{idx + 1}"
