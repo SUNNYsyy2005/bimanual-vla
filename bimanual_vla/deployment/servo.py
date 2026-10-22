@@ -321,6 +321,8 @@ class ServoLoop:
         self._plan_last_index = 0
         self._timing_invalidations = 0
         self._plan_timing: dict[str, Any] = {}
+        self._deferred_install: tuple[int, float] | None = None
+        self._prefix_install_deferrals = 0
         self._thread = threading.Thread(target=self._run, name="piper-ruckig-servo", daemon=True)
         self._thread.start()
 
@@ -438,13 +440,22 @@ class ServoLoop:
                     }
                     self._paused = False
                     self._hold = False
+                    self._deferred_install = None
                     self._condition.notify_all()
                     return
             raise ChunkPlanDeferred("ready splice missed publication cycles; old plan retained")
         except ChunkPlanDeferred:
+            with self._condition:
+                # Do not let the next request reserve another delay window of
+                # the old plan before this candidate can retry installation.
+                # Holds/faults still invalidate normally; expired candidates
+                # must not prevent obtaining a fresh inference indefinitely.
+                if self._plan is not None and not (self._hold or self._fault or self._paused):
+                    self._deferred_install = (generation, float(target_times[-1]))
             raise
         except ServoError as exc:
             with self._condition:
+                self._deferred_install = None
                 if (self._fault or self._closed or self._stopping
                         or (self._paused and self._sample_count and not self._stationary())):
                     raise ServoError(self._fault or "planner unavailable during chunk preparation") from exc
@@ -456,6 +467,13 @@ class ServoLoop:
             if (self._plan is None or self._paused or self._hold or self._fault
                     or self._stopping or steps <= 0):
                 return None
+            if self._deferred_install is not None:
+                generation, expires = self._deferred_install
+                if time.monotonic() < expires:
+                    self._prefix_install_deferrals += 1
+                    raise ChunkPlanDeferred(
+                        f"RTC prefix waits for deferred chunk {generation} installation")
+                self._deferred_install = None
             times = capture + np.arange(1, steps + 1) / action_hz
             if times[0] < self._plan.times[0] or times[-1] > self._plan.times[-1]:
                 return None
@@ -493,6 +511,7 @@ class ServoLoop:
                         and not self._fault and not self._paused and not self._hold)
 
     def _invalidate_plan(self) -> None:
+        self._deferred_install = None
         self._plan = None
         self._plan_timing = {}
         self._invalidate_prefixes()
@@ -604,6 +623,9 @@ class ServoLoop:
                     "chunk_planner": self._plan is not None,
                     "committed_until": self._committed_until,
                     "timing_invalidations": self._timing_invalidations,
+                    "deferred_install_generation": (self._deferred_install[0]
+                                                    if self._deferred_install else None),
+                    "prefix_install_deferrals": self._prefix_install_deferrals,
                     "handoff_mode": "ready_then_splice",
                     "plan_timing": dict(self._plan_timing),
                     "state": self.servo.metrics()}

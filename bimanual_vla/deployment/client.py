@@ -49,6 +49,7 @@ from scipy.spatial.transform import Rotation
 from bimanual_vla.collection.camera import CameraCapture, CameraFrameSet, CameraPreview
 from bimanual_vla.deployment.recording import DeploymentRunRecorder
 from bimanual_vla.collection.output import require_can_interface_up
+from bimanual_vla.collection.can_identity import resolve_can_selector, resolve_can_pair
 from bimanual_vla.data.action_conventions import (
     DELIVERY_CHUNK_ORIGIN_ACTION_SEMANTICS,
     DELIVERY_MODEL_ACTION_SEMANTICS,
@@ -495,6 +496,7 @@ def connect_piper(can_name: str) -> Any:
     """Connect for feedback; this alone does not enable or command the arm."""
     from piper_sdk import C_PiperInterface_V2
 
+    can_name = resolve_can_selector(can_name)
     require_can_interface_up(can_name)
     piper = C_PiperInterface_V2(can_name, judge_flag=False, can_auto_init=False)
     piper.CreateCanBus(
@@ -2046,6 +2048,12 @@ class PeriodicSchedule:
         periods = int(math.floor(elapsed / self.period_s)) + 1
         self.next_at += periods * self.period_s
         return True
+
+    def wakeup_deadline(self, control_deadline: float, now: float, *, in_flight: bool) -> float:
+        """Wake for a future request deadline without consuming a slot or busy retrying."""
+        if not in_flight and now < self.next_at < control_deadline:
+            return self.next_at
+        return control_deadline
 
     def mark_launched(self, now: float) -> None:
         """Consume a coalesced request and rate-limit from its actual launch."""
@@ -6011,6 +6019,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
             args.min_action_chunk_steps,
         )
 
+        request_refresh_tick = False
         next_control_at = time.monotonic()
         launch_schedule = PeriodicSchedule(args.hz, next_at=next_control_at)
         manual_trigger = ManualInferenceTrigger(getattr(args, "manual_trigger_file", None))
@@ -6334,8 +6343,10 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                     observation_captured_monotonic,
                                     copy=False,
                                 )
+                                camera_selected_monotonic = time.monotonic()
                                 generation = execution.allocate_inference_generation()
                                 rtc_snapshot = execution.rtc_request_metadata(protocol)
+                                rtc_prefix_finished_monotonic = time.monotonic()
                                 if bool(getattr(args, "send_policy_telemetry", True)):
                                     execution_snapshot = execution.metadata(
                                         rtc_metadata=rtc_snapshot,
@@ -6347,6 +6358,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                     # separately. Avoid constructing/freezing
                                     # it on the control thread for this request.
                                     execution_snapshot = {}
+                                metadata_finished_monotonic = time.monotonic()
                                 snapshot = make_observation_snapshot(
                                     generation=generation,
                                     raw_delivery_state=delivery_state,
@@ -6390,12 +6402,21 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                     observation_snapshot=snapshot,
                                 )
 
+                                preparation_timing = {
+                                    "feedback_to_snapshot_start_ms": (camera_selection_started_monotonic - observation_captured_monotonic) * 1000,
+                                    "camera_select_ms": (camera_selected_monotonic - camera_selection_started_monotonic) * 1000,
+                                    "rtc_prefix_build_ms": (rtc_prefix_finished_monotonic - camera_selected_monotonic) * 1000,
+                                    "execution_metadata_ms": (metadata_finished_monotonic - rtc_prefix_finished_monotonic) * 1000,
+                                    "snapshot_freeze_ms": (camera_selection_finished_monotonic - metadata_finished_monotonic) * 1000,
+                                }
+
                                 def infer_snapshot(
                                     *,
                                     policy_ref=policy,
                                     protocol_ref=protocol,
                                     snapshot_ref=snapshot,
                                     launch_ref=launch,
+                                    preparation_timing_ref=preparation_timing,
                                     camera_started_at=camera_selection_started_at,
                                     camera_started_monotonic=(
                                         camera_selection_started_monotonic
@@ -6406,6 +6427,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                     ),
                                 ) -> InferenceWorkerResult:
                                     nonlocal prompt_sent_revision
+                                    worker_started_monotonic = time.monotonic()
                                     send_prompt = prompt_sent_revision != prompt_revision
                                     observation = build_observation(
                                         snapshot=snapshot_ref,
@@ -6464,6 +6486,12 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                         * 1000.0,
                                         inference_generation=launch_ref.generation,
                                     )
+                                    client_timing.update(preparation_timing_ref)
+                                    client_timing.update(
+                                        request_worker_queue_ms=(worker_started_monotonic - launch_ref.launched_monotonic) * 1000,
+                                        request_payload_build_ms=(request_sent_monotonic - worker_started_monotonic) * 1000,
+                                        capture_to_rpc_ms=(request_sent_monotonic - snapshot_ref.captured_monotonic) * 1000,
+                                    )
                                     return InferenceWorkerResult(
                                         result=result,
                                         image_timestamps={
@@ -6475,6 +6503,9 @@ def run_rtc_client(args: argparse.Namespace) -> None:
 
                                 launch_candidate = (launch, infer_snapshot)
                             except Exception as exc:
+                                # A failed snapshot (including a deferred RTC
+                                # prefix) never sends its configuration revision.
+                                execution._rtc_config_sent_revision = None
                                 execution.record_launch_deferred()
                                 launch_schedule.next_at = min(
                                     launch_schedule.next_at,
@@ -6640,12 +6671,18 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                 )
                 logging.exception("20 Hz control tick failed")
 
-            next_control_at += control_period
+            if not request_refresh_tick:
+                next_control_at += control_period
             now = time.monotonic()
             if now > next_control_at:
                 missed = int(math.floor((now - next_control_at) / control_period)) + 1
                 next_control_at += missed * control_period
-            sleep_s = next_control_at - time.monotonic()
+            wake_at = next_control_at
+            if execution.async_inference and execution.inference_trigger_mode == "periodic":
+                wake_at = launch_schedule.wakeup_deadline(
+                    next_control_at, time.monotonic(), in_flight=worker.in_flight)
+            request_refresh_tick = wake_at < next_control_at
+            sleep_s = wake_at - time.monotonic()
             if sleep_s > 0:
                 time.sleep(sleep_s)
     except KeyboardInterrupt:
@@ -7363,6 +7400,10 @@ def main() -> None:
         if args.arm_side not in {"both", "right"}:
             parser.error("bimanual mode requires --arm-side both")
         args.arm_side = "both"
+        try:
+            resolve_can_pair(args.left_can, args.right_can)
+        except ValueError as exc:
+            parser.error(str(exc))
         if args.left_can == args.right_can:
             parser.error("--left-can and --right-can must differ in bimanual mode")
         if len({args.cam_high_device, args.cam_left_wrist_device, args.cam_right_wrist_device}) != 3:

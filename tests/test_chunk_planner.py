@@ -10,6 +10,51 @@ from bimanual_vla.deployment.servo import ServoConfig, ServoLoop
 
 
 class ChunkPlannerTest(unittest.TestCase):
+    def test_deferred_install_cannot_reserve_another_old_prefix_window(self):
+        from bimanual_vla.deployment.servo import ChunkPlanDeferred
+        loop, times, targets, old_prefix = self.prefix_fixture()
+        with patch('bimanual_vla.deployment.servo.time.monotonic', return_value=100.5):
+            with patch('bimanual_vla.deployment.chunk_planner.compile_chunk',
+                       side_effect=ChunkPlanDeferred('concurrent writer change')):
+                with self.assertRaises(ChunkPlanDeferred):
+                    loop.install_chunk(targets, times, np.arange(len(times)), generation=2)
+            commitment = loop._committed_until
+            for _ in range(2):
+                with self.assertRaisesRegex(ChunkPlanDeferred, 'deferred chunk 2'):
+                    loop.rtc_prefix(100.5, 7, 20)
+            self.assertEqual(loop._committed_until, commitment)
+            self.assertTrue(loop.prefix_is_valid(old_prefix['plan_id']))
+        with patch('bimanual_vla.deployment.servo.time.monotonic', return_value=100.55):
+            loop.install_chunk(targets, times, np.arange(len(times)), generation=2)
+            self.assertLessEqual(loop.metrics()['plan_timing']['splice_monotonic'], 100.57)
+            prefix = loop.rtc_prefix(100.55, 7, 20)
+            self.assertTrue(loop.prefix_is_valid(prefix['plan_id']))
+            self.assertIsNone(loop.metrics()['deferred_install_generation'])
+            for offset in prefix['sample_offsets_s']:
+                self.assertEqual(loop._plan.context_at(100.55+offset)['generation'], 2)
+
+    def test_deferred_prefix_gate_releases_on_expiry_hold_and_rejection(self):
+        from bimanual_vla.deployment.servo import ChunkPlanDeferred, ChunkPlanRejected
+        for release in ('expiry', 'hold', 'rejection'):
+            with self.subTest(release=release):
+                loop, times, targets, _ = self.prefix_fixture()
+                with patch('bimanual_vla.deployment.chunk_planner.compile_chunk',
+                           side_effect=ChunkPlanDeferred('retry')):
+                    with self.assertRaises(ChunkPlanDeferred):
+                        loop.install_chunk(targets, times, np.arange(len(times)), generation=2)
+                if release == 'hold':
+                    loop.hold()
+                    self.assertIsNone(loop.rtc_prefix(100.5, 7, 20))
+                elif release == 'expiry':
+                    with patch('bimanual_vla.deployment.servo.time.monotonic', return_value=times[-1]+1):
+                        loop.rtc_prefix(times[-1]+1, 7, 20)
+                else:
+                    bad = targets.copy(); bad[:, 0] = 100
+                    with self.assertRaises(ChunkPlanRejected):
+                        loop.install_chunk(bad, times, np.arange(len(times)), generation=2)
+                    self.assertIsNotNone(loop.rtc_prefix(100.5, 7, 20))
+                self.assertIsNone(loop.metrics()['deferred_install_generation'])
+
     def test_install_before_next_request_avoids_an_extra_rtc_delay_window(self):
         waits = []
         for reserve_first in (True, False):

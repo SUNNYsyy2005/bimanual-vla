@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from bimanual_vla.collection.can_identity import resolve_can_pair
+
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -189,6 +191,7 @@ class CollectionSession:
                 piper = self._robot_connect(self.config.can_name)
                 connected.append(piper)
             else:
+                resolve_can_pair(self.config.left_can_name, self.config.right_can_name)
                 left = self._robot_connect(self.config.left_can_name)
                 connected.append(left)
                 right = self._robot_connect(self.config.right_can_name)

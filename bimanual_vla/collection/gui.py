@@ -12,6 +12,9 @@ still rejected before and during recording.
 
 from __future__ import annotations
 
+from bimanual_vla.collection.can_identity import (list_can_adapters, validate_can_selector,
+                                                 resolve_can_selector, resolve_can_pair, load_can_bindings, save_can_bindings)
+
 import json
 import math
 import os
@@ -619,7 +622,7 @@ def build_inference_bridge_command(
     if arm_mode == BIMANUAL:
         if arm_side != "both":
             raise ValueError("bimanual inference requires arm side both")
-        if validate_can_name(left_can) == validate_can_name(right_can):
+        if validate_can_selector(left_can) == validate_can_selector(right_can):
             raise ValueError("left and right CAN interfaces must be distinct")
         camera_devices = (cam_high_device.strip(), cam_left_wrist_device.strip(), cam_right_wrist_device.strip())
         explicit_camera_devices = [
@@ -655,11 +658,11 @@ def build_inference_bridge_command(
         "--arm-side",
         "both" if arm_mode == BIMANUAL else arm_side,
         "--can",
-        validate_can_name(can),
+        validate_can_selector(can),
         "--left-can",
-        validate_can_name(left_can),
+        validate_can_selector(left_can),
         "--right-can",
-        validate_can_name(right_can),
+        validate_can_selector(right_can),
         "--cam-high-device",
         cam_high_device.strip(),
         "--cam-wrist-device",
@@ -892,7 +895,7 @@ class CollectorGUI:
         self.root.geometry("1800x1200")
         self.root.minsize(1350, 950)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.gui_preferences = load_gui_preferences()
+        self.gui_preferences = {**load_can_bindings(), **load_gui_preferences()}
 
         self.session: CollectionSession | None = None
         self.piper = None
@@ -949,9 +952,9 @@ class CollectorGUI:
         self.arm_mode_var = tk.StringVar(value=BIMANUAL)
         self.schema_var = tk.StringVar(value=DELIVERY_SCHEMA)
         self.arm_side_var = tk.StringVar(value="right")
-        self.can_var = tk.StringVar(value=DEFAULT_CAN)
-        self.left_can_var = tk.StringVar(value=DEFAULT_LEFT_CAN)
-        self.right_can_var = tk.StringVar(value=DEFAULT_RIGHT_CAN)
+        self.can_var = tk.StringVar(value=str(self.gui_preferences.get("can_selector") or DEFAULT_CAN))
+        self.left_can_var = tk.StringVar(value=str(self.gui_preferences.get("left_can_selector") or DEFAULT_LEFT_CAN))
+        self.right_can_var = tk.StringVar(value=str(self.gui_preferences.get("right_can_selector") or DEFAULT_RIGHT_CAN))
         self.high_var = tk.StringVar(value=DEFAULT_HIGH_DEVICE)
         self.wrist_var = tk.StringVar(value=DEFAULT_WRIST_DEVICE)
         self.left_wrist_var = tk.StringVar(
@@ -2420,6 +2423,9 @@ class CollectorGUI:
 
     def _save_gui_preferences(self) -> None:
         values: dict[str, object] = {
+            "can_selector": self.can_var.get().strip(),
+            "left_can_selector": self.left_can_var.get().strip(),
+            "right_can_selector": self.right_can_var.get().strip(),
             "upload_server": self.dataset_server_var.get().strip(),
             "remember_can_password": bool(self.remember_can_password_var.get()),
             "remember_upload_token": bool(self.remember_upload_token_var.get()),
@@ -2487,6 +2493,7 @@ class CollectorGUI:
         if self.remember_upload_token_var.get() and self.dataset_token_var.get().strip():
             values["upload_token"] = self.dataset_token_var.get().strip()
         try:
+            save_can_bindings(values)
             save_gui_preferences(values)
         except OSError as exc:
             self.status_var.set(f"Could not save GUI preferences: {exc}")
@@ -2600,8 +2607,8 @@ class CollectorGUI:
         if self.arm_mode == BIMANUAL:
             rows.extend(
                 (
-                    ("Left-arm CAN", self.left_can_var),
-                    ("Right-arm CAN", self.right_can_var),
+                    ("Left-arm CAN (serial)", self.left_can_var),
+                    ("Right-arm CAN (serial)", self.right_can_var),
                     ("Left wrist camera", self.left_wrist_var),
                     ("Right wrist camera", self.right_wrist_var),
                 )
@@ -2609,7 +2616,7 @@ class CollectorGUI:
         else:
             rows.extend(
                 (
-                    ("Robot CAN", self.can_var),
+                    ("Robot CAN (serial)", self.can_var),
                     ("Wrist camera", self.wrist_var),
                 )
             )
@@ -2624,7 +2631,10 @@ class CollectorGUI:
         pending = {label: tk.StringVar(value=variable.get()) for label, variable in rows}
         for row, (label, _variable) in enumerate(rows):
             ttk.Label(body, text=label, width=20).grid(row=row, column=0, sticky="w", pady=4)
-            ttk.Entry(body, textvariable=pending[label], width=58).grid(
+            widget = (ttk.Combobox(body, textvariable=pending[label], width=58,
+                                  values=["serial:" + r["serial"] for r in list_can_adapters() if r["serial"]])
+                      if "CAN" in label else ttk.Entry(body, textvariable=pending[label], width=58))
+            widget.grid(
                 row=row,
                 column=1,
                 sticky="ew",
@@ -2648,11 +2658,11 @@ class CollectorGUI:
                 if fps <= 0 or camera_fps <= 0 or fps > camera_fps:
                     raise ValueError("rates must be positive and collection rate cannot exceed camera rate")
                 can_values = (
-                    (pending["Left-arm CAN"].get(), pending["Right-arm CAN"].get())
+                    (pending["Left-arm CAN (serial)"].get(), pending["Right-arm CAN (serial)"].get())
                     if self.arm_mode == BIMANUAL
-                    else (pending["Robot CAN"].get(),)
+                    else (pending["Robot CAN (serial)"].get(),)
                 )
-                names = tuple(validate_can_name(value) for value in can_values)
+                names = tuple(validate_can_selector(value) for value in can_values)
                 if len(set(names)) != len(names):
                     raise ValueError("left and right CAN names must be distinct")
                 root = pathlib.Path(pending["Dataset root"].get()).expanduser()
@@ -2667,6 +2677,7 @@ class CollectorGUI:
             self._update_device_summary()
             self._refresh_dataset_choices()
             self._apply_dataset_name(self.dataset_name_var.get(), parent=dialog)
+            self._save_gui_preferences()
             self.status_var.set("Device settings updated")
             close_dialog()
 
@@ -2850,11 +2861,8 @@ class CollectorGUI:
 
     def _configured_can_names(self) -> tuple[str, ...]:
         if self.arm_mode == BIMANUAL:
-            return (
-                validate_can_name(self.left_can_var.get()),
-                validate_can_name(self.right_can_var.get()),
-            )
-        return (validate_can_name(self.can_var.get()),)
+            return resolve_can_pair(self.left_can_var.get(), self.right_can_var.get())
+        return (resolve_can_selector(self.can_var.get()),)
 
     def _ask_can_activation_password(self, can_names: tuple[str, ...]) -> str | None:
         result: dict[str, str | None] = {"password": None}
@@ -2949,14 +2957,19 @@ class CollectorGUI:
             self.inference_connect_button.configure(state="disabled")
         self._set_connection_config_enabled(False)
 
+        selectors = ((self.left_can_var.get(), self.right_can_var.get())
+                     if self.arm_mode == BIMANUAL else (self.can_var.get(),))
+
         def worker(secret: str) -> None:
             try:
+                current_names = (resolve_can_pair(*selectors) if len(selectors) == 2
+                                 else (resolve_can_selector(selectors[0]),))
                 # USB topology changes when adapters are moved between ports
                 # or a hub is re-enumerated. Resolve each current interface's
                 # actual bus-info instead of rejecting valid adapters because
                 # they no longer match an old hard-coded port.
                 statuses = activate_can_interfaces(
-                    can_names,
+                    current_names,
                     secret,
                 )
                 self.messages.put(("can_activation_done", statuses))
