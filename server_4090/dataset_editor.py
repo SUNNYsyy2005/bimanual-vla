@@ -952,6 +952,11 @@ def _recompute_episode_stats(table: pa.Table, existing: dict[str, Any]) -> dict[
     """Refresh every numeric parquet statistic after reindex/task edits."""
     result = dict(existing.get("stats", {})) if isinstance(existing, dict) else {}
     for name in table.column_names:
+        # LeRobot v2.1 treats every stats key containing "image" as RGB.
+        # Acquisition timestamps remain parquet payload, not image stats.
+        if "image" in name and "timestamp" in name:
+            result.pop(name, None)
+            continue
         values = _numeric_column(table, name)
         if values is not None:
             result[name] = _column_stats(values)
