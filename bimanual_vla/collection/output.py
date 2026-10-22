@@ -26,6 +26,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from bimanual_vla.collection.camera import CameraCapture
+from bimanual_vla.collection.can_identity import resolve_can_selector
 from bimanual_vla.data.contract import (
     BIMANUAL,
     DEFAULT_FPS,
@@ -358,6 +359,7 @@ def reset_robot_arms(
 def connect(can_name: str) -> Any:
     if C_PiperInterface_V2 is None:
         raise RuntimeError("piper_sdk is not installed; run this collector in the Piper hardware environment")
+    can_name = resolve_can_selector(can_name)
     require_can_interface_up(can_name)
     piper = C_PiperInterface_V2(can_name, judge_flag=False, can_auto_init=False)
     piper.CreateCanBus(

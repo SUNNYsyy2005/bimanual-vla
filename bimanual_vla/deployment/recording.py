@@ -424,7 +424,7 @@ class DeploymentRunRecorder:
             }),
         }
         if result is not None:
-            for key in ("execution_control", "transport_timing", "_client_transport_timing"):
+            for key in ("model_phase_timing", "execution_control", "transport_timing", "_client_transport_timing"):
                 if key in result:
                     payload[key] = _json_safe(result[key])
         self._enqueue(("model", payload, arrays))
