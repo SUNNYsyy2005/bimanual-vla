@@ -71,3 +71,38 @@ test('metric discovery includes keys introduced after the first training point',
   await context.loadRlinfSelectedMetrics();
   assert.match(elements.get('rlinfMetric').innerHTML,/train.gradient_norm/);
 });
+
+test('PPO fixed validation and extra development never overwrite each other at round zero', () => {
+  const {context,elements} = chartContext();
+  elements.get('rlinfMetric').value='eval.SR@sde';
+  elements.get('rlinfXAxis').value='round';
+  elements.set('rlinfCohort',{value:'fixed_validation'});
+  context.rlinfMetricData.set('ppo',{run:{name:'PPO'},evaluation_points:[
+    {round:0,actor_updates:0,sampler:'sde',cohort:'fixed_validation',SR:.05},
+    {round:0,actor_updates:0,sampler:'sde',cohort:'extra_development',SR:.4167},
+  ]});
+  context.drawRlinfChart();
+  assert.match(elements.get('rlinfLegend').innerHTML,/<strong>0.05<\/strong>/);
+  assert.doesNotMatch(elements.get('rlinfLegend').innerHTML,/0.4167/);
+  elements.get('rlinfCohort').value='extra_development';
+  context.drawRlinfChart();
+  assert.match(elements.get('rlinfLegend').innerHTML,/<strong>0.4167<\/strong>/);
+});
+
+test('PPO table shows zero actor updates and never presents training SR as evaluation SR', () => {
+  const elements=new Map(['rlinfRuns','rlinfRunsSummary','rlinfRunsPagination'].map(id=>[id,{innerHTML:'',querySelectorAll:()=>[]}]));
+  const context={document:{getElementById:id=>elements.get(id)},rlinfRuns:[{
+    id:'ppo',name:'PPO',state:'running',method:'ppo-lag',completed_training_round:1,actor_updates:0,
+    planned_rounds:32,evaluation_points:0,next_evaluation_round:8,latest:{'train.SR':.75}
+  }],rlinfSelected:new Set(),rlinfDeleteSelection:new Set(),rlinfDeleting:false,
+    esc:String,paginateList:(_,rows)=>rows,renderListPagination:()=>'',
+    rlinfCanDelete:()=>false,updateRlinfDeleteSelection(){},fillRlinfEvalRuns(){}};
+  vm.createContext(context);
+  context.filteredRlinfRuns=()=>context.rlinfRuns;
+  vm.runInContext(extract('function formatRlinfPercent(', '\nasync function loadRlinfSelectedMetrics()'),context);
+  context.renderRlinfRuns();
+  const html=elements.get('rlinfRuns').innerHTML;
+  assert.match(html,/Actor 更新 0/);assert.match(html,/训练 1 \/ 32/);
+  assert.match(html,/- \/ -/);assert.match(html,/当轮训练 SR 75.0%/);
+  assert.match(html,/第 8 轮/);
+});

@@ -622,7 +622,7 @@
 
 {% if dashboard_profile == "simulation" %}
     <section id="module-rlinf" class="dashboard-module" data-module="rlinf" hidden>
-      <div class="module-heading"><div><h2>RLinf 训练监控</h2><p>对比 4090、H100、H200 上的 RLinf 训练轮次、指标和评估曲线。</p></div><div class="toolbar"><span id="rlinfRefreshTime" class="muted">尚未刷新</span><button class="inline secondary" type="button" onclick="loadRlinfRuns()">刷新曲线</button></div></div>
+      <div class="module-heading"><div><h2>RLinf 训练监控 · GRPO / PPO</h2><p>对比 GRPO、PPO 及其 Lagrangian 版本的训练、固定集评测和 critic 指标。</p></div><div class="toolbar"><span id="rlinfRefreshTime" class="muted">尚未刷新</span><button class="inline secondary" type="button" onclick="loadRlinfRuns()">刷新曲线</button></div></div>
       <div class="grid rlinf-grid">
         <section class="card"><h2>启动 RLinf 训练</h2><p id="rlinfLaunchHint" class="muted">提交配置由服务器端 profile 管理。</p>
           <form id="rlinfLaunchForm" class="compact-submission">
@@ -638,12 +638,13 @@
         </section>
         <section class="card rlinf-runs-card">
           <div class="training-output-heading"><div><h2>运行记录与最新指标</h2><p class="muted">可多选不同算法、随机种子和硬件的运行记录进行对比。</p></div><span id="rlinfRunsSummary" class="muted">等待数据</span></div>
-          <div class="toolbar"><input id="rlinfRunFilter" aria-label="筛选 RLinf 运行" placeholder="搜索运行名称、算法、目标或状态"><button id="rlinfDeleteSelected" class="inline danger" type="button" onclick="deleteRlinfRuns([...rlinfDeleteSelection])" disabled>删除已选记录</button></div>
+          <div class="toolbar"><input id="rlinfRunFilter" aria-label="筛选 RLinf 运行" placeholder="搜索运行名称、算法、目标或状态"><select id="rlinfAlgorithmFilter" aria-label="按算法筛选"><option value="">全部算法</option><option value="ppo-lag">PPO-Lag</option><option value="ppo">PPO</option><option value="grpo-lag">GRPO-Lag</option><option value="grpo">GRPO</option></select><button id="rlinfDeleteSelected" class="inline danger" type="button" onclick="deleteRlinfRuns([...rlinfDeleteSelection])" disabled>删除已选记录</button></div>
           <p class="muted">勾选“对比”可跨页比较曲线；“删除”清理运行记录及已结束任务的 Dashboard 日志，保留原始曲线文件、模型和 checkpoint。</p>
-          <div class="table-wrap"><table><thead><tr><th>对比</th><th>目标 / 运行</th><th>状态</th><th>指标点数</th><th>成功率 / 风险率</th><th>更新时间</th><th><label><input id="rlinfDeletePage" type="checkbox" aria-label="选择本页可删除记录">删除</label></th><th>操作</th></tr></thead><tbody id="rlinfRuns"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>对比</th><th>目标 / 运行</th><th>状态 / 阶段</th><th>训练 / 更新 / 评测</th><th>评测 SR / 风险率</th><th>结果时间 / 同步时间</th><th><label><input id="rlinfDeletePage" type="checkbox" aria-label="选择本页可删除记录">删除</label></th><th>操作</th></tr></thead><tbody id="rlinfRuns"></tbody></table></div>
           <div id="rlinfRunsPagination"></div>
           <div id="rlinfLogPanel" hidden><div class="toolbar"><strong id="rlinfLogTitle">训练日志</strong><button class="inline secondary" type="button" onclick="rlinfLogRunId ? loadRlinfRunLog(rlinfLogRunId) : loadRlinfLog(rlinfLogTaskId)">刷新日志</button><button class="inline secondary" type="button" onclick="document.getElementById('rlinfLogPanel').hidden = true">收起</button></div><pre id="rlinfLog"></pre></div>
-          <div class="chart-toolbar"><div><label for="rlinfMetric">指标</label><select id="rlinfMetric"></select></div><div><label for="rlinfXAxis">横坐标</label><select id="rlinfXAxis"><option value="actor_updates">Actor updates</option><option value="round">训练轮次（round）</option></select></div></div>
+          <div class="chart-toolbar"><div><label for="rlinfMetric">指标</label><select id="rlinfMetric"></select></div><div><label for="rlinfXAxis">横坐标</label><select id="rlinfXAxis"><option value="round">训练轮次（round）</option><option value="actor_updates">Actor updates</option></select></div><div><label for="rlinfCohort">评测集</label><select id="rlinfCohort"><option value="fixed_validation">固定验证集</option><option value="extra_development">补充开发集</option><option value="">未标注评测集</option></select></div></div>
+          <p class="muted">训练 SR 来自当轮采集；评测 SR 仅在评测轮次更新。初始化风险排除后按有效轨迹计算 SR；实际 Actor 更新次数可能小于训练轮数。</p>
           <p id="rlinfMetricSummary" class="muted"></p>
           <div class="chart-shell"><canvas id="rlinfChart" aria-label="RLinf multi-run metric chart"></canvas></div><div id="rlinfLegend" class="metric-legend"></div>
         </section>
@@ -6105,7 +6106,8 @@ function rlinfCanDelete(run) {
 }
 function filteredRlinfRuns() {
   const query = document.getElementById('rlinfRunFilter').value.trim().toLowerCase();
-  return rlinfRuns.filter(run => !query || [run.name, run.method, run.target, run.state, run.task_id].join(' ').toLowerCase().includes(query));
+  const algorithm = document.getElementById('rlinfAlgorithmFilter')?.value || '';
+  return rlinfRuns.filter(run => (!algorithm || (run.algorithm || run.method) === algorithm) && (!query || [run.name, run.method, run.target, run.state, run.task_id, run.job_id].join(' ').toLowerCase().includes(query)));
 }
 function updateRlinfDeleteSelection() {
   const button = document.getElementById('rlinfDeleteSelected');
@@ -6250,12 +6252,20 @@ function renderRlinfRuns() {
   body.innerHTML = paginateList('rlinfRuns', filtered).map(run => {
     if (run.state === 'unavailable') return `<tr><td>—</td><td>${esc(run.source_label)}</td><td class="bad">不可用</td><td colspan="5">${esc(run.error || '')}</td></tr>`;
     const selected = rlinfSelected.has(run.id) ? 'checked' : '';
-    const roundCount = Math.max(Number(run.training_points || 0), Number(run.evaluation_points || 0));
-    const sr = run.latest?.['eval.SR@ode'] ?? run.latest?.['eval.SR@sde'] ?? run.latest?.['eval.SR'] ?? run.latest?.['eval.success_at_end'] ?? run.latest?.['train.SR'] ?? run.latest?.['train.env/success_once'];
-    const risk = run.latest?.['eval.risk_rate@ode'] ?? run.latest?.['eval.risk_rate@sde'] ?? run.latest?.['eval.risk_rate'] ?? run.latest?.['train.risk_rate'] ?? run.latest?.['train.rollout/safety/episode_cost_rate'];
-    const updated = run.updated_at ? new Date(run.updated_at * 1000).toLocaleString() : '-';
+    const roundCount = `训练 ${run.completed_training_round ?? run.training_points ?? 0}${run.planned_rounds ? ` / ${run.planned_rounds}` : ''}<br>Actor 更新 ${run.actor_updates ?? '—'} · 评测 ${run.evaluation_points ? run.completed_evaluation_round : '待评测'}${run.next_evaluation_round != null ? `<br><span class="muted">下次评测：第 ${run.next_evaluation_round} 轮</span>` : ''}`;
+    const sr = run.latest?.['eval.SR@ode'] ?? run.latest?.['eval.SR@sde'] ?? run.latest?.['eval.SR'] ?? run.latest?.['eval.success_at_end'];
+    const risk = run.latest?.['eval.risk_rate@ode'] ?? run.latest?.['eval.risk_rate@sde'] ?? run.latest?.['eval.risk_rate'];
+    const trainSR = run.latest?.['train.SR'] ?? run.latest?.['train.env/success_once'];
+    const eligible = run.latest?.['eval.eligible_episodes@ode'] ?? run.latest?.['eval.eligible_episodes@sde'] ?? run.latest?.['eval.eligible_episodes'];
+    const excluded = run.latest?.['eval.excluded_initialization_risk@ode'] ?? run.latest?.['eval.excluded_initialization_risk@sde'] ?? run.latest?.['eval.excluded_initialization_risk'];
+    const cohortLabel = {fixed_validation:'固定验证集',extra_development:'补充开发集'}[run.evaluation_cohort] || '评测';
+    const metrics = `${formatRlinfPercent(sr)} / ${formatRlinfPercent(risk)}<br><span class="muted">${cohortLabel} · 第 ${run.evaluation_points ? run.completed_evaluation_round : '—'} 轮<br>当轮训练 SR ${formatRlinfPercent(trainSR)}${eligible != null ? `<br>有效 ${eligible} · 初始化排除 ${excluded ?? 0}` : ''}</span>`;
+    const phaseLabel = {sampling_train:'采集训练轨迹',sampling_evaluation:'评测采集',sampling_parity:'采样一致性检查',actor_backward:'Actor 更新',critic_fit:'Critic 拟合',critic_gae_prepare:'优势估计',likelihood_gate:'似然检查',checkpoint_save:'保存 checkpoint',actor_initialization:'加载策略'}[run.phase] || run.phase || '';
+    const resultTime = run.finished_at || run.updated_at;
+    const updated = resultTime ? new Date(resultTime * 1000).toLocaleString() : '-';
+    const syncTime = run.synced_at ? new Date(run.synced_at * 1000).toLocaleString() : null;
     const disabled = !rlinfCanDelete(run) || rlinfDeleting;
-    return `<tr><td><input type="checkbox" data-rlinf-run="${esc(run.id)}" ${selected} aria-label="Compare ${esc(run.name)}"></td><td><strong>${esc(run.name)}</strong><br><span class="muted">${esc(run.target)} · ${esc(run.method)}</span></td><td><span class="pill">${esc(run.state)}</span></td><td>${roundCount}</td><td>${formatRlinfPercent(sr)} / ${formatRlinfPercent(risk)}</td><td>${esc(updated)}</td><td><input type="checkbox" data-rlinf-delete="${esc(run.id)}" ${rlinfDeleteSelection.has(run.id) ? 'checked' : ''} ${disabled ? 'disabled' : ''} aria-label="选择删除 ${esc(run.name)}"></td><td><button class="inline secondary" data-rlinf-run-log="${esc(run.id)}">日志</button><button class="inline danger" data-rlinf-remove="${esc(run.id)}" ${disabled ? 'disabled' : ''}>删除</button></td></tr>`;
+    return `<tr><td><input type="checkbox" data-rlinf-run="${esc(run.id)}" ${selected} aria-label="Compare ${esc(run.name)}"></td><td><strong>${esc(run.name)}</strong><br><span class="muted">${esc(run.target)} · ${esc(run.method)}${run.job_id ? ` · Job ${esc(run.job_id)}` : ''}</span></td><td><span class="pill" title="${esc(run.status_reason || '')}">${esc(run.state === 'stopped' ? '已停止' : run.state)}</span><br><span class="muted">${esc(phaseLabel)}</span></td><td>${roundCount}</td><td>${metrics}</td><td>${run.finished_at ? "完成：" : "结果："}${esc(updated)}${syncTime ? `<br><span class="muted">同步：${esc(syncTime)}</span>` : ""}</td><td><input type="checkbox" data-rlinf-delete="${esc(run.id)}" ${rlinfDeleteSelection.has(run.id) ? 'checked' : ''} ${disabled ? 'disabled' : ''} aria-label="选择删除 ${esc(run.name)}"></td><td><button class="inline secondary" data-rlinf-run-log="${esc(run.id)}">日志</button><button class="inline danger" data-rlinf-remove="${esc(run.id)}" ${disabled ? 'disabled' : ''}>删除</button></td></tr>`;
   }).join('') || '<tr><td colspan="8" class="muted">没有匹配的运行记录。</td></tr>';
   updateRlinfDeleteSelection();
   body.querySelectorAll('[data-rlinf-delete]').forEach(input => input.addEventListener('change', () => {
@@ -6290,6 +6300,14 @@ async function loadRlinfSelectedMetrics() {
     if (run) Object.assign(run, data.run);
   }
   renderRlinfRuns();
+  const cohortSelect = document.getElementById('rlinfCohort');
+  if (cohortSelect) {
+    const cohorts = [...new Set([...rlinfMetricData.values()].flatMap(item => (item.evaluation_points || []).map(point => point.cohort || '')))];
+    const previousCohort = cohortSelect.value;
+    const labels = {fixed_validation:'固定验证集',extra_development:'补充开发集', '':'未标注评测集'};
+    cohortSelect.innerHTML = cohorts.map(value => `<option value="${esc(value)}">${esc(labels[value] || value)}</option>`).join('');
+    cohortSelect.value = cohorts.includes(previousCohort) ? previousCohort : cohorts.includes('fixed_validation') ? 'fixed_validation' : cohorts[0] || '';
+  }
   const keys = [...new Set([...rlinfMetricData.values()].flatMap(item => [
     ...(item.training_points || []).flatMap(point => Object.keys(point).filter(key => !['round','actor_updates','step','sampler','method','algorithm'].includes(key) && typeof point[key] === 'number').map(key => `train.${key}`)),
     ...(item.evaluation_points || []).flatMap(point => Object.keys(point).filter(key => !['round','actor_updates','step','sampler','method','algorithm'].includes(key) && typeof point[key] === 'number').map(key => `eval.${key}${point.sampler ? `@${point.sampler}` : ''}`)),
@@ -6299,6 +6317,8 @@ async function loadRlinfSelectedMetrics() {
   select.innerHTML = keys.map(key => `<option value="${esc(key)}">${esc(key)}</option>`).join('');
   if (keys.includes(previous)) select.value = previous;
   else if (keys.includes('eval.SR@ode')) select.value = 'eval.SR@ode';
+  else if (keys.includes('eval.SR@sde')) select.value = 'eval.SR@sde';
+  else if (keys.includes('eval.SR')) select.value = 'eval.SR';
   else if (keys.includes('train.SR')) select.value = 'train.SR';
   else if (keys.length) select.value = keys[0];
   drawRlinfChart();
@@ -6323,6 +6343,7 @@ function drawRlinfChart() {
   const isEval = key.startsWith('eval.');
   const rawKey = key.replace(/^(train|eval)\./, '').split('@')[0];
   const sampler = key.includes('@') ? key.split('@').pop() : null;
+  const cohort = document.getElementById('rlinfCohort')?.value || '';
   const axis = document.getElementById('rlinfXAxis').value;
   const candidates = [...rlinfMetricData.values()].flatMap(data => (isEval ? data.evaluation_points : data.training_points) || []);
   // Pick one axis for all runs; never mix rounds and actor updates on a shared scale.
@@ -6331,7 +6352,7 @@ function drawRlinfChart() {
   const sets = [];
   for (const [index, [id, data]] of [...rlinfMetricData.entries()].entries()) {
     const run = data.run;
-    const points = ((isEval ? data.evaluation_points : data.training_points) || []).filter(point => (!sampler || point.sampler === sampler) && typeof point[rawKey] === 'number' && Number.isFinite(point[rawKey]) && typeof point[xKey] === 'number' && Number.isFinite(point[xKey]));
+    const points = ((isEval ? data.evaluation_points : data.training_points) || []).filter(point => (!isEval || (point.cohort || '') === cohort) && (!sampler || point.sampler === sampler) && typeof point[rawKey] === 'number' && Number.isFinite(point[rawKey]) && typeof point[xKey] === 'number' && Number.isFinite(point[xKey]));
     const values = [...new Map(points.map(point => [point[xKey], {x: point[xKey], y: point[rawKey]}])).values()].sort((a,b) => a.x-b.x);
     if (values.length) sets.push({id, name: run.name, values, color: METRIC_COLORS[index % METRIC_COLORS.length]});
   }
@@ -6409,6 +6430,8 @@ document.getElementById('rlinfEvalForm')?.addEventListener('submit', async event
 document.getElementById('rlinfProfile')?.addEventListener('change', renderRlinfLaunchFields);
 document.getElementById('rlinfMetric')?.addEventListener('change', drawRlinfChart);
 document.getElementById('rlinfXAxis')?.addEventListener('change', drawRlinfChart);
+document.getElementById('rlinfCohort')?.addEventListener('change', drawRlinfChart);
+document.getElementById('rlinfAlgorithmFilter')?.addEventListener('change', () => { resetListPage('rlinfRuns'); renderRlinfRuns(); });
 document.getElementById('rlinfRunFilter')?.addEventListener('input', () => { resetListPage('rlinfRuns'); renderRlinfRuns(); });
 document.getElementById('rlinfDeletePage')?.addEventListener('change', event => {
   for (const run of paginateList('rlinfRuns', filteredRlinfRuns()).filter(rlinfCanDelete)) {
