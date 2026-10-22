@@ -1,0 +1,320 @@
+[
+  {
+    "time": "104131",
+    "definition": "Actual handoff: at least one incoming joint |v|>=0.02 rad/s; maximum backwards command excursion within 250 ms or next handoff, excluding gaps/startup.",
+    "eligible_handoffs": 65,
+    "command_counts": {
+      "0.005": 41,
+      "0.01": 24,
+      "0.02": 6
+    },
+    "raw_eligible": 65,
+    "raw_counts": {
+      "0.005": 56,
+      "0.01": 41,
+      "0.02": 8
+    },
+    "examples": [
+      {
+        "generation": 43,
+        "at_s": 22.34933950100003,
+        "window_s": 0.20141438100017695,
+        "joint_index": 1,
+        "retreat_rad": 0.027705251368720374
+      },
+      {
+        "generation": 46,
+        "at_s": 23.800599938000232,
+        "window_s": 0.24897249399964494,
+        "joint_index": 4,
+        "retreat_rad": 0.025901324264073766
+      },
+      {
+        "generation": 50,
+        "at_s": 25.89799169800017,
+        "window_s": 0.24288989399974525,
+        "joint_index": 1,
+        "retreat_rad": 0.025642354057894945
+      },
+      {
+        "generation": 66,
+        "at_s": 34.261213537,
+        "window_s": 0.24962759100026233,
+        "joint_index": 1,
+        "retreat_rad": 0.024399788608264972
+      },
+      {
+        "generation": 49,
+        "at_s": 25.46154952500001,
+        "window_s": 0.24827694500027064,
+        "joint_index": 11,
+        "retreat_rad": 0.022262378250360593
+      }
+    ]
+  },
+  {
+    "time": "104306",
+    "definition": "Actual handoff: at least one incoming joint |v|>=0.02 rad/s; maximum backwards command excursion within 250 ms or next handoff, excluding gaps/startup.",
+    "eligible_handoffs": 89,
+    "command_counts": {
+      "0.005": 52,
+      "0.01": 36,
+      "0.02": 15
+    },
+    "raw_eligible": 89,
+    "raw_counts": {
+      "0.005": 82,
+      "0.01": 73,
+      "0.02": 51
+    },
+    "examples": [
+      {
+        "generation": 80,
+        "at_s": 25.875173233999703,
+        "window_s": 0.24062590500034275,
+        "joint_index": 8,
+        "retreat_rad": 0.03431041398604551
+      },
+      {
+        "generation": 93,
+        "at_s": 29.954675213999963,
+        "window_s": 0.2396833829998286,
+        "joint_index": 8,
+        "retreat_rad": 0.03417260140771328
+      },
+      {
+        "generation": 76,
+        "at_s": 24.65448427299998,
+        "window_s": 0.24003339699993376,
+        "joint_index": 8,
+        "retreat_rad": 0.028914962006058698
+      },
+      {
+        "generation": 81,
+        "at_s": 26.175089084999854,
+        "window_s": 0.2445981229998324,
+        "joint_index": 1,
+        "retreat_rad": 0.027120365850953565
+      },
+      {
+        "generation": 54,
+        "at_s": 18.42693017600004,
+        "window_s": 0.1997291929997118,
+        "joint_index": 8,
+        "retreat_rad": 0.025671859721901003
+      }
+    ]
+  },
+  {
+    "time": "104416",
+    "definition": "Actual handoff: at least one incoming joint |v|>=0.02 rad/s; maximum backwards command excursion within 250 ms or next handoff, excluding gaps/startup.",
+    "eligible_handoffs": 120,
+    "command_counts": {
+      "0.005": 68,
+      "0.01": 32,
+      "0.02": 6
+    },
+    "raw_eligible": 120,
+    "raw_counts": {
+      "0.005": 101,
+      "0.01": 87,
+      "0.02": 39
+    },
+    "examples": [
+      {
+        "generation": 40,
+        "at_s": 11.746804420999979,
+        "window_s": 0.24166616200000135,
+        "joint_index": 8,
+        "retreat_rad": 0.029838654300919254
+      },
+      {
+        "generation": 41,
+        "at_s": 12.06741550400011,
+        "window_s": 0.23099492499977714,
+        "joint_index": 8,
+        "retreat_rad": 0.029557529567583063
+      },
+      {
+        "generation": 54,
+        "at_s": 15.658164060999752,
+        "window_s": 0.24915986200039697,
+        "joint_index": 8,
+        "retreat_rad": 0.028940762021092525
+      },
+      {
+        "generation": 86,
+        "at_s": 24.46564905000014,
+        "window_s": 0.2414008929999909,
+        "joint_index": 8,
+        "retreat_rad": 0.025958390708983092
+      },
+      {
+        "generation": 120,
+        "at_s": 34.05779936099998,
+        "window_s": 0.24980787000004057,
+        "joint_index": 8,
+        "retreat_rad": 0.02370494452599914
+      }
+    ]
+  },
+  {
+    "time": "104534",
+    "definition": "Actual handoff: at least one incoming joint |v|>=0.02 rad/s; maximum backwards command excursion within 250 ms or next handoff, excluding gaps/startup.",
+    "eligible_handoffs": 98,
+    "command_counts": {
+      "0.005": 59,
+      "0.01": 35,
+      "0.02": 3
+    },
+    "raw_eligible": 99,
+    "raw_counts": {
+      "0.005": 87,
+      "0.01": 66,
+      "0.02": 24
+    },
+    "examples": [
+      {
+        "generation": 10,
+        "at_s": 3.323455019999983,
+        "window_s": 0.23948580999967817,
+        "joint_index": 8,
+        "retreat_rad": 0.026255840942741283
+      },
+      {
+        "generation": 8,
+        "at_s": 2.5822930199997245,
+        "window_s": 0.23811437499989552,
+        "joint_index": 11,
+        "retreat_rad": 0.020987891878308518
+      },
+      {
+        "generation": 26,
+        "at_s": 7.75395546899972,
+        "window_s": 0.23820363799995903,
+        "joint_index": 1,
+        "retreat_rad": 0.02081088822029098
+      },
+      {
+        "generation": 101,
+        "at_s": 29.102926451999338,
+        "window_s": 0.24791141700006847,
+        "joint_index": 1,
+        "retreat_rad": 0.018044684572251724
+      },
+      {
+        "generation": 40,
+        "at_s": 12.212805214999662,
+        "window_s": 0.23145045799992658,
+        "joint_index": 9,
+        "retreat_rad": 0.017193965514178233
+      }
+    ]
+  },
+  {
+    "time": "104653",
+    "definition": "Actual handoff: at least one incoming joint |v|>=0.02 rad/s; maximum backwards command excursion within 250 ms or next handoff, excluding gaps/startup.",
+    "eligible_handoffs": 41,
+    "command_counts": {
+      "0.005": 20,
+      "0.01": 12,
+      "0.02": 3
+    },
+    "raw_eligible": 41,
+    "raw_counts": {
+      "0.005": 40,
+      "0.01": 34,
+      "0.02": 12
+    },
+    "examples": [
+      {
+        "generation": 42,
+        "at_s": 14.513137447999725,
+        "window_s": 0.2487293980002505,
+        "joint_index": 4,
+        "retreat_rad": 0.027139065339156
+      },
+      {
+        "generation": 29,
+        "at_s": 10.923042936999991,
+        "window_s": 0.24858815500010678,
+        "joint_index": 1,
+        "retreat_rad": 0.025885546217655264
+      },
+      {
+        "generation": 12,
+        "at_s": 3.7097458759999427,
+        "window_s": 0.22919789000025048,
+        "joint_index": 1,
+        "retreat_rad": 0.025534363792478885
+      },
+      {
+        "generation": 31,
+        "at_s": 11.50215135399958,
+        "window_s": 0.2498236880001059,
+        "joint_index": 1,
+        "retreat_rad": 0.016812291641923327
+      },
+      {
+        "generation": 20,
+        "at_s": 5.9982682800000475,
+        "window_s": 0.2283806879995609,
+        "joint_index": 1,
+        "retreat_rad": 0.016627347960154314
+      }
+    ]
+  },
+  {
+    "time": "104728",
+    "definition": "Actual handoff: at least one incoming joint |v|>=0.02 rad/s; maximum backwards command excursion within 250 ms or next handoff, excluding gaps/startup.",
+    "eligible_handoffs": 79,
+    "command_counts": {
+      "0.005": 37,
+      "0.01": 28,
+      "0.02": 6
+    },
+    "raw_eligible": 80,
+    "raw_counts": {
+      "0.005": 66,
+      "0.01": 51,
+      "0.02": 27
+    },
+    "examples": [
+      {
+        "generation": 47,
+        "at_s": 14.205653197999709,
+        "window_s": 0.23991532400032156,
+        "joint_index": 8,
+        "retreat_rad": 0.026971640274697672
+      },
+      {
+        "generation": 31,
+        "at_s": 9.406056337999871,
+        "window_s": 0.24907460800022818,
+        "joint_index": 8,
+        "retreat_rad": 0.025215115899052593
+      },
+      {
+        "generation": 21,
+        "at_s": 6.493394182999509,
+        "window_s": 0.2397832490005385,
+        "joint_index": 8,
+        "retreat_rad": 0.02363531475153581
+      },
+      {
+        "generation": 40,
+        "at_s": 12.147150079999847,
+        "window_s": 0.24935706999985996,
+        "joint_index": 8,
+        "retreat_rad": 0.022344270758452023
+      },
+      {
+        "generation": 29,
+        "at_s": 8.703903874999924,
+        "window_s": 0.2422000130000015,
+        "joint_index": 8,
+        "retreat_rad": 0.021730959246331824
+      }
+    ]
+  }
+]
