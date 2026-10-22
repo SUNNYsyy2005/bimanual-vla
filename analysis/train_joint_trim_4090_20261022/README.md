@@ -25,3 +25,5 @@
 评估用两条训练 episode 和全部六条 heldout、多个帧位置、seed 0/1、5/10 次去噪；使用真实图像、原始任务提示词，无 RTC、无滤波。统计关节/夹爪误差、示范与预测二阶差分、与初始噪声相关系数；保留原始预测。结果写入本目录 `final_noise_evaluation/`。高相关性必须结合误差及二阶差分幅值解释，不能单独证明数据集或训练原因。
 
 远端项目 `/home/sunny/bimanual-vla`。训练日志 `/home/sunny/.local/share/bimanual-vla-server/tasks/train-20261022-172626-643dce0f/task.log`。训练参数、任务响应、数据处理报告及复现实验脚本均在本目录；无需 token 落盘。
+
+已按用户要求交接至 4090 Codex Bridge 会话 `01a1630a-d68d-7c13-84fb-a2feb4f1294c`，名称「bimanual-vla：joint_dataset训练与噪声评估接续」，工作目录 `/home/sunny/bimanual-vla`。已确认交接消息被消费并开始 active turn；具体任务见 `HANDOFF.md`。
