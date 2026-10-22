@@ -159,6 +159,13 @@ Method: section 5.1 (reads `norm_stats.json` and the dataset).
   continuation. Add explicit evaluation by prefix length and source rather than interpreting low d=0 loss
   as evidence that planner-prefix continuation is accurate.
 
+**Evaluation implementation update (2026-10-22):** the standard held-out evaluator now adds
+separate demonstration-prefix losses for supported d=0/4/5/6/7/8/10, while retaining
+the historical d=0 metric. The evaluation-only API also accepts a separately supplied
+planner prefix; the normal dataset loader does not supply one and reports this explicitly.
+CPU regression tests pass, but current-checkpoint prefix evaluation results are still pending.
+See [evaluation behavior and limitations](docs/RTC_EVALUATION.md).
+
 ### Q7. Is RTC normalization applied at the wrong granularity? No such axis error was found in the deployed code.
 
 The audit used the remote serving code and current checkpoint assets directly:
