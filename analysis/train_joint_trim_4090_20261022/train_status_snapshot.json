@@ -1,0 +1,84 @@
+{
+  "task": {
+    "active": true,
+    "created_at": "2026-10-22T17:26:26+0800",
+    "dependency": null,
+    "dependency_state": null,
+    "finished_at": null,
+    "id": "train-20261022-172626-643dce0f",
+    "lost_reason": null,
+    "metadata": {
+      "arm_mode": "single",
+      "arm_side": "right",
+      "auto_eval": {
+        "batch_size": 1,
+        "disabled_reason": null,
+        "enabled": true,
+        "every_steps": 5000,
+        "max_batches": 50,
+        "minimum_free_gpu_mib": 23000,
+        "num_workers": 2,
+        "seed": 42,
+        "split": "test",
+        "xla_memory_fraction": 0.85
+      },
+      "base_checkpoint": "/mnt/nvme0n1p4_1T/sunny/tsq-storage/checkpoints/base-models/pi05_base",
+      "batch_size": 4,
+      "checkpoint_dir": "/mnt/nvme0n1p4_1T/sunny/tsq-storage/checkpoints/openpi/pi05_piper_single_arm_lora/joint_trim_nopad_no_rtc_b4_20261022",
+      "cluster_target": null,
+      "dataset_id": "joint_trim_nopad_20261022",
+      "execution_target": "local_4090",
+      "exp_name": "joint_trim_nopad_no_rtc_b4_20261022",
+      "finetuning": {
+        "action_expert_tuning": "full",
+        "image_resize_mode": "stretch",
+        "llm_lora": false,
+        "rtc_training": false,
+        "rtc_training_delay_weights": null,
+        "rtc_training_max_delay": 8
+      },
+      "fsdp_devices": 1,
+      "gpu_ids": [
+        2
+      ],
+      "keep_period": 5000,
+      "model_variant": "pi05",
+      "norm_batch_size": 16,
+      "num_workers": 4,
+      "runtime": "local_4090",
+      "save_interval": 1000,
+      "schema": "joint",
+      "split_seed": 42,
+      "steps": 20000,
+      "test_episodes": 6,
+      "test_ratio": 0.1,
+      "train_episodes": 59,
+      "xla_memory_fraction": 0.9
+    },
+    "pid": 2139803,
+    "progress": null,
+    "queued_at": null,
+    "result": null,
+    "returncode": null,
+    "skip_reason": null,
+    "start_error": null,
+    "started_at": "2026-10-22T17:26:26+0800",
+    "state": "running",
+    "terminal": false,
+    "training_metrics": {
+      "has_points": true,
+      "latest_step": 1000,
+      "series": [
+        "grad_norm",
+        "loss",
+        "param_norm"
+      ],
+      "source": "local_tail",
+      "status": "has_metrics",
+      "tail_bytes": 34551,
+      "total_points": 11
+    },
+    "type": "train",
+    "waiting_reason": null
+  }
+}
