@@ -1,0 +1,74 @@
+{
+  "checks": [
+    {
+      "index": 0,
+      "state_shape": [
+        7
+      ],
+      "actions_shape": [
+        50,
+        7
+      ],
+      "max_error": 0
+    },
+    {
+      "index": 1,
+      "state_shape": [
+        7
+      ],
+      "actions_shape": [
+        50,
+        7
+      ],
+      "max_error": 0
+    },
+    {
+      "index": 40,
+      "state_shape": [
+        7
+      ],
+      "actions_shape": [
+        50,
+        7
+      ],
+      "max_error": 0
+    },
+    {
+      "index": 200,
+      "state_shape": [
+        7
+      ],
+      "actions_shape": [
+        50,
+        7
+      ],
+      "max_error": 0
+    },
+    {
+      "index": 6496,
+      "state_shape": [
+        7
+      ],
+      "actions_shape": [
+        50,
+        7
+      ],
+      "max_error": 0
+    },
+    {
+      "index": 12992,
+      "state_shape": [
+        7
+      ],
+      "actions_shape": [
+        50,
+        7
+      ],
+      "max_error": 0
+    }
+  ],
+  "numeric_max_error": 0,
+  "decoded_seconds": 1.0380894490517676,
+  "numeric_only_seconds": 0.05819613207131624,
+  "same_episode_selection": true
+}
