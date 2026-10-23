@@ -35,3 +35,11 @@
 新的评估等待程序 `evaluate_after_resume.py` 在独立 `codex-bimanual-jointtrim-noise-20261022.scope` 中运行（PID 2948191，runner 2948190），仅在训练退出码为 0、20000 步 checkpoint 完整且 GPU 空闲时运行原 `evaluate_noise.py`。状态、退出记录和日志分别是 `resume_noise_followup_status.json`、`resume_noise_waiter_exit.json`、`resume_noise_followup.log`；最终预测和统计仍写入 `final_noise_evaluation/`。Bridge 已对训练与评估等待 PID 登记持久监控及成功结束通知。训练完成后还需核对退出码、普通 heldout loss 与噪声评估结果，再形成结论。
 
 已按用户要求交接至 4090 Codex Bridge 会话 `01a1630a-d68d-7c13-84fb-a2feb4f1294c`，名称「bimanual-vla：joint_dataset训练与噪声评估接续」，工作目录 `/home/sunny/bimanual-vla`。已确认交接消息被消费并开始 active turn；具体任务见 `HANDOFF.md`。
+
+## 2026-10-23：10000 步中期噪声评估
+
+第二次续训从完整 5000 步 checkpoint 恢复，训练 PID `2000120` 在独立 `codex-bimanual-jointtrim-resume-5000-20261023.scope` 中运行。保存期间按块释放当前 checkpoint 的写入缓存。10000 步 checkpoint 于 10:50:22 完成 Orbax 目录终结，根目录、`params` 和 `train_state` 元数据齐全；训练继续超过 10300 步。这证明本次 10000 步保存成功，但还不能证明后续保存均安全。
+
+用户要求不等到 20000 步，先使用已完成的 10000 步权重测试噪声。`evaluate_midpoint_10000.py` 已在独立 `codex-bimanual-jointtrim-midpoint-10000-20261023.scope` 启动，工作负载 PID `2836517`；状态文件为 `midpoint_10000_status.json`，退出记录为 `midpoint_10000_waiter_exit.json`，评估日志为 `midpoint_10000_evaluation.log`，结果目录为 `midpoint_10000_noise_evaluation/`。沿用 `evaluate_noise.py` 的真实图像、train/heldout、5/10 去噪步、原始预测、误差与二阶差分统计，无 RTC 和输出滤波。触发器仅在 checkpoint 完整、保存结束且稳定、可用内存至少 48 GiB、单卡空闲显存至少 23000 MiB 时启动。
+
+10:51:30 资源检查：checkpoint 已完整，系统可用内存约 76 GiB，但 GPU 0/1/2/3 空闲显存分别约 4992/8951/1832/18722 MiB，没有符合门槛的空卡；状态明确为 `waiting_idle_gpu`，尚无中期评估指标。Bridge 已登记 PID `2836517` 的持久监控与结束通知。原 20000 步训练继续。最终评估等待程序已改为在中期评估终态之后运行，新 PID `2901103` 位于独立 `codex-bimanual-jointtrim-final-after-midpoint-20261023.scope`，也已登记 Bridge 结束通知。两次评估均须凭退出码、`summary.json`、原始预测和日志核实，不能把等待状态写成成功。
