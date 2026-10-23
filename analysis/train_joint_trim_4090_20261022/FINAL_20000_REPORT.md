@@ -19,4 +19,4 @@
 
 用户确认原 `joint_dataset` 实为**左臂**，但左臂关节状态和左腕图像被误标为 `right`。本轮训练与评估沿用原标签，故 checkpoint 的 `action_contract.arm_side=right` 是训练溯源，不能全局改为 `left` 或交换模型槽位。20k 导出/部署应沿用已验证的 15k 兼容映射：`provenance.deployment_arm_side=left`；对外 `arm_side=left`、相机 `cam_left_wrist`；内部仍将该腕图送入 `right_wrist_0_rgb`，并保持左槽 mask 为 `false`。关节数值与 norm 不变。未来重建训练数据时再修正物理标签。此处只记录导出约束；离线误差评估没有验证真实机器人闭环表现。
 
-训练与评估退出记录分别为 `resume_from_5000_exit.json`、`resume_noise_waiter_5000_ordered_exit.json`；最终原始结果在 `final_noise_evaluation/`。15k 的部署目标与 manifest 路径仍需核对，复用时须验证上述每个字段及相机槽位，不能仅改显示名称。
+训练与评估退出记录分别为 `resume_from_5000_exit.json`、`resume_noise_waiter_5000_ordered_exit.json`；最终原始结果在 `final_noise_evaluation/`。15k 的部署记录位于 `analysis/joint_15000_local_20261023/`，目标是 RTX 5060 Laptop 的 `/home/user/models/pi05_5060/joint_trim_nopad_no_rtc_b4_20261022/`。20k 已准备 `transfer_manifest_20000.json`：仅覆盖 63 个推理参数/资产文件，共 6,176,496,207 bytes，并记录逐文件 SHA256；目标机传输、转换和服务验证仍待完成。复用时须验证上述每个字段及相机槽位，不能仅改显示名称。
