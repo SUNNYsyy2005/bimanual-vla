@@ -45,3 +45,7 @@
 10:51:30 资源检查：checkpoint 已完整，系统可用内存约 76 GiB，但 GPU 0/1/2/3 空闲显存分别约 4992/8951/1832/18722 MiB，没有符合门槛的空卡；状态明确为 `waiting_idle_gpu`，尚无中期评估指标。Bridge 已登记 PID `2836517` 的持久监控与结束通知。原 20000 步训练继续。最终评估等待程序已改为在中期评估终态之后运行，新 PID `2901103` 位于独立 `codex-bimanual-jointtrim-final-after-midpoint-20261023.scope`，也已登记 Bridge 结束通知。两次评估均须凭退出码、`summary.json`、原始预测和日志核实，不能把等待状态写成成功。
 
 随后用户明确授权在 GPU 3 共享试跑。10000 步评估完成 44 个观测 × 2 seeds × 2 去噪步数的全部 176 次推理；`results.json`、`summary.json` 和 176 个原始预测 NPZ 已核验完整且数值有限。等待包装进程在推理完成后收到 SIGTERM，退出码 `-15` 已保留，但产物状态标记为 `completed_artifact_verified`。具体指标、差异解释和执行证据见 [MIDPOINT_10000_REPORT.md](MIDPOINT_10000_REPORT.md)。原训练和最终评估仍继续。
+
+## 2026-10-23：最终训练与评估完成
+
+20k 训练和自动噪声评估均以退出码 0 结束，`20000` checkpoint 完整；最终 176 份原始预测、逐条结果和汇总均已核验。指标、10000 步对比及左臂物理标签的 20k 部署兼容映射见 [FINAL_20000_REPORT.md](FINAL_20000_REPORT.md)。训练与评估所用原 `right` 标签未改写；对外部署应标左臂，模型内部继续使用训练时的右腕槽位。

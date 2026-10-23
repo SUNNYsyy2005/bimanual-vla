@@ -1,0 +1,66 @@
+{
+  "checkpoint": "/mnt/nvme0n1p4_1T/sunny/tsq-storage/checkpoints/openpi/pi05_piper_single_arm_lora/joint_trim_nopad_no_rtc_b4_20261022/20000",
+  "script_sha256": "6c43f7ffe0ae142744e3ce082cc0a01c6bb80022e83f24c5a2892e73c1ae2e68",
+  "groups": [
+    {
+      "split": "train",
+      "steps": 5,
+      "predictions": 24,
+      "observations": 12,
+      "means": {
+        "noise_d2_correlation": 0.9760091650998071,
+        "mean_abs_d2_rad": 0.03338259067233163,
+        "demo_mean_abs_d2_rad": 0.0022169766404355564,
+        "joint_mae_rad": 0.04271934505557199,
+        "first5_joint_mae_rad": 0.021407047082674074,
+        "steps6_10_joint_mae_rad": 0.03391675715697243,
+        "gripper_mae_fraction": 0.02654531628728975
+      }
+    },
+    {
+      "split": "train",
+      "steps": 10,
+      "predictions": 24,
+      "observations": 12,
+      "means": {
+        "noise_d2_correlation": 0.9856346966078892,
+        "mean_abs_d2_rad": 0.035778541969362206,
+        "demo_mean_abs_d2_rad": 0.0022169766404355564,
+        "joint_mae_rad": 0.04655864007295782,
+        "first5_joint_mae_rad": 0.023005598504335062,
+        "steps6_10_joint_mae_rad": 0.036946100682822905,
+        "gripper_mae_fraction": 0.0276703860306305
+      }
+    },
+    {
+      "split": "heldout",
+      "steps": 5,
+      "predictions": 64,
+      "observations": 32,
+      "means": {
+        "noise_d2_correlation": 0.960668282642336,
+        "mean_abs_d2_rad": 0.03372508111010346,
+        "demo_mean_abs_d2_rad": 0.004190783412923338,
+        "joint_mae_rad": 0.09286716528241548,
+        "first5_joint_mae_rad": 0.02926032558100627,
+        "steps6_10_joint_mae_rad": 0.06013972020038498,
+        "gripper_mae_fraction": 0.06614915772572347
+      }
+    },
+    {
+      "split": "heldout",
+      "steps": 10,
+      "predictions": 64,
+      "observations": 32,
+      "means": {
+        "noise_d2_correlation": 0.9751363650744932,
+        "mean_abs_d2_rad": 0.03653400432375474,
+        "demo_mean_abs_d2_rad": 0.004190783412923338,
+        "joint_mae_rad": 0.09545253096532093,
+        "first5_joint_mae_rad": 0.030748755854143293,
+        "steps6_10_joint_mae_rad": 0.06262334557053341,
+        "gripper_mae_fraction": 0.06710634919768252
+      }
+    }
+  ]
+}
