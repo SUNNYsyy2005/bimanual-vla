@@ -158,11 +158,29 @@ if len(sys.argv)>4 and sys.argv[4]=='1':
   ids={v for v in ids if v and all(c in '0123456789_' for c in v)}
   if ids:
     try:
-      result=subprocess.run(['squeue','-h','-j',','.join(sorted(ids)),'-o','%A|%T'],capture_output=True,text=True,timeout=8)
+      # Query the user's queue: one expired ID must not invalidate all active IDs.
+      import getpass
+      result=subprocess.run(['squeue','-h','-u',getpass.getuser(),'-o','%A|%i|%T'],capture_output=True,text=True,timeout=8)
       if result.returncode==0:
         job_states={job:'NOT_IN_QUEUE' for job in ids}
-        job_states.update(dict(line.strip().split('|',1) for line in result.stdout.splitlines() if '|' in line))
+        for line in result.stdout.splitlines():
+          fields=line.strip().split('|')
+          if len(fields)==3:
+            for job in fields[:2]:
+              if job in ids: job_states[job]=fields[2]
     except (OSError,subprocess.TimeoutExpired): pass
+    missing=ids-{j for j,s in job_states.items() if s!='NOT_IN_QUEUE'}
+    if missing:
+      try:
+        result=subprocess.run(['sacct','-X','-n','-P','-S','1970-01-01','-j',','.join(sorted(missing)),
+                               '-o','JobIDRaw,JobID,State'],capture_output=True,text=True,timeout=8)
+        if result.returncode==0:
+          for line in result.stdout.splitlines():
+            fields=line.strip().split('|')
+            if len(fields)>=3 and '.' not in fields[0]:
+              for job in fields[:2]:
+                if job in missing: job_states[job]=fields[2].split()[0].rstrip('+')
+      except (OSError,subprocess.TimeoutExpired): pass
 print(json.dumps({'curves':curves,'events':events,'tracked':tracked,'statuses':statuses,'metadata':metadata,'job_states':job_states},separators=(',',':')))
 '''
 
@@ -302,7 +320,8 @@ def _run_updated_at(relative: str, tracked: dict[str, Any]) -> float | None:
 
 def _scan_root(source: dict[str, Any], root: str, max_depth: int, *, parse_events: bool = False) -> dict[str, Any]:
     python = str(source.get("python") or "python3")
-    flags = ["1" if parse_events else "0", "1" if source.get("query_slurm") else "0"]
+    query_slurm = source.get("query_slurm", bool(source.get("ssh_host")) and str(source.get("target", "")).lower() in {"h100", "h200"})
+    flags = ["1" if parse_events else "0", "1" if query_slurm else "0"]
     command = shlex.join([python, "-c", REMOTE_SCAN, root, str(max_depth), *flags])
     if source.get("ssh_host"):
         host = str(source.get("ssh_host") or "").strip()
@@ -460,10 +479,16 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
                 state = {'COMPLETE': 'completed', 'COMPLETED': 'completed', 'FAILED': 'failed', 'INTERRUPTED': 'stopped',
                          'STARTING': 'running', 'RUNNING': 'running'}.get(str(status).upper(), 'observed')
                 job_state = job_states.get(str(protocol.get('job_id')))
-                if state == 'running' and source.get('query_slurm'):
+                if state == 'running':
+                    # A protocol is a startup record, not a liveness heartbeat.
                     state = {'RUNNING': 'running', 'COMPLETING': 'running', 'PENDING': 'queued',
-                             'SUSPENDED': 'stopped'}.get(job_state, 'observed')
+                             'CONFIGURING': 'queued', 'SUSPENDED': 'stopped',
+                             'COMPLETED': 'completed', 'FAILED': 'failed', 'OUT_OF_MEMORY': 'failed',
+                             'TIMEOUT': 'stopped', 'CANCELLED': 'stopped', 'PREEMPTED': 'stopped',
+                             'NODE_FAIL': 'failed', 'BOOT_FAIL': 'failed'}.get(job_state, 'observed')
                 status_reason = f"Slurm {protocol.get('job_id', '-')}; {job_state or status}; {phase.get('name', '')}"
+                if state == 'observed' and str(status).upper() in {'RUNNING', 'STARTING'}:
+                    status_reason += '; protocol is stale or execution could not be verified'
                 if completion.get('error'):
                     status_reason += '; ' + str(completion['error'])[:300]
             runs.append({
