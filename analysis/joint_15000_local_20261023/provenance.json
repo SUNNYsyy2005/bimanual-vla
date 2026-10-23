@@ -45,5 +45,7 @@
     "parameters": 811,
     "unused_vocabulary_heads_removed": true
   },
-  "source_host": "4x4090"
+  "source_host": "4x4090",
+  "deployment_arm_side": "left",
+  "deployment_relabel_reason": "User confirmed physical left arm state and wrist video were labeled right during training; preserve original model camera slot and all numerical conventions."
 }

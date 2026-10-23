@@ -21,11 +21,15 @@ DELTA_MASK = [True] * 6 + [False] + [True] * 6 + [False]
 
 
 class PiperInputs:
-    def __init__(self, state_dim=14, arm_side='both'):
+    def __init__(self, state_dim=14, arm_side='both', training_arm_side=None):
         self.state_dim = state_dim
         self.arm_side = arm_side
+        self.training_arm_side = training_arm_side or arm_side
+        if state_dim == 7 and self.training_arm_side not in ('left', 'right'):
+            raise ValueError('Invalid training camera side')
         self.cameras = CAMERAS if state_dim == 14 else {
-            k: v for k, v in CAMERAS.items() if k in ('cam_high', f'cam_{arm_side}_wrist')}
+            'cam_high': 'base_0_rgb',
+            f'cam_{arm_side}_wrist': f'{self.training_arm_side}_wrist_0_rgb'}
 
     def __call__(self, data):
         state = np.asarray(data['state'], dtype=np.float32)
@@ -45,8 +49,8 @@ class PiperInputs:
             images[key] = image
         masks = {k: np.True_ for k in images}
         if self.state_dim == 7:
-            absent = 'left_wrist_0_rgb' if self.arm_side == 'right' else 'right_wrist_0_rgb'
-            images[absent] = np.zeros_like(images[f'{self.arm_side}_wrist_0_rgb'])
+            absent = 'left_wrist_0_rgb' if self.training_arm_side == 'right' else 'right_wrist_0_rgb'
+            images[absent] = np.zeros_like(images[f'{self.training_arm_side}_wrist_0_rgb'])
             masks[absent] = np.False_
         # Preserve training image token order, including the masked opposite wrist.
         images = {k: images[k] for k in CAMERAS.values()}
@@ -124,13 +128,16 @@ def create_policy(args):
             ('bimanual', 'joint', 14), ('single', 'joint', 7)):
         raise ValueError('Expected a single-arm or bimanual joint-space Piper contract')
     dim = contract['state_dim']
-    side = contract['arm_side']
+    training_side = contract['arm_side']
+    side = provenance.get('deployment_arm_side', training_side)
+    if dim != 7 and side != training_side:
+        raise ValueError('Arm-side relabeling is only supported for single-arm models')
     if dim == 7 and side not in ('left', 'right'):
         raise ValueError('Single-arm checkpoint must specify left or right')
     rtc = bool(settings['rtc_training'])
     delay = settings['rtc_training_max_delay'] if rtc else 0
     delta_mask = ([True] * 6 + [False]) * (dim // 7)
-    inputs = PiperInputs(dim, side)
+    inputs = PiperInputs(dim, side, training_side)
     prompt = args.prompt or provenance.get('default_prompt', 'put the bottle on the balck pad')
     norm_path = checkpoint / 'assets' / contract['dataset_id'] / 'norm_stats.json'
     raw = json.loads(norm_path.read_text())['norm_stats']
@@ -142,7 +149,7 @@ def create_policy(args):
     model, _ = load_model(str(checkpoint), 'bf16')
     if rtc:
         install_trained_sampler(model, delay)
-    metadata = dict(contract, action_dim=dim, wire_action_dim=dim,
+    metadata = dict(contract, arm_side=side, training_arm_side=training_side, action_dim=dim, wire_action_dim=dim,
         robot_type='piper_bimanual' if dim == 14 else 'piper', model_variant='pi05', checkpoint=str(checkpoint),
         checkpoint_step=15000, experiment=provenance.get('experiment', checkpoint.parent.name), precision='bf16',
         camera_keys=list(inputs.cameras), image_resize_mode='stretch', image_transport='raw',
