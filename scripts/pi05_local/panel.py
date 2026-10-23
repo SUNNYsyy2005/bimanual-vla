@@ -156,7 +156,7 @@ class PolicyPanel:
                 raise ValueError('需要已校验的 Piper 15k 检查点')
             self.model_valid = True
             rtc_label = f"RTC 最大延迟 {settings['rtc_training_max_delay']} 步" if settings['rtc_training'] else '无 RTC'
-            self.model_info.configure(text=f"训练步数 {data['checkpoint_step']:,}  ·  {rtc_label}  ·  {data['action_contract']['arm_mode']} / {data['action_contract']['arm_side']}\n{self.model_path()}")
+            self.model_info.configure(text=f"训练步数 {data['checkpoint_step']:,}  ·  {rtc_label}  ·  {data['action_contract']['arm_mode']} / {data.get('deployment_arm_side', data['action_contract']['arm_side'])}\n{self.model_path()}")
         except (OSError, ValueError, KeyError) as exc:
             self.model_info.configure(text=f'模型不可用：{exc}')
         self.buttons()

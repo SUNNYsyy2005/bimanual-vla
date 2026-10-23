@@ -20,6 +20,20 @@ class LocalPi05InputsTest(unittest.TestCase):
         self.assertTrue(result['image_mask']['right_wrist_0_rgb'])
         self.assertEqual(np.count_nonzero(result['image']['left_wrist_0_rgb']),0)
         self.assertEqual(result['state'].shape,(7,))
+    def test_left_relabel_preserves_training_tensors(self):
+        high=np.full((224,224,3),10,np.uint8); wrist=np.full_like(high,20)
+        state=np.arange(7,dtype=np.float32)/10
+        actions=np.tile(state,(50,1))
+        original=serve.PiperInputs(7,'right')({'state':state,'actions':actions,'images':{'cam_high':high,'cam_right_wrist':wrist}})
+        remapped=serve.PiperInputs(7,'left','right')({'state':state,'actions':actions,'images':{'cam_high':high,'cam_left_wrist':wrist}})
+        for key in ('state','actions'):
+            np.testing.assert_array_equal(original[key],remapped[key])
+        for key in original['image']:
+            np.testing.assert_array_equal(original['image'][key],remapped['image'][key])
+        self.assertEqual(original['image_mask'],remapped['image_mask'])
+        with self.assertRaises(ValueError):
+            serve.PiperInputs(7,'left','right')({'state':state,'images':{'cam_high':high,'cam_right_wrist':wrist}})
+
     def test_rejects_bimanual_state_on_single_policy(self):
         with self.assertRaises(ValueError):
             serve.PiperInputs(7,'right')({'state':np.zeros(14),'images':{}})

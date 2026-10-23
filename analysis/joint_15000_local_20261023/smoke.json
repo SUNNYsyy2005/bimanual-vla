@@ -13,7 +13,7 @@
     "dataset_id": "joint_trim_nopad_20261022",
     "schema": "joint",
     "arm_mode": "single",
-    "arm_side": "right",
+    "arm_side": "left",
     "state_dim": 7,
     "raw_action_dim": 7,
     "model_action_dim": 7,
@@ -31,6 +31,7 @@
     "state_gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
     "action_offset": 1,
     "model_action_start_offset": 1,
+    "training_arm_side": "right",
     "action_dim": 7,
     "wire_action_dim": 7,
     "robot_type": "piper",
@@ -41,7 +42,7 @@
     "precision": "bf16",
     "camera_keys": [
       "cam_high",
-      "cam_right_wrist"
+      "cam_left_wrist"
     ],
     "image_resize_mode": "stretch",
     "image_transport": "raw",
@@ -63,8 +64,8 @@
     "rtc_chunk_origin_reanchoring": true,
     "rtc_temporal_consistency": false,
     "denoising_steps": 5,
-    "policy_instance_id": "94940-1792729379550392015",
-    "policy_instance_started_at": 1792729379.5503943,
+    "policy_instance_id": "97392-1792730535063439045",
+    "policy_instance_started_at": 1792730535.0634408,
     "rtc_capabilities": {},
     "word_embedding_device": "cpu"
   },
@@ -72,54 +73,54 @@
   "frame": 40,
   "requests": [
     {
-      "seconds": 0.8100845229928382,
+      "seconds": 0.6418510609946679,
       "shape": [
         50,
         7
       ],
-      "joint_mae_rad": 0.03906374052166939
+      "joint_mae_rad": 0.08711107820272446
     },
     {
-      "seconds": 0.2908087690011598,
+      "seconds": 0.2537869710067753,
       "shape": [
         50,
         7
       ],
-      "joint_mae_rad": 0.05091266706585884
+      "joint_mae_rad": 0.04632965847849846
     },
     {
-      "seconds": 0.3379170850093942,
+      "seconds": 0.25651833799201995,
       "shape": [
         50,
         7
       ],
-      "joint_mae_rad": 0.0342692993581295
+      "joint_mae_rad": 0.04167653247714043
     },
     {
-      "seconds": 0.33587137701397296,
+      "seconds": 0.3115948340127943,
       "shape": [
         50,
         7
       ],
-      "joint_mae_rad": 0.042844258248806
+      "joint_mae_rad": 0.04639275372028351
     },
     {
-      "seconds": 0.29737201900570653,
+      "seconds": 0.26776868499291595,
       "shape": [
         50,
         7
       ],
-      "joint_mae_rad": 0.039765845984220505
+      "joint_mae_rad": 0.03215939924120903
     },
     {
-      "seconds": 0.32074364500294905,
+      "seconds": 0.25696608900034335,
       "shape": [
         50,
         7
       ],
-      "joint_mae_rad": 0.03805364668369293
+      "joint_mae_rad": 0.03391944244503975
     }
   ],
-  "warm_median_s": 0.32074364500294905,
+  "warm_median_s": 0.25696608900034335,
   "note": "One heldout observation, repeated stochastic outputs; not a benchmark or robot execution"
 }
