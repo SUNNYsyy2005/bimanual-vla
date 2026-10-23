@@ -18,3 +18,5 @@
 `midpoint_10000_status.json` 标记 `completed_artifact_verified`。已独立核对 44 个观测各有 seed 0/1 与 5/10 步的四条记录，176 条 `results.json` 行与 176 个 NPZ 文件一一对应，全部预测/真值/噪声数组有限且维度正确；四个 `summary.json` 分组均值与逐条结果一致。checkpoint 路径为本实验 `10000`，评估脚本 SHA256 与 manifest 一致，日志有 `COMPLETED`。
 
 用户随后明确授权 GPU 3 共享试跑，覆盖此前要求整卡空闲的约束。GPU 3 上已有另一服务占约 5.3 GiB；试跑将 JAX 显存预分配比例设为 0.65，推理子进程 PID 2962611 完成全部产物并释放显存。等待包装进程在推理完成后收到 SIGTERM，退出码为 `-15`；这个退出码保留在 `midpoint_gpu3_exit.json`，不代表模型推理失败。GPU 3 服务进程未被操作。此次评估结果不覆盖最终 `final_noise_evaluation/`；原 20k 训练及最终评估继续。
+
+运行时 `nvidia-smi` 显示评估进程在 GPU 3 占约 16064 MiB，原服务仍占约 5336 MiB；结束后 GPU 3 恢复为原服务约 5360 MiB、空闲约 18722 MiB。本次证明原先要求单卡空闲 23000 MiB 的门槛对**这次推理配置**过严；定向 GPU 3、启动前空闲至少 17000 MiB、XLA fraction 0.65 的试跑成功。这个实测余量不保证其他模型或并发负载也安全。
