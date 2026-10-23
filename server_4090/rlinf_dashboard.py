@@ -221,7 +221,7 @@ def _curve_points(value: Any) -> list[dict[str, Any]]:
         row: dict[str, Any] = {}
         # Expose small numerical diagnostics (e.g. PPO critic) without groups/actions.
         expanded = dict(item)
-        for namespace in ("critic", "ppo_advantage"):
+        for namespace in ("critic", "ppo_advantage", "ppo_update"):
             nested = item.get(namespace)
             if isinstance(nested, dict):
                 expanded.update({f"{namespace}.{key}": value for key, value in nested.items()})
@@ -457,6 +457,8 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
             algorithm = next((v.lower() for v in (cfg.get('algorithm'), protocol.get('algorithm'), source.get('method'), leaf) if isinstance(v, str) and v), leaf)
             if cfg.get('task_name'):
                 name = f"{label} / {cfg['task_name']}"
+            if cfg.get('algorithm_revision') == 'ppo-lag-v3-minibatch':
+                name += ' · PPO v3（续训）'
             state = task.get("state") if task else str(source.get("state", "observed"))
             status_reason = source.get("status_reason")
             synced_at, finished_at = None, None
@@ -500,6 +502,8 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
                 "name": name,
                 "method": algorithm,
                 "algorithm": algorithm,
+                "algorithm_revision": cfg.get('algorithm_revision'),
+                "algorithm_switch_after_round": next((p.get('round', 0)-1 for p in curves_for_run['training'] if 'ppo_update.optimizer_steps' in p), None),
                 "task_name": cfg.get('task_name'),
                 "job_id": protocol.get('job_id'),
                 "phase": phase.get('name'),
