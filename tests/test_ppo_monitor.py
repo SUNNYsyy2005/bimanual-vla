@@ -1,12 +1,15 @@
 import copy
+import contextlib
+import io
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from server_4090.rlinf_dashboard import scan_runs, metrics_for_run, _scan_root, _local_metadata
+from server_4090.rlinf_dashboard import scan_runs, metrics_for_run, _scan_root, _local_metadata, REMOTE_SCAN
 from server_4090.configure_ppo_monitor import configure_ppo_monitor
 
 
@@ -36,7 +39,7 @@ class PPOMonitorTest(unittest.TestCase):
 
     def test_zero_points_still_show_startup_and_completion_wins(self):
         self.put('training_curve.json',[]);self.put('evaluation_curve.json',[])
-        self.assertEqual(scan_runs(self.cfg)[0]['state'],'running')
+        self.assertEqual(scan_runs(self.cfg)[0]['state'],'observed')
         self.put('completion.json',dict(status='FAILED',error='numeric check failed'))
         run=scan_runs(self.cfg)[0]
         self.assertEqual(run['state'],'failed');self.assertIn('numeric check failed',run['status_reason'])
@@ -58,6 +61,38 @@ class PPOMonitorTest(unittest.TestCase):
     def test_explicit_stop_survives_stale_protocol(self):
         self.cfg['rlinf_dashboard']['sources'][0]['state']='stopped'
         self.assertEqual(scan_runs(self.cfg)[0]['state'],'stopped')
+
+    def test_slurm_terminal_states_override_stale_running_protocol(self):
+        cfg=copy.deepcopy(self.cfg);cfg['rlinf_dashboard']['sources'][0].update(python=sys.executable,query_slurm=True)
+        scan=_scan_root({'python':sys.executable},str(self.root),2)
+        for status,expected in [('COMPLETED','completed'),('FAILED','failed'),('OUT_OF_MEMORY','failed'),
+                                ('CANCELLED','stopped'),('TIMEOUT','stopped'),('PENDING','queued')]:
+            with self.subTest(status=status):
+                scan['job_states']={'123':status}
+                with patch('server_4090.rlinf_dashboard._scan_root',return_value=scan):
+                    run=scan_runs(cfg)[0]
+                    self.assertEqual(run['state'],expected);self.assertIn(status,run['status_reason'])
+
+    def test_completion_receipt_wins_over_failed_postprocessing_job(self):
+        self.put('completion.json',dict(status='COMPLETE'))
+        cfg=copy.deepcopy(self.cfg);cfg['rlinf_dashboard']['sources'][0].update(python=sys.executable,query_slurm=True)
+        scan=_scan_root({'python':sys.executable},str(self.root),2);scan['job_states']={'123':'FAILED'}
+        with patch('server_4090.rlinf_dashboard._scan_root',return_value=scan):
+            self.assertEqual(scan_runs(cfg)[0]['state'],'completed')
+
+    def test_remote_queue_arrays_and_terminal_accounting(self):
+        other=self.root/'old';other.mkdir()
+        (other/'protocol.json').write_text(json.dumps(dict(status='RUNNING',job_id='456')))
+        def respond(command,**kwargs):
+            if command[0]=='squeue':
+                self.assertIn('-u',command);self.assertNotIn('-j',command)
+                return subprocess.CompletedProcess(command,0,'123|120_1|RUNNING\n','')
+            self.assertEqual(command[0],'sacct')
+            return subprocess.CompletedProcess(command,0,'456|450_2|CANCELLED by 1000\n','')
+        output=io.StringIO()
+        with patch.object(sys,'argv',['scan',str(self.root),'2','0','1']), patch('subprocess.run',side_effect=respond), contextlib.redirect_stdout(output):
+            exec(compile(REMOTE_SCAN,'remote_scan','exec'),{})
+        self.assertEqual(json.loads(output.getvalue())['job_states'],{'123':'RUNNING','456':'CANCELLED'})
 
     def test_registration_is_idempotent_and_preserves_other_settings(self):
         config=dict(secret='fixture',rlinf_dashboard=dict(sources=[{'id':'existing'}],targets={'h100':{'profiles':{'grpo':{}}}}))
