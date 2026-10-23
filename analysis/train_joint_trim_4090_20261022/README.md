@@ -43,3 +43,5 @@
 用户要求不等到 20000 步，先使用已完成的 10000 步权重测试噪声。`evaluate_midpoint_10000.py` 已在独立 `codex-bimanual-jointtrim-midpoint-10000-20261023.scope` 启动，工作负载 PID `2836517`；状态文件为 `midpoint_10000_status.json`，退出记录为 `midpoint_10000_waiter_exit.json`，评估日志为 `midpoint_10000_evaluation.log`，结果目录为 `midpoint_10000_noise_evaluation/`。沿用 `evaluate_noise.py` 的真实图像、train/heldout、5/10 去噪步、原始预测、误差与二阶差分统计，无 RTC 和输出滤波。触发器仅在 checkpoint 完整、保存结束且稳定、可用内存至少 48 GiB、单卡空闲显存至少 23000 MiB 时启动。
 
 10:51:30 资源检查：checkpoint 已完整，系统可用内存约 76 GiB，但 GPU 0/1/2/3 空闲显存分别约 4992/8951/1832/18722 MiB，没有符合门槛的空卡；状态明确为 `waiting_idle_gpu`，尚无中期评估指标。Bridge 已登记 PID `2836517` 的持久监控与结束通知。原 20000 步训练继续。最终评估等待程序已改为在中期评估终态之后运行，新 PID `2901103` 位于独立 `codex-bimanual-jointtrim-final-after-midpoint-20261023.scope`，也已登记 Bridge 结束通知。两次评估均须凭退出码、`summary.json`、原始预测和日志核实，不能把等待状态写成成功。
+
+随后用户明确授权在 GPU 3 共享试跑。10000 步评估完成 44 个观测 × 2 seeds × 2 去噪步数的全部 176 次推理；`results.json`、`summary.json` 和 176 个原始预测 NPZ 已核验完整且数值有限。等待包装进程在推理完成后收到 SIGTERM，退出码 `-15` 已保留，但产物状态标记为 `completed_artifact_verified`。具体指标、差异解释和执行证据见 [MIDPOINT_10000_REPORT.md](MIDPOINT_10000_REPORT.md)。原训练和最终评估仍继续。

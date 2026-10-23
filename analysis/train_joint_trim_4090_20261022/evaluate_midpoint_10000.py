@@ -51,7 +51,7 @@ def idle_gpu() -> int | None:
          "--format=csv,noheader,nounits"], text=True)
     for line in inventory.splitlines():
         index, free, utilization = (float(field.strip()) for field in line.split(","))
-        if free >= 23000 and utilization < 5:
+        if int(index) == 3 and free >= 17000 and utilization < 5:
             return int(index)
     return None
 
@@ -111,7 +111,7 @@ def main() -> int:
             continue
         if gpu is None:
             record("waiting_idle_gpu", available_gib=round(available, 1),
-                   required_free_mib=23000)
+                   required_free_mib=17000, requested_gpu=3)
             time.sleep(30)
             continue
         # Recheck the save boundary immediately before inference starts.
@@ -120,7 +120,7 @@ def main() -> int:
             continue
         env = {key: value for key, value in os.environ.items()
                if not key.startswith("BIMANUAL_VLA_SERVER_")}
-        env.update(CUDA_VISIBLE_DEVICES=str(gpu), XLA_PYTHON_CLIENT_MEM_FRACTION="0.75",
+        env.update(CUDA_VISIBLE_DEVICES=str(gpu), XLA_PYTHON_CLIENT_MEM_FRACTION="0.65",
                    OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="2",
                    PYTHONPATH="/home/sunny/bimanual-vla:/home/sunny/robotwin_ws/RoboTwin/policy/pi05/src")
         record("evaluating", gpu=gpu, available_gib=round(available, 1))

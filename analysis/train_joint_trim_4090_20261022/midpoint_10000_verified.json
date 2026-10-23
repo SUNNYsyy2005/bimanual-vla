@@ -1,0 +1,23 @@
+{
+  "state": "completed_artifact_verified",
+  "checkpoint": "/mnt/nvme0n1p4_1T/sunny/tsq-storage/checkpoints/openpi/pi05_piper_single_arm_lora/joint_trim_nopad_no_rtc_b4_20261022/10000",
+  "output": "/home/sunny/bimanual-vla/analysis/train_joint_trim_4090_20261022/midpoint_10000_noise_evaluation",
+  "observed_at": "2026-10-23T11:00:23.638043+08:00",
+  "observations": 44,
+  "seeds": [
+    0,
+    1
+  ],
+  "denoising_steps": [
+    5,
+    10
+  ],
+  "prediction_files": 176,
+  "results_rows": 176,
+  "summary_groups": 4,
+  "all_finite": true,
+  "script_sha256": "6c43f7ffe0ae142744e3ce082cc0a01c6bb80022e83f24c5a2892e73c1ae2e68",
+  "evaluator_log_completed": true,
+  "wrapper_returncode": -15,
+  "wrapper_note": "SIGTERM reached the waiting wrapper after evaluate_noise.py had written COMPLETED, summary, results, and all 176 raw prediction files; -15 is not an evaluator failure."
+}
