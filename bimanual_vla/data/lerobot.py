@@ -563,6 +563,8 @@ class Pi0LeRobotDatasetWriter:
             for key, value in normalized_images.items():
                 raw_payload[f"observation.images.{key}"] = value
                 raw_payload[f"image_timestamps_{key}"] = image_timestamps[key]
+            if metadata and "terminal_padding" in metadata:
+                raw_payload["terminal_padding"] = np.asarray(bool(metadata["terminal_padding"]))
             if metadata:
                 for key, value in metadata.items():
                     raw_payload[f"meta.{key}"] = np.asarray(value)

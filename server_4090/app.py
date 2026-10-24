@@ -144,7 +144,7 @@ APP_DIR = Path(__file__).resolve().parent
 REPO_DIR = APP_DIR.parent
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-TASK_TYPES = {"norm", "train", "eval", "policy", "transfer"}
+TASK_TYPES = {"norm", "train", "eval", "policy", "transfer", "dataset_alignment"}
 PROCESS_STATES = {"starting", "running", "stopping"}
 WAITING_STATES = {"waiting_norm", "waiting_gpu"}
 TERMINAL_STATES = {"completed", "failed", "lost", "stopped", "skipped"}
@@ -4172,6 +4172,10 @@ def create_app(config_path: Path) -> Flask:
         validate_installed=validate_installed_dataset,
         assert_idle=assert_dataset_idle,
     )
+    from server_4090.dataset_timing_api import register_timing_routes
+    register_timing_routes(app, config=config, tasks=tasks, editor=dataset_editor,
+                           environment=lambda: build_environment(config, None),
+                           assert_idle=assert_dataset_idle)
     uploads = UploadManager(config, dataset_editor)
     observations = PolicyTelemetryStore(config)
     allowed_gpus = set(map(int, config["allowed_gpu_ids"]))

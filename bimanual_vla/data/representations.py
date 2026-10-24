@@ -36,6 +36,13 @@ def select_representation(data, target_schema=None):
                        ("joint_qpos", "joint_state")):
         if not np.array_equal(data[key], data[alias]):
             raise ValueError(f"dual recording {key} disagrees with {alias}")
+    joints = np.asarray(data["joint_state"])
+    if np.any(joints[:, 6::7] < 0) or np.any(joints[:, 6::7] > 1):
+        raise ValueError("joint gripper must use opening fraction in [0,1]")
+    if not np.allclose(joints[:, 6::7], np.asarray(data["eef_state"])[:, 9::10], atol=1e-6, rtol=0):
+        raise ValueError("joint/EEF gripper measurements disagree")
+    if np.max(np.abs(np.asarray(data["joint_state_timestamp"]) - np.asarray(data["eef_state_timestamp"]))) > .050:
+        raise ValueError("joint/EEF state timestamps differ by more than 50 ms")
     if not np.allclose(data["joint_actions"], derive_joint_actions(data["joint_state"]), atol=1e-6):
         raise ValueError("joint_actions must be next measured joint targets")
     expected_ts = next_observation_timestamps(data["joint_state_timestamp"], fps=source.fps)

@@ -13,6 +13,7 @@ from bimanual_vla.collection.camera import CameraCapture
 from bimanual_vla.collection.gui import build_dataset_tool_command, prepare_preview_frame
 from bimanual_vla.collection.output import read_robot_sample, PiperFeedbackStaleError
 from bimanual_vla.data.contract import EpisodeBuffer, EpisodeContract, build_delivery_state
+from bimanual_vla.data.check import check_dataset
 from bimanual_vla.data.export import export_dataset, inspect_npz_episode
 from bimanual_vla.data.image_resize import resize_stretch
 from bimanual_vla.data.upload import prepare_raw_npz_dataset
@@ -63,6 +64,7 @@ def test_one_recording_exports_both_training_contracts(tmp_path, mode, side, arm
         np.testing.assert_array_equal(spec["action_timestamps"][:-1], spec["state_timestamps"][1:])
         output = tmp_path / schema
         export_dataset(source, output, target_schema=schema)
+        assert check_dataset(output) == []
         info = json.loads((output / "meta/info.json").read_text())
         contract = json.loads((output / "meta/policy_contract.json").read_text())
         assert info["image_resize_mode"] == contract["image_resize_mode"] == "stretch"
@@ -215,3 +217,40 @@ def test_read_next_waits_for_new_camera_timestamp():
     assert camera.read_next({"cam_high": 99.9}).timestamps["cam_high"] == 100.0
     with pytest.raises(RuntimeError, match="fresh camera"):
         camera.read_next({"cam_high": 100.0}, timeout_s=.001)
+
+
+def test_actual_session_dual_capture_uses_camera_paced_30hz_and_sdk_stamps(tmp_path):
+    from bimanual_vla.collection.session import CollectionConfig, CollectionSession
+    from bimanual_vla.collection.output import RobotStateSample
+    clock = {"index": 0}
+    class Cameras:
+        def __init__(self, **kwargs): self.keys = kwargs["cam_ids"]
+        def open(self): pass
+        def close(self): pass
+        def start_background_capture(self): pass
+        def read_next(self, previous):
+            clock["index"] += 1
+            timestamp = 100 + clock["index"] / 30
+            return SimpleNamespace(images={key: np.full((224, 224, 3), 10 + clock["index"] + i*30, np.uint8) for i,key in enumerate(self.keys)},
+                timestamps={key: timestamp for key in self.keys})
+    def read_state(robot):
+        step = clock["index"]
+        timestamp = 100 + step / 30
+        qpos = np.asarray([step*.01]*6 + [step*.1], np.float32)
+        state = build_delivery_state([step*.01, 0, .2], np.eye(3), step*.1*.07)
+        return RobotStateSample(state, qpos, timestamp, {"left_joint":timestamp-.002,"left_eef":timestamp,"left_gripper":timestamp-.001})
+    robot = SimpleNamespace(DisconnectPort=lambda: None)
+    session = CollectionSession(CollectionConfig(output_dir=tmp_path, arm_side="left", record_both=True),
+        robot_connect=lambda _:robot, camera_factory=Cameras, state_reader=read_state,
+        camera_verifier=lambda cameras,fps:{}, gripper_command_reader=lambda robot:(None,None))
+    session.connect()
+    session.start_episode("cube", "pick up the cube")
+    for _ in range(5): session.capture_once()
+    session.stop_episode()
+    path, stats = session.save_episode(True)
+    assert stats.actual_fps == pytest.approx(30)
+    with np.load(path) as data:
+        assert data["fps"] == 30 and set(data["recorded_state_schemas"]) == {"joint", "delivery"}
+        assert data["feedback_timestamp_left_joint"][0] == pytest.approx(100+1/30-.002)
+        assert data["joint_state"].shape == (6,7)
+    session.disconnect()

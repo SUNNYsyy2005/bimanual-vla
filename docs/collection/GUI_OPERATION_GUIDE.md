@@ -342,7 +342,7 @@ unset BIMANUAL_VLA_SERVER_TOKEN
 
 - [ ] `can0`、`can1` 均为 `UP` 且有实时反馈。
 - [ ] 三路 RGB 相机画面和实际 `/dev/videoN` 正确。
-- [ ] Collection rate 为 `20 Hz`。
+- [ ] Collection rate 为 `30 Hz`，相机为 `30 FPS`，实际接收帧率检查通过。
 - [ ] Dataset、Task name 和 Instruction 正确。
 - [ ] 机械臂和场景位于安全起始状态。
 
@@ -385,3 +385,15 @@ SDK 与相机时间戳是**主机接收时间**，不是硬件触发/曝光时�
 bin/bimanual-vla data-export --input-dir episodes/cube --root datasets/cube_joint --target-schema joint
 bin/bimanual-vla data-export --input-dir episodes/cube --root datasets/cube_delivery --target-schema delivery
 ```
+
+
+## Dashboard 时间对齐
+
+在 Dashboard“数据集”面板找到已上传的数据，点击“时间对齐”：
+
+1. 选择目标频率与最大允许偏差，必要时填写每路相机时间修正（正值加到相机原时间戳）。未知延迟保持 0。
+2. 点击“检查并预览”，查看有效帧率、原相机相对状态的时间偏差与对齐后的最大偏差。相机实测只有 15 FPS 时，应选择 15 Hz；工具不会复制图像伪造 30 Hz。
+3. 检查通过后输入**新数据集名称**，点击“生成对齐数据集”。后台任务关闭网页后仍继续；在“最近的时间对齐任务”查看结果、日志或停止。
+4. 确认任务 completed、输出校验通过后，用新数据集计算模型 norm 并训练。原数据集不变，输出保留逐帧来源映射和原 episode 元数据副本。
+
+当前支持含原始状态、动作及各相机时间戳的 v3 joint / delivery 数据。Event 标注、未知附加列或缺原始时间戳会明确阻止转换。新旧臂标签不会在时间对齐中自动交换；若原始物理标签错误，需单独核验契约。接收时间对齐不等于硬件曝光同步。

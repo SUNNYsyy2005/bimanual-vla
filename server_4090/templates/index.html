@@ -406,6 +406,20 @@
         <div class="card half"><h2>上传数据集</h2><p>{{ "仿真数据上传执行：" if dashboard_profile == "simulation" else "真机采集机执行：" }}</p><pre id="uploadCommand">bin/bimanual-vla data-upload LEROBOT_OR_GUI_NPZ_DIR --name my_dataset --dataset-origin {{ upload_default_origin }} --server http://192.168.101.9:{{ server_port }} --token TOKEN --workers 4 --merge</pre><p class="muted">{{ "仿真 Dashboard 默认只接收并显示 --dataset-origin simulation 的数据；正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。" if dashboard_profile == "simulation" else "仿真数据上传时仍使用 --dataset-origin simulation，其暂存目录与真机数据隔离，并且不会出现在实机 Dashboard 列表或训练/Policy 数据集选择器中。正式 LeRobot 数据仍安装到兼容 OpenPI 的统一根目录，并写入来源 marker。" }}</p></div>
         <div class="card half"><h2>格式与媒体说明</h2><div class="section-note">Dashboard 可识别单臂 7D / 10D、双臂 14D / 20D 和其他自定义维度，并显示所有 <code>dtype: video</code> / <code>dtype: image</code> 相机。{{ "这里只呈现仿真数据集；可从本页面统一提交 4×4090 本地训练/评测或 H100/H200 Slurm 训练/评测。" if dashboard_profile == "simulation" else "这里只呈现真机和未分类数据集；将来源标记为仿真后，该数据集会从 Dashboard 隐藏，但数据集 ID 和底层训练加载路径不会改变。" }}</div></div>
         <div class="card"><h2>{{ "已接收仿真数据集" if dashboard_profile == "simulation" else "已接收真机数据集" }}</h2><div class="toolbar"><label style="margin:0">来源筛选</label><select id="datasetOriginFilter" class="dataset-origin-select"><option value="all">全部</option>{% for origin in visible_dataset_origins %}<option value="{{ origin }}">{{ "真机" if origin == "real" else "仿真" if origin == "simulation" else "未分类" }}</option>{% endfor %}</select><button class="inline secondary" type="button" onclick="loadDatasetLocations(true)">刷新 4×4090/H100/H200 位置</button><span id="datasetOriginSummary" class="muted">等待状态数据。</span></div><div class="table-wrap"><table class="dataset-table"><thead><tr><th>ID / 来源</th><th>位置 / 同步</th><th>规模</th><th>Schema / 相机</th><th>动作语义</th><th>操作</th></tr></thead><tbody id="datasets"></tbody></table></div><div id="datasetsPagination"></div></div>
+        <div class="card" id="datasetTimingPanel" hidden>
+          <h2>时间对齐 · <span id="timingDatasetName"></span></h2>
+          <p class="muted">检查相机、状态和动作的接收时间戳，按最近真实样本生成新数据集。原数据保留；低帧率图像不会复制成高帧率。缺少真实时间戳的数据不能自动修复。</p>
+          <div id="timingOptions" class="toolbar">
+            <label>输出频率<select id="timingFps"><option value="">沿用数据集频率</option><option value="15">15 Hz</option><option value="20">20 Hz</option><option value="25">25 Hz</option><option value="30">30 Hz</option></select></label>
+            <label>允许偏差（ms）<input id="timingTolerance" type="number" value="50" min="1" max="50"></label>
+          </div>
+          <div id="timingCameraOffsets" class="toolbar"></div>
+          <p class="muted">相机时间修正：正值加到原相机时间戳上；未知延迟请保留 0。接收时间对齐不等同于硬件曝光同步。</p>
+          <div class="toolbar"><label>新数据集名称<input id="timingTarget"></label><button id="timingInspect" class="secondary" type="button" onclick="inspectDatasetTiming()">检查并预览</button><button id="timingApply" type="button" onclick="applyDatasetTiming()" disabled>生成对齐数据集</button></div>
+          <div id="timingStatus" role="status" class="muted"></div>
+          <div id="timingReport" class="table-wrap"></div>
+          <details><summary onclick="loadTimingJobs()">最近的时间对齐任务（关闭页面后继续执行）</summary><div id="timingJobs"></div></details>
+        </div>
         <div class="card">
           <h2>数据传输任务</h2>
           <p class="muted">显示数据集、checkpoint 和评估视频 transfer 的实时状态；进度来自传输 runner 的 sidecar，旧任务会用目标目录清单做保守估算。</p>
@@ -1905,7 +1919,7 @@ function fillDatasets(items) {
           <td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps<br>${d.train_episodes == null ? '<span class="muted">尚未生成 train/test 划分</span>' : `<span class="pill">${esc(d.train_episodes)} train</span> <span class="pill">${esc(d.test_episodes)} test</span>`}<br>${(d.norm_model_variants || []).length ? `<span class="ok">norm ready: ${esc((d.norm_model_variants || []).map(modelVariantLabel).join(', '))}</span>` : '<span class="warn">norm 需计算或划分已变化</span>'}</td>
           <td><span class="pill">${esc(d.schema_label || d.schema)}</span> <span class="pill">${esc(d.arm_mode || '-')}</span> <span class="pill">${esc(d.dataset_layout || '-')}</span> <span class="pill">contract v${esc(d.contract_version || '?')}</span> ${d.training_supported ? '<span class="ok">训练兼容</span>' : '<span class="warn">仅管理 / 预览</span>'}<br><code>${esc(d.state_key || 'state?')}</code> ${esc(JSON.stringify(d.state_shape))} → <code>${esc(d.action_key || 'action?')}</code> ${esc(JSON.stringify(d.action_shape))}<br>state=${esc(d.state_dim || '?')}D · raw action=${esc(d.raw_action_dim || '?')}D · model/wire=${esc(d.model_action_dim || '?')}D · arm=${esc(d.arm_side || '-')}<br>${d.contract_error ? `<span class="bad">${esc(d.contract_error)}</span><br>` : ''}${d.training_error ? `<span class="warn">${esc(d.training_error)}</span><br>` : ''}${(d.media || []).map(m => `<span class="pill">${esc(m.type)} · ${esc(cameraDisplayName(m.key, d.arm_side))}</span>`).join(' ') || '<span class="muted">无相机媒体</span>'}</td>
           <td><strong>raw</strong> ${esc(d.raw_action_semantics || '-')}<br><span class="muted">convention=${esc(d.raw_action_convention || '-')}</span><br><strong>model</strong> ${esc(d.model_action_semantics || '-')}<br><span class="muted">convention=${esc(d.model_action_convention || '-')}</span><br><strong>gripper</strong> raw=${esc(d.raw_gripper_semantics || '-')} → wire=${esc(d.wire_gripper_semantics || '-')}<br><span class="muted">raw offset=${d.action_offset == null ? '-' : esc(d.action_offset)} · model start=+${esc(d.model_action_start_offset ?? 1)} step</span></td>
-          <td>${(d.remote_only || d.read_only) ? `<span class="muted">${d.remote_only ? '远端数据集：先同步到 4×4090 后可编辑。' : '外部读取目录数据集：只读；如需编辑请先同步到存储目录。'}</span>` : `<select class="dataset-origin-select" onchange="setDatasetOrigin('${esc(d.id)}', this.value)">${datasetOriginOptions(d.dataset_origin)}</select><br><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button><button class="inline secondary" onclick="renameDataset('${esc(d.id)}')">重命名</button><button class="inline danger" onclick="deleteDataset('${esc(d.id)}')">删除数据集</button>`}</td>
+          <td>${(d.remote_only || d.read_only) ? `<span class="muted">${d.remote_only ? '远端数据集：先同步到 4×4090 后可编辑。' : '外部读取目录数据集：只读；如需编辑请先同步到存储目录。'}</span>` : `<select class="dataset-origin-select" onchange="setDatasetOrigin('${esc(d.id)}', this.value)">${datasetOriginOptions(d.dataset_origin)}</select><br><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button><button class="inline secondary" onclick="renameDataset('${esc(d.id)}')">重命名</button><button class="inline danger" onclick="deleteDataset('${esc(d.id)}')">删除数据集</button>`}${!d.remote_only ? `<button class="inline secondary" onclick="openDatasetTiming('${esc(d.id)}')">时间对齐</button>` : ''}</td>
         </tr>`);
     }
   }
@@ -1954,6 +1968,122 @@ function updateMergeSourceOptions(items = (latestStatus && latestStatus.datasets
   source.innerHTML = choices.map(d => `<option value="${esc(d.id)}">[${esc(datasetOriginLabel(d.dataset_origin))}] ${esc(d.id)} · ${esc(d.episodes)} episodes</option>`).join('');
   if (choices.some(d => d.id === previous)) source.value = previous;
   document.getElementById('mergeDatasetButton').disabled = !target || !choices.length;
+}
+
+
+let timingDataset = '', timingPreviewTask = '', timingGeneration = 0;
+function invalidateTimingPreview() {
+  timingGeneration += 1;
+  timingPreviewTask = '';
+  document.getElementById('timingApply').disabled = true;
+  document.getElementById('timingInspect').disabled = false;
+}
+async function openDatasetTiming(datasetId) {
+  invalidateTimingPreview();
+  timingDataset = datasetId;
+  const generation = timingGeneration;
+  document.getElementById('datasetTimingPanel').hidden = false;
+  document.getElementById('timingDatasetName').textContent = datasetId;
+  document.getElementById('timingTarget').value = `${datasetId.slice(0, 115)}_aligned`;
+  document.getElementById('timingReport').innerHTML = '';
+  document.getElementById('timingStatus').textContent = '加载相机与频率…';
+  try {
+    const data = await api(`/api/datasets/${encodeURIComponent(datasetId)}?limit=1`);
+    if (generation !== timingGeneration) return;
+    const info = data.info || {};
+    const cameras = info.camera_keys || Object.keys(info.features || {}).filter(k => k.startsWith('observation.images.')).map(k => k.replace('observation.images.', ''));
+    document.getElementById('timingCameraOffsets').innerHTML = cameras.map(key => `<label>${esc(cameraDisplayName(key, info.arm_side))} 修正（ms）<input type="number" data-timing-camera="${esc(key)}" value="0" min="-1000" max="1000" step="1"></label>`).join('');
+    document.getElementById('timingFps').value = '';
+    document.getElementById('timingStatus').textContent = `原数据频率 ${info.fps || '?'} Hz。先检查时间偏差，再生成新数据集。`;
+    document.querySelectorAll('#timingOptions input, #timingOptions select, #timingCameraOffsets input').forEach(el => el.onchange = invalidateTimingPreview);
+    document.getElementById('datasetTimingPanel').scrollIntoView({behavior:'smooth', block:'start'});
+    await loadTimingJobs();
+  } catch (error) { show(error.message); }
+}
+function renderTimingReport(report) {
+  const target = document.getElementById('timingReport');
+  target.innerHTML = '';
+  if (!report) return;
+  if (report.error || (report.errors || []).length) {
+    const errors = document.createElement('pre');
+    errors.className = 'bad';
+    errors.textContent = report.error || report.errors.join('\n');
+    target.appendChild(errors);
+  }
+  if ((report.episodes || []).length) {
+    target.insertAdjacentHTML('beforeend', '<table><thead><tr><th>Episode</th><th>输入 → 输出帧数</th><th>各流有效 Hz</th><th>原相机时间－状态时间（中位数）</th><th>对齐后最大偏差</th></tr></thead><tbody>' + report.episodes.map(row => {
+      const worst = values => Math.max(0, ...Object.values(values || {}).map(v => Number(v.max_ms) || 0)).toFixed(2);
+      return `<tr><td>${esc(row.episode)}</td><td>${row.input_frames} → ${row.output_frames}</td><td>${Object.entries(row.effective_fps).map(([k,v]) => `${esc(k)}: ${Number(v).toFixed(2)}`).join('<br>')}</td><td>${Object.entries(row.before || {}).map(([k,v]) => `${esc(k)}: ${Number(v.signed_p50_ms).toFixed(2)} ms`).join('<br>')}</td><td>${worst(row.after)} ms</td></tr>`;
+    }).join('') + '</tbody></table>');
+  }
+  const note = document.createElement('p'); note.className = 'muted';
+  note.textContent = report.status === 'completed' ? `已生成 ${report.output_dataset}，输出校验通过。训练前请为新数据集重新计算所用模型的 norm。` : (report.note || '');
+  target.appendChild(note);
+}
+async function watchTimingTask(taskId, generation = timingGeneration) {
+  const datasetId = timingDataset;
+  while (generation === timingGeneration) {
+    const result = await api(`/api/datasets/${encodeURIComponent(datasetId)}/time-alignment/jobs/${encodeURIComponent(taskId)}`);
+    if (generation !== timingGeneration) return;
+    document.getElementById('timingStatus').textContent = `${taskId} · ${result.task.state}`;
+    if (!['starting', 'running', 'stopping', 'waiting'].includes(result.task.state)) {
+      renderTimingReport(result.report);
+      document.getElementById('timingInspect').disabled = false;
+      const valid = result.task.state === 'completed' && result.report?.status === 'inspected' && result.report.can_align;
+      if (valid) {
+        const options = result.report.options;
+        document.getElementById('timingFps').value = String(options.fps);
+        document.getElementById('timingTolerance').value = options.max_skew_ms;
+        document.querySelectorAll('[data-timing-camera]').forEach(el => { el.value = options.camera_offsets_ms[el.dataset.timingCamera] || 0; });
+      }
+      timingPreviewTask = valid ? taskId : '';
+      document.getElementById('timingApply').disabled = !valid;
+      if (!result.report) document.getElementById('timingStatus').textContent += ' · 未生成结果，请查看任务日志';
+      await loadTimingJobs();
+      if (result.report?.status === 'completed') await loadDatasetLocations(true);
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1500));
+  }
+}
+async function inspectDatasetTiming() {
+  if (!timingDataset) return;
+  invalidateTimingPreview();
+  const generation = timingGeneration;
+  document.getElementById('timingInspect').disabled = true;
+  const offsets = {};
+  document.querySelectorAll('[data-timing-camera]').forEach(el => { offsets[el.dataset.timingCamera] = Number(el.value); });
+  const payload = {fps: Number(document.getElementById('timingFps').value) || null,
+    max_skew_ms: Number(document.getElementById('timingTolerance').value), camera_offsets_ms: offsets};
+  try {
+    const task = await api(`/api/datasets/${encodeURIComponent(timingDataset)}/time-alignment/inspect`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    await watchTimingTask(task.id, generation);
+  } catch (error) { document.getElementById('timingInspect').disabled = false; show(error.message); }
+}
+async function applyDatasetTiming() {
+  if (!timingPreviewTask) return;
+  const previewTask = timingPreviewTask;
+  invalidateTimingPreview();
+  const generation = timingGeneration;
+  document.getElementById('timingInspect').disabled = true;
+  try {
+    const task = await api(`/api/datasets/${encodeURIComponent(timingDataset)}/time-alignment/apply`, {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({preview_task_id:previewTask, target_dataset_id:document.getElementById('timingTarget').value.trim()})});
+    await watchTimingTask(task.id, generation);
+  } catch (error) { document.getElementById('timingInspect').disabled = false; show(error.message); }
+}
+async function loadTimingJobs() {
+  if (!timingDataset) return;
+  const datasetId = timingDataset;
+  try {
+    const response = await api(`/api/tasks?type=dataset_alignment&dataset_id=${encodeURIComponent(datasetId)}&limit=10`);
+    if (datasetId !== timingDataset) return;
+    document.getElementById('timingJobs').innerHTML = (response.tasks || []).map(task => `<p><code>${esc(task.id)}</code> · ${esc(task.state)} <button class="inline secondary" onclick="reopenTimingTask('${esc(task.id)}')">结果 / 进度</button><button class="inline secondary" onclick="loadLog('${esc(task.id)}','training')">日志</button>${['starting','running'].includes(task.state) ? `<button class="inline danger" onclick="stopTask('${esc(task.id)}',false)">停止</button>` : ''}</p>`).join('') || '<p class="muted">暂无任务</p>';
+  } catch (error) { show(error.message); }
+}
+async function reopenTimingTask(taskId) {
+  invalidateTimingPreview();
+  try { await watchTimingTask(taskId); } catch (error) { show(error.message); }
 }
 
 async function openDatasetEditor(datasetId) {
