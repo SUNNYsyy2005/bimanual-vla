@@ -15,6 +15,8 @@ same-step master-arm targets use :mod:`teleop_single` or
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import argparse
 import pathlib
 import sys
@@ -122,7 +124,7 @@ def _require_fresh_feedback(
         timestamp = float(getattr(message, "time_stamp", 0.0) or 0.0)
         hz = float(getattr(message, "Hz", 0.0) or 0.0)
         age_s = now - timestamp if timestamp > 0 else float("inf")
-        if timestamp <= 0 or age_s > max_age_s or age_s < -1.0:
+        if not np.isfinite(timestamp) or timestamp <= 0 or age_s > max_age_s or age_s < -0.050:
             failures.append(f"{name}: age={age_s:.3f}s Hz={hz:.1f}")
     if failures:
         raise PiperFeedbackStaleError(
@@ -170,7 +172,7 @@ def read_output_gripper_command_sample(
         message = getter()
         timestamp = float(getattr(message, "time_stamp", 0.0) or 0.0)
         age_s = time.time() - timestamp if timestamp > 0 else float("inf")
-        if timestamp <= 0 or age_s > max_age_s or age_s < -1.0:
+        if not np.isfinite(timestamp) or timestamp <= 0 or age_s > max_age_s or age_s < -0.050:
             return None
         command = getattr(message, "gripper_ctrl", None)
         opening_m = abs(float(getattr(command, "grippers_angle"))) / GRIPPER_FACTOR
@@ -265,6 +267,54 @@ def read_output_state(piper: Any) -> tuple[np.ndarray, np.ndarray]:
     """Backwards-compatible return of single-arm 10D delivery state + 7D qpos."""
     qpos = read_output_qpos(piper)
     return read_output_delivery_state(piper, qpos), qpos
+
+
+@dataclass(frozen=True)
+class RobotStateSample:
+    state: np.ndarray
+    joint_qpos: np.ndarray
+    state_timestamp: float
+    feedback_timestamps: dict[str, float]
+
+
+def read_robot_sample(robot: Any, *, schema: str, arm_mode: str, arm_side: str) -> RobotStateSample:
+    """Snapshot CAN feedback and retain its SDK host-receive timestamps.
+
+    SDK messages are mutable caches. Copy each on read and reject samples whose
+    components are more than 50 ms apart or older than one collection period.
+    This is bounded software synchronization, not a hardware exposure trigger.
+    """
+    from copy import deepcopy
+
+    arms = {arm_side: robot} if arm_mode == SINGLE_ARM else robot
+    if arm_mode == BIMANUAL and (not isinstance(arms, dict) or set(arms) != {"left", "right"}):
+        raise ValueError("bimanual robot must contain left and right arms")
+    states, joints, stamps = [], [], {}
+    for side in ((arm_side,) if arm_mode == SINGLE_ARM else ("left", "right")):
+        arm = arms[side]
+        messages = {
+            "joint": deepcopy(arm.GetArmJointMsgs()),
+            "gripper": deepcopy(arm.GetArmGripperMsgs()),
+        }
+        if schema == DELIVERY_SCHEMA:
+            messages["eef"] = deepcopy(arm.GetArmEndPoseMsgs())
+        _require_fresh_feedback(messages, max_age_s=0.050)
+        stamps.update({f"{side}_{key}": float(value.time_stamp) for key, value in messages.items()})
+        qpos = _qpos_from_feedback(messages["joint"], messages["gripper"])
+        joints.append(qpos)
+        if schema == JOINT_SCHEMA:
+            states.append(qpos)
+        else:
+            pose = messages["eef"].end_pose
+            xyz = np.asarray([pose.X_axis, pose.Y_axis, pose.Z_axis], dtype=np.float64) / 1_000_000
+            rpy = np.deg2rad(np.asarray([pose.RX_axis, pose.RY_axis, pose.RZ_axis]) / 1000)
+            states.append(build_delivery_state(xyz, Rotation.from_euler("xyz", rpy).as_matrix(),
+                                               gripper_opening_m(float(qpos[6]))))
+    if max(stamps.values()) - min(stamps.values()) > 0.050:
+        raise PiperFeedbackStaleError("joint/EEF/gripper feedback synchronization exceeds 50 ms")
+    component = "eef" if schema == DELIVERY_SCHEMA else "joint"
+    timestamp = max(value for key, value in stamps.items() if key.endswith((component, "gripper")))
+    return RobotStateSample(np.concatenate(states), np.concatenate(joints), timestamp, stamps)
 
 
 def read_robot_state(
@@ -438,6 +488,12 @@ def verify_camera_streams(
             failures.append(
                 f"{key}: requested {expected_fps} FPS but negotiated {actual_fps:.3f} FPS"
             )
+    if not failures and hasattr(cameras, "measure_fps"):
+        measured = cameras.measure_fps()
+        for key, actual_fps in measured.items():
+            checks[key]["measured_fps"] = actual_fps
+            if not np.isfinite(actual_fps) or abs(actual_fps - expected_fps) / expected_fps > 0.05:
+                failures.append(f"{key}: requested {expected_fps} FPS but measured {actual_fps:.3f} FPS")
     if failures:
         raise RuntimeError("Camera verification failed: " + "; ".join(failures))
     return checks

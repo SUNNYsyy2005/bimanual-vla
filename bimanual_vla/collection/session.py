@@ -9,6 +9,8 @@ from enum import Enum
 from pathlib import Path
 import tempfile
 from typing import Any, Callable
+
+import numpy as np
 import time
 
 from bimanual_vla.collection.camera import CameraCapture
@@ -26,17 +28,16 @@ from bimanual_vla.collection.output import (
     connect,
     next_episode_index,
     read_robot_gripper_command_samples,
-    read_robot_state,
+    read_robot_sample,
+    RobotStateSample,
     verify_camera_streams,
 )
 from bimanual_vla.data.contract import (
     BIMANUAL,
-    DEFAULT_FPS,
     DEFAULT_ACTION_HORIZON,
     DELIVERY_SCHEMA,
-    DELIVERY_MEASURED_ACTION_SOURCE,
+    DELIVERY_COMMANDED_GRIPPER_ACTION_SOURCE,
     JOINT_MEASURED_ACTION_SOURCE,
-    IMAGE_HW,
     JOINT_SCHEMA,
     SINGLE_ARM,
     EpisodeBuffer,
@@ -57,11 +58,12 @@ class CollectionConfig:
     can_name: str = DEFAULT_CAN
     cam_high_device: str = DEFAULT_HIGH_DEVICE
     cam_wrist_device: str = DEFAULT_WRIST_DEVICE
-    capture_fps: int = DEFAULT_FPS
+    capture_fps: int = DEFAULT_CAMERA_FPS
     action_horizon: int = DEFAULT_ACTION_HORIZON
     camera_fps: int = DEFAULT_CAMERA_FPS
     output_dir: Path = Path("episodes_piper_v21")
     schema: str = DELIVERY_SCHEMA
+    record_both: bool = False
     arm_mode: str = SINGLE_ARM
     arm_side: str = "right"
     left_can_name: str = DEFAULT_LEFT_CAN
@@ -72,12 +74,14 @@ class CollectionConfig:
     def __post_init__(self):
         if self.capture_fps <= 0:
             raise ValueError("capture_fps must be positive")
-        if self.camera_fps <= 0:
-            raise ValueError("camera_fps must be positive")
+        if self.camera_fps not in (15, 30):
+            raise ValueError("camera_fps must be 15 or 30 on this rig")
         if self.action_horizon <= 0:
             raise ValueError("action_horizon must be positive")
         if self.capture_fps > self.camera_fps:
             raise ValueError("capture_fps cannot exceed camera_fps")
+        if self.record_both and self.schema != DELIVERY_SCHEMA:
+            raise ValueError("record_both requires the delivery primary schema")
         EpisodeContract(
             schema=self.schema,
             arm_mode=self.arm_mode,
@@ -125,7 +129,7 @@ class CollectionSession:
         config: CollectionConfig,
         robot_connect: Callable[[str], Any] = connect,
         camera_factory: Callable[..., CameraCapture] = CameraCapture,
-        state_reader: Callable[[Any], tuple[Any, Any]] | None = None,
+        state_reader: Callable[[Any], RobotStateSample | tuple[Any, Any]] | None = None,
         gripper_command_reader: Callable[[Any], Any | None] | None = None,
         camera_verifier: Callable[[Any, int], dict[str, dict]] = verify_camera_streams,
         episode_validator: Callable[..., EpisodeStats] = validate_episode,
@@ -134,10 +138,11 @@ class CollectionSession:
         self._robot_connect = robot_connect
         self._camera_factory = camera_factory
         self._state_reader = state_reader or (
-            lambda robot: read_robot_state(
+            lambda robot: read_robot_sample(
                 robot,
                 schema=self.config.schema,
                 arm_mode=self.config.arm_mode,
+                arm_side=self.config.arm_side,
             )
         )
         self._gripper_command_reader = gripper_command_reader or (
@@ -153,6 +158,7 @@ class CollectionSession:
         self.buffer: EpisodeBuffer | None = None
         self.label: EpisodeLabel | None = None
         self.camera_checks: dict[str, dict] = {}
+        self._last_camera_timestamps: dict[str, float] = {}
         self.episode_index = next_episode_index(Path(config.output_dir))
 
     def _wait_for_robot_feedback(self, robot: Any, timeout_s: float = 3.0) -> None:
@@ -212,12 +218,15 @@ class CollectionSession:
             cameras = self._camera_factory(
                 cam_ids=camera_ids,
                 fps=self.config.camera_fps,
-                image_hw=IMAGE_HW,
+                image_hw=(224, 224),
+                resize_mode="stretch",
                 capture_hw=CAMERA_SOURCE_HW,
                 parallel_reads=True,
             )
             cameras.open()
             checks = self._camera_verifier(cameras, self.config.camera_fps)
+            if hasattr(cameras, "start_background_capture"):
+                cameras.start_background_capture()
         except Exception:
             if "cameras" in locals():
                 cameras.close()
@@ -226,6 +235,7 @@ class CollectionSession:
             raise
         self.piper = piper
         self.cameras = cameras
+        self._last_camera_timestamps = {}
         self.camera_checks = checks
         self.state = SessionState.READY
         return checks
@@ -265,23 +275,29 @@ class CollectionSession:
             new_cameras = self._camera_factory(
                 cam_ids=camera_ids,
                 fps=self.config.camera_fps,
-                image_hw=IMAGE_HW,
+                image_hw=(224, 224),
+                resize_mode="stretch",
                 capture_hw=CAMERA_SOURCE_HW,
                 parallel_reads=True,
             )
             new_cameras.open()
             checks = self._camera_verifier(new_cameras, self.config.camera_fps)
+            if hasattr(new_cameras, "start_background_capture"):
+                new_cameras.start_background_capture()
         except Exception:
             if new_cameras is not None:
                 new_cameras.close()
             if old_cameras is not None:
                 try:
                     old_cameras.open()
+                    if hasattr(old_cameras, "start_background_capture"):
+                        old_cameras.start_background_capture()
                     self.cameras = old_cameras
                 except Exception:
                     self.cameras = None
             raise
         self.cameras = new_cameras
+        self._last_camera_timestamps = {}
         self.camera_checks = checks
         return checks
 
@@ -297,10 +313,13 @@ class CollectionSession:
             action_source=(
                 JOINT_MEASURED_ACTION_SOURCE
                 if self.config.schema == JOINT_SCHEMA
-                else DELIVERY_MEASURED_ACTION_SOURCE
+                else DELIVERY_COMMANDED_GRIPPER_ACTION_SOURCE
             ),
-            action_alignment="next_observation",
+            action_alignment=("next_observation" if self.config.schema == JOINT_SCHEMA
+                              else "next_observation_pose_same_step_gripper"),
             action_horizon=self.config.action_horizon,
+            record_both=self.config.record_both,
+            image_resize_mode="stretch",
         )
         self.state = SessionState.RECORDING
         return self.label
@@ -312,18 +331,44 @@ class CollectionSession:
             SessionState.REVIEW,
         }:
             raise RuntimeError("devices are not connected")
-        state, joint_qpos = self._state_reader(self.piper)
-        state_timestamp = time.time()
+        frame_set = None
+        if self.config.capture_fps == self.config.camera_fps and hasattr(self.cameras, "read_next"):
+            # At 30/30 Hz the camera stream is the clock. Two independent timers
+            # can otherwise select the same frame twice despite a healthy camera.
+            frame_set = self.cameras.read_next(self._last_camera_timestamps)
+        measured = self._state_reader(self.piper)
+        captured_monotonic = time.monotonic()
+        if isinstance(measured, RobotStateSample):
+            state, joint_qpos = measured.state, measured.joint_qpos
+            state_timestamp = measured.state_timestamp
+            feedback_timestamps = measured.feedback_timestamps
+        else:
+            state, joint_qpos = measured  # Compatibility for injected readers.
+            state_timestamp = time.time()
+            feedback_timestamps = None
         gripper_command_targets = None
         gripper_command_timestamps = None
         if self.config.schema == DELIVERY_SCHEMA:
             command_sample = self._gripper_command_reader(self.piper)
             if isinstance(command_sample, tuple) and len(command_sample) == 2:
                 gripper_command_targets, gripper_command_timestamps = command_sample
+                if gripper_command_targets is not None and gripper_command_timestamps is not None:
+                    gripper_command_targets = np.asarray(gripper_command_targets, dtype=np.float32).copy()
+                    gripper_command_timestamps = np.asarray(gripper_command_timestamps, dtype=np.float64).copy()
+                    aligned = np.isfinite(gripper_command_timestamps) & (np.abs(gripper_command_timestamps - state_timestamp) <= 0.050)
+                    gripper_command_targets[~aligned] = np.nan
+                    gripper_command_timestamps[~aligned] = np.nan
             else:
                 # Preserve custom value-only readers used by older UIs/tests.
                 gripper_command_targets = command_sample
-        images, image_timestamps = self.cameras.read()
+        if frame_set is not None:
+            images, image_timestamps = frame_set.images, frame_set.timestamps
+        elif hasattr(self.cameras, "read_nearest"):
+            frame_set = self.cameras.read_nearest(captured_monotonic)
+            images, image_timestamps = frame_set.images, frame_set.timestamps
+        else:
+            images, image_timestamps = self.cameras.read()
+        self._last_camera_timestamps = dict(image_timestamps)
         if self.state is SessionState.RECORDING:
             assert self.buffer is not None
             self.buffer.add(
@@ -334,6 +379,7 @@ class CollectionSession:
                 gripper_targets=gripper_command_targets,
                 gripper_command_timestamps=gripper_command_timestamps,
                 state_timestamp=state_timestamp,
+                feedback_timestamps=feedback_timestamps,
             )
         return CaptureSample(
             state=state,

@@ -231,6 +231,7 @@ class Pi0LeRobotDatasetWriter:
         save_raw_npz: bool = True,
         val_ratio: float = 0.1,
         schema: str = JOINT_SCHEMA,
+        image_resize_mode: str = "unspecified",
         arm_mode: str | None = None,
         arm_side: str = "right",
         action_semantics: str | None = None,
@@ -310,6 +311,7 @@ class Pi0LeRobotDatasetWriter:
             if key in contract_fields:
                 contract_kwargs[key] = value
         self.contract = EpisodeContract(**contract_kwargs)
+        self.image_resize_mode = image_resize_mode
         self.schema = self.contract.schema
         self.arm_mode = self.contract.arm_mode
         self.arm_side = self.contract.arm_side
@@ -772,7 +774,9 @@ class Pi0LeRobotDatasetWriter:
     def _contract_dict(self) -> dict[str, Any]:
         return {
             "contract_version": self.contract_version,
+            "fps": self.fps,
             "schema": self.schema,
+            "image_resize_mode": self.image_resize_mode,
             "arm_mode": self.arm_mode,
             "arm_side": self.arm_side,
             "state_dim": len(self.state_names),
@@ -859,7 +863,11 @@ class Pi0LeRobotDatasetWriter:
             try:
                 for frame in frames:
                     if frame.shape[:2] != (h, w):
-                        frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+                        if self.image_resize_mode == "stretch":
+                            from bimanual_vla.data.image_resize import resize_stretch
+                            frame = resize_stretch(frame, h, w)
+                        else:
+                            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
                     writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             finally:
                 writer.release()

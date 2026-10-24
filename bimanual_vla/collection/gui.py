@@ -64,9 +64,8 @@ from bimanual_vla.data.arm_geometry import normalize_arm_base_offset
 from bimanual_vla.data.panel import DataProcessPanel
 
 
-# ``CameraCapture`` keeps the model/data contract at 256x256 by letterboxing
-# the requested camera stream into a square. Recover each source stream's
-# aspect ratio before resizing so the live view is not stretched.
+# Collection uses 224x224 stretch images; legacy inference may still letterbox.
+# The preview restores the native aspect according to the active resize mode.
 CAMERA_PREVIEW_ASPECT = CAMERA_SOURCE_HW[1] / CAMERA_SOURCE_HW[0]
 PREVIEW_SLOTS = (
     ("high", "Overhead camera"),
@@ -447,7 +446,7 @@ def build_dataset_tool_command(
     module_name: str,
     source_dir: str | pathlib.Path,
     dataset_name: str,
-    fps: int,
+    fps: int | None,
     action: str,
     server: str = DEFAULT_SERVER,
     workers: int = 4,
@@ -455,10 +454,13 @@ def build_dataset_tool_command(
     allow_incomplete_gripper_coverage: bool = False,
     rebuild: bool = False,
     arm_base_offset: tuple[float, float, float] | None = None,
+    target_schema: str | None = None,
 ) -> list[str]:
     """Build a token-free uploader command for the GUI background worker."""
-    name = safe_dataset_name(dataset_name.strip())
-    if fps <= 0 or workers <= 0:
+    if target_schema not in (None, JOINT_SCHEMA, DELIVERY_SCHEMA):
+        raise ValueError("target schema must be joint or delivery")
+    name = safe_dataset_name(dataset_name.strip() + (f"_{target_schema}" if target_schema else ""))
+    if (fps is not None and fps <= 0) or workers <= 0:
         raise ValueError("FPS and upload workers must be positive")
     if action not in {"prepare", "upload"}:
         raise ValueError(f"unsupported dataset action: {action}")
@@ -472,9 +474,11 @@ def build_dataset_tool_command(
         str(source),
         "--name",
         name,
-        "--fps",
-        str(fps),
     ]
+    if fps is not None:
+        command.extend(("--fps", str(fps)))
+    if target_schema is not None:
+        command.extend(("--target-schema", target_schema))
     if allow_incomplete_gripper_coverage:
         command.append("--allow-incomplete-gripper-coverage")
     if rebuild:
@@ -803,6 +807,7 @@ def prepare_preview_frame(
     frame: np.ndarray,
     *,
     target_aspect: float = CAMERA_PREVIEW_ASPECT,
+    resize_mode: str = "pad",
 ) -> np.ndarray | None:
     """Convert a camera frame to HWC RGB and remove capture letterboxing.
 
@@ -821,6 +826,8 @@ def prepare_preview_frame(
         raise ValueError("target_aspect must be positive and finite")
 
     height, width = rgb.shape[:2]
+    if resize_mode == "stretch":
+        return cv2.resize(rgb, (max(1, round(height * target_aspect)), height), interpolation=cv2.INTER_LINEAR)
     current_aspect = width / height
     if current_aspect > target_aspect:
         # Wider than the source stream: trim the side padding.
@@ -840,12 +847,13 @@ def letterbox_preview_frame(
     *,
     target_hw: tuple[int, int] = PREVIEW_DEFAULT_HW,
     source_aspect: float = CAMERA_PREVIEW_ASPECT,
+    resize_mode: str = "pad",
 ) -> np.ndarray | None:
     """Render a camera frame into a fixed rectangle without distortion."""
     target_h, target_w = (int(value) for value in target_hw)
     if target_h <= 0 or target_w <= 0:
         raise ValueError("target_hw values must be positive")
-    rgb = prepare_preview_frame(frame, target_aspect=source_aspect)
+    rgb = prepare_preview_frame(frame, target_aspect=source_aspect, resize_mode=resize_mode)
     if rgb is None:
         return None
     height, width = rgb.shape[:2]
@@ -937,7 +945,7 @@ class CollectorGUI:
         self._space_pressed = False
         self._space_action_pending = False
         self.episode_index = 0
-        self.capture_fps = 20
+        self.capture_fps = DEFAULT_CAMERA_FPS
         self.camera_fps = DEFAULT_CAMERA_FPS
 
         # PhotoImage references must be retained for Tk to keep them alive.
@@ -950,8 +958,9 @@ class CollectorGUI:
         self.episode_paths: dict[str, pathlib.Path] = {}
         self.preview_key_to_slot: dict[str, str] = {}
         self.arm_mode_var = tk.StringVar(value=BIMANUAL)
-        self.schema_var = tk.StringVar(value=DELIVERY_SCHEMA)
-        self.arm_side_var = tk.StringVar(value="right")
+        self.schema_var = tk.StringVar(value="both")
+        self.dataset_schema_var = tk.StringVar(value="joint")
+        self.arm_side_var = tk.StringVar(value=str(self.gui_preferences.get("collection_arm_side") or "left"))
         self.can_var = tk.StringVar(value=str(self.gui_preferences.get("can_selector") or DEFAULT_CAN))
         self.left_can_var = tk.StringVar(value=str(self.gui_preferences.get("left_can_selector") or DEFAULT_LEFT_CAN))
         self.right_can_var = tk.StringVar(value=str(self.gui_preferences.get("right_can_selector") or DEFAULT_RIGHT_CAN))
@@ -963,7 +972,7 @@ class CollectorGUI:
         self.right_wrist_var = tk.StringVar(
             value=str(self.gui_preferences.get("right_wrist_device") or DEFAULT_RIGHT_WRIST_DEVICE)
         )
-        self.fps_var = tk.StringVar(value="20")
+        self.fps_var = tk.StringVar(value=str(DEFAULT_CAMERA_FPS))
         self.camera_fps_var = tk.StringVar(value=str(DEFAULT_CAMERA_FPS))
         self.out_var = tk.StringVar(value="episodes_piper_v21")
         self.task_var = tk.StringVar(value="pick_cube")
@@ -1392,7 +1401,7 @@ class CollectorGUI:
             (
                 "Collection format",
                 self.schema_var,
-                (("Joint", JOINT_SCHEMA), ("End-effector", DELIVERY_SCHEMA)),
+                (("Joint + End-effector", "both"), ("Joint", JOINT_SCHEMA), ("End-effector", DELIVERY_SCHEMA)),
             ),
             ("Single-arm side", self.arm_side_var, (("right", "right"), ("left", "left"))),
         ]
@@ -2161,7 +2170,7 @@ class CollectorGUI:
 
     @property
     def schema(self) -> str:
-        return self.schema_var.get()
+        return DELIVERY_SCHEMA if self.schema_var.get() == "both" else self.schema_var.get()
 
     @property
     def arm_side(self) -> str:
@@ -2485,6 +2494,7 @@ class CollectorGUI:
             "inference_ik_rate_limit_enabled": self.inference_ik_rate_limit_var.get(),
             "inference_ik_max_joint_step_rad": self.inference_ik_max_step_var.get().strip(),
             "left_wrist_device": self.left_wrist_var.get().strip(),
+            "collection_arm_side": self.arm_side_var.get(),
             "right_wrist_device": self.right_wrist_var.get().strip(),
             "swap_wrist_cameras": bool(self.swap_wrist_cameras_var.get()),
         }
@@ -2655,8 +2665,8 @@ class CollectorGUI:
             try:
                 fps = int(pending["Collection rate (Hz)"].get())
                 camera_fps = int(pending["Camera rate (Hz)"].get())
-                if fps <= 0 or camera_fps <= 0 or fps > camera_fps:
-                    raise ValueError("rates must be positive and collection rate cannot exceed camera rate")
+                if fps <= 0 or camera_fps not in (15, 30) or fps > camera_fps:
+                    raise ValueError("camera rate must be 15 or 30; collection rate must be positive and no higher")
                 can_values = (
                     (pending["Left-arm CAN (serial)"].get(), pending["Right-arm CAN (serial)"].get())
                     if self.arm_mode == BIMANUAL
@@ -3306,6 +3316,7 @@ class CollectorGUI:
                     camera_fps=camera_fps,
                     output_dir=self.out_dir,
                     schema=self.schema,
+                    record_both=self.schema_var.get() == "both",
                     arm_mode=self.arm_mode,
                     arm_side=self.arm_side,
                     left_can_name=self.left_can_var.get().strip(),
@@ -3485,7 +3496,7 @@ class CollectorGUI:
         dt = 1.0 / fps
         try:
             while not self.capture_stop.is_set():
-                t0 = time.time()
+                t0 = time.monotonic()
                 with self.data_lock:
                     if self.session is None:
                         return
@@ -3501,7 +3512,9 @@ class CollectorGUI:
                     count = self.session.frame_count if is_recording else 0
                 if is_recording:
                     self.messages.put(("progress", count))
-                delay = dt - (time.time() - t0)
+                camera_paced = (fps == self.camera_fps and self.session is not None
+                                and hasattr(self.session.cameras, "read_next"))
+                delay = 0 if camera_paced else dt - (time.monotonic() - t0)
                 if delay > 0:
                     time.sleep(delay)
         except Exception as exc:
@@ -3658,6 +3671,7 @@ class CollectorGUI:
                     frame,
                     target_hw=(target_h, target_w),
                     source_aspect=source_aspect,
+                    resize_mode=getattr(self.cameras, "resize_mode", "pad"),
                 )
                 if rgb is None:
                     continue
@@ -3686,6 +3700,7 @@ class CollectorGUI:
                 frame,
                 target_hw=(target_h, target_w),
                 source_aspect=source_aspect,
+                resize_mode=getattr(self.cameras, "resize_mode", "pad"),
             )
             if rgb is None:
                 continue
@@ -3808,8 +3823,14 @@ class CollectorGUI:
             values=("merge", "install", "overwrite"),
             state="readonly",
         ).grid(row=8, column=1, sticky="ew", padx=(8, 0), pady=4)
+        ttk.Label(form, text="Training representation", width=18).grid(row=9, column=0, sticky="w", pady=4)
+        ttk.Combobox(form, textvariable=self.dataset_schema_var,
+                     values=("joint", "delivery", "As recorded"), state="readonly").grid(
+                         row=9, column=1, sticky="ew", padx=(8, 0), pady=4)
+        ttk.Label(form, text="joint: joint angles; delivery: end-effector pose. Each uses its own dataset suffix.").grid(
+            row=10, column=0, columnspan=2, sticky="w")
         options = ttk.Frame(form)
-        options.grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        options.grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(
             options,
             text="Allow incomplete gripper coverage",
@@ -3890,7 +3911,7 @@ class CollectorGUI:
             source = self.out_dir.resolve()
             if not any(source.glob("ep_*.npz")):
                 raise ValueError(f"no ep_*.npz files found in {source}")
-            fps = int(self.fps_var.get())
+            fps = None  # Read recorded FPS, including existing 20 Hz datasets.
             workers = int(self.dataset_workers_var.get())
             command = build_dataset_tool_command(
                 python_executable=sys.executable,
@@ -3905,6 +3926,7 @@ class CollectorGUI:
                 allow_incomplete_gripper_coverage=self.dataset_allow_gripper_var.get(),
                 rebuild=self.dataset_rebuild_var.get(),
                 arm_base_offset=self._dataset_arm_base_offset(action),
+                target_schema={"joint": JOINT_SCHEMA, "delivery": DELIVERY_SCHEMA, "As recorded": None}[self.dataset_schema_var.get()],
             )
             environment = os.environ.copy()
             if action == "upload":

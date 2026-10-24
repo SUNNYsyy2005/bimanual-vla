@@ -139,10 +139,18 @@ def _legacy_matches_next_measured(states: np.ndarray, actions: np.ndarray, arm_c
     return expected.shape == actions.shape and bool(np.allclose(actions, expected, atol=1e-5, rtol=1e-5))
 
 
-def inspect_npz_episode(path: str | Path, *, fps: int = 20) -> dict[str, Any]:
+def inspect_npz_episode(path: str | Path, *, fps: int | None = None, target_schema: str | None = None) -> dict[str, Any]:
     """Load and validate one raw NPZ using shape/metadata duck typing."""
     path = Path(path)
-    with np.load(path, allow_pickle=False) as data:
+    from bimanual_vla.data.representations import select_representation
+    with np.load(path, allow_pickle=False) as raw_data:
+        fps = int(_scalar(raw_data, "fps", 20)) if fps is None else fps
+        if "collection_format_version" in raw_data:
+            from bimanual_vla.data.validate import validate_episode
+            validate_episode(path, target_fps=fps)
+        data = select_representation(raw_data, target_schema)
+        if "fps" in data and int(_scalar(data, "fps")) != fps:
+            raise ValueError(f"{path}: requested FPS {fps} differs from recorded FPS {_scalar(data, 'fps')}; resampling is required")
         state, state_field = _array(data, ("observation.state", "state", "qpos", "joint_qpos"))
         action, action_field = _array(data, ("action", "actions"))
         states = np.asarray(state, dtype=np.float32)
@@ -290,10 +298,17 @@ def inspect_npz_episode(path: str | Path, *, fps: int = 20) -> dict[str, Any]:
             "source_timestamp_field": timestamp_field,
             "source_camera_fields": image_fields,
             "legacy_next_measured_verified": bool(legacy_next_measured),
+            "source_recorded_state_schemas": np.asarray(data["recorded_state_schemas"]).tolist() if "recorded_state_schemas" in data else [dimensions["schema"]],
+            "image_resize_mode": _text(data, "image_resize_mode", "unspecified"),
         }
+        if dimensions["schema"] == "delivery":
+            for key in ("pose_action_source", "pose_action_alignment", "gripper_action_source", "gripper_action_alignment"):
+                if key in data:
+                    metadata[key] = _text(data, key)
         return {
             **dimensions,
             "path": path,
+            "image_resize_mode": _text(data, "image_resize_mode", "unspecified"),
             "states": states,
             "actions": actions,
             "timestamps": timestamps,
@@ -337,7 +352,7 @@ def _homogeneous_key(spec: dict[str, Any]) -> tuple[Any, ...]:
             "schema", "arm_mode", "arm_side", "state_dim", "raw_action_dim",
             "model_action_dim", "state_names", "action_names", "camera_keys",
             "action_semantics", "action_source", "action_alignment", "action_offset",
-            "gripper_semantics", "rotation_semantics", "coordinate_frame", "legacy_format",
+            "gripper_semantics", "rotation_semantics", "coordinate_frame", "legacy_format", "image_resize_mode",
         )
     )
 
@@ -346,14 +361,17 @@ def _validate_inputs(
     paths: list[Path],
     target_fps: float,
     allow_incomplete_gripper_coverage: bool = False,
+    target_schema: str | None = None,
 ) -> list[dict[str, Any]]:
     del allow_incomplete_gripper_coverage  # Shape/range checks are per episode; coverage is not fabricated.
     episodes: list[dict[str, Any]] = []
     failures: list[str] = []
     for path in paths:
         try:
-            episode = inspect_npz_episode(path, fps=int(target_fps))
-            episodes.append(episode)
+            episode = inspect_npz_episode(path, fps=int(target_fps), target_schema=target_schema)
+            episodes.append({key: value for key, value in episode.items() if key not in {
+                "states", "actions", "timestamps", "state_timestamps", "action_timestamps", "image_timestamps", "images"
+            }})
             print(
                 f"OK {path}: schema={episode['schema']} arm={episode['arm_mode']} "
                 f"state/action={episode['state_dim']}/{episode['raw_action_dim']} "
@@ -455,10 +473,11 @@ def export_dataset(
     input_dir: str | Path,
     root: str | Path,
     *,
-    fps: int = 20,
+    fps: int | None = None,
     allow_incomplete_gripper_coverage: bool = False,
     validate_only: bool = False,
     arm_base_offset: Any = None,
+    target_schema: str | None = None,
 ) -> Path | None:
     """Validate GUI NPZ episodes and export successful ones to LeRobot v2.1."""
     input_root = Path(input_dir).expanduser()
@@ -466,7 +485,10 @@ def export_dataset(
     if not paths:
         raise SystemExit(f"No episodes found in {input_root}")
 
-    episodes = _validate_inputs(paths, fps, allow_incomplete_gripper_coverage)
+    if fps is None:
+        with np.load(paths[0], allow_pickle=False) as first_raw:
+            fps = int(_scalar(first_raw, "fps", 20))
+    episodes = _validate_inputs(paths, fps, allow_incomplete_gripper_coverage, target_schema)
     if not episodes:
         raise SystemExit("No successful episodes are available for export")
     if validate_only:
@@ -484,6 +506,7 @@ def export_dataset(
         action_names=list(first["action_names"]),
         camera_keys=list(first["camera_keys"]),
         image_hw=(224, 224),
+        image_resize_mode=first["image_resize_mode"],
         schema=first["schema"],
         arm_mode=first["arm_mode"],
         arm_side=first["arm_side"],
@@ -502,7 +525,8 @@ def export_dataset(
     )
 
     frames = 0
-    for count, item in enumerate(episodes, start=1):
+    for count, summary in enumerate(episodes, start=1):
+        item = inspect_npz_episode(summary["path"], fps=fps, target_schema=target_schema)
         index = writer.append_episode(**_load_episode(item["path"], spec=item))
         frames += len(item["states"])
         print(
@@ -526,6 +550,7 @@ def run(args):
         allow_incomplete_gripper_coverage=args.allow_incomplete_gripper_coverage,
         validate_only=args.validate_only,
         arm_base_offset=args.arm_base_offset,
+        target_schema=getattr(args, "target_schema", None),
     )
 
 
@@ -534,7 +559,8 @@ def main():
     ap.add_argument("--input-dir", default="episodes_piper_v21")
     ap.add_argument("--repo-id", default="piper/piper_v1")
     ap.add_argument("--root", default="piper/piper_v1")
-    ap.add_argument("--fps", type=int, default=20)
+    ap.add_argument("--fps", type=int, default=None, help="expected FPS; defaults to recorded metadata (legacy: 20)")
+    ap.add_argument("--target-schema", choices=("joint", "delivery"), help="select training representation from dual recordings")
     ap.add_argument("--validate-only", action="store_true")
     ap.add_argument("--arm-base-offset", nargs=3, type=float, metavar=("X_M", "Y_M", "Z_M"))
     ap.add_argument(

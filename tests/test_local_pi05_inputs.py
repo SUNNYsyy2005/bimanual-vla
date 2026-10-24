@@ -41,6 +41,12 @@ class LocalPi05InputsTest(unittest.TestCase):
         result=serve.PiperInputs()({'state':np.zeros(14),'images':{k:np.zeros((224,224,3),np.uint8) for k in serve.CAMERAS}})
         self.assertTrue(all(result['image_mask'].values()))
         self.assertEqual(result['state'].shape,(14,))
+    def test_model_rate_comes_from_contract(self):
+        self.assertEqual(serve.policy_timing_metadata({})['action_hz'], 20.0)
+        self.assertEqual(serve.policy_timing_metadata({'fps': 30})['action_time_step_s'], 1/30)
+        with self.assertRaises(ValueError):
+            serve.policy_timing_metadata({'fps': float('nan')})
+
     def test_physical_output_slicing(self):
         a=np.arange(50*32,dtype=np.float32).reshape(50,32)
         np.testing.assert_array_equal(serve.PiperOutputs(7)({'actions':a})['actions'],a[:,:7])
