@@ -65,7 +65,7 @@ class FakeCameras:
 
     def read(self):
         self.counter += 1
-        now = 100.0 + self.counter * 0.05
+        now = time.time()
         frames = {
             key: np.full((*IMAGE_HW, 3), 20 + index + self.counter, dtype=np.uint8)
             for index, key in enumerate(self.kwargs["cam_ids"])
@@ -372,7 +372,7 @@ class CollectionSessionTest(unittest.TestCase):
         state[6], state[13] = 0.2, 0.8
         with tempfile.TemporaryDirectory() as directory:
             session = CollectionSession(
-                CollectionConfig(output_dir=Path(directory), schema=JOINT_SCHEMA, arm_mode=BIMANUAL, arm_side="both", left_can_name="can_left", right_can_name="can_right"),
+                CollectionConfig(capture_fps=20, output_dir=Path(directory), schema=JOINT_SCHEMA, arm_mode=BIMANUAL, arm_side="both", left_can_name="can_left", right_can_name="can_right"),
                 robot_connect=robots.__getitem__, camera_factory=FakeCameras,
                 state_reader=lambda robot: (state, state.copy()),
                 camera_verifier=lambda cameras, fps: {key: {"ok": True, "fps": fps} for key in cameras.kwargs["cam_ids"]},
@@ -397,7 +397,7 @@ class CollectionSessionTest(unittest.TestCase):
         qpos = np.zeros(14, dtype=np.float32)
         with tempfile.TemporaryDirectory() as directory:
             session = CollectionSession(
-                CollectionConfig(output_dir=Path(directory), schema=DELIVERY_SCHEMA, arm_mode=BIMANUAL, arm_side="both", left_can_name="can_left", right_can_name="can_right"),
+                CollectionConfig(capture_fps=20, output_dir=Path(directory), schema=DELIVERY_SCHEMA, arm_mode=BIMANUAL, arm_side="both", left_can_name="can_left", right_can_name="can_right"),
                 robot_connect=robots.__getitem__, camera_factory=FakeCameras,
                 state_reader=lambda robot: (state, qpos),
                 camera_verifier=lambda cameras, fps: {key: {"ok": True, "fps": fps} for key in cameras.kwargs["cam_ids"]},
@@ -410,7 +410,7 @@ class CollectionSessionTest(unittest.TestCase):
                 self.assertEqual(data["actions"].shape, (2, 20))
                 self.assertEqual(data["raw_action_dim"].item(), 20)
                 self.assertEqual(data["model_action_dim"].item(), 14)
-                self.assertEqual(data["action_source"].item(), "next_measured_eef_fallback")
+                self.assertEqual(data["action_source"].item(), "next_measured_eef_fallback_with_same_step_commanded_gripper")
             session.disconnect()
 
     def test_failed_validation_does_not_publish_episode(self):

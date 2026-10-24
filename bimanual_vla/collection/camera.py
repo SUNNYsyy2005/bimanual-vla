@@ -347,11 +347,15 @@ class CameraCapture:
         capture_hw: tuple[int, int] | None = None,
         parallel_reads: bool = False,
         policy_image_hw: tuple[int, int] | None = None,
+        resize_mode: str = "pad",
     ):
         self._ids = cam_ids or dict(DEFAULT_CAM_IDS)
         self._configured_ids = dict(self._ids)
         self._fps = fps
         self._image_hw = tuple(image_hw)
+        if resize_mode not in {"stretch", "pad"}:
+            raise ValueError("resize_mode must be stretch or pad")
+        self.resize_mode = resize_mode
         self._capture_hw = tuple(capture_hw or image_hw)
         self._parallel_reads = parallel_reads
         self._policy_image_hw = (
@@ -484,6 +488,10 @@ class CameraCapture:
                 self._source_aspects[key] = src_w / src_h
                 if self._preview_enabled:
                     self._latest_preview_images[key] = rgb.copy()
+            if self.resize_mode == "stretch":
+                from bimanual_vla.data.image_resize import resize_stretch
+                images[key] = resize_stretch(rgb, target_h, target_w).transpose(2, 0, 1)
+                continue
             scale = min(target_w / src_w, target_h / src_h)
             new_w = max(1, round(src_w * scale))
             new_h = max(1, round(src_h * scale))
@@ -502,11 +510,16 @@ class CameraCapture:
         """Precompute exactly the server's PIL resize on the camera thread."""
         if self._policy_image_hw is None:
             return None
-        from openpi_client import image_tools
+        if self.resize_mode == "stretch":
+            from bimanual_vla.data.image_resize import resize_stretch
+            resize = resize_stretch
+        else:
+            from openpi_client import image_tools
+            resize = image_tools.resize_with_pad
 
         height, width = self._policy_image_hw
         return {
-            key: image_tools.resize_with_pad(
+            key: resize(
                 np.transpose(frame, (1, 2, 0)), height, width
             ).transpose(2, 0, 1)
             for key, frame in images.items()
@@ -537,6 +550,36 @@ class CameraCapture:
                 )
         with self._read_lock:
             return self._read_direct()
+
+    def read_next(self, previous: dict[str, float], *, timeout_s: float = 1.0) -> CameraFrameSet:
+        """Wait for a newer complete frame set from every active camera."""
+        if self._background_thread is None:
+            raise RuntimeError("read_next requires background capture")
+        deadline = time.monotonic() + timeout_s
+        with self._latest_condition:
+            while True:
+                if self._background_error is not None:
+                    raise RuntimeError("background camera capture failed") from self._background_error
+                if self._frame_history:
+                    latest = self._frame_history[-1]
+                    if all(value > previous.get(key, float("-inf")) for key, value in latest.timestamps.items()):
+                        return latest.copied()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("timed out waiting for a fresh camera frame set")
+                self._latest_condition.wait(timeout=remaining)
+
+    def measure_fps(self, samples: int = 16) -> dict[str, float]:
+        """Measure received frame cadence after draining initial driver buffers."""
+        history = {key: [] for key in self._caps}
+        with self._read_lock:
+            for index in range(samples + 3):
+                self._read_direct()
+                if index >= 3:
+                    for key, value in self._last_direct_monotonic_timestamps.items():
+                        history[key].append(value)
+        return {key: (len(values) - 1) / (values[-1] - values[0])
+                for key, values in history.items()}
 
     def read_nearest(
         self, target_monotonic: float, *, copy: bool = True

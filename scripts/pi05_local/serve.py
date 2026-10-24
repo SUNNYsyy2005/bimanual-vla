@@ -105,6 +105,14 @@ def offload_word_embedding(model):
     logging.info('Word embedding lookup on CPU; %.0f MiB GPU weights released; BF16 unchanged', saved_mib)
 
 
+def policy_timing_metadata(contract):
+    # Historical 15k/20k contracts omitted the rate; those models were trained at 20 Hz.
+    hz = float(contract.get('action_hz', contract.get('fps', 20.0)))
+    if not np.isfinite(hz) or hz <= 0:
+        raise ValueError('model action rate must be positive and finite')
+    return {'action_hz': hz, 'action_time_step_s': 1.0 / hz}
+
+
 def create_policy(args):
     import sentencepiece
     import torch
@@ -153,7 +161,7 @@ def create_policy(args):
         robot_type='piper_bimanual' if dim == 14 else 'piper', model_variant='pi05', checkpoint=str(checkpoint),
         checkpoint_step=15000, experiment=provenance.get('experiment', checkpoint.parent.name), precision='bf16',
         camera_keys=list(inputs.cameras), image_resize_mode='stretch', image_transport='raw',
-        action_horizon=50, action_hz=20.0, action_time_step_s=0.05,
+        action_horizon=50, **policy_timing_metadata(contract),
         action_start_offset_steps=contract['model_action_start_offset'],
         action_semantics=contract['wire_action_semantics'],
         action_convention=contract['wire_action_convention'],

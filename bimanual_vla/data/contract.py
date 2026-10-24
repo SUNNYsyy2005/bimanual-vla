@@ -228,6 +228,9 @@ class EpisodeContract:
             raise ValueError(f"{arm_mode} contract requires {expected_wrist} wrist camera(s)")
         if arm_mode == BIMANUAL and set(wrist_keys) != {"cam_left_wrist", "cam_right_wrist"}:
             raise ValueError("bimanual camera keys must include left and right wrist cameras")
+        if (arm_mode == SINGLE_ARM and self.version >= CONTRACT_VERSION
+                and wrist_keys != (f"cam_{arm_side}_wrist",)):
+            raise ValueError("single-arm wrist camera label must match physical arm_side")
         object.__setattr__(self, "camera_keys", camera_keys)
 
         source = str(self.action_source).strip()
@@ -686,10 +689,10 @@ def terminal_hold_action(contract: EpisodeContract, state: np.ndarray) -> np.nda
 
 def _as_contract_image(image: np.ndarray, name: str) -> np.ndarray:
     frame = np.asarray(image)
-    if frame.shape == (3, *IMAGE_HW):
+    if frame.shape in {(3, *IMAGE_HW), (3, 224, 224)}:
         frame = frame.transpose(1, 2, 0)
-    if frame.shape != (*IMAGE_HW, 3):
-        raise ValueError(f"{name} must have RGB shape {(*IMAGE_HW, 3)}, got {frame.shape}")
+    if frame.shape not in {(*IMAGE_HW, 3), (224, 224, 3)}:
+        raise ValueError(f"{name} must have RGB shape (224,224,3) or {(*IMAGE_HW, 3)}, got {frame.shape}")
     if frame.dtype != np.uint8:
         raise ValueError(f"{name} must have dtype uint8, got {frame.dtype}")
     return frame.copy()
@@ -712,8 +715,14 @@ class EpisodeBuffer:
         action_horizon: int = DEFAULT_ACTION_HORIZON,
         coordinate_frame: str = DEFAULT_COORDINATE_FRAME,
         source_frame: str = "",
+        record_both: bool = False,
+        image_resize_mode: str | None = None,
     ):
         self.fps = int(fps)
+        self.record_both = record_both
+        self.image_resize_mode = image_resize_mode
+        if record_both and schema != DELIVERY_SCHEMA:
+            raise ValueError("dual recording requires delivery state and joint_qpos")
         self.contract = EpisodeContract(
             schema=schema,
             arm_mode=arm_mode,
@@ -733,6 +742,7 @@ class EpisodeBuffer:
         self.start()
 
     def start(self) -> None:
+        self.feedback_timestamps: list[dict[str, float]] = []
         self.states: list[np.ndarray] = []
         self.commanded_actions: list[np.ndarray] = []
         self._action_presence: list[bool] = []
@@ -756,6 +766,7 @@ class EpisodeBuffer:
         state_timestamp: float | None = None,
         action_timestamp: float | None = None,
         gripper_command_timestamps: np.ndarray | None = None,
+        feedback_timestamps: dict[str, float] | None = None,
     ) -> None:
         state_array = np.asarray(state, dtype=np.float32)
         if state_array.shape != (self.contract.state_dim,) or not np.isfinite(state_array).all():
@@ -807,6 +818,26 @@ class EpisodeBuffer:
         if not all(np.isfinite(value) for value in camera_ts.values()):
             raise ValueError("camera timestamps must be finite")
 
+        if self.record_both and qpos_array is None:
+            raise ValueError("dual recording requires joint_qpos for every frame")
+        feedback = dict(feedback_timestamps or {})
+        if feedback and (not all(np.isfinite(v) for v in feedback.values())
+                         or max(feedback.values()) - min(feedback.values()) > 0.050):
+            raise ValueError("invalid or unsynchronized feedback timestamps")
+        if self.feedback_timestamps and set(feedback) != set(self.feedback_timestamps[-1]):
+            raise ValueError("feedback timestamp fields changed during episode")
+        # New GUI recordings enforce camera/state synchronization before accepting a frame.
+        if self.image_resize_mode is not None:
+            if self.state_timestamps and abs((ts_state - self.state_timestamps[-1]) - 1.0 / self.fps) > 0.5 / self.fps:
+                raise ValueError("capture interval deviates by more than half a frame; stop and check collection load")
+            if feedback and any(abs(value - ts_state) > 0.050 for value in feedback.values()):
+                raise ValueError("feedback/state synchronization exceeds 50 ms")
+            if any(abs(value - ts_state) > 0.050 for value in camera_ts.values()):
+                raise ValueError("camera/state receive timestamps differ by more than 50 ms")
+            if any(self.image_timestamps[key] and value <= self.image_timestamps[key][-1]
+                   for key, value in camera_ts.items()):
+                raise ValueError("duplicate or out-of-order camera frame timestamp")
+        self.feedback_timestamps.append(feedback)
         self.states.append(state_array.copy())
         self._action_presence.append(action_array is not None)
         if action_array is not None:
@@ -899,6 +930,31 @@ class EpisodeBuffer:
         if all(self._qpos_presence) and self._qpos_presence:
             qpos = np.asarray(self.joint_qpos, dtype=np.float32)
             payload["joint_qpos"] = np.concatenate((qpos, qpos[-1:]), axis=0)
+        if self.image_resize_mode is not None:
+            payload["collection_format_version"] = np.asarray(1)
+            payload["image_resize_mode"] = np.asarray(self.image_resize_mode)
+            payload["image_timestamp_source"] = np.asarray("host_receive_unix_seconds")
+        if self.feedback_timestamps and self.feedback_timestamps[0]:
+            for key in self.feedback_timestamps[0]:
+                values = np.asarray([frame[key] for frame in self.feedback_timestamps], dtype=np.float64)
+                # Synthetic terminal holds do not invent new hardware measurements.
+                payload[f"feedback_timestamp_{key}"] = np.concatenate((values, values[-1:]))
+            payload["state_timestamp_source"] = np.asarray("sdk_host_receive_unix_seconds")
+        if self.record_both:
+            payload["recorded_state_schemas"] = np.asarray([JOINT_SCHEMA, DELIVERY_SCHEMA])
+            payload["joint_state"] = payload["joint_qpos"]
+            payload["joint_actions"] = derive_joint_actions(payload["joint_state"])
+            if self.feedback_timestamps[0]:
+                joint_ts = [max(v for k, v in frame.items() if k.endswith(("joint", "gripper")))
+                            for frame in self.feedback_timestamps]
+                payload["joint_state_timestamp"] = self._padded_timestamps(joint_ts)
+            else:
+                payload["joint_state_timestamp"] = state_timestamp.copy()
+            payload["joint_action_timestamp"] = next_observation_timestamps(payload["joint_state_timestamp"], fps=self.fps)
+            payload["eef_state"] = states
+            payload["eef_actions"] = payload["actions"]
+            payload["eef_state_timestamp"] = state_timestamp
+            payload["eef_action_timestamp"] = action_timestamp
         return payload
 
     def save(self, path: str | Path, task_name: str, instruction: str, success: bool) -> Path:
