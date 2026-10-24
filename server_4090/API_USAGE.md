@@ -437,6 +437,41 @@ Content-Type: application/json
 
 ---
 
+### 4.10 时间对齐（检查 → 新数据集）
+
+数据集面板的“时间对齐”入口支持本机可读的 v3 joint / delivery 绝对动作数据。先检查，再生成新名称的数据集；原始数据不改动。远端数据须先同步到 4×4090。接口沿用 Dashboard Bearer token 鉴权。
+
+```http
+POST /api/datasets/<dataset_id>/time-alignment/inspect
+Content-Type: application/json
+
+{"fps":30,"max_skew_ms":50,"camera_offsets_ms":{"cam_high":0,"cam_left_wrist":0}}
+```
+
+返回 `202` 和 TaskManager 任务（含 `id`）。`fps` 可省略以沿用源频率，支持 15/20/25/30 Hz；偏差上限大于 0 且不超过 50 ms。相机修正单位 ms，**正值加到原时间戳上**，未知延迟保持 0。
+
+```http
+GET /api/datasets/<dataset_id>/time-alignment/jobs/<task_id>
+```
+
+返回 `task` 与 `report`。成功检查的 `report.status=inspected`，`can_align=true` 才可应用；报告含每 episode 有效帧率、原相机相对状态的有符号中位偏差、对齐后的最大偏差、预计输出大小/内存。缺时间戳、源变化、缺帧、低帧率升频等问题会阻止生成。
+
+```http
+POST /api/datasets/<dataset_id>/time-alignment/apply
+Content-Type: application/json
+
+{"preview_task_id":"<检查任务 id>","target_dataset_id":"cube_aligned"}
+```
+
+返回 `202`，用新任务 id 查询。完成须同时看到 `task.state=completed` 和 `report.status=completed`、`validation=passed`。目标名必须未占用；预览过期须重新检查。
+
+- 最近真实样本重采样；不插值姿态、不复制图像补帧、不做滤波。15 FPS 相机不能生成真实 30 Hz 数据。
+- 下一观测动作按新频率重建，并去掉缺少后继测量的末帧；同拍命令按动作时间戳选择。末端混合动作保留当前状态对应的夹爪命令及下一状态姿态。
+- 保留原臂侧、相机名、关节单位、坐标系和夹爪语义；训练/验证 episode 划分保持。生成新的 metadata/statistics 与数据集 norm，训练前仍须计算对应模型的 norm 资产。
+- `meta/time_alignment.json` 保存检查/生成报告；`meta/time_alignment/episode_*.npz` 保存精确源行映射，旁边保存原 info 与 episode metadata。原始接收时间对齐不能证明硬件曝光同步。
+- 目前不重排 Event 标注与未知附加列；遇到这些数据会明确阻止，避免静默丢标签。没有原始时间戳的旧数据不能用帧号代替实测同步。
+- CPU worker 在独立 transient user scope 中运行，检查自身 cgroup，GPU 不可见。request/result/runtime 文件保存到 `<workspace_root>/dataset_alignment/<request_id>/`；任务列表支持恢复查看、日志和停止。需正常的 user systemd 环境，失败不会回退到服务内处理。
+
 ## 5. 跨服务器数据集位置与同步
 
 ### 5.1 查询数据集在哪些服务器
