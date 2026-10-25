@@ -1,0 +1,26 @@
+{
+  "run": "20261021T110058.959495+0800_104517",
+  "generation": 31,
+  "capture": 15.5848000219994,
+  "arrival": 15.763386405000347,
+  "protected_prefix_end": 15.8348000219994,
+  "early_handoff": 15.837445673038019,
+  "initial_q": 0.2849058438789745,
+  "initial_v": -0.14986300883575576,
+  "initial_a": -3.0,
+  "actual_min_next_450ms": 0.1999514338123857,
+  "timely_handoff_min_next_450ms": 0.26117639255361114,
+  "actual_retreat": 0.0849544100665888,
+  "timely_retreat": 0.02372945132536336,
+  "config": {
+    "backend": "ruckig",
+    "hz": 100.0,
+    "max_velocity": 0.6,
+    "max_acceleration": 3.0,
+    "max_jerk": 60.0,
+    "max_tracking_error": 0.35,
+    "target_timeout_s": 0.15,
+    "max_gripper_velocity": 0.08,
+    "follow_waypoint_velocity": false
+  }
+}

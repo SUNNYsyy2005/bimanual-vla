@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import time
+import types
 from typing import Any
 
 import jax
@@ -27,9 +28,10 @@ from openpi.training import checkpoints
 from openpi.training import data_loader
 
 import openpi_single_arm as piper
+from rtc_evaluation import evaluation_delays, prefix_loss_per_dim
 
 
-RESULT_VERSION = 1
+RESULT_VERSION = 2
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -189,6 +191,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     # boolean array and fails with TracerBoolConversionError at the first batch.
     eval_loss = nnx_utils.module_jit(model.compute_loss_per_dim, static_argnames=("train",))
 
+    maximum = int(getattr(model, "rtc_training_max_delay", 0))
+    declared_rtc = (config.policy_metadata.get("finetuning") or {}).get("rtc_training", False)
+    if declared_rtc and not maximum:
+        raise RuntimeError("RTC checkpoint was loaded without a clean-prefix model; refusing d=0-only evaluation")
+    delays = evaluation_delays(maximum, int(config.model.action_horizon),
+                               getattr(args, "rtc_eval_delays", None))
+    rtc_loss = (nnx_utils.module_jit(types.MethodType(prefix_loss_per_dim, model),
+                                   static_argnames=("delay",)) if maximum else None)
+    rtc_totals: dict[int, np.ndarray] = {}
+    print(f"Evaluation conditions: demo prefix delays={delays}; planner prefix not supplied", flush=True)
+
     rng = jax.random.key(args.eval_seed)
     total_per_dim: np.ndarray | None = None
     total_action_rows = 0
@@ -203,6 +216,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if total_per_dim is None:
             total_per_dim = np.zeros_like(per_dim_sum)
         total_per_dim += per_dim_sum
+        # Same observations, flow noise and flow time for every delay. Prefix
+        # masking is already suffix-normalized; divide all sums by B*H below.
+        for delay in delays:
+            if delay == 0:
+                rtc_totals[0] = total_per_dim
+                continue
+            conditional = rtc_loss(batch_rng, observation, actions, delay=delay)
+            conditional_sum = np.asarray(jax.device_get(jnp.sum(conditional, axis=(0, 1))),
+                                         dtype=np.float64)
+            if not np.all(np.isfinite(conditional_sum)):
+                raise RuntimeError(f"non-finite RTC evaluation loss at delay={delay}")
+            rtc_totals[delay] = rtc_totals.get(delay, np.zeros_like(conditional_sum)) + conditional_sum
         batch_samples = int(actions.shape[0])
         evaluated_samples += batch_samples
         total_action_rows += batch_samples * int(actions.shape[1])
@@ -268,6 +293,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             schema=str(config.policy_metadata.get("schema", args.schema)),
         )
     )
+    result["rtc_evaluation"] = {
+        "delays": list(delays), "prefix_sources": ["demonstration"],
+        "planner_prefix_evaluated": False,
+        "loss_definition": "normalized flow velocity MSE over generated suffix only",
+        "paired_observations_noise_and_time": True,
+        "by_delay": {},
+    }
+    for delay in delays:
+        mean = rtc_totals[delay] / total_action_rows
+        label = f"eval_rtc_demo_d{delay}"
+        metrics = {
+            "loss_model": float(np.mean(mean[:model_action_dim])),
+            "loss_objective": float(np.mean(mean[:objective_dim])),
+            "loss_per_dim": mean.tolist(),
+            "generated_rows_per_sample": int(config.model.action_horizon) - delay,
+        }
+        result["rtc_evaluation"]["by_delay"][str(delay)] = metrics
+        result[f"{label}_loss_model"] = metrics["loss_model"]
+        result[f"{label}_loss_objective"] = metrics["loss_objective"]
+        components = _component_metrics(mean, model_action_dim=model_action_dim,
+                                       schema=str(config.policy_metadata.get("schema", args.schema)))
+        for key, value in components.items():
+            if key.startswith("eval_loss_"):
+                result[f"{label}_{key.removeprefix('eval_')}"] = value
     for key, value in result.items():
         if isinstance(value, float) and not math.isfinite(value):
             raise RuntimeError(f"non-finite evaluation result: {key}={value}")
@@ -318,6 +367,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--max-batches", type=int, default=50)
     parser.add_argument("--eval-seed", type=int, default=0)
+    parser.add_argument("--rtc-eval-delays", type=int, nargs="+", default=None,
+                        help="RTC demo-prefix delays; default 0/4/5/6/7/8/10 plus training maximum, within supported range")
     args = parser.parse_args()
     for name in ("batch_size", "max_batches"):
         if getattr(args, name) <= 0:

@@ -28,3 +28,18 @@ def leading_hold_cut(state, action, *, joint_threshold=.001,
     onset = int(starts[0]) if len(starts) else None
     return dict(start_frame=max(0, onset - int(keep_before_motion)) if onset is not None else 0,
                 motion_onset_frame=onset, all_idle=onset is None)
+
+
+def boundary_hold_range(state, action, **kwargs):
+    """Inclusive range retaining context around motion, including internal stops.
+
+    Use cumulative displacement from each endpoint, rather than a velocity
+    threshold that can discard slow movement. Entirely idle episodes are kept.
+    """
+    leading = leading_hold_cut(state, action, **kwargs)
+    trailing = leading_hold_cut(np.asarray(state)[::-1], np.asarray(action)[::-1], **kwargs)
+    count = len(state)
+    start = leading["start_frame"]
+    end = max(start, count - 1 - trailing["start_frame"])
+    return dict(start_frame=start, end_frame=end, removed_leading=start,
+                removed_trailing=count-1-end, all_idle=leading["all_idle"])

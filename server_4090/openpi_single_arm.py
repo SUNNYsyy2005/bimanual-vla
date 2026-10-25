@@ -1775,6 +1775,7 @@ def _create_torch_dataset_for_episodes(
     episodes: tuple[int, ...],
     *,
     action_offset: int,
+    load_images: bool = True,
 ):
     repo_id = data_config.repo_id
     if repo_id is None:
@@ -1782,7 +1783,11 @@ def _create_torch_dataset_for_episodes(
     if repo_id == "fake":
         return data_loader.FakeDataset(model_config, num_samples=1024)
     dataset_meta = data_loader.lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = data_loader.lerobot_dataset.LeRobotDataset(
+    dataset_class = data_loader.lerobot_dataset.LeRobotDataset
+    if not load_images:
+        from bimanual_vla.data.norm_video import NormOnlyLeRobotDataset
+        dataset_class = NormOnlyLeRobotDataset
+    dataset = dataset_class(
         repo_id,
         delta_timestamps={
             key: action_delta_timestamps(action_horizon, dataset_meta.fps, action_offset)
@@ -2075,6 +2080,7 @@ def run_norm(args: argparse.Namespace) -> None:
         config.model,
         split.train_episodes,
         action_offset=int(config.policy_metadata["action_offset"]),
+        load_images=False,
     )
 
     dataset = data_loader.TransformedDataset(

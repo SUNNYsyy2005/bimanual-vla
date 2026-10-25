@@ -1,0 +1,297 @@
+{
+  "stats_sha256": "8c90e7e6a3f7081118b772d3919b2344bf985acf9e80c4e66cd3100d8b70e2e5",
+  "joint_scales": [
+    {
+      "index": 0,
+      "name": "L1",
+      "state_bin_width": 0.013534312280923128,
+      "action_physical_units_per_normalized_unit": 0.3653983742480278,
+      "normalized_delta_for_0_02": 0.054734781021286795
+    },
+    {
+      "index": 1,
+      "name": "L2",
+      "state_bin_width": 0.008183671598220187,
+      "action_physical_units_per_normalized_unit": 0.9344425197844505,
+      "normalized_delta_for_0_02": 0.021403135641359126
+    },
+    {
+      "index": 2,
+      "name": "L3",
+      "state_bin_width": 0.004558037810683251,
+      "action_physical_units_per_normalized_unit": 0.5683791425113677,
+      "normalized_delta_for_0_02": 0.035187779607166
+    },
+    {
+      "index": 3,
+      "name": "L4",
+      "state_bin_width": 0.004091360782602802,
+      "action_physical_units_per_normalized_unit": 0.28368308509039886,
+      "normalized_delta_for_0_02": 0.07050120733714797
+    },
+    {
+      "index": 4,
+      "name": "L5",
+      "state_bin_width": 0.004462993552446366,
+      "action_physical_units_per_normalized_unit": 0.5474881283824443,
+      "normalized_delta_for_0_02": 0.03653047246721143
+    },
+    {
+      "index": 5,
+      "name": "L6",
+      "state_bin_width": 0.003495708997062408,
+      "action_physical_units_per_normalized_unit": 0.2168220440869331,
+      "normalized_delta_for_0_02": 0.092241543447405
+    },
+    {
+      "index": 6,
+      "name": "Lgripper",
+      "state_bin_width": 0.00388281640625,
+      "action_physical_units_per_normalized_unit": 0.4970005,
+      "normalized_delta_for_0_02": 0.04024140820783882
+    },
+    {
+      "index": 7,
+      "name": "R1",
+      "state_bin_width": 0.013371186587218196,
+      "action_physical_units_per_normalized_unit": 0.33942478959608086,
+      "normalized_delta_for_0_02": 0.0589232154310244
+    },
+    {
+      "index": 8,
+      "name": "R2",
+      "state_bin_width": 0.008834978837997639,
+      "action_physical_units_per_normalized_unit": 0.9054932025794983,
+      "normalized_delta_for_0_02": 0.022087410422326266
+    },
+    {
+      "index": 9,
+      "name": "R3",
+      "state_bin_width": 0.0058401108823296416,
+      "action_physical_units_per_normalized_unit": 0.6157946474437713,
+      "normalized_delta_for_0_02": 0.0324783596009191
+    },
+    {
+      "index": 10,
+      "name": "R4",
+      "state_bin_width": 0.0014922357711396178,
+      "action_physical_units_per_normalized_unit": 0.1291249719415903,
+      "normalized_delta_for_0_02": 0.15488870742250385
+    },
+    {
+      "index": 11,
+      "name": "R5",
+      "state_bin_width": 0.0038077060752585534,
+      "action_physical_units_per_normalized_unit": 0.48090814463543896,
+      "normalized_delta_for_0_02": 0.04158798353303282
+    },
+    {
+      "index": 12,
+      "name": "R6",
+      "state_bin_width": 0.001552331440573558,
+      "action_physical_units_per_normalized_unit": 0.1353306978230476,
+      "normalized_delta_for_0_02": 0.14778612925022458
+    },
+    {
+      "index": 13,
+      "name": "Rgripper",
+      "state_bin_width": 0.00390547265625,
+      "action_physical_units_per_normalized_unit": 0.4999005,
+      "normalized_delta_for_0_02": 0.04000796158435529
+    }
+  ],
+  "runs": [
+    {
+      "time": "104131",
+      "accepted": 67,
+      "right_j2_same_bin_pairs": 12,
+      "adjacent_pairs": 66,
+      "right_j2_retreat_when_same_bin": {
+        "count": 5,
+        "total": 12
+      },
+      "right_j2_retreat_when_changed_bin": {
+        "count": 17,
+        "total": 54
+      },
+      "prefix_roundtrip_float64_max": 2.220446049250313e-16,
+      "normalized_prefix_abs_max": 1.000398079217764,
+      "state_edge_bins_per_dim": [
+        0,
+        2,
+        0,
+        0,
+        18,
+        0,
+        0,
+        0,
+        14,
+        15,
+        0,
+        9,
+        0,
+        0
+      ]
+    },
+    {
+      "time": "104306",
+      "accepted": 92,
+      "right_j2_same_bin_pairs": 14,
+      "adjacent_pairs": 91,
+      "right_j2_retreat_when_same_bin": {
+        "count": 8,
+        "total": 14
+      },
+      "right_j2_retreat_when_changed_bin": {
+        "count": 47,
+        "total": 77
+      },
+      "prefix_roundtrip_float64_max": 2.220446049250313e-16,
+      "normalized_prefix_abs_max": 1.000398079217764,
+      "state_edge_bins_per_dim": [
+        0,
+        3,
+        20,
+        0,
+        7,
+        0,
+        0,
+        0,
+        3,
+        14,
+        0,
+        12,
+        0,
+        0
+      ]
+    },
+    {
+      "time": "104416",
+      "accepted": 124,
+      "right_j2_same_bin_pairs": 22,
+      "adjacent_pairs": 123,
+      "right_j2_retreat_when_same_bin": {
+        "count": 9,
+        "total": 22
+      },
+      "right_j2_retreat_when_changed_bin": {
+        "count": 46,
+        "total": 101
+      },
+      "prefix_roundtrip_float64_max": 2.220446049250313e-16,
+      "normalized_prefix_abs_max": 1.0120704103919413,
+      "state_edge_bins_per_dim": [
+        0,
+        3,
+        0,
+        0,
+        36,
+        0,
+        0,
+        0,
+        4,
+        14,
+        0,
+        15,
+        0,
+        0
+      ]
+    },
+    {
+      "time": "104534",
+      "accepted": 101,
+      "right_j2_same_bin_pairs": 18,
+      "adjacent_pairs": 100,
+      "right_j2_retreat_when_same_bin": {
+        "count": 10,
+        "total": 18
+      },
+      "right_j2_retreat_when_changed_bin": {
+        "count": 10,
+        "total": 82
+      },
+      "prefix_roundtrip_float64_max": 2.220446049250313e-16,
+      "normalized_prefix_abs_max": 1.0120704103919413,
+      "state_edge_bins_per_dim": [
+        15,
+        3,
+        0,
+        12,
+        43,
+        0,
+        0,
+        0,
+        3,
+        3,
+        0,
+        45,
+        0,
+        0
+      ]
+    },
+    {
+      "time": "104653",
+      "accepted": 45,
+      "right_j2_same_bin_pairs": 15,
+      "adjacent_pairs": 44,
+      "right_j2_retreat_when_same_bin": {
+        "count": 1,
+        "total": 15
+      },
+      "right_j2_retreat_when_changed_bin": {
+        "count": 5,
+        "total": 29
+      },
+      "prefix_roundtrip_float64_max": 2.220446049250313e-16,
+      "normalized_prefix_abs_max": 1.0120704103919413,
+      "state_edge_bins_per_dim": [
+        0,
+        3,
+        0,
+        0,
+        21,
+        0,
+        11,
+        0,
+        13,
+        3,
+        0,
+        21,
+        0,
+        0
+      ]
+    },
+    {
+      "time": "104728",
+      "accepted": 82,
+      "right_j2_same_bin_pairs": 16,
+      "adjacent_pairs": 81,
+      "right_j2_retreat_when_same_bin": {
+        "count": 7,
+        "total": 16
+      },
+      "right_j2_retreat_when_changed_bin": {
+        "count": 32,
+        "total": 65
+      },
+      "prefix_roundtrip_float64_max": 2.220446049250313e-16,
+      "normalized_prefix_abs_max": 1.000398079217764,
+      "state_edge_bins_per_dim": [
+        0,
+        3,
+        0,
+        0,
+        12,
+        0,
+        0,
+        0,
+        3,
+        3,
+        0,
+        40,
+        0,
+        0
+      ]
+    }
+  ]
+}

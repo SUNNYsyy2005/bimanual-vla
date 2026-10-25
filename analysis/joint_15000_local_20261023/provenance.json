@@ -1,0 +1,51 @@
+{
+  "checkpoint_step": 15000,
+  "experiment": "joint_trim_nopad_no_rtc_b4_20261022",
+  "all_checks_passed": true,
+  "files_verified": 62,
+  "manifest_sha256": "63e2dd728b10c0113dacba4311f554f223c8c370d8f0a012b82a6a0d6c92fd8c",
+  "action_contract": {
+    "finetuning": {
+      "action_expert_tuning": "full",
+      "llm_lora": false,
+      "rtc_training": false,
+      "rtc_training_max_delay": 8,
+      "rtc_training_delay_weights": null,
+      "image_resize_mode": "stretch"
+    },
+    "version": 3,
+    "dataset_id": "joint_trim_nopad_20261022",
+    "schema": "joint",
+    "arm_mode": "single",
+    "arm_side": "right",
+    "state_dim": 7,
+    "raw_action_dim": 7,
+    "model_action_dim": 7,
+    "contract_version": 3,
+    "raw_action_semantics": "absolute_joint_position_opening_fraction",
+    "model_action_semantics": "joint_delta_chunk_origin_first_6_absolute_gripper_target",
+    "raw_action_convention": "absolute_joint_target",
+    "model_action_convention": "chunk_origin",
+    "gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+    "raw_gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+    "wire_gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+    "delivery_action_convention": null,
+    "wire_action_semantics": "absolute_joint_position_opening_fraction",
+    "wire_action_convention": "absolute_joint_target",
+    "state_gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+    "action_offset": 1,
+    "model_action_start_offset": 1
+  },
+  "default_prompt": "pick up the cube on the black site",
+  "conversion": {
+    "checkpoint": "/home/user/models/pi05_5060/joint_trim_nopad_no_rtc_b4_20261022/15000_jax",
+    "pi05": true,
+    "action_dim": 32,
+    "action_horizon": 50,
+    "parameters": 811,
+    "unused_vocabulary_heads_removed": true
+  },
+  "source_host": "4x4090",
+  "deployment_arm_side": "left",
+  "deployment_relabel_reason": "User confirmed physical left arm state and wrist video were labeled right during training; preserve original model camera slot and all numerical conventions."
+}

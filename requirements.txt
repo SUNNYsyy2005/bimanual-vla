@@ -23,6 +23,8 @@ safetensors==0.8.0
 
 # Piper hardware and Policy transport
 piper_sdk==0.6.1
+# Local state-to-state S curves; optional servo is enabled in the robot GUI.
+ruckig==0.12.2
 python-can==4.6.1
 websockets==15.0.1
 openpi-client==0.1.2
