@@ -6731,7 +6731,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 "openpi_python": target.get("openpi_python"),
                 "inventory_python": target.get("inventory_python"),
                 "log_transport": target.get("log_transport", "sattach"),
-                "cache_root": target.get("cache_root"),
+                "cache_root": target.get("cache_root") or str(PurePosixPath(str(target.get("workdir") or "/tmp")).parent / "cache"),
                 "log_dir": target.get("log_dir"),
                 "remote_job_dir": target.get("remote_job_dir"),
                 "cache_root": target.get("cache_root"),
