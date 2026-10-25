@@ -567,6 +567,13 @@
         </section>
         </div>
         <section class="card checkpoint-card">
+  <details id="remoteCheckpointPanel"><summary>集群检查点 → 4090</summary>
+    <p class="muted">选择单个 step 回传推理权重。完整续训状态保留在集群。</p>
+    <button type="button" id="refreshRemoteCheckpoints">刷新集群检查点</button>
+    <div id="remoteCheckpointRows"></div>
+  </details>
+</section>
+<section class="card checkpoint-card">
           <div class="training-output-heading"><div><h2>Checkpoint 列表</h2><p class="muted">按实验名称、模型系列、机械臂类型、数据集和 step 筛选。</p></div><span id="checkpointSummary" class="muted">等待 checkpoint 数据。</span></div>
           <div class="checkpoint-filter-grid">
             <div><label for="checkpointExperimentSearch">实验名称包含</label><input id="checkpointExperimentSearch" type="search" placeholder="例如 handover_mic"></div>
@@ -6541,4 +6548,38 @@ if (tokenInput.value) {
 }
 setInterval(() => { if (tokenInput.value) refreshAll(); }, 8000);
 setInterval(refreshObservation, 1500);
+
+let remoteCheckpointRows = [];
+let remoteCheckpointPoll;
+async function loadRemoteCheckpointRows(force = false) {
+  clearTimeout(remoteCheckpointPoll);
+  try {
+    const result = await api('/api/checkpoints/remote' + (force ? '?refresh=1' : ''));
+    remoteCheckpointRows = [];
+    document.getElementById('remoteCheckpointRows').innerHTML = (result.locations || []).map(location => {
+      const rows = (location.checkpoints || []).map(row => {
+        const index = remoteCheckpointRows.push({...row, source:location.source}) - 1;
+        return `<p>${esc(row.experiment)} · ${Number(row.step)} <button type="button" data-sync-remote="${index}">回传 4090</button></p>`;
+      }).join('');
+      return `<div><strong>${esc(location.label)}</strong> · ${esc(location.state)} ${location.error ? esc(location.error) : ''}${rows}</div>`;
+    }).join('');
+    if ((result.locations || []).some(row => row.state === 'loading') && document.getElementById('remoteCheckpointPanel').open)
+      remoteCheckpointPoll = setTimeout(() => loadRemoteCheckpointRows(), 1500);
+  } catch (error) { show(error.message); }
+}
+document.getElementById('refreshRemoteCheckpoints').onclick = () => loadRemoteCheckpointRows(true);
+document.getElementById('remoteCheckpointPanel').addEventListener('toggle', event => {
+  if (event.target.open) loadRemoteCheckpointRows(); else clearTimeout(remoteCheckpointPoll);
+});
+document.getElementById('remoteCheckpointRows').onclick = async event => {
+  const button = event.target.closest('[data-sync-remote]');
+  if (!button) return;
+  const row = remoteCheckpointRows[Number(button.dataset.syncRemote)];
+  button.disabled = true;
+  try {
+    const task = await api('/api/checkpoints/sync', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:row.source,target:'local_4090',config_name:row.config_name,exp_name:row.experiment,step:row.step})});
+    show(`已提交权重回传：${task.id}`, false);
+  } catch (error) { show(error.message); }
+  finally { button.disabled = false; }
+};
 </script></body></html>

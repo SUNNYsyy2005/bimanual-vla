@@ -4114,6 +4114,8 @@ def build_environment(
 def create_app(config_path: Path) -> Flask:
     config_file = Path(config_path).expanduser().resolve()
     config = upgrade_native_profiles(load_config(config_file))
+    from server_4090.remote_checkpoints import RemoteCheckpointInventory
+    remote_checkpoints = RemoteCheckpointInventory(config.get("cluster_targets", {}))
     token = os.environ.get("BIMANUAL_VLA_SERVER_TOKEN", "")
     if len(token) < 20:
         raise RuntimeError("set BIMANUAL_VLA_SERVER_TOKEN to a random value of at least 20 characters")
@@ -6726,6 +6728,10 @@ print(json.dumps(rows, ensure_ascii=False))
                 "dataset_root": target.get("dataset_root"),
                 "openpi_python": target.get("openpi_python"),
                 "workdir": target.get("workdir"),
+                "openpi_python": target.get("openpi_python"),
+                "inventory_python": target.get("inventory_python"),
+                "log_transport": target.get("log_transport", "sattach"),
+                "cache_root": target.get("cache_root"),
                 "log_dir": target.get("log_dir"),
                 "remote_job_dir": target.get("remote_job_dir"),
                 "cache_root": target.get("cache_root"),
@@ -6774,6 +6780,10 @@ print(json.dumps(rows, ensure_ascii=False))
                 "node": target.get("node"),
                 "gpu_type": target.get("gpu_type"),
                 "workdir": target.get("workdir"),
+                "openpi_python": target.get("openpi_python"),
+                "inventory_python": target.get("inventory_python"),
+                "log_transport": target.get("log_transport", "sattach"),
+                "cache_root": target.get("cache_root"),
                 "remote_job_dir": target.get("remote_job_dir"),
                 "log_dir": target.get("log_dir"),
                 "dataset_root": str(PurePosixPath(str(target["checkpoint_base_dir"]).rstrip("/")) / config_name),
@@ -7139,6 +7149,16 @@ print(json.dumps(rows, ensure_ascii=False))
         )
         return jsonify(task), 201
 
+    @app.get("/api/checkpoints/remote")
+    def list_remote_checkpoints():
+        locations = remote_checkpoints.snapshot(force=request.args.get("refresh") == "1", source=request.args.get("source"))
+        # Keep real/simulation Dashboard provenance filtering consistent.
+        for location in locations:
+            location["checkpoints"] = [row for row in location["checkpoints"]
+                if any(origin in visible_dataset_origin_set() for origin in checkpoint_dataset_origins(row["dataset_ids"]).values())
+                or (not row["dataset_ids"] and "unknown" in visible_dataset_origin_set())]
+        return jsonify({"locations": locations})
+
     @app.post("/api/checkpoints/sync")
     def sync_checkpoint():
         payload = request.get_json(force=True)
@@ -7167,6 +7187,40 @@ print(json.dumps(rows, ensure_ascii=False))
             raise ValueError(f"unknown checkpoint target location: {target_name}")
         if source_name == target_name:
             raise ValueError("source and target must differ")
+        if payload.get("step") is not None:
+            if target_name != "local_4090" or source_name not in config.get("cluster_targets", {}):
+                raise ValueError("single-step sync supports cluster to local_4090")
+            step = safe_int(payload["step"], "checkpoint step", 0, 10**9)
+            row = remote_checkpoints.selected(source_name, config_name, exp_name, step)
+            contract = row.get("action_contract")
+            if not contract:
+                raise ValueError("checkpoint has no action contract; cannot prepare policy deployment")
+            source, target = dict(locations[source_name]), dict(locations[target_name])
+            marker_path = str(PurePosixPath(target["dataset_root"]) / ".policy_action_conventions" / (exp_name + ".json"))
+            source["dataset_root"] = str(PurePosixPath(row["root"]) / config_name / exp_name)
+            target["dataset_root"] = str(PurePosixPath(target["dataset_root"]) / exp_name)
+            if source.get("kind") == "slurm_only":
+                staging = source.get("nas_dataset_staging_root") or config["nas_checkpoint_staging_root"]
+                source["nas_dataset_staging_root"] = str(PurePosixPath(staging) / source_name / config_name / exp_name)
+            for existing in tasks.list():
+                meta = existing.get("metadata", {})
+                if (existing.get("type") == "transfer" and existing.get("state") in PROCESS_STATES
+                        and meta.get("transfer_kind") == "checkpoint"
+                        and (meta.get("source"), meta.get("config_name"), meta.get("exp_name"), meta.get("checkpoint_step"))
+                        == (source_name, config_name, exp_name, step)):
+                    return jsonify(existing), 200
+            transfer_request = dict(source=source, target=target, step=step, contract=contract,
+                                    marker_path=marker_path, parallelism=parallelism,
+                                    nas_staging_root=config.get("nas_checkpoint_staging_root"))
+            task = tasks.start("transfer", [config["openpi_python"], str(APP_DIR / "checkpoint_sync_runner.py"),
+                               "--request-json", json_arg(transfer_request)], env=build_environment(config, None),
+                               metadata={"transfer_kind": "checkpoint", "config_name": config_name,
+                                         "exp_name": exp_name, "checkpoint_step": step,
+                                         "source": source_name, "target": target_name,
+                                         "source_path": str(PurePosixPath(source["dataset_root"]) / str(step)),
+                                         "target_path": str(PurePosixPath(target["dataset_root"]) / str(step)),
+                                         "parallelism": parallelism})
+            return jsonify(task), 201
         slurm_involved = (
             locations[source_name].get("kind") == "slurm_only"
             or locations[target_name].get("kind") == "slurm_only"
