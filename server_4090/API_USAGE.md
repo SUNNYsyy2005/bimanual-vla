@@ -437,6 +437,41 @@ Content-Type: application/json
 
 ---
 
+### 4.10 时间对齐（检查 → 新数据集）
+
+数据集面板的“时间对齐”入口支持本机可读的 v3 joint / delivery 绝对动作数据。先检查，再生成新名称的数据集；原始数据不改动。远端数据须先同步到 4×4090。接口沿用 Dashboard Bearer token 鉴权。
+
+```http
+POST /api/datasets/<dataset_id>/time-alignment/inspect
+Content-Type: application/json
+
+{"fps":30,"max_skew_ms":50,"camera_offsets_ms":{"cam_high":0,"cam_left_wrist":0}}
+```
+
+返回 `202` 和 TaskManager 任务（含 `id`）。`fps` 可省略以沿用源频率，支持 15/20/25/30 Hz；偏差上限大于 0 且不超过 50 ms。相机修正单位 ms，**正值加到原时间戳上**，未知延迟保持 0。
+
+```http
+GET /api/datasets/<dataset_id>/time-alignment/jobs/<task_id>
+```
+
+返回 `task` 与 `report`。成功检查的 `report.status=inspected`，`can_align=true` 才可应用；报告含每 episode 有效帧率、原相机相对状态的有符号中位偏差、对齐后的最大偏差、预计输出大小/内存。缺时间戳、源变化、缺帧、低帧率升频等问题会阻止生成。
+
+```http
+POST /api/datasets/<dataset_id>/time-alignment/apply
+Content-Type: application/json
+
+{"preview_task_id":"<检查任务 id>","target_dataset_id":"cube_aligned"}
+```
+
+返回 `202`，用新任务 id 查询。完成须同时看到 `task.state=completed` 和 `report.status=completed`、`validation=passed`。目标名必须未占用；预览过期须重新检查。
+
+- 最近真实样本重采样；不插值姿态、不复制图像补帧、不做滤波。15 FPS 相机不能生成真实 30 Hz 数据。
+- 下一观测动作按新频率重建，并去掉缺少后继测量的末帧；同拍命令按动作时间戳选择。末端混合动作保留当前状态对应的夹爪命令及下一状态姿态。
+- 保留原臂侧、相机名、关节单位、坐标系和夹爪语义；训练/验证 episode 划分保持。生成新的 metadata/statistics 与数据集 norm，训练前仍须计算对应模型的 norm 资产。
+- `meta/time_alignment.json` 保存检查/生成报告；`meta/time_alignment/episode_*.npz` 保存精确源行映射，旁边保存原 info 与 episode metadata。原始接收时间对齐不能证明硬件曝光同步。
+- 目前不重排 Event 标注与未知附加列；遇到这些数据会明确阻止，避免静默丢标签。没有原始时间戳的旧数据不能用帧号代替实测同步。
+- CPU worker 在独立 transient user scope 中运行，检查自身 cgroup，GPU 不可见。request/result/runtime 文件保存到 `<workspace_root>/dataset_alignment/<request_id>/`；任务列表支持恢复查看、日志和停止。需正常的 user systemd 环境，失败不会回退到服务内处理。
+
 ## 5. 跨服务器数据集位置与同步
 
 ### 5.1 查询数据集在哪些服务器
@@ -776,7 +811,9 @@ H100/H200 Slurm 示例：
 - `keep_period`：传给 Orbax checkpoint manager，额外保护 step 能被该值整除的 checkpoint；例如 `save_interval=2000` 且 `keep_period=2000` 会保留 `4000/6000/8000/10000` 等 2k 倍数 checkpoint。传 `0`/空值可禁用周期保护（只保留最新 checkpoint）。
 - `eval_interval_steps` 必须能被 `save_interval` 整除，且当前要求是 5000 的倍数；
 - 若 norm 不存在，本地训练会自动先创建 norm task，并在 norm 完成后训练；Slurm 训练会在一个 Slurm job 内先 norm 后 train。
+- H100/H200 重试可显式传 `reuse_norm_stats=true` 跳过 norm，前提是目标节点已有当前数据集的统计结果；训练启动仍检查 split manifest 和动作契约。数据内容变更后应重新计算，不应复用。
 - 独立存储节点（`access_mode=slurm_only`）使用节点配置中的基础模型路径，并在 Slurm 作业内检查 `params`；不要求 4090 同时保存基础模型。NAS 不可用时，可设置节点的 `log_transport=sattach`，通过 Slurm 回传后续训练输出；`log_dir` 仍需是计算节点上已存在的目录。此方式不补传连接前的输出，也不替代数据集或 checkpoint 同步。
+- 节点可设置 `checkpoint_chunk_pause_s`（0–60 秒），覆盖分块保存的等待时间。H200 可设为 `0` 以保留分块保存并取消额外等待；此配置仅影响新启动的 Slurm 作业。
 - `execution_target` 为 H100/H200 时，Dashboard 会先根据远端 inventory 判断数据集是否存在；不存在或 inventory 不可用时，默认先执行一次幂等数据集同步（`auto_sync_dataset=true`，目标已存在则跳过），然后再提交 Slurm norm/train。
 - 本地 Dashboard 训练默认使用 `training_task_launch_backend=nohup`：训练 runner 通过 `nohup` 和独立会话脱离 Dashboard/终端生命周期；任务状态仍由 `task_runner.py` 的 `exit.json` 和日志维护。该设置不等价于绕过内核/显存 OOM 或磁盘配额限制。
 - Policy 推理只能在 4×4090 启动；H100/H200 训练出的 checkpoint 需要通过 `POST /api/checkpoints/sync` 同步回 4×4090 的本地 checkpoint root 后才能在实机 Policy 中选择。

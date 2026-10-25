@@ -1,0 +1,126 @@
+{
+  "success": true,
+  "metadata": {
+    "finetuning": {
+      "action_expert_tuning": "full",
+      "llm_lora": false,
+      "rtc_training": false,
+      "rtc_training_max_delay": 8,
+      "rtc_training_delay_weights": null,
+      "image_resize_mode": "stretch"
+    },
+    "version": 3,
+    "dataset_id": "joint_trim_nopad_20261022",
+    "schema": "joint",
+    "arm_mode": "single",
+    "arm_side": "left",
+    "state_dim": 7,
+    "raw_action_dim": 7,
+    "model_action_dim": 7,
+    "contract_version": 3,
+    "raw_action_semantics": "absolute_joint_position_opening_fraction",
+    "model_action_semantics": "joint_delta_chunk_origin_first_6_absolute_gripper_target",
+    "raw_action_convention": "absolute_joint_target",
+    "model_action_convention": "chunk_origin",
+    "gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+    "raw_gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+    "wire_gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+    "delivery_action_convention": null,
+    "wire_action_semantics": "absolute_joint_position_opening_fraction",
+    "wire_action_convention": "absolute_joint_target",
+    "state_gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+    "action_offset": 1,
+    "model_action_start_offset": 1,
+    "training_arm_side": "right",
+    "action_dim": 7,
+    "wire_action_dim": 7,
+    "robot_type": "piper",
+    "model_variant": "pi05",
+    "checkpoint": "/home/user/models/pi05_5060/joint_trim_nopad_no_rtc_b4_20261022/15000_pt",
+    "checkpoint_step": 15000,
+    "experiment": "joint_trim_nopad_no_rtc_b4_20261022",
+    "precision": "bf16",
+    "camera_keys": [
+      "cam_high",
+      "cam_left_wrist"
+    ],
+    "image_resize_mode": "stretch",
+    "image_transport": "raw",
+    "action_horizon": 50,
+    "action_hz": 20.0,
+    "action_time_step_s": 0.05,
+    "action_start_offset_steps": 1,
+    "action_semantics": "absolute_joint_position_opening_fraction",
+    "action_convention": "absolute_joint_target",
+    "model_gripper_semantics": "absolute_opening_fraction_0_closed_1_open",
+    "transport": "openpi_websocket_v1",
+    "default_prompt": "pick up the cube on the black site",
+    "rtc_supported": false,
+    "rtc_mode": "off",
+    "rtc_backend": "pytorch",
+    "rtc_algorithm": null,
+    "rtc_training_max_delay": 0,
+    "rtc_physical_action_dim": 7,
+    "rtc_chunk_origin_reanchoring": true,
+    "rtc_temporal_consistency": false,
+    "denoising_steps": 5,
+    "policy_instance_id": "97392-1792730535063439045",
+    "policy_instance_started_at": 1792730535.0634408,
+    "rtc_capabilities": {},
+    "word_embedding_device": "cpu"
+  },
+  "episode": 7,
+  "frame": 40,
+  "requests": [
+    {
+      "seconds": 0.6418510609946679,
+      "shape": [
+        50,
+        7
+      ],
+      "joint_mae_rad": 0.08711107820272446
+    },
+    {
+      "seconds": 0.2537869710067753,
+      "shape": [
+        50,
+        7
+      ],
+      "joint_mae_rad": 0.04632965847849846
+    },
+    {
+      "seconds": 0.25651833799201995,
+      "shape": [
+        50,
+        7
+      ],
+      "joint_mae_rad": 0.04167653247714043
+    },
+    {
+      "seconds": 0.3115948340127943,
+      "shape": [
+        50,
+        7
+      ],
+      "joint_mae_rad": 0.04639275372028351
+    },
+    {
+      "seconds": 0.26776868499291595,
+      "shape": [
+        50,
+        7
+      ],
+      "joint_mae_rad": 0.03215939924120903
+    },
+    {
+      "seconds": 0.25696608900034335,
+      "shape": [
+        50,
+        7
+      ],
+      "joint_mae_rad": 0.03391944244503975
+    }
+  ],
+  "warm_median_s": 0.25696608900034335,
+  "note": "One heldout observation, repeated stochastic outputs; not a benchmark or robot execution"
+}

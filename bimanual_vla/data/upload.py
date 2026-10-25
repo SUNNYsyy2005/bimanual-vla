@@ -96,7 +96,7 @@ def build_archive(dataset_root: Path, dataset_name: str, cache_dir: Path, rebuil
     return archive, sha256, archive.stat().st_size
 
 
-RAW_EXPORT_CACHE_VERSION = 2
+RAW_EXPORT_CACHE_VERSION = 3
 LEROBOT_NORMALIZATION_VERSION = 2
 
 
@@ -143,14 +143,16 @@ def dataset_episode_count(root: Path) -> int | None:
 def _raw_export_key(
     source: Path,
     *,
-    fps: int,
+    fps: int | None,
     allow_incomplete_gripper_coverage: bool,
+    target_schema: str | None = None,
 ) -> tuple[str, str]:
     source_hash = source_signature(source)
     options = (
         f"version={RAW_EXPORT_CACHE_VERSION}\n"
         f"source={source_hash}\n"
         f"fps={fps}\n"
+        f"target_schema={target_schema}\n"
         f"allow_incomplete_gripper_coverage={int(allow_incomplete_gripper_coverage)}\n"
     )
     return source_hash, hashlib.sha256(options.encode()).hexdigest()
@@ -161,16 +163,18 @@ def prepare_raw_npz_dataset(
     dataset_name: str,
     cache_dir: Path,
     *,
-    fps: int,
+    fps: int | None,
     allow_incomplete_gripper_coverage: bool,
     rebuild: bool,
     arm_base_offset: Any = None,
+    target_schema: str | None = None,
 ) -> Path:
     """Export raw GUI episodes to a reusable, atomically published cache."""
     source_hash, export_key = _raw_export_key(
         source,
         fps=fps,
         allow_incomplete_gripper_coverage=allow_incomplete_gripper_coverage,
+        target_schema=target_schema,
     )
     normalized_arm_base_offset = normalize_arm_base_offset(arm_base_offset)
     export_cache = cache_dir / "exports"
@@ -183,6 +187,7 @@ def prepare_raw_npz_dataset(
         "source_signature": source_hash,
         "export_key": export_key,
         "fps": fps,
+        "target_schema": target_schema,
         "allow_incomplete_gripper_coverage": allow_incomplete_gripper_coverage,
         "arm_base_offset": list(normalized_arm_base_offset) if normalized_arm_base_offset is not None else None,
     }
@@ -212,6 +217,8 @@ def prepare_raw_npz_dataset(
             "fps": fps,
             "allow_incomplete_gripper_coverage": allow_incomplete_gripper_coverage,
         }
+        if target_schema is not None:
+            export_kwargs["target_schema"] = target_schema
         if normalized_arm_base_offset is not None:
             export_kwargs["arm_base_offset"] = normalized_arm_base_offset
         exported = export_dataset(source, temp_root, **export_kwargs)
@@ -647,15 +654,20 @@ def prepare_dataset_directory(
     dataset_name: str,
     cache_dir: Path,
     *,
-    fps: int,
+    fps: int | None,
     allow_incomplete_gripper_coverage: bool,
     rebuild: bool,
     arm_base_offset: Any = None,
     require_bimanual_offset: bool = False,
+    target_schema: str | None = None,
 ) -> tuple[Path, str]:
     """Resolve a LeRobot input directly or auto-export a GUI NPZ directory."""
     kind = classify_dataset_source(source)
     if kind == "lerobot":
+        if target_schema is not None:
+            info = json.loads((source / "meta" / "info.json").read_text())
+            if classify_lerobot_contract(info)["schema"] != target_schema:
+                raise ValueError("requested representation requires the original dual NPZ recordings")
         prepared = prepare_lerobot_dataset(
             source, dataset_name, cache_dir, rebuild=rebuild
         )
@@ -683,6 +695,7 @@ def prepare_dataset_directory(
         allow_incomplete_gripper_coverage=allow_incomplete_gripper_coverage,
         rebuild=rebuild,
         arm_base_offset=arm_base_offset,
+        target_schema=target_schema,
     )
     return prepare_lerobot_dataset(
         exported, dataset_name, cache_dir, rebuild=rebuild
@@ -801,6 +814,7 @@ def upload_one(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", type=Path, help="LeRobot directory, GUI ep_*.npz directory, or .tar with --archive")
+    parser.add_argument("--target-schema", choices=("joint", "delivery"))
     parser.add_argument("--name", default=None, help="server-side LeRobot repo/directory name")
     parser.add_argument(
         "--dataset-origin",
@@ -826,8 +840,8 @@ def main() -> int:
     parser.add_argument(
         "--fps",
         type=int,
-        default=20,
-        help="expected/exported FPS for a raw GUI NPZ directory (default: 20)",
+        default=None,
+        help="expected FPS; defaults to the recorded metadata (legacy: 20)",
     )
     parser.add_argument(
         "--allow-incomplete-gripper-coverage",
@@ -861,7 +875,7 @@ def main() -> int:
         parser.error("--prepare-only requires a dataset directory, not --archive")
     if not args.prepare_only and (not args.token or len(args.token) < 20):
         parser.error("provide --token or BIMANUAL_VLA_SERVER_TOKEN (at least 20 characters)")
-    if args.workers <= 0 or args.chunk_mib <= 0 or args.attempts <= 0 or args.fps <= 0:
+    if args.workers <= 0 or args.chunk_mib <= 0 or args.attempts <= 0 or (args.fps is not None and args.fps <= 0):
         parser.error("workers, chunk-mib, attempts, and fps must be positive")
     source = args.dataset.expanduser().resolve()
     dataset_name = safe_dataset_name(args.name or source.stem if args.archive else args.name or source.name)
@@ -889,6 +903,7 @@ def main() -> int:
                 dataset_name,
                 cache_dir,
                 fps=args.fps,
+                target_schema=args.target_schema,
                 allow_incomplete_gripper_coverage=args.allow_incomplete_gripper_coverage,
                 rebuild=args.rebuild,
                 arm_base_offset=args.arm_base_offset,

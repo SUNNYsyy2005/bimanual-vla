@@ -66,7 +66,7 @@ bash start_gui.sh
 | GUI 字段 | 建议值 | 说明 |
 |---|---|---|
 | `Left-arm CAN` / `Right-arm CAN` | `can0` / `can1` | 左右臂 CAN 接口 |
-| `Collection rate (Hz)` | `20` | 数据采集频率 |
+| `Collection rate (Hz)` | `30` | 与相机原始流统一；旧 20 Hz 数据保留原频率 |
 | `Camera rate (Hz)` | `30` | 相机原始流频率 |
 | `Dataset root` | `.../episodes_piper_v21` | 数据集父目录 |
 | `Dataset` | 从下拉列表选择已有目录 | 当前 NPZ 保存目录 |
@@ -87,6 +87,7 @@ bash start_gui.sh
 
 Arm data 的显示由 `Collection format` 决定：
 
+- `Joint + End-effector`（默认）：一次采样保存两套状态，显示末端状态；转换时选择 `joint` 或 `delivery`。
 - `End-effector`：每侧显示 `x y z rx ry rz gripper`，旋转为 XYZ 欧拉角弧度。
 - `Joint`：每侧显示 `j1 j2 j3 j4 j5 j6 gripper`。
 
@@ -341,7 +342,7 @@ unset BIMANUAL_VLA_SERVER_TOKEN
 
 - [ ] `can0`、`can1` 均为 `UP` 且有实时反馈。
 - [ ] 三路 RGB 相机画面和实际 `/dev/videoN` 正确。
-- [ ] Collection rate 为 `20 Hz`。
+- [ ] Collection rate 为 `30 Hz`，相机为 `30 FPS`，实际接收帧率检查通过。
 - [ ] Dataset、Task name 和 Instruction 正确。
 - [ ] 机械臂和场景位于安全起始状态。
 
@@ -363,3 +364,36 @@ unset BIMANUAL_VLA_SERVER_TOKEN
 - `overwrite` 会替换服务器同名数据集，使用前必须确认。
 - 服务器合并、删除或修改 episode 后，旧 normalization stats 会失效，训练前应重新计算 norm stats。
 - 删除本地原始 NPZ 前，先确认服务器数据可用并且已有独立备份。
+
+
+## 同一次采样选择两种训练表示（2026-10-25）
+
+1. `Collection format` 选择 `Joint + End-effector`。单臂时确认物理侧与 `Single-arm side` 一致；默认左臂，左右标签与腕相机名称始终匹配。
+2. 新采样默认 `30 Hz / 30 FPS`，连接时同时检查驱动协商值与实际接收帧率。相机实际只有 15 FPS 时会拒绝以 30 FPS 采集，不通过复制帧补成 30 FPS。30/30 模式由新相机帧驱动采样，避免两只定时器导致重复帧。
+3. 在 `Convert / upload` 的 `Training representation` 中选择 `joint`（关节训练）或 `delivery`（末端训练），分别转换两次即可得到 `<名称>_joint` 与 `<名称>_delivery`。缓存独立，原 NPZ 不变，图像只采一份。`As recorded` 沿用原主表示（双记录主表示是 delivery）。
+4. 单臂 joint 是 7D 状态/7D 绝对动作；delivery 是 10D 状态/10D 绝对动作，训练变换生成 7D 模型动作。双臂维度翻倍，顺序固定为左+右。没有把关节与末端拼成一个新模型输入。
+5. 夹爪统一为开度比例 `0=关，1=开`；关节单位 rad，末端位置 m、旋转 rotation6D、坐标系为各从臂基座。输出臂采样的姿态/关节动作仍取下一条测量（offset=1）；末端模式可使用同一时刻夹爪命令并保留来源标签，缺失时回退下一条测量。
+6. 新图像直接从原 RGB 拉伸至 224×224，保存 `image_resize_mode=stretch`。历史补边数据不会自动变成无补边数据。历史误标 right 的左臂模型继续使用其既有部署映射，新数据使用正确的物理 left 标签。
+
+转换默认读取每个原始数据集的真实 `fps`，不会用当前 GUI 采样设置重标旧数据。混合 20/30 Hz 会报错，必须显式重采样才能合并。30 Hz 的 50 步动作覆盖约 1.67 秒；新模型推理应读取契约频率。现有省略频率的本机 15k/20k 模型仍按历史 20 Hz 解释。
+
+SDK 与相机时间戳是**主机接收时间**，不是硬件触发/曝光时间。原始数据保留各臂 joint/eef/gripper 的 SDK 时间戳；超 50 ms 偏差、重复相机帧时间或超过半帧的采样间隔偏差会中止本段采样。保存与转换会再次验证时间和标签。原始文件末尾仍保留现有契约的一帧终止保持及其 `terminal_padding` 标记，不将该帧称为新硬件测量。
+
+命令行也可对同一份双记录数据分别转换（省略 `--fps` 自动读取）：
+
+```bash
+bin/bimanual-vla data-export --input-dir episodes/cube --root datasets/cube_joint --target-schema joint
+bin/bimanual-vla data-export --input-dir episodes/cube --root datasets/cube_delivery --target-schema delivery
+```
+
+
+## Dashboard 时间对齐
+
+在 Dashboard“数据集”面板找到已上传的数据，点击“时间对齐”：
+
+1. 选择目标频率与最大允许偏差，必要时填写每路相机时间修正（正值加到相机原时间戳）。未知延迟保持 0。
+2. 点击“检查并预览”，查看有效帧率、原相机相对状态的时间偏差与对齐后的最大偏差。相机实测只有 15 FPS 时，应选择 15 Hz；工具不会复制图像伪造 30 Hz。
+3. 检查通过后输入**新数据集名称**，点击“生成对齐数据集”。后台任务关闭网页后仍继续；在“最近的时间对齐任务”查看结果、日志或停止。
+4. 确认任务 completed、输出校验通过后，用新数据集计算模型 norm 并训练。原数据集不变，输出保留逐帧来源映射和原 episode 元数据副本。
+
+当前支持含原始状态、动作及各相机时间戳的 v3 joint / delivery 数据。Event 标注、未知附加列或缺原始时间戳会明确阻止转换。新旧臂标签不会在时间对齐中自动交换；若原始物理标签错误，需单独核验契约。接收时间对齐不等于硬件曝光同步。

@@ -262,7 +262,7 @@ def _empty_stats(path: Path, contract: EpisodeContract, instruction: str = "") -
     )
 
 
-def validate_episode(path: str | Path, target_fps: float = TARGET_FPS) -> EpisodeStats:
+def validate_episode(path: str | Path, target_fps: float | None = None) -> EpisodeStats:
     path = Path(path)
     errors: list[str] = []
     with np.load(path, allow_pickle=False) as data:
@@ -271,7 +271,14 @@ def validate_episode(path: str | Path, target_fps: float = TARGET_FPS) -> Episod
         except Exception as exc:
             fallback = EpisodeContract()
             raise EpisodeValidationError(path, [f"cannot infer episode contract: {exc}"], _empty_stats(path, fallback)) from exc
+        target_fps = float(contract.fps) if target_fps is None else target_fps
         _validate_contract_metadata(data, contract, errors)
+        if "recorded_state_schemas" in data:
+            from bimanual_vla.data.representations import select_representation
+            try:
+                select_representation(data)
+            except (ValueError, KeyError) as exc:
+                errors.append(str(exc))
         instruction = _read_string_scalar(data, "instruction", True, errors) or ""
         task = _read_string_scalar(data, "task", False, errors)
         if task is None:
@@ -327,6 +334,8 @@ def validate_episode(path: str | Path, target_fps: float = TARGET_FPS) -> Episod
                 errors.append("state timestamps must be strictly increasing")
             real_ts = state_ts[:real_frames]
             dt_s = np.diff(real_ts)
+            if "collection_format_version" in data and np.any(np.abs(dt_s - 1 / contract.fps) > 0.5 / contract.fps):
+                errors.append("capture interval deviates by more than half a frame")
             if len(dt_s) and np.all(dt_s > 0):
                 actual_fps = float(1.0 / np.mean(dt_s))
                 duration_s = float(real_ts[-1] - real_ts[0])
@@ -345,6 +354,9 @@ def validate_episode(path: str | Path, target_fps: float = TARGET_FPS) -> Episod
             if state_ts.shape == action_ts.shape and real_frames:
                 anchor = np.minimum(np.arange(real_frames) + contract.action_offset, frame_count - 1)
                 skew = np.abs(action_ts[:real_frames] - state_ts[anchor])
+                if ("collection_format_version" in data and contract.action_offset == 1
+                        and np.max(skew) > 1e-6):
+                    errors.append("next-observation action timestamps disagree with target state")
                 if contract.action_alignment == "same_step_command" and np.max(skew) > MAX_SYNC_S:
                     errors.append(f"state/action command sync exceeds 50 ms: max={np.max(skew)*1000:.2f} ms")
         elif action_ts.size:
@@ -358,8 +370,8 @@ def validate_episode(path: str | Path, target_fps: float = TARGET_FPS) -> Episod
             image, field = _load_image(data, contract, key, errors)
             images[key] = image
             _require_dtype(image, np.uint8, field, errors)
-            if image.shape != (frame_count, *IMAGE_HW, 3):
-                errors.append(f"{field} shape must be ({frame_count},{IMAGE_HW[0]},{IMAGE_HW[1]},3), got {image.shape}")
+            if image.shape not in {(frame_count, *IMAGE_HW, 3), (frame_count, 224, 224, 3)}:
+                errors.append(f"{field} must have {frame_count} RGB frames at 224x224 or legacy 256x256, got {image.shape}")
             ts_field = contract.timestamp_field(key)
             image_ts = np.asarray(data[ts_field]) if ts_field in data.files else np.empty(0)
             if ts_field not in data.files:
@@ -378,7 +390,7 @@ def validate_episode(path: str | Path, target_fps: float = TARGET_FPS) -> Episod
             else:
                 sync_by_key[key] = np.empty(0, dtype=np.float64)
             frozen = 0
-            if image.shape == (frame_count, *IMAGE_HW, 3) and real_frames:
+            if image.shape in {(frame_count, *IMAGE_HW, 3), (frame_count, 224, 224, 3)} and real_frames:
                 black = np.flatnonzero(np.max(image.reshape(frame_count, -1), axis=1) == 0)
                 if len(black):
                     errors.append(f"{key} contains all-black frames: {black[:10].tolist()}")
@@ -386,7 +398,7 @@ def validate_episode(path: str | Path, target_fps: float = TARGET_FPS) -> Episod
                 if real_frames > 1 and frozen == real_frames - 1:
                     errors.append(f"{key} is frozen for the entire non-terminal episode")
             frozen_by_key[key] = frozen
-        if "cam_high" in images and images["cam_high"].shape == (frame_count, *IMAGE_HW, 3):
+        if "cam_high" in images and images["cam_high"].shape in {(frame_count, *IMAGE_HW, 3), (frame_count, 224, 224, 3)}:
             for key, image in images.items():
                 if key != "cam_high" and image.shape == images["cam_high"].shape and np.array_equal(image[:real_frames], images["cam_high"][:real_frames]):
                     errors.append(f"cam_high and {key} are identical; check camera mappings")
@@ -610,7 +622,7 @@ def format_dataset_report(stats: list[EpisodeStats]) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-dir", default="episodes_piper_v21")
-    parser.add_argument("--target-fps", type=float, default=TARGET_FPS)
+    parser.add_argument("--target-fps", type=float, default=None, help="defaults to each recorded contract FPS")
     args = parser.parse_args()
     paths = sorted(Path(args.input_dir).glob("ep_*.npz"))
     if not paths:

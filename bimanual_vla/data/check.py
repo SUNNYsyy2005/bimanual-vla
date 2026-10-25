@@ -264,12 +264,11 @@ def _metadata_errors(info: dict[str, Any], contract: dict[str, Any]) -> list[str
             errors.append("canonical action_names must match action feature names")
         if int(info.get("action_horizon", -1)) != DEFAULT_ACTION_HORIZON:
             errors.append(f"canonical action_horizon must be {DEFAULT_ACTION_HORIZON}")
-        # The original real-Piper contract used 20 Hz, while the RoboTwin
-        # simulation collection path records a uniform 25 Hz stream.  Both
-        # are valid when the dataset metadata and timestamp columns agree;
+        # Real collection supports 15/30 Hz cameras and historical 20 Hz data;
+        # RoboTwin uses 25 Hz. All require metadata/timestamp agreement;
         # never silently relabel one rate as the other.
-        if int(info.get("fps", -1)) not in {20, 25}:
-            errors.append("canonical Piper datasets must use fps=20 or fps=25")
+        if int(info.get("fps", -1)) not in {15, 20, 25, 30}:
+            errors.append("canonical Piper datasets must use fps=15, 20, 25 or 30")
         if info.get("gripper_semantics") != GRIPPER_OPENING_FRACTION:
             errors.append("canonical gripper semantics must be opening fraction (0 closed, 1 open)")
         if info.get("coordinate_frame") != "slave_base":
