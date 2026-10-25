@@ -18,6 +18,8 @@ packing, so later checkpoint garbage collection cannot remove files mid-copy.
 It excludes optimizer state, exports 256 MiB parts with SHA256 hashes, and
 uploads through four SSH lanes by default. The receiver starts downloading
 published parts while the remaining parts upload. It verifies every part,
+Download lanes use independent TCP connections so a slow multiplexed connection
+does not constrain every part.
 rejects archive links and unsafe paths, validates file sizes and checkpoint
 metadata, then installs the checkpoint atomically on 4090. The action contract
 must match the destination experiment. Failed downloads can resume partial

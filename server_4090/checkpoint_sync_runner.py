@@ -123,7 +123,9 @@ def sync_slurm(request):
                     offset=path.stat().st_size if path.exists() else 0
                     if offset>part['size']:path.unlink();offset=0
                     remote=shlex.quote(staging+'/'+name)
-                    cmd=[*SSH_OPTS,'-S',sock,host,'if test -f '+remote+'; then tail -c +'+str(offset+1)+' '+remote+'; else exit 75; fi']
+                    # Independent TCP connections avoid coupling every lane to
+                    # the congestion window of one slow multiplexed connection.
+                    cmd=[*SSH_OPTS,'-o','ControlPath=none','-o','ControlMaster=no',host,'if test -f '+remote+'; then tail -c +'+str(offset+1)+' '+remote+'; else exit 75; fi']
                     with path.open('ab') as out:
                         p=subprocess.run(cmd,stdout=out,stderr=subprocess.PIPE,env=clean_transport_env())
                     if p.returncode==75:
