@@ -11,9 +11,9 @@
 </div>
 
 <p align="center">
-  <img src="assets/hero.jpg" width="640" alt="Complete Piper bimanual real-robot setup with Pika devices awaiting integration">
+  <img src="assets/hero.jpg" width="100%" alt="Piper bimanual real-robot setup with RGB cameras">
   <br>
-  <em>Real-robot system. Pika devices shown are awaiting integration（Pika 设备待接入）.</em>
+  <em>Piper bimanual real-robot system.</em>
 </p>
 
 ## Overview
@@ -49,24 +49,11 @@ behavior depends on the active Policy contract and hardware configuration.
 
 ## System Overview
 
-```mermaid
-flowchart LR
-    Robot["Piper + RGB cameras"] --> Collect["Demonstration collection"]
-    Collect --> Data["LeRobot datasets"]
-    Data --> Train["OpenPI SFT"]
-    Train --> Weights["Checkpoints + action contracts"]
-    Sim["Simulation rollouts + rewards"] --> RL["RLinf RL training"]
-    RL --> RLWeights["RL checkpoints + evaluation videos"]
-    Weights --> Policy["Policy server + model-side RTC"]
-    Robot -->|Images and state| Policy
-    Policy --> Queue["Timed action queue"]
-    Queue --> Execute["Local safety checks + Ruckig"]
-    Execute --> Robot
-    Dashboard["Dashboard: data, jobs, metrics, transfers"] -.-> Data
-    Dashboard -.-> Train
-    Dashboard -.-> Weights
-    Dashboard -.-> RL
-```
+<p align="center">
+  <img src="assets/architecture_overview_v2.png" width="100%" alt="bimanual-vla architecture: real-robot data collection, OpenPI SFT and simulation RLinf RL training, real-time deployment, and multi-node Dashboard management">
+  <br>
+  <em>Pika devices shown in the collection panel are awaiting integration（Pika 设备待接入）.</em>
+</p>
 
 The public workflow is organized into three stages. Detailed data contracts,
 validation rules, transport fields, and server operations live in
