@@ -160,7 +160,7 @@ class RemoteCheckpointInventory:
                 # A browser can issue several refreshes while opening a dialog.
                 # Reuse the completed metadata for 30s; never submit duplicate jobs.
                 fresh=time.time()-(row.get('updated_at') or 0)<30
-                if force and (source is None or name==source) and row['state']!='loading' and not fresh:
+                if force and name == source and row['state']!='loading' and not fresh:
                     row['state']='loading'
                     self.pool.submit(self._refresh,name,dict(target))
             return json.loads(json.dumps(list(self.entries.values())))

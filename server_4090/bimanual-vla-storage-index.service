@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh canonical storage locations and queued Dashboard mutations
+[Service]
+Type=oneshot
+WorkingDirectory=%h/bimanual-vla
+ExecStart=%h/miniconda3/envs/openpi/bin/python -m server_4090.storage_catalog --config %h/bimanual-vla/server_4090/config.simulation.json --action refresh --scheduled
+Nice=10
+TimeoutStartSec=30min
+UMask=0077

@@ -1,0 +1,9 @@
+[Unit]
+Description=Check storage index updates every minute; canonical refresh every 15 minutes
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=bimanual-vla-storage-index.service
+[Install]
+WantedBy=timers.target

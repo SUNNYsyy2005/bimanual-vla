@@ -84,17 +84,43 @@ def upgrade_native_profiles(config: dict[str, Any]) -> dict[str, Any]:
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 CURVE_NAMES = {"training_curve.json", "evaluation_curve.json"}
-REMOTE_SCAN = r'''import json, os, pathlib, sys, subprocess
+REMOTE_SCAN = r'''import json, os, pathlib, sys, subprocess, time
 root=pathlib.Path(sys.argv[1]); limit=int(sys.argv[2]); parse_events=len(sys.argv)>3 and sys.argv[3]=='1'
-curves={}; events={}; tracked={}; statuses={}; metadata={}; job_states={}
+curves={}; events={}; tracked={}; statuses={}; metadata={}; job_states={}; resolved={}
 tracked_suffixes=('.log','.out','.err')
 tracked_names={'training_curve.json','evaluation_curve.json','process.json','resource_samples.jsonl','metrics.log','protocol.json','completion.json','monitor_phase.json'}
+scan_started=time.monotonic(); directory_count=0; scan_warning=None
+payload_dirs={'checkpoints','params','train','eval','rollouts','video','videos','frames','images','latents','features','replay_buffer','runtime-cache','cache','data','datasets','assets','bddl_files','init_files','code','configs','wandb','__pycache__','node_modules','artifacts'}
+def bounded_walk(root):
+  global scan_warning
+  pending=[root];visited=set();entries=0
+  while pending:
+    current=pending.pop();real=str(current.resolve())
+    if real in visited:continue
+    visited.add(real);dirs=[];files=[]
+    try:
+      with os.scandir(current) as children:
+        for entry in children:
+          entries+=1
+          if entries>50000 or time.monotonic()-scan_started>8:
+            scan_warning='目录探测达到本轮限额；已保留发现结果，请选择具体实验范围'
+            return
+          if entry.is_dir():
+            if not entry.name.startswith(('.', 'tmp-', 'ray-', 'round_', 'round-', 'eval-round', 'train-round')) and entry.name not in payload_dirs:dirs.append(entry.name)
+          else:files.append(entry.name)
+    except OSError:continue
+    yield str(current),dirs,files
+    # New experiment groups are read first; never walk model/rollout payloads.
+    dirs.sort(key=lambda name:(current/name).stat().st_mtime if (current/name).exists() else 0)
+    pending.extend(current/name for name in dirs)
 if root.is_dir():
-  for current, dirs, files in os.walk(root, followlinks=True):
-    if "run.json" in files: dirs[:] = []
+  for current, dirs, files in bounded_walk(root):
+    directory_count+=1
+    if "run.json" in files: dirs[:] = [d for d in dirs if d in ('metrics','logs','tensorboard','metadata')]
     rel=pathlib.Path(current).relative_to(root)
+    resolved[rel.as_posix()]=str(pathlib.Path(current).resolve())
     if len(rel.parts)>=limit: dirs[:]=[]
-    dirs[:]=[d for d in dirs if not d.startswith('.')]
+    dirs[:]=[d for d in dirs if not d.startswith('.') and d not in ('checkpoints','params','train','eval','rollouts','video','videos','frames','images','latents','features','replay_buffer')]
     meta={}
     for name in ('protocol.json','completion.json','config.json','monitor_phase.json'):
       if name not in files: continue
@@ -104,7 +130,29 @@ if root.is_dir():
           value=json.loads(path.read_text(encoding='utf-8'))
           if isinstance(value,dict): meta[name]=value
       except (OSError,ValueError): pass
-    if meta: metadata[rel.as_posix()]=meta
+    if 'run.json' in files:
+      try:
+        manifest=json.loads((pathlib.Path(current)/'run.json').read_text())
+        if manifest.get('backend')!='rlinf' or manifest.get('kind')=='eval':
+          dirs[:]=[]
+          continue
+        meta['run.json']=manifest
+        # Native output is only a source of small diagnostic metadata, never a recursive payload scan.
+        native=manifest.get('native_output')
+        if native:
+          native_path=(pathlib.Path(current)/native).resolve()
+          if native_path.is_relative_to(pathlib.Path(current).resolve()):
+            for name in ('protocol.json','config.json','completion.json','monitor_phase.json'):
+              path=native_path/name
+              if path.is_file() and path.stat().st_size<=8*1024*1024:
+                value=json.loads(path.read_text())
+                if isinstance(value,dict):meta.setdefault(name,value)
+      except (OSError,ValueError):pass
+    metadata_rel=rel
+    if pathlib.Path(current).name=='metadata' and (pathlib.Path(current).parent/'run.json').is_file():metadata_rel=rel.parent
+    if meta:
+      existing=metadata.setdefault(metadata_rel.as_posix(),{})
+      for key,value in meta.items():existing.setdefault(key,value)
     for name in files:
       if name not in tracked_names and not name.endswith(tracked_suffixes): continue
       path=pathlib.Path(current)/name
@@ -115,7 +163,9 @@ if root.is_dir():
       path=pathlib.Path(current)/name
       try:
         if path.stat().st_size>8*1024*1024: continue
-        curves[str(path.relative_to(root))]=json.loads(path.read_text(encoding='utf-8'))
+        key=path.relative_to(root)
+        if path.parent.name=='metrics' and (path.parent.parent/'run.json').is_file(): key=key.parent.parent/key.name
+        curves[str(key)]=json.loads(path.read_text(encoding='utf-8'))
       except Exception: pass
     if 'process.json' in files:
       path=pathlib.Path(current)/'process.json'
@@ -137,12 +187,12 @@ if root.is_dir():
       event_key=run_rel.as_posix()
       events[event_key]={'files':[str(path.relative_to(root)) for path in event_files],
                          'updated_at':max(path.stat().st_mtime for path in event_files)}
-    if event_files and parse_events:
+    if event_files and parse_events and (run_rel/'training_curve.json').as_posix() not in curves:
       try:
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
         points={}; eval_points={}
         for event_file in sorted(event_files, key=lambda item: item.stat().st_mtime):
-          accumulator=EventAccumulator(str(event_file), size_guidance={'scalars': 0})
+          accumulator=EventAccumulator(str(event_file), size_guidance={'scalars': 10000})
           accumulator.Reload()
           for tag in accumulator.Tags().get('scalars', []):
             destination=eval_points if tag.startswith('eval/') else points
@@ -157,7 +207,7 @@ if root.is_dir():
           curves.setdefault(key, {'points':[eval_points[step] for step in sorted(eval_points)]})
       except Exception: pass
 if len(sys.argv)>4 and sys.argv[4]=='1':
-  ids={str(m.get('protocol.json',{}).get('job_id','')) for m in metadata.values()}
+  ids={str(m.get('run.json',{}).get('origin',{}).get('job_id') or m.get('protocol.json',{}).get('job_id','')) for m in metadata.values()}
   ids={v for v in ids if v and all(c in '0123456789_' for c in v)}
   if ids:
     try:
@@ -184,18 +234,18 @@ if len(sys.argv)>4 and sys.argv[4]=='1':
               for job in fields[:2]:
                 if job in missing: job_states[job]=fields[2].split()[0].rstrip('+')
       except (OSError,subprocess.TimeoutExpired): pass
-print(json.dumps({'curves':curves,'events':events,'tracked':tracked,'statuses':statuses,'metadata':metadata,'job_states':job_states},separators=(',',':')))
+print(json.dumps({'curves':curves,'events':events,'tracked':tracked,'statuses':statuses,'metadata':metadata,'job_states':job_states,'scan_warning':scan_warning,'directories_checked':directory_count,'resolved':resolved},separators=(',',':')))
 '''
 
 
 def _local_metadata(root: Path, max_depth: int) -> dict[str, Any]:
     result = {}
     for current, dirs, files in os.walk(root, followlinks=True):
-        if "run.json" in files: dirs[:] = []
+        if "run.json" in files: dirs[:] = [d for d in dirs if d in ('metrics','logs','tensorboard')]
         rel = Path(current).relative_to(root)
         if len(rel.parts) >= max_depth:
             dirs[:] = []
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in {'checkpoints','params','train','eval','rollouts','video','videos','frames','images','latents','features','replay_buffer'}]
         meta = {}
         for name in ('protocol.json', 'completion.json', 'config.json', 'monitor_phase.json'):
             if name not in files:
@@ -250,11 +300,11 @@ def _local_curves(root: Path, max_depth: int) -> dict[str, Any]:
     if not root.is_dir():
         return result
     for current, dirs, files in os.walk(root, followlinks=True):
-        if "run.json" in files: dirs[:] = []
+        if "run.json" in files: dirs[:] = [d for d in dirs if d in ('metrics','logs','tensorboard')]
         rel = Path(current).relative_to(root)
         if len(rel.parts) >= max_depth:
             dirs[:] = []
-        dirs[:] = [name for name in dirs if not name.startswith(".")]
+        dirs[:] = [name for name in dirs if not name.startswith(".") and name not in {"checkpoints","params","train","eval","rollouts","video","videos","frames","images","latents","features","replay_buffer"}]
         for name in CURVE_NAMES:
             if name not in files:
                 continue
@@ -262,7 +312,9 @@ def _local_curves(root: Path, max_depth: int) -> dict[str, Any]:
             try:
                 if path.stat().st_size > 8 * 1024 * 1024:
                     continue
-                result[path.relative_to(root).as_posix()] = json.loads(path.read_text(encoding="utf-8"))
+                key=path.relative_to(root)
+                if path.parent.name=="metrics" and (path.parent.parent/"run.json").is_file(): key=key.parent.parent/key.name
+                result[key.as_posix()] = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
         if "process.json" in files:
@@ -289,11 +341,11 @@ def _local_tracked_mtimes(root: Path, max_depth: int) -> dict[str, float]:
     tracked_names = {"training_curve.json", "evaluation_curve.json", "process.json",
                      "resource_samples.jsonl", "metrics.log", "protocol.json", "completion.json", "monitor_phase.json"}
     for current, dirs, files in os.walk(root, followlinks=True):
-        if "run.json" in files: dirs[:] = []
+        if "run.json" in files: dirs[:] = [d for d in dirs if d in ('metrics','logs','tensorboard')]
         rel = Path(current).relative_to(root)
         if len(rel.parts) >= max_depth:
             dirs[:] = []
-        dirs[:] = [name for name in dirs if not name.startswith(".")]
+        dirs[:] = [name for name in dirs if not name.startswith(".") and name not in {"checkpoints","params","train","eval","rollouts","video","videos","frames","images","latents","features","replay_buffer"}]
         for name in files:
             if name not in tracked_names and not name.endswith((".log", ".out", ".err")):
                 continue
@@ -325,7 +377,11 @@ def _run_updated_at(relative: str, tracked: dict[str, Any]) -> float | None:
 
 
 def _scan_root(source: dict[str, Any], root: str, max_depth: int, *, parse_events: bool = False) -> dict[str, Any]:
-    python = str(source.get("python") or "python3")
+    if source.get('storage_location'):
+        from .storage_catalog import storage_worker
+        return storage_worker(source['storage_location'], dict(action='run_summary', root=root, max_depth=max_depth,
+                              parse_events=parse_events, scan_code=REMOTE_SCAN))
+    python = str(source.get("python") or sys.executable)
     query_slurm = source.get("query_slurm", bool(source.get("ssh_host")) and str(source.get("target", "")).lower() in {"h100", "h200"})
     flags = ["1" if parse_events else "0", "1" if query_slurm else "0"]
     command = shlex.join([python, "-c", REMOTE_SCAN, root, str(max_depth), *flags])
@@ -369,7 +425,7 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
         if not SAFE_ID.fullmatch(source_id) or not root:
             continue
         depth = max(1, min(8, int(source.get("max_depth", 5))))
-        statuses, metadata, job_states = {}, {}, {}
+        statuses, metadata, job_states, resolved_paths = {}, {}, {}, {}
         try:
             if source.get("ssh_host") or source.get("python"):
                 scan = _scan_root(source, root, depth, parse_events=False)
@@ -379,14 +435,15 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
                 statuses = scan.get("statuses", {})
                 metadata = scan.get("metadata", {})
                 job_states = scan.get("job_states", {})
+                resolved_paths = scan.get("resolved", {})
             else:
                 curves = _local_curves(Path(root), depth)
                 event_runs = {}
                 tracked_mtimes = _local_tracked_mtimes(Path(root), depth)
                 metadata = _local_metadata(Path(root), depth)
-            if not source.get("ssh_host") and not Path(root).is_dir():
+            if not source.get("ssh_host") and not source.get('storage_location') and not Path(root).is_dir():
                 raise FileNotFoundError(f"configured curve root does not exist: {root}")
-            source_error = None
+            source_error = scan.get('scan_warning') if source.get('ssh_host') or source.get('python') else None
         except Exception as exc:
             curves, event_runs, tracked_mtimes, source_error = {}, {}, {}, str(exc)
         grouped: dict[str, dict[str, Any]] = {}
@@ -407,7 +464,7 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
         for relative, meta in metadata.items():
             proto = meta.get('protocol.json', {})
             candidate = meta.get('config.json') or proto.get('config') or {}
-            if proto and (proto.get('algorithm') or (isinstance(candidate, dict) and isinstance(candidate.get('algorithm'), str))):
+            if meta.get('run.json') or proto and (proto.get('algorithm') or (isinstance(candidate, dict) and isinstance(candidate.get('algorithm'), str))):
                 grouped.setdefault(relative, {"training": [], "evaluation": [], "files": []})
         for relative, event_info in event_runs.items():
             entry = grouped.setdefault(relative or ".", {"training": [], "evaluation": [], "files": []})
@@ -423,7 +480,12 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
             run_path = root.rstrip("/") + ("/" + relative if relative != "." else "")
             task = next((item for output, item in active_by_output.items() if run_path == output or run_path.startswith(output.rstrip("/") + "/")), None)
             meta = metadata.get(relative, {})
-            protocol = meta.get('protocol.json', {})
+            manifest=meta.get('run.json', {})
+            protocol = dict(meta.get('protocol.json', {}))
+            if manifest:
+                protocol['job_id']=manifest.get('origin',{}).get('job_id') or protocol.get('job_id')
+                protocol.setdefault('status',manifest.get('state'))
+                protocol.setdefault('algorithm',manifest.get('algorithm'))
             cfg = meta.get('config.json') or protocol.get('config') or {}
             if not isinstance(cfg, dict):
                 cfg = {}
@@ -461,8 +523,13 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
             label = str(source.get("label", source_id))
             name = label if relative in ("", ".") else f"{label} / {relative}"
             algorithm = next((v.lower() for v in (cfg.get('algorithm'), protocol.get('algorithm'), source.get('method'), leaf) if isinstance(v, str) and v), leaf)
-            if cfg.get('task_name'):
+            if manifest:
+                name=' / '.join(str(v) for v in (manifest.get('task'),manifest.get('experiment'),manifest.get('run_id')) if v)
+                algorithm=manifest.get('algorithm') or algorithm
+            if cfg.get('task_name') and not manifest:
                 name = f"{label} / {cfg['task_name']}"
+            if source_id.startswith('live-') and not manifest:
+                name=relative if relative not in ('','.') else Path(root).name
             if cfg.get('algorithm_revision') == 'ppo-lag-v3-minibatch':
                 name += ' · PPO v3（续训）'
             state = task.get("state") if task else str(source.get("state", "observed"))
@@ -499,7 +566,12 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
                     status_reason += '; protocol is stale or execution could not be verified'
                 if completion.get('error'):
                     status_reason += '; ' + str(completion['error'])[:300]
+            if manifest.get('state') in {'created','planned'} and not protocol.get('job_id') and not curves_for_run['training'] and not curves_for_run['evaluation']:
+                continue
+            from server_4090.rlinf_identity import contract_from_config
+            inferred_contract = contract_from_config(config, cfg)
             runs.append({
+                "_physical_path": resolved_paths.get(relative,run_path),
                 "id": run_id,
                 "source_id": source_id,
                 "source_label": source.get("label", source_id),
@@ -510,7 +582,11 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
                 "algorithm": algorithm,
                 "algorithm_revision": cfg.get('algorithm_revision'),
                 "algorithm_switch_after_round": next((p.get('round', 0)-1 for p in curves_for_run['training'] if 'ppo_update.optimizer_steps' in p), None),
-                "task_name": cfg.get('task_name'),
+                "action_contract": manifest.get('action_contract') or (task.get('metadata', {}).get('action_contract') if task else None) or cfg.get('action_contract') or inferred_contract,
+                "task_name": manifest.get("task") or cfg.get('task_name'),
+                "run_id": manifest.get("run_id"),
+                "_canonical": bool(manifest),
+                "_aliases": [run_path]+[str(Path(run_path)/manifest["native_output"])] if manifest.get("native_output") else [run_path]+([manifest["origin"]["legacy_path"]] if manifest.get("origin",{}).get("legacy_path") else []),
                 "job_id": protocol.get('job_id'),
                 "phase": phase.get('name'),
                 "current_round": phase.get('round'),
@@ -526,7 +602,7 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
                 "state": state,
                 "task_id": task.get("id") if task else None,
                 "launch_profile": task.get("metadata", {}).get("launch_profile") if task else None,
-                "execution_target": task.get("metadata", {}).get("execution_target") if task else source.get("target"),
+                "execution_target": manifest.get("execution_node") or manifest.get("execution_target") or (task.get("metadata", {}).get("execution_target") if task else source.get("target")),
                 "updated_at": stat_updated,
                 "synced_at": synced_at,
                 "finished_at": finished_at,
@@ -558,11 +634,31 @@ def public_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 CHECKPOINT_SCAN = r'''import base64,json,os,pathlib,re,sys,zipfile
 root=pathlib.Path(sys.argv[1]).resolve(); rows=[]
+index_path=root/'checkpoints/index.json'
+if index_path.is_file():
+  index=json.loads(index_path.read_text())
+  if index.get('schema')!='checkpoint_index.v1': raise ValueError('Invalid checkpoint index')
+  for item in index.get('checkpoints',[]):
+    if item.get('complete') is not True: continue
+    relative=pathlib.PurePosixPath(str(item.get('path','')))
+    if relative.is_absolute() or '..' in relative.parts or not relative.parts or relative.parts[0]!='checkpoints': continue
+    checkpoint=root/relative
+    weight=checkpoint if checkpoint.is_file() else checkpoint/'actor/model_state_dict/full_weights.pt'
+    if not weight.is_file() or root not in weight.resolve().parents: continue
+    # This evaluator accepts RLinf full actor weights, not arbitrary native actor snapshots.
+    if weight.name!='full_weights.pt' or not zipfile.is_zipfile(weight): continue
+    step=item.get('step')
+    if step is None:
+      match=re.fullmatch(r'global_step_(\d+)',checkpoint.name)
+      if not match: continue
+      step=int(match[1])
+    relative=weight.relative_to(root).as_posix()
+    rows.append({'id':base64.urlsafe_b64encode(relative.encode()).decode().rstrip('='),'step':int(step),'path':str(weight),'relative_path':relative,'size_bytes':weight.stat().st_size,'discovery':'checkpoint_index'})
 if root.is_dir():
   for current,dirs,files in os.walk(root, followlinks=True):
     rel=pathlib.Path(current).relative_to(root)
     if len(rel.parts)>4: dirs[:]=[]; continue
-    dirs[:]=[d for d in dirs if not d.startswith('.') and d not in ('video','tensorboard') and not (pathlib.Path(current)/d).is_symlink()]
+    dirs[:]=[d for d in dirs if not d.startswith('.') and d not in ('video','tensorboard','logs','metrics','train','eval','rollouts','frames','latents') and not (pathlib.Path(current)/d).is_symlink()]
     match=re.fullmatch(r'global_step_(\d+)',pathlib.Path(current).name)
     if not match: continue
     weight=pathlib.Path(current)/'actor/model_state_dict/full_weights.pt'
@@ -571,7 +667,7 @@ if root.is_dir():
     if root not in resolved.parents: continue
     relative=weight.relative_to(root).as_posix()
     rows.append({'id':base64.urlsafe_b64encode(relative.encode()).decode().rstrip('='),'step':int(match[1]),'path':str(weight),'relative_path':relative,'size_bytes':weight.stat().st_size})
-print(json.dumps(sorted(rows,key=lambda row:row['step'],reverse=True)))
+print(json.dumps(sorted({row['path']:row for row in rows}.values(),key=lambda row:row['step'],reverse=True)))
 '''
 
 
@@ -589,11 +685,13 @@ def checkpoints_for_run(run: dict[str, Any]) -> list[dict[str, Any]]:
 
 NATIVE_LOG_READ = r'''import json,os,pathlib,sys
 root=pathlib.Path(sys.argv[1]).resolve(); candidates=[]
-if root.is_dir():
+if (root/'run.json').is_file() and (root/'logs').is_dir():
+  candidates=[p for p in (root/'logs').iterdir() if p.is_file() and not p.is_symlink() and p.suffix.lower() in ('.log','.out','.err')]
+elif root.is_dir():
   for current,dirs,files in os.walk(root, followlinks=True):
     rel=pathlib.Path(current).relative_to(root)
     if len(rel.parts)>=3: dirs[:]=[]
-    dirs[:]=[name for name in dirs if not name.startswith('.') and name not in ('checkpoints','video','tensorboard')]
+    dirs[:]=[name for name in dirs if not name.startswith('.') and not (pathlib.Path(current)/name).is_symlink() and name not in ('checkpoints','params','video','videos','tensorboard','train','eval','rollouts','frames','images','latents','features','replay_buffer','runtime-cache','cache','data','datasets','assets','wandb')]
     for name in files:
       path=pathlib.Path(current)/name
       if path.suffix.lower() not in ('.log','.out','.err') or path.is_symlink() or root not in path.resolve().parents: continue
@@ -635,6 +733,33 @@ def evaluation_profile(config: dict[str, Any], run: dict[str, Any]) -> tuple[str
     if not profile.get("enabled", True) or not profile.get("evaluation"):
         raise ValueError("该运行没有配置原生 RLInf rollout 评测入口")
     return target_id, target, str(profile_id), profile
+
+
+_live_event_cache = {}
+
+
+def live_metrics_for_run(run):
+    source = dict(run.get('_source') or {})
+    root = run['path']
+    source['query_slurm']=False
+    scanned = _scan_root(source, root, 2, parse_events=False)
+    curves = scanned.get('curves', {})
+    events=scanned.get('events',{})
+    if events and not any(key.endswith('training_curve.json') for key in curves):
+        key=(source.get('ssh_host'),root)
+        signature=json.dumps(events,sort_keys=True)
+        cached=_live_event_cache.get(key)
+        if cached and cached[0]==signature:
+            curves=cached[1]
+        else:
+            curves=_scan_root(source,root,2,parse_events=True).get('curves',{})
+            if len(_live_event_cache)>=128:_live_event_cache.pop(next(iter(_live_event_cache)),None)
+            _live_event_cache[key]=(signature,curves)
+    training = _curve_points(curves.get('training_curve.json') or curves.get('metrics/training_curve.json') or [])
+    evaluation = _curve_points(curves.get('evaluation_curve.json') or curves.get('metrics/evaluation_curve.json') or [])
+    current = dict(run, _training=training, _evaluation=evaluation, _event_files=[],
+                   training_points=len(training), evaluation_points=len(evaluation), checked_at=time.time())
+    return metrics_for_run([current], current['id'])
 
 
 def metrics_for_run(runs: list[dict[str, Any]], run_id: str) -> dict[str, Any]:

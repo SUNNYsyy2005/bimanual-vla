@@ -62,9 +62,9 @@ test('pagination clamps after deletion and keeps selections across pages', () =>
 });
 
 test('metric discovery includes keys introduced after the first training point', async () => {
-  const elements = new Map([['rlinfMetric',{value:'',innerHTML:''}]]);
-  const context = {rlinfMetricRequest:0,rlinfSelected:new Set(['run']),rlinfRuns:[{id:'run'}],
-    api:async()=>({run:{id:'run'},training_points:[{actor_updates:1,loss:1},{actor_updates:2,gradient_norm:3}],evaluation_points:[]}),
+  const elements = new Map([['rlinfMetric',{value:'',innerHTML:''}], ['rlinfMetricLoadStatus',{}]]);
+  const context = {rlinfMetricData:new Map(), rlinfMetricRequest:0,rlinfSelected:new Set(['run']),rlinfRuns:[{id:'run'}],
+    readRlinfLive:async()=>({run:{id:'run'},training_points:[{actor_updates:1,loss:1},{actor_updates:2,gradient_norm:3}],evaluation_points:[]}),
     document:{getElementById:id=>elements.get(id)},renderRlinfRuns(){},drawRlinfChart(){},esc:String};
   vm.createContext(context);
   vm.runInContext(extract('async function loadRlinfSelectedMetrics()', '\nfunction drawRlinfChart()'), context);
@@ -95,7 +95,7 @@ test('PPO table shows zero actor updates and never presents training SR as evalu
     id:'ppo',name:'PPO',state:'running',method:'ppo-lag',completed_training_round:1,actor_updates:0,
     planned_rounds:32,evaluation_points:0,next_evaluation_round:8,latest:{'train.SR':.75}
   }],rlinfSelected:new Set(),rlinfDeleteSelection:new Set(),rlinfDeleting:false,
-    esc:String,paginateList:(_,rows)=>rows,renderListPagination:()=>'',
+    setInterval(){}, modelIdentityLabel:()=>'', esc:String,paginateList:(_,rows)=>rows,renderListPagination:()=>'',
     rlinfCanDelete:()=>false,updateRlinfDeleteSelection(){},fillRlinfEvalRuns(){}};
   vm.createContext(context);
   context.filteredRlinfRuns=()=>context.rlinfRuns;

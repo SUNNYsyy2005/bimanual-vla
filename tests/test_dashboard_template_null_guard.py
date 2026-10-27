@@ -14,9 +14,10 @@ class DashboardTemplateNullGuardTest(unittest.TestCase):
         self.assertIn('id="trainExperimentName"', template)
         self.assertIn('list="trainExperimentOptions"', template)
         self.assertIn("fillTrainingExperiments(data.experiments || [])", template)
-        self.assertIn("if (isFoundationModel(model)) return true;", template)
-        self.assertIn("model.experiment !== experiment", template)
-        self.assertIn("model.arm_mode === dataset.arm_mode", template)
+        self.assertIn('id="trainWeightScene"', template)
+        self.assertIn("modelScenes(model).includes(scene)", template)
+        self.assertNotIn("const sameDataset", template)
+        self.assertIn("modelIdentityReason(model,dataset)", template)
 
     def test_dataset_origin_filter_and_upload_classification_are_visible(self):
         template = (
