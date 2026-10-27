@@ -4159,6 +4159,8 @@ def build_environment(
 def create_app(config_path: Path) -> Flask:
     config_file = Path(config_path).expanduser().resolve()
     config = upgrade_native_profiles(load_config(config_file))
+    from server_4090.remote_checkpoints import RemoteCheckpointInventory
+    remote_checkpoints = RemoteCheckpointInventory(config.get("cluster_targets", {}))
     token = os.environ.get("BIMANUAL_VLA_SERVER_TOKEN", "")
     if len(token) < 20:
         raise RuntimeError("set BIMANUAL_VLA_SERVER_TOKEN to a random value of at least 20 characters")
@@ -6641,6 +6643,10 @@ print(json.dumps(rows, ensure_ascii=False))
                 "dataset_root": target.get("dataset_root"),
                 "openpi_python": target.get("openpi_python"),
                 "workdir": target.get("workdir"),
+                "openpi_python": target.get("openpi_python"),
+                "inventory_python": target.get("inventory_python"),
+                "log_transport": target.get("log_transport", "sattach"),
+                "cache_root": target.get("cache_root") or str(PurePosixPath(str(target.get("workdir") or "/tmp")).parent / "cache"),
                 "log_dir": target.get("log_dir"),
                 "remote_job_dir": target.get("remote_job_dir"),
                 "cache_root": target.get("cache_root"),
@@ -6689,6 +6695,10 @@ print(json.dumps(rows, ensure_ascii=False))
                 "node": target.get("node"),
                 "gpu_type": target.get("gpu_type"),
                 "workdir": target.get("workdir"),
+                "openpi_python": target.get("openpi_python"),
+                "inventory_python": target.get("inventory_python"),
+                "log_transport": target.get("log_transport", "sattach"),
+                "cache_root": target.get("cache_root"),
                 "remote_job_dir": target.get("remote_job_dir"),
                 "log_dir": target.get("log_dir"),
                 "dataset_root": str(PurePosixPath(str(target["checkpoint_base_dir"]).rstrip("/")) / config_name),
@@ -7029,9 +7039,6 @@ print(json.dumps(rows, ensure_ascii=False))
             },
         )
         return jsonify(task), 201
-
-    from server_4090.remote_checkpoints import RemoteCheckpointInventory
-    remote_checkpoints = RemoteCheckpointInventory(config.get("cluster_targets", {}))
 
     extension_nodes_lock = threading.Lock()
 
@@ -8823,7 +8830,7 @@ print(json.dumps(rows, ensure_ascii=False))
         if not roots:
             raise ValueError("no evaluation artifact/video root configured")
         eval_name = f"step_{checkpoint['step']}_{uuid.uuid4().hex[:12]}"
-        local_output = Path(config["eval_video_roots"][0]) / "rlinf" / target_id / eval_name
+        local_output = roots[0] / "rlinf" / target_id / eval_name
         kind = target.get("kind", "local")
         output = str(local_output) if kind == "local" else str(PurePosixPath(profile["run_root"]) / "dashboard_evaluations" / eval_name)
         context = video_catalog.classify(Path(run["path"]).parent, Path(run["path"]).name + "/context.mp4", {

@@ -14,6 +14,21 @@ from bimanual_vla.collection.camera import (
 
 
 class JointCameraSelectionTest(unittest.TestCase):
+    def test_reviewed_selector_is_not_overridden_by_saved_serial_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / '.config/bimanual-vla'
+            settings.mkdir(parents=True)
+            (settings / 'camera_serials.json').write_text('{"cam_high": "STALE-SERIAL"}')
+            reviewed = root / 'video4'
+            reviewed.touch()
+            with mock.patch('pathlib.Path.home', return_value=root), mock.patch(
+                'bimanual_vla.collection.camera._serial_rgb_device'
+            ) as serial_lookup:
+                selected = select_video_devices({'cam_high': str(reviewed)}, strict_explicit=True)
+            self.assertEqual(selected, {'cam_high': str(reviewed)})
+            serial_lookup.assert_not_called()
+
     def test_serial_selects_rgb_not_auxiliary_or_other_camera(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -40,7 +55,8 @@ class JointCameraSelectionTest(unittest.TestCase):
             identity = lambda node: root / ('usb_a' if node in nodes[:2] else 'usb_b')
             with mock.patch('bimanual_vla.collection.camera._physical_video_device', side_effect=identity), mock.patch(
                 'bimanual_vla.collection.camera._enumerate_video_candidates', return_value=candidates
-            ):
+            ), mock.patch.dict('bimanual_vla.collection.camera.CAMERA_ROLE_PATH_HINTS',
+                               {'cam_left_wrist': ('video6',), 'cam_right_wrist': ('video22',)}):
                 selected = select_video_devices({'cam_left_wrist': 'auto', 'cam_right_wrist': 'auto'}, device_root=root)
                 self.assertEqual(selected['cam_right_wrist'], str(nodes[2]))
                 with self.assertRaisesRegex(RuntimeError, 'same physical camera'):
@@ -54,7 +70,7 @@ class JointCameraSelectionTest(unittest.TestCase):
             format_score=score,
         )
 
-    def test_two_identical_wrist_roles_receive_distinct_devices(self):
+    def test_two_identical_wrist_roles_without_topology_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             left = root / "video12"
@@ -66,13 +82,11 @@ class JointCameraSelectionTest(unittest.TestCase):
                 self._candidate(right, "depth_camera_405"),
             ]
             with mock.patch("bimanual_vla.collection.camera._enumerate_video_candidates", return_value=candidates):
-                selected = select_video_devices(
-                    {"cam_left_wrist": "auto", "cam_right_wrist": "auto"},
-                    device_root=root,
-                )
-
-            self.assertEqual(selected["cam_left_wrist"], str(left))
-            self.assertEqual(selected["cam_right_wrist"], str(right))
+                with self.assertRaisesRegex(RuntimeError, "Cannot safely distinguish"):
+                    select_video_devices(
+                        {"cam_left_wrist": "auto", "cam_right_wrist": "auto"},
+                        device_root=root,
+                    )
 
     def test_current_usb_topology_keeps_left_and_right_physical_roles(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -111,7 +125,10 @@ class JointCameraSelectionTest(unittest.TestCase):
             for path in paths:
                 path.touch()
             candidates = [self._candidate(path, "depth_camera_405") for path in paths]
-            with mock.patch("bimanual_vla.collection.camera._enumerate_video_candidates", return_value=candidates):
+            with mock.patch("bimanual_vla.collection.camera._enumerate_video_candidates", return_value=candidates), mock.patch.dict(
+                "bimanual_vla.collection.camera.CAMERA_ROLE_PATH_HINTS",
+                {"cam_left_wrist": ("video8",), "cam_right_wrist": ("video22",)}
+            ):
                 pair = select_video_devices(
                     {"cam_right_wrist": "auto", "cam_left_wrist": "auto"}, device_root=root)
                 for role in ("cam_left_wrist", "cam_right_wrist"):
@@ -144,7 +161,39 @@ class JointCameraSelectionTest(unittest.TestCase):
             self.assertEqual(pair["cam_left_wrist"], str(paths[1]))
             self.assertEqual(pair["cam_right_wrist"], "usb-0:5.2:1.0-video-index4")
 
-    def test_stale_paths_fall_back_without_collision(self):
+    def test_unreviewed_workstation_topology_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            port_22 = root / "video10"
+            port_132 = root / "video22"
+            port_22.touch()
+            port_132.touch()
+            candidates = [
+                self._candidate(port_22, "depth_camera_405"),
+                self._candidate(port_132, "depth_camera_405"),
+            ]
+
+            def selector(path: Path) -> str:
+                return (
+                    "usb-0:2.2:1.0-video-index4"
+                    if path == port_22
+                    else "usb-0:13.2:1.0-video-index4"
+                )
+
+            with mock.patch(
+                "bimanual_vla.collection.camera._enumerate_video_candidates",
+                return_value=candidates,
+            ), mock.patch(
+                "bimanual_vla.collection.camera._stable_video_selector",
+                side_effect=selector,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Cannot safely distinguish"):
+                    select_video_devices(
+                        {"cam_left_wrist": "auto", "cam_right_wrist": "auto"},
+                        device_root=root,
+                    )
+
+    def test_stale_paths_do_not_fall_back_to_ambiguous_order(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             first = root / "video12"
@@ -156,15 +205,27 @@ class JointCameraSelectionTest(unittest.TestCase):
                 self._candidate(second, "depth_camera_405"),
             ]
             with mock.patch("bimanual_vla.collection.camera._enumerate_video_candidates", return_value=candidates):
-                selected = select_video_devices(
-                    {
-                        "cam_left_wrist": root / "missing-left",
-                        "cam_right_wrist": root / "missing-right",
-                    },
-                    device_root=root,
-                )
+                with self.assertRaisesRegex(RuntimeError, "Cannot safely distinguish"):
+                    select_video_devices(
+                        {
+                            "cam_left_wrist": root / "missing-left",
+                            "cam_right_wrist": root / "missing-right",
+                        },
+                        device_root=root,
+                    )
 
-            self.assertEqual(set(selected.values()), {str(first), str(second)})
+    def test_reviewed_selector_never_falls_back_after_disappearing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch("bimanual_vla.collection.camera._enumerate_video_candidates") as discover:
+                with self.assertRaisesRegex(RuntimeError, "reviewed selector is unavailable") as rejected:
+                    select_video_devices(
+                        {"cam_high": str(root / "missing-video")},
+                        device_root=root,
+                        strict_explicit=True,
+                    )
+            self.assertNotIn("missing-video", str(rejected.exception))
+            discover.assert_not_called()
 
     def test_valid_explicit_device_is_reserved_before_auto_assignment(self):
         with tempfile.TemporaryDirectory() as directory:

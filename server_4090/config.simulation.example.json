@@ -35,7 +35,7 @@
   "evaluation_xla_memory_fraction": 0.85,
   "policy_allow_busy_gpus": true,
   "policy_min_free_gpu_mib": 12000,
-  "policy_xla_memory_fraction": 0.60,
+  "policy_xla_memory_fraction": 0.6,
   "policy_xla_preallocate": false,
   "training_task_launch_backend": "nohup",
   "task_monitor_interval_s": 2.0,
@@ -161,5 +161,34 @@
   },
   "transfer_parallelism": 4,
   "nas_dataset_staging_root": "/DATA/NAS/GPUServer/${USER}/dashboard_dataset_sync",
-  "nas_checkpoint_staging_root": "/DATA/NAS/GPUServer/${USER}/dashboard_checkpoint_sync"
+  "nas_checkpoint_staging_root": "/DATA/NAS/GPUServer/${USER}/dashboard_checkpoint_sync",
+  "rlinf_dashboard": {
+    "enabled": false,
+    "poll_seconds": 20,
+    "sources": [],
+    "targets": {
+      "h100": {
+        "enabled": false,
+        "kind": "slurm",
+        "label": "H100",
+        "submit_host": "login-server",
+        "partition": "h100",
+        "node": "h100-ksy-01",
+        "project_root": "/path/to/Safe-RL-with-WM",
+        "run_root": "/path/to/Safe-RL-with-WM/outputs/dashboard_runs",
+        "profiles": {}
+      },
+      "h200-ali-01": {
+        "enabled": false,
+        "kind": "slurm",
+        "label": "H200 ali-01",
+        "submit_host": "login-server",
+        "partition": "h200",
+        "node": "h200-ali-01",
+        "project_root": "/path/to/staged/Safe-RL-with-WM",
+        "run_root": "/path/to/shared/NAS/rlinf/h200-ali-01",
+        "profiles": {}
+      }
+    }
+  }
 }

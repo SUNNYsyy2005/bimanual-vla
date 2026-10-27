@@ -14,6 +14,13 @@ import numpy as np
 import time
 
 from bimanual_vla.collection.camera import CameraCapture
+from bimanual_vla.device_guard import (
+    ResolvedDevices,
+    arm_role_request,
+    camera_role_request,
+    check_devices,
+    configured_resolver,
+)
 from bimanual_vla.collection.output import (
     CAMERA_SOURCE_HW,
     DEFAULT_CAMERA_FPS,
@@ -70,6 +77,7 @@ class CollectionConfig:
     right_can_name: str = DEFAULT_RIGHT_CAN
     cam_left_wrist_device: str = DEFAULT_LEFT_WRIST_DEVICE
     cam_right_wrist_device: str = DEFAULT_RIGHT_WRIST_DEVICE
+    rlsok_resolver: str | None = None
 
     def __post_init__(self):
         if self.capture_fps <= 0:
@@ -173,6 +181,7 @@ class CollectionSession:
         self.label: EpisodeLabel | None = None
         self.camera_checks: dict[str, dict] = {}
         self._last_camera_timestamps: dict[str, float] = {}
+        self.device_resolution: ResolvedDevices | None = None
         self.episode_index = next_episode_index(Path(config.output_dir))
 
     def _wait_for_robot_feedback(self, robot: Any, timeout_s: float = 3.0) -> None:
@@ -200,6 +209,9 @@ class CollectionSession:
     def connect(self) -> dict[str, dict]:
         if self.state is not SessionState.DISCONNECTED:
             raise RuntimeError(f"cannot connect while session is {self.state.value}")
+        previous_config = self.config
+        previous_resolution = self.device_resolution
+        self._resolve_devices()
         connected: list[Any] = []
         try:
             if self.config.arm_mode == SINGLE_ARM:
@@ -221,6 +233,7 @@ class CollectionSession:
                 resize_mode="stretch",
                 capture_hw=CAMERA_SOURCE_HW,
                 parallel_reads=True,
+                strict_selectors=bool(configured_resolver(self.config.rlsok_resolver)),
             )
             cameras.open()
             checks = self._camera_verifier(cameras, self.config.camera_fps)
@@ -231,6 +244,8 @@ class CollectionSession:
                 cameras.close()
             for item in reversed(connected):
                 item.DisconnectPort()
+            self.config = previous_config
+            self.device_resolution = previous_resolution
             raise
         self.piper = piper
         self.cameras = cameras
@@ -238,6 +253,48 @@ class CollectionSession:
         self.camera_checks = checks
         self.state = SessionState.READY
         return checks
+
+    def _resolve_devices(self) -> None:
+        """Resolve reviewed roles before any CAN or V4L2 handle is opened."""
+        config = self.config
+        resolved = check_devices(
+            purpose="collection",
+            arm_mode=config.arm_mode,
+            arm_side=config.arm_side,
+            arms=arm_role_request(
+                config.arm_mode, config.arm_side,
+                single=config.can_name, left=config.left_can_name, right=config.right_can_name,
+            ),
+            cameras=camera_role_request(
+                config.arm_mode, config.arm_side,
+                overhead=config.cam_high_device, wrist=config.cam_wrist_device,
+                left_wrist=config.cam_left_wrist_device,
+                right_wrist=config.cam_right_wrist_device,
+            ),
+            resolver=config.rlsok_resolver,
+        )
+        if resolved is None:
+            self.device_resolution = None
+            return
+        if self.state is not SessionState.DISCONNECTED:
+            current_arms = arm_role_request(
+                config.arm_mode, config.arm_side,
+                single=config.can_name, left=config.left_can_name, right=config.right_can_name,
+            )
+            if resolved.arms != current_arms:
+                raise RuntimeError("RLSOK: connected CAN mapping changed; disconnect devices first")
+        side = config.arm_side
+        self.config = replace(
+            config,
+            can_name=resolved.arms.get(side, config.can_name),
+            left_can_name=resolved.arms.get("left", config.left_can_name),
+            right_can_name=resolved.arms.get("right", config.right_can_name),
+            cam_high_device=resolved.cameras["overhead"],
+            cam_wrist_device=resolved.cameras.get(f"{side}_wrist", config.cam_wrist_device),
+            cam_left_wrist_device=resolved.cameras.get("left_wrist", config.cam_left_wrist_device),
+            cam_right_wrist_device=resolved.cameras.get("right_wrist", config.cam_right_wrist_device),
+        )
+        self.device_resolution = resolved
 
     def reconnect_cameras(self) -> dict[str, dict]:
         """Reconnect only cameras while keeping the robot/CAN session alive.
@@ -248,6 +305,9 @@ class CollectionSession:
         """
         if self.state is SessionState.DISCONNECTED or self.piper is None:
             raise RuntimeError("cannot reconnect cameras while devices are disconnected")
+        previous_config = self.config
+        previous_resolution = self.device_resolution
+        self._resolve_devices()
         camera_ids = self.config.camera_devices
 
         old_cameras = self.cameras
@@ -262,12 +322,15 @@ class CollectionSession:
                 resize_mode="stretch",
                 capture_hw=CAMERA_SOURCE_HW,
                 parallel_reads=True,
+                strict_selectors=bool(configured_resolver(self.config.rlsok_resolver)),
             )
             new_cameras.open()
             checks = self._camera_verifier(new_cameras, self.config.camera_fps)
             if hasattr(new_cameras, "start_background_capture"):
                 new_cameras.start_background_capture()
         except Exception:
+            self.config = previous_config
+            self.device_resolution = previous_resolution
             if new_cameras is not None:
                 new_cameras.close()
             if old_cameras is not None:

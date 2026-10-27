@@ -70,9 +70,9 @@ class CameraFrameSet:
             ),
         )
 
-# Camera roles used by the current collection rig.  Device numbers and USB
-# paths can change after reconnecting a hub, but these model names and serial
-# backed udev properties remain stable.
+# Camera roles used by the current collection rig. Device numbers can change
+# after reconnecting a hub, so auto-selection combines model metadata with
+# reviewed USB-topology bindings for otherwise identical wrist cameras.
 CAMERA_MODEL_HINTS = {
     # Current physical installation: D435i is the overhead view. Both wrist
     # roles are D405 units. Their default USB topology bindings are required
@@ -305,6 +305,7 @@ def select_video_devices(
     configured_devices: dict[str, object],
     *,
     device_root: Path = Path("/dev"),
+    strict_explicit: bool = False,
 ) -> dict[str, object]:
     """Resolve camera roles without assigning one physical USB camera twice.
 
@@ -320,7 +321,7 @@ def select_video_devices(
     bindings = json.loads(bindings_path.read_text()) if device_root == Path('/dev') and bindings_path.is_file() else {}
 
     for camera_key, configured_device in configured_devices.items():
-        if camera_key in bindings:
+        if camera_key in bindings and not strict_explicit:
             # A saved identity supersedes old GUI video paths after replugging.
             configured_device = 'serial:' + str(bindings[camera_key])
         explicit = _existing_configured_device(
@@ -328,6 +329,10 @@ def select_video_devices(
             device_root=device_root,
         )
         if explicit is None:
+            if strict_explicit and str(configured_device).strip().lower() != "auto":
+                raise RuntimeError(
+                    f"Camera {camera_key} reviewed selector is unavailable"
+                )
             pending.append(camera_key)
             continue
         concrete = _concrete_video_device(explicit, device_root=device_root)
@@ -374,6 +379,24 @@ def select_video_devices(
                 f"Cannot auto-discover a distinct RGB device for {camera_key} "
                 f"(expected {expected}). Check camera connections or choose devices "
                 "in Device settings."
+            )
+        role_path_hints = CAMERA_ROLE_PATH_HINTS.get(camera_key, ())
+        topology_matches = [
+            candidate
+            for candidate in available
+            if any(
+                hint in _stable_video_selector(candidate.device)
+                for hint in role_path_hints
+            )
+        ]
+        if role_path_hints and topology_matches:
+            available = topology_matches
+        elif role_path_hints and len(available) > 1:
+            raise RuntimeError(
+                f"Cannot safely distinguish {camera_key}: {len(available)} matching "
+                "cameras were found, but none matched its reviewed USB topology. "
+                "Choose an explicit stable /dev/v4l/by-path selector in Device "
+                "settings instead of relying on /dev/videoN order."
             )
         candidate = available[0]
         selected[camera_key] = _stable_video_selector(candidate.device)
@@ -422,6 +445,7 @@ class CameraCapture:
         image_hw: tuple[int, int] = (IMG_H, IMG_W),
         capture_hw: tuple[int, int] | None = None,
         parallel_reads: bool = False,
+        strict_selectors: bool = False,
         policy_image_hw: tuple[int, int] | None = None,
         resize_mode: str = "stretch",
     ):
@@ -434,6 +458,7 @@ class CameraCapture:
         self.resize_mode = resize_mode
         self._capture_hw = tuple(capture_hw or image_hw)
         self._parallel_reads = parallel_reads
+        self._strict_selectors = strict_selectors
         self._policy_image_hw = (
             tuple(int(value) for value in policy_image_hw)
             if policy_image_hw is not None else None
@@ -462,6 +487,7 @@ class CameraCapture:
         self._last_direct_monotonic_timestamps: dict[str, float] = {}
         self._source_aspects: dict[str, float] = {}
         self._background_error: BaseException | None = None
+        self._background_started_monotonic: float | None = None
         self._preview_enabled = False
 
     def set_preview_enabled(self, enabled: bool) -> None:
@@ -470,12 +496,16 @@ class CameraCapture:
 
     def open(self):
         try:
-            selected_ids = select_video_devices(self._configured_ids)
+            selected_ids = select_video_devices(
+                self._configured_ids, strict_explicit=self._strict_selectors
+            )
             for key, configured_id in self._configured_ids.items():
                 dev_id = selected_ids[key]
                 self._ids[key] = dev_id
                 cap = cv2.VideoCapture(dev_id)
                 if not cap.isOpened():
+                    if self._strict_selectors:
+                        raise RuntimeError(f"Cannot open reviewed camera {key}")
                     raise RuntimeError(
                         f"Cannot open camera {key} at {dev_id} "
                         f"(configured selector: {configured_id})"
@@ -514,6 +544,7 @@ class CameraCapture:
             self._last_direct_monotonic_timestamps.clear()
             self._source_aspects.clear()
             self._background_error = None
+            self._background_started_monotonic = None
 
     @property
     def source_aspects(self) -> dict[str, float]:
@@ -693,6 +724,29 @@ class CameraCapture:
             )
             return selected.copied() if copy else selected
 
+    def assert_background_healthy(self, *, max_frame_age_s: float = STALE_THRESHOLD_S) -> None:
+        """Check the live stream without reading or copying camera frames."""
+        if max_frame_age_s <= 0:
+            raise ValueError("max_frame_age_s must be positive")
+        with self._latest_condition:
+            if self._background_thread is None or self._background_stop.is_set():
+                raise RuntimeError("background camera capture is not running")
+            if self._background_error is not None:
+                raise RuntimeError("background camera capture failed") from self._background_error
+            now = time.monotonic()
+            timestamps = self._latest_monotonic_timestamps
+            if set(timestamps) != set(self._caps):
+                started = self._background_started_monotonic
+                if started is None or now - started > max_frame_age_s:
+                    raise RuntimeError("background camera capture has no complete fresh frame")
+                return
+            stale = [
+                key for key, captured in timestamps.items()
+                if now - captured > max_frame_age_s or captured > now + 1.0
+            ]
+            if stale:
+                raise RuntimeError("background camera frames are stale: " + ", ".join(sorted(stale)))
+
     def start_background_capture(
         self,
         callback: Callable[[dict[str, np.ndarray], dict[str, float], float], None] | None = None,
@@ -716,6 +770,8 @@ class CameraCapture:
         self._background_stop.clear()
         with self._latest_condition:
             self._frame_history.clear()
+            self._latest_monotonic_timestamps.clear()
+            self._background_started_monotonic = time.monotonic()
 
         def loop() -> None:
             period = 1.0 / capture_fps

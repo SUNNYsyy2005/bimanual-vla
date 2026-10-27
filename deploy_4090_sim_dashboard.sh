@@ -13,12 +13,19 @@ LOCAL_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_ROOT/server_4090/templates'"
 rsync -av --relative --exclude='__pycache__/' --exclude='*.py[cod]' \
   "$LOCAL_ROOT/./server_4090/app.py" \
+  "$LOCAL_ROOT/./server_4090/cluster_read_guard.py" \
+  "$LOCAL_ROOT/./server_4090/checkpoint_export.py" \
+  "$LOCAL_ROOT/./server_4090/rlinf_dashboard.py" \
+  "$LOCAL_ROOT/./server_4090/rlinf_eval_runner.py" \
+  "$LOCAL_ROOT/./server_4090/rlinf_eval_collect.py" \
+  "$LOCAL_ROOT/./server_4090/configure_rlinf_native.py" \
   "$LOCAL_ROOT/./server_4090/dataset_editor.py" \
   "$LOCAL_ROOT/./server_4090/episode_split.py" \
   "$LOCAL_ROOT/./server_4090/openpi_single_arm.py" \
   "$LOCAL_ROOT/./server_4090/eval_heldout_loss.py" \
   "$LOCAL_ROOT/./server_4090/slurm_job_runner.py" \
   "$LOCAL_ROOT/./server_4090/dataset_transfer_runner.py" \
+  "$LOCAL_ROOT/./server_4090/dataset_delete_runner.py" \
   "$LOCAL_ROOT/./server_4090/slurm_dataset_sync_runner.py" \
   "$LOCAL_ROOT/./server_4090/video_transfer_runner.py" \
   "$LOCAL_ROOT/./server_4090/remote_checkpoints.py" \
@@ -30,9 +37,6 @@ rsync -av --relative --exclude='__pycache__/' --exclude='*.py[cod]' \
   "$LOCAL_ROOT/./server_4090/experiment_artifacts.py" \
   "$LOCAL_ROOT/./server_4090/artifact_history_runner.py" \
   "$LOCAL_ROOT/./server_4090/prepare_artifact_migration.py" \
-  "$LOCAL_ROOT/./server_4090/rlinf_dashboard.py" \
-  "$LOCAL_ROOT/./server_4090/rlinf_eval_runner.py" \
-  "$LOCAL_ROOT/./server_4090/rlinf_eval_collect.py" \
   "$LOCAL_ROOT/./server_4090/bimanual-vla-artifact-index.service" \
   "$LOCAL_ROOT/./server_4090/bimanual-vla-artifact-index.timer" \
   "$LOCAL_ROOT/./server_4090/validate_lerobot.py" \
