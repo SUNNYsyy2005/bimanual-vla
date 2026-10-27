@@ -62,6 +62,7 @@ from bimanual_vla.deployment.hardware_safety import (
 )
 from bimanual_vla.collection.output import require_can_interface_up
 from bimanual_vla.collection.can_identity import resolve_can_selector, resolve_can_pair
+from bimanual_vla.device_guard import DeviceCheckRejected, RuntimeDeviceGuard
 from bimanual_vla.data.action_conventions import (
     DELIVERY_CHUNK_ORIGIN_ACTION_SEMANTICS,
     DELIVERY_MODEL_ACTION_SEMANTICS,
@@ -201,6 +202,10 @@ class ExecutionBlocked(RuntimeError):
 
 class PiperFeedbackStaleError(ExecutionBlocked):
     """Piper SDK getters contain missing or cached CAN feedback."""
+
+
+class RuntimeHardwareFault(ExecutionBlocked):
+    """A live device failed; this session must not reuse its action queue."""
 
 
 class NonBlockingConsoleHandler(logging.Handler):
@@ -5399,7 +5404,7 @@ class ExecutionController:
                 )
             }
             if bad_status:
-                raise ExecutionBlocked(f"Piper status is not normal: {bad_status}")
+                raise RuntimeHardwareFault(f"Piper status is not normal: {bad_status}")
 
             if self.arm_hold_targets:
                 driver_statuses = (
@@ -5548,15 +5553,16 @@ class ExecutionController:
 
         except ExecutionBlocked as exc:
             self.discard_pending_actions(str(exc), kind="other")
+            if isinstance(exc, (RuntimeHardwareFault, PiperFeedbackStaleError)):
+                self._block("blocked", str(exc))
+                raise
             return self._block("blocked", str(exc))
         except Exception as exc:
             logging.exception("Piper enable/hold handshake failed")
             self.discard_pending_actions(
                 f"Piper enable/hold handshake failed: {exc}", kind="other"
             )
-            return self._block(
-                "blocked", f"Piper enable/hold handshake failed: {exc}"
-            )
+            raise RuntimeHardwareFault("Piper enable/hold handshake failed") from exc
 
         execution_time = self._estimated_execution_time(now_monotonic)
         if self.pending_actions:
@@ -6025,9 +6031,9 @@ class ExecutionController:
                 self._cancel_staged_enable_plan(
                     f"staged post-enable robot command failed: {exc}", kind="other"
                 )
-                return False
+                raise RuntimeHardwareFault("Piper command failed during staged enable") from exc
             self.discard_pending_actions(f"robot command failed: {exc}", kind="other")
-            return self._block("blocked", f"robot command failed: {exc}")
+            raise RuntimeHardwareFault("Piper command failed") from exc
 
         self._commit_staged_enable_plan(queued.generation)
         if not holding:
@@ -6899,6 +6905,34 @@ def run_rtc_client(args: argparse.Namespace) -> None:
     chunks enter the timestamped queue only after schema, freshness, execution
     authorization, workspace, IK, and Piper-status checks pass.
     """
+    from bimanual_vla.device_guard import arm_role_request, camera_role_request, check_devices
+
+    requested_arms = arm_role_request(
+        args.arm_mode, args.arm_side,
+        single=args.can, left=args.left_can, right=args.right_can,
+    )
+    requested_cameras = camera_role_request(
+        args.arm_mode, args.arm_side,
+        overhead=args.cam_high_device, wrist=args.cam_wrist_device,
+        left_wrist=args.cam_left_wrist_device,
+        right_wrist=args.cam_right_wrist_device,
+    )
+    resolved = check_devices(
+        purpose="deployment",
+        arm_mode=args.arm_mode,
+        arm_side=args.arm_side,
+        arms=requested_arms,
+        cameras=requested_cameras,
+        resolver=getattr(args, "rlsok_resolver", None),
+    )
+    if resolved is not None:
+        args.can = resolved.arms.get(args.arm_side, args.can)
+        args.left_can = resolved.arms.get("left", args.left_can)
+        args.right_can = resolved.arms.get("right", args.right_can)
+        args.cam_high_device = resolved.cameras["overhead"]
+        args.cam_wrist_device = resolved.cameras.get(f"{args.arm_side}_wrist", args.cam_wrist_device)
+        args.cam_left_wrist_device = resolved.cameras.get("left_wrist", args.cam_left_wrist_device)
+        args.cam_right_wrist_device = resolved.cameras.get("right_wrist", args.cam_right_wrist_device)
     output_mode = getattr(args, "output_mode", "auto")
     for key in ("NO_PROXY", "no_proxy"):
         entries = [item.strip() for item in os.environ.get(key, "").split(",") if item.strip()]
@@ -6923,10 +6957,13 @@ def run_rtc_client(args: argparse.Namespace) -> None:
         }
     else:
         logging.info("Connecting Piper feedback on %s ...", args.can)
-        pipers = {args.arm_side: connect_piper(args.can)}
         from bimanual_vla.collection.camera import select_video_device
-        wrist_device = select_video_device(f"cam_{args.arm_side}_wrist", args.cam_wrist_device)
+        # Reviewed selectors must reach CameraCapture unchanged; its strict mode
+        # rejects missing devices instead of replacing the resolver's decision.
+        wrist_device = (args.cam_wrist_device if resolved is not None else
+                        select_video_device(f"cam_{args.arm_side}_wrist", args.cam_wrist_device))
         camera_ids = {"cam_high": args.cam_high_device, "cam_wrist": wrist_device}
+        pipers = {args.arm_side: connect_piper(args.can)}
 
     monitoring = MonitoringRecorder(
         args.monitoring_dir,
@@ -6949,6 +6986,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
         resize_mode="pad",  # Updated from checkpoint metadata on connection.
         capture_hw=CAMERA_SOURCE_HW,
         parallel_reads=True,
+        strict_selectors=resolved is not None,
         policy_image_hw=(224, 224) if args.preresize_policy_images else None,
     )
     preview = CameraPreview(
@@ -6957,6 +6995,15 @@ def run_rtc_client(args: argparse.Namespace) -> None:
     )
     cameras.set_preview_enabled(preview.enabled)
     worker = AsyncPolicyInference()
+    runtime_device_guard = (
+        RuntimeDeviceGuard(
+            baseline=resolved, purpose="deployment",
+            arm_mode=args.arm_mode, arm_side=args.arm_side,
+            arms=requested_arms, cameras=requested_cameras,
+            resolver=getattr(args, "rlsok_resolver", None),
+        )
+        if resolved is not None else None
+    )
     recorder = DeploymentRunRecorder(
         args.record_root,
         video_fps=(args.record_video_fps or args.camera_fps),
@@ -6966,6 +7013,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
     protocol = None
     count = 0
     command_count = 0
+    hardware_fault: str | None = None
     initial_qpos: np.ndarray | None = None
     return_attempted = False
     returned_to_initial = False
@@ -7075,6 +7123,8 @@ def run_rtc_client(args: argparse.Namespace) -> None:
             recorder.run_dir if recorder.is_active else "disabled",
         )
         monitoring.record("camera_ready", camera_checks=camera_checks, camera_ids=camera_ids)
+        if runtime_device_guard is not None:
+            runtime_device_guard.start()
         logging.warning(
             "%s %s client: output_mode=%s control=%.3g Hz periodic/retry=%.3g Hz trigger=%s step=%d "
             "expected_chunk=%d minimum_chunk=%d. Robot commands require local --allow-execution and safety checks.",
@@ -7246,7 +7296,18 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                 preview.update(cameras.latest_preview_images)
             command_sent = False
             completion: InferenceCompletion | None = None
+            reading_hardware_feedback = False
             try:
+                if runtime_device_guard is not None and runtime_device_guard.fault is not None:
+                    raise RuntimeHardwareFault(runtime_device_guard.fault)
+                try:
+                    cameras.assert_background_healthy(
+                        max_frame_age_s=max(0.5, 3.0 / float(args.camera_fps))
+                    )
+                except RuntimeError as exc:
+                    raise RuntimeHardwareFault(f"camera stream unavailable: {exc}") from exc
+                if preview.enabled:
+                    preview.update(cameras.latest_preview_images)
                 if (
                     policy is None
                     and not worker.in_flight
@@ -7385,6 +7446,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                             logging.warning("Policy connection unavailable: %s", exc)
 
                 if protocol is not None:
+                    reading_hardware_feedback = True
                     sides = (
                         ("left", "right") if args.arm_mode == "bimanual" else (args.arm_side,)
                     )
@@ -7432,6 +7494,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                         },
                         captured_at=observation_captured_at,
                     )
+                    reading_hardware_feedback = False
 
                     completion = worker.poll()
                     if completion is not None:
@@ -7443,6 +7506,15 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                     # another delay window (e.g. 7 steps / 350 ms).
                     # Feedback/camera timestamps remain anchored to the capture
                     # above; planning time is included in the request latency.
+                    # Recheck immediately before the only robot command path.
+                    if runtime_device_guard is not None and runtime_device_guard.fault is not None:
+                        raise RuntimeHardwareFault(runtime_device_guard.fault)
+                    try:
+                        cameras.assert_background_healthy(
+                            max_frame_age_s=max(0.5, 3.0 / float(args.camera_fps))
+                        )
+                    except RuntimeError as exc:
+                        raise RuntimeHardwareFault(f"camera stream unavailable: {exc}") from exc
                     command_sent = execution.execute_next(
                         delivery_state,
                         qpos,
@@ -7502,10 +7574,15 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                             camera_selection_started_monotonic = time.monotonic()
                             frame_set: CameraFrameSet | None = None
                             try:
-                                frame_set = cameras.read_nearest(
-                                    observation_captured_monotonic,
-                                    copy=False,
-                                )
+                                try:
+                                    frame_set = cameras.read_nearest(
+                                        observation_captured_monotonic,
+                                        copy=False,
+                                    )
+                                except RuntimeError as exc:
+                                    raise RuntimeHardwareFault(
+                                        f"camera observation unavailable: {exc}"
+                                    ) from exc
                                 camera_selected_monotonic = time.monotonic()
                                 generation = execution.allocate_inference_generation()
                                 rtc_snapshot = execution.rtc_request_metadata(
@@ -7666,6 +7743,8 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                     )
 
                                 launch_candidate = (launch, infer_snapshot)
+                            except RuntimeHardwareFault:
+                                raise
                             except Exception as exc:
                                 # A failed snapshot (including a deferred RTC
                                 # prefix) never sends its configuration revision.
@@ -7826,6 +7905,13 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                 launch_schedule.pending_latest = True
 
                 # Launch retries happen on the next tick; no synchronous infer call.
+            except (PiperFeedbackStaleError, RuntimeHardwareFault) as exc:
+                hardware_fault = str(exc)
+                execution.discard_pending_actions(hardware_fault, kind="hardware_fault")
+                execution._block("blocked", hardware_fault)
+                monitoring.record("runtime_hardware_fault", reason=hardware_fault)
+                logging.error("Runtime hardware fault; ending execution: %s", hardware_fault)
+                break
             except ExecutionBlocked as exc:
                 execution._block("blocked", str(exc))
                 monitoring.record(
@@ -7835,6 +7921,13 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                 )
                 logging.warning("20 Hz feedback/safety check blocked: %s", exc)
             except Exception as exc:
+                if reading_hardware_feedback:
+                    hardware_fault = "Piper feedback read failed"
+                    execution.discard_pending_actions(hardware_fault, kind="hardware_fault")
+                    execution._block("blocked", hardware_fault)
+                    monitoring.record("runtime_hardware_fault", reason=hardware_fault)
+                    logging.error("Runtime hardware fault; ending execution: %s", hardware_fault)
+                    break
                 execution._block("blocked", f"control tick failed: {exc}")
                 monitoring.record(
                     "control_tick_error",
@@ -7873,6 +7966,8 @@ def run_rtc_client(args: argparse.Namespace) -> None:
             save_return_pose(args, initial_qpos, safe_to_return=servo_stopped_safely)
         if not servo_stopped_safely:
             logging.error("Servo did not settle safely; automatic return is suppressed")
+        if runtime_device_guard is not None:
+            runtime_device_guard.close()
         worker.shutdown()
         try:
             recorder.stop(reason="client_stopped")
@@ -7883,6 +7978,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
         cameras.close()
         if (
             bool(getattr(args, "auto_return", True))
+            and hardware_fault is None
             and initial_qpos is not None
             and command_count > 0
             and servo_stopped_safely
@@ -7983,10 +8079,17 @@ def run_rtc_client(args: argparse.Namespace) -> None:
         monitoring.close(reason="stopped")
         if return_attempted and not returned_to_initial:
             raise ExecutionBlocked("return to initial pose failed; see return diagnostics")
+    if hardware_fault is not None:
+        raise DeviceCheckRejected(hardware_fault)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--rlsok-resolver",
+        default=os.environ.get("BIMANUAL_VLA_RLSOK_RESOLVER", ""),
+        help="project-side RLSOK v1.5.8 resolver executable; checked before CAN/camera open",
+    )
     parser.add_argument("--host", default=os.environ.get("BIMANUAL_VLA_POLICY_HOST", DEFAULT_POLICY_HOST))
     parser.add_argument("--port", type=int, default=int(os.environ.get("BIMANUAL_VLA_POLICY_PORT", DEFAULT_POLICY_PORT)))
     parser.add_argument("--arm-mode", choices=("single", "bimanual"), default="single")
@@ -8637,7 +8740,12 @@ def main() -> None:
             parser.error(str(exc))
         if args.left_can == args.right_can:
             parser.error("--left-can and --right-can must differ in bimanual mode")
-        if len({args.cam_high_device, args.cam_left_wrist_device, args.cam_right_wrist_device}) != 3:
+        explicit_cameras = [
+            device for device in (
+                args.cam_high_device, args.cam_left_wrist_device, args.cam_right_wrist_device
+            ) if device.lower() != "auto"
+        ]
+        if len(set(explicit_cameras)) != len(explicit_cameras):
             parser.error("bimanual camera devices must be distinct")
     elif args.arm_side not in {"left", "right"}:
         parser.error("single mode requires --arm-side left or right")
@@ -8655,6 +8763,8 @@ def main() -> None:
             run_return_only(args)
         else:
             run_rtc_client(args)
+    except DeviceCheckRejected as exc:
+        parser.exit(2, f"{exc}\n")
     finally:
         root_logger.handlers = previous_handlers
         root_logger.setLevel(previous_level)

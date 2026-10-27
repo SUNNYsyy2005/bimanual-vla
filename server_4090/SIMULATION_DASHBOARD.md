@@ -1085,3 +1085,58 @@ H100 走 4×4090 ↔ login-server 的并行 tar 流。H200 仍遵守 Slurm-only 
 API 见 [统一训练历史与 rollout 产物](API_USAGE.md#统一训练历史与-rollout-产物2026-10-23)。两类训练提交支持 `artifact_identity`；后台每五分钟更新历史索引和视频目录。训练提交登记清单，后端 writer 的输出路径仍需按约束配置。
 
 历史迁移保留旧路径兼容链接、事件标注和 checkpoint 动作约定。运行中任务延后迁移，旧输出已缺失的记录显式标为 missing；H200 指标镜像仅代表 mirror_only，不代表实际节点上的完整训练产物已迁移。当前迁移范围与回执见 [迁移记录](../docs/EXPERIMENT_ARTIFACT_MIGRATION_20261023.md)。
+
+
+## RLinf curves and launch profiles
+
+The simulation dashboard now exposes `/api/rlinf/runs` and `/api/rlinf/runs/<id>/metrics`. It reads `training_curve.json` and `evaluation_curve.json`, and also reads TensorBoard scalar event files (including the RLinf `env/*`, `rollout/*`, `eval/*`, and `time/*` tags). Training and evaluation series stay separate, and new numeric metrics appear without front-end changes. The UI can overlay several runs and refresh them while training continues.
+
+Configure `rlinf_dashboard` in the protected `config.simulation.json`:
+
+- `sources`: `{id, label, target, root, ssh_host?, python?, max_depth?}`. Omit `ssh_host` for a local 4090 path. For H100, the login node can read the shared `/DATA/disk0` tree; set `python` to the training environment that has TensorBoard installed. For H200, export curves to a NAS path visible from the login node and use that path as the source root.
+- `targets`: each enabled target declares `kind: local|slurm`, its project and run roots, and named profiles. A profile supplies an allowlisted algorithm list, command template, optional environment, typed `overrides`, and optional `algorithm_values` (for example, mapping `grpo-lag` to `algorithm.safety.enabled=true`). The dashboard owns command construction; browser requests cannot supply shell commands or filesystem paths.
+- Local targets reserve selected GPU IDs through the existing GPU checks. Slurm targets go through the existing `slurm_job_runner.py` path, which submits `sbatch`, streams job logs, and tracks the process from the task list.
+
+The configured H100 profile launches the LIBERO-Safety PI0.5 GRPO smoke configuration from the shared Safe-RL-with-WM checkout. H200 targets use Slurm-only submission and assume the project, `safe-rl-wm-train` environment, LIBERO-Safety assets, and PI0.5 weights have been staged on that selected H200 node. The dashboard does not copy these large assets during launch; the selected target's requirements are shown beside the launch form. H200 curve sources remain disabled until the configured NAS output directory exists and has been verified, so unavailable NAS paths cannot stall dashboard refreshes.
+
+The training history is searchable by experiment/run name, task ID, algorithm, or state. It is paged (10 by default; 10/25/50/100 selectable), and terminal task records plus their local dashboard logs can be deleted in bulk. This does not delete model outputs, checkpoints, or remote Slurm output files.
+
+Native RLInf profile command template:
+
+```json
+{
+  "command_template": [
+    "{python}", "{project_root}/third_party/wovr/examples/embodiment/train_embodied_agent.py",
+    "--config-path", "{project_root}/configs/rlinf",
+    "--config-name", "libero_safety_grpo_pi05_smoke",
+    "runner.logger.log_path={run_dir}"
+  ],
+  "backend": "rlinf",
+  "evaluation": {"backend": "rlinf", "config_name": "libero_safety_grpo_pi05_smoke"},
+  "algorithms": ["grpo", "grpo-lag"]
+}
+```
+
+New algorithms and resource targets are added by adding a server-side profile; the metric reader accepts new numeric fields without front-end code changes. Do not point an H200 source at node-local storage: H200 jobs need to copy metric snapshots to the configured shared/NAS export while they run.
+
+Native profiles expose actor learning rate, save/evaluation intervals, group size and count, update epochs, micro batch size, seed, rollout horizon, safety budget, and dual learning rate. The server maps these into Hydra overrides, validates ranges and batch divisibility, and sets native RLInf component placement to the selected physical GPU IDs for local jobs.
+
+Use `configure_rlinf_native.py --config ... --project ... --python ... --model ... --libero-config ... --libero-source ... --transformer-root ... --run-root ...` to explicitly replace the 4090 launch profile with native RLInf. The helper backs up the protected configuration, configures a separate native run root, and handles LIBERO-Safety snapshots whose namespace package would otherwise be shadowed by stock LIBERO. Paths and dependencies must be prepared before enabling the profile; existing GPU jobs are not stopped.
+
+The RLInf run list supports search, paging (10/25/50/100), cross-page curve comparisons, and single/bulk record deletion. Deletion persists across restarts, removes associated terminal dashboard task logs, and preserves raw metric files/checkpoints. Active training or rollout tasks block deletion. The chart uses a fixed CSS size, shared scales, sorted steps, plot clipping, responsive ticks, and wrapped legends. Its axis selector keeps rounds and actor updates separate.
+
+`GET /api/rlinf/runs/<id>/checkpoints` lists nonempty `global_step_N/actor/model_state_dict/full_weights.pt` files. `POST /api/rlinf/evaluate` accepts `run_id`, `checkpoint_id`, `episodes`, `max_steps`, `seed`, `gpu_ids`, and a boolean `record_video`. It starts the native RLInf eval runner with those exact weights; clients cannot specify arbitrary paths or commands. `GET /api/rlinf/evaluations` returns rollout task status/results. Local results/videos go under the first `eval_video_roots` directory. Slurm evaluations save to the profile's shared output root, then collect JSON and video artifacts back to the dashboard; H200 profiles therefore need a NAS output root visible on the compute node and login node.
+
+The rollout form controls video generation and provides a filtered link to the existing **评估视频** module. Turning recording off disables native video writing; turning it on produces videos in the same indexed artifact tree. Evaluation task logs and results also appear directly in the RLInf module. Slurm commands embed the current evaluation helper, so a separate copy of that helper on H100/H200 is unnecessary. Eval-only rollout models inherit the trained actor architecture before loading its exported weights.
+
+`GET /api/rlinf/runs/<id>/log` reads dashboard task output or the run's native `.log`/`.out`/`.err` files, including `metrics.log` for observed runs. Log reads are bounded, confined to the configured run, and reject symlink log paths. The checkpoint picker also verifies the completed PyTorch ZIP container, excluding weights still being written.
+
+## Dataset inventory and deleting a storage copy
+
+The primary dataset list (`GET /api/datasets`, also returned by `/api/status`) scans the active storage root, configured read roots, and available local archive roots. It preserves active storage precedence for duplicate IDs and includes local metadata in the location response so the browser can restore full local rows independently of an older status snapshot. Local NVMe/archive entries are classified by their actual location kind; inventory-derived rows are rebuilt to discard stale deleted entries. Dataset IDs without `meta/info.json` and origins hidden by the dashboard profile remain outside this LeRobot dataset list.
+
+Each dataset's location column has **删除此位置副本** with an explicit target selector. `POST /api/datasets/<id>/delete-copy` accepts `{target, confirm_dataset_id}`; the confirmation must exactly match the ID. Deleting active NVMe storage also removes its current norm assets through the existing dataset editor. Deleting an archive/H100/H200 copy removes only that copy, preserving other locations, model checkpoints, and historical tasks.
+
+Archive/cluster deletions are tracked as transfer tasks (`transfer_kind: dataset_delete`). Both H100 and H200 use `sbatch`/`srun` with zero GPUs. The runner resolves and validates the configured root, rejects traversal and symlink dataset roots, requires dataset metadata, checks file ownership, and checks this user's other active Slurm batch scripts before deletion. Active dashboard tasks block deletion, and an active delete blocks new tasks for that dataset. Successful H200 deletion refreshes the node inventory and removes the ID from its local inventory cache. Deletion requires the target's configured Conda Python, partition, and node to be available.
+
+The transfer/delete table independently polls `GET /api/transfers`, preserving its last successful list on request errors and allowing manual refresh. It does not wait for full-dashboard inventory scans. Deletion tasks display deletion status instead of byte progress; completed legacy transfers and Slurm-only destinations are not recursively rescanned merely to render task progress.

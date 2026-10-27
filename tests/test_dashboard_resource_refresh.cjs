@@ -29,6 +29,7 @@ function dashboard(remoteFailure = false) {
     gpuResourcesRequest: null, latestGpuInventory: null,
     gpuFailure: false, statusPending: false,
     episodeDatasetData: {},
+    pendingDatasetDeleteTasks: new Set(),
     esc: value => String(value),
     document: { getElementById: id => {
       if (!elements.has(id)) elements.set(id, {
@@ -59,6 +60,7 @@ function dashboard(remoteFailure = false) {
     'fillDatasets', 'fillTrainingExperiments', 'fillBaseModels',
     'fillExecutionTargets', 'fillCheckpoints', 'fillTasks', 'fillTrainingTasks',
     'fillTransferTasks', 'refreshSelectedLogs', 'fillObservation', 'loadRemoteCheckpoints',
+    'loadTransferTasks',
     'loadDatasetEpisodes', 'loadEvalVideos', 'loadTrainingMetrics',
   ]) context[name] = () => {};
   vm.createContext(context);
