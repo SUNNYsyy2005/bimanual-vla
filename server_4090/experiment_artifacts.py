@@ -79,6 +79,9 @@ def record_task(config: dict, task: dict) -> dict:
                               "remote_checkpoint_dir": metadata.get("remote_checkpoint_dir"),
                               "rlinf_output_dir": metadata.get("rlinf_output_dir"),
                               "execution_target": metadata.get("execution_target")})
+    result["task_scene"] = metadata.get("task_scene")
+    result["action_contract"] = metadata.get("action_contract")
+    result["dataset_ids"] = [metadata["dataset_id"]] if metadata.get("dataset_id") else []
     catalog.atomic_write(directory / "run.json", result)
     catalog.atomic_write(directory / "metadata" / "submission.json", metadata)
     logs = directory / "logs"

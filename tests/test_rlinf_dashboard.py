@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from unittest import mock
@@ -41,15 +42,31 @@ class RlinfDashboardTest(unittest.TestCase):
         with zipfile.ZipFile(weight, "w") as archive:
             archive.writestr("archive/data.pkl", b"fake-weights")
         self.weight = weight
+        contract = dict(robot_type="franka-panda", arm_mode="single", action_space="eef_pose")
+        for target in self.config["rlinf_dashboard"]["targets"].values():
+            for profile in target.get("profiles", {}).values():
+                profile["action_contract"] = contract
+        self.config["rlinf_dashboard"]["verified_run_contracts"] = [
+            dict(node="4x4090", paths=[str(self.output)], action_contract=contract, evidence="test fixture")
+        ]
 
     def make_app(self):
         path = self.root / "config.json"
         path.write_text(json.dumps(self.config), encoding="utf-8")
         with mock.patch.dict(os.environ, {"BIMANUAL_VLA_SERVER_TOKEN": "test-token-" + "x" * 24}):
-            return create_app(path).test_client()
+            app = create_app(path)
+            self.addCleanup(app.extensions["live_mirror"].close)
+            return app.test_client()
 
     def request(self, client, method, endpoint, **kwargs):
-        return getattr(client, method)(endpoint, headers={"Authorization": "Bearer test-token-" + "x" * 24}, **kwargs)
+        deadline = time.monotonic() + 5
+        while True:
+            response = getattr(client, method)(endpoint, headers={"Authorization": "Bearer test-token-" + "x" * 24}, **kwargs)
+            data = response.get_json(silent=True) or {}
+            pending = data.get("ready") is False or data.get("sync", {}).get("ready") is False
+            if method != "get" or not pending or time.monotonic() >= deadline:
+                return response
+            time.sleep(.01)
 
     def add_task(self, task_id, *, state="completed", task_type="train", **metadata):
         folder = self.root / "workspace/tasks" / task_id
@@ -91,12 +108,13 @@ class RlinfDashboardTest(unittest.TestCase):
         self.assertEqual(checkpoints_for_run(run), [])
 
     def test_delete_persists_and_preserves_model_files(self):
+        self.add_task("finished")
         client = self.make_app()
         run_id = self.request(client, "get", "/api/rlinf/runs").json["runs"][0]["id"]
         response = self.request(client, "delete", f"/api/rlinf/runs/{run_id}")
         self.assertEqual(response.status_code, 200, response.json)
         self.assertTrue(self.weight.exists())
-        self.assertTrue((self.output / "training_curve.json").exists())
+        self.assertFalse((self.output / "training_curve.json").exists())
         self.assertEqual(self.request(self.make_app(), "get", "/api/rlinf/runs").json["runs"], [])
 
     def test_batch_delete_validates_whole_selection(self):

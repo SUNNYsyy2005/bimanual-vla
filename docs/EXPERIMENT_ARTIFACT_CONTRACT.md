@@ -218,3 +218,33 @@ python server_4090/eval_video_catalog_runner.py --config config.simulation.json 
 新训练后端完成以下事项即可被通用工具识别：运行清单合法；每个产物有身份与阶段；checkpoint 可验证且恢复能力明确；指标轴/单位明确；episode 有逐回合证据；视频有 sidecar；跨节点根目录明确；运行失败/恢复不会覆盖旧运行；旧路径兼容与迁移 receipt 可追溯。
 
 不满足要求的记录应显式显示 unknown / incomplete / missing / mirror_only，而不是隐藏或补造结果。
+
+## 10. 存储位置与文件状态
+
+Dashboard 管理的是各服务器、各磁盘上实际存在的文件，不要求登记副本用途、数据集合或整份备份的完整性。按本约定分开存放模型、日志和 rollout；不必为 JEPA 等下游实验重复复制整次实验目录。需要传输时只选择实际需要的轨迹、独立图像或视频。
+
+- 索引记录节点、物理根目录、相对路径、类型、文件数/大小及更新时间。模型和日志由训练页面管理，轨迹/图像/视频由 Rollout 页面管理；删除只作用于明确选中的存储位置和文件类型。
+- 实体文件、指向别处的链接/引用、临时/未完成文件必须区分；显示引用时保留真实目标路径，不能把路径引用当成已保存的轨迹或权重。
+- 写入或外部传输尚未结束的文件使用 `.partial` / `.incoming` 等临时名称，完成后原子改名。完整性有证据才标记：传输内容校验、容器结构检查、仅存在但未校验分别注明。实验完成状态不等同于文件完整性证据。
+- 无论文件来自 Dashboard 还是 Codex/外部脚本，后台都能根据规范目录更新索引，不要求人工填写传输用途或备份清单。已有校验记录由系统自动维护；未经核实的文件保留待核实状态。
+- 索引只加速查询；执行传输和删除前再次核对物理路径、文件是否变化以及活跃任务引用。文件删除与索引更新通过持久操作记录衔接，后台旧扫描不能恢复已删除记录。
+- 历史混合目录可先建立只读摘要，不为了建立索引搬动正在使用的文件，也不把整个混合目录交给模型或 rollout 的批量删除入口。
+
+
+## 11. 界面职责与实时发现（2026-10-24）
+
+SFT 与 RLinf 各自管理本后端训练进程、历史及模型；模型与日志/指标分开管理。删除历史只清理该运行日志、训练/评测曲线和诊断指标，保留模型、来源配置、Rollout 回合产物；跨节点清理失败不得宣称全部完成。
+
+Rollout 视觉产物指逐帧视频、帧图像、JEPA 特征及 VLA latent（含原 TSQ-RL 实验），不指训练曲线图。实验曲线图归日志/指标。轨迹容器中的视觉/latent 数组按所在文件管理，不在删除历史时拆分或清除。`feature` 是选择性传输/删除可选的 Rollout 文件类型。
+
+模型和运行历史索引是浏览加速层，不是新文件/进程是否存在的依据。checkpoint 选择器支持按节点/实验直接浅层发现未登记模型；新训练支持运行目录或进程/Slurm 队列直接发现，曲线读取目标运行的最新日志/指标。操作前定向核对资源与活动状态。跨后端复用须同时满足数据集/任务、权重格式及动作配置兼容，不能仅凭实验名称自动转换模型。
+
+整组新实验也必须可发现：从已配置实验父目录识别新建实验组，读取首批曲线，不要求先登记新实验或重建全量索引。可直接读取的目录在页面可见时定期浅层探测；H200 节点本地目录通过显式 CPU Slurm 读取，界面须说明调度延迟，不自动反复提交探测作业。
+
+## 12. JEPA / world-model derived rollout artifacts (2026-10-24)
+
+- Reusing PPO/GRPO rollouts does not require copying the whole source experiment. Store the frozen input manifest under `metadata/input-manifest.json`; reference the actual source node, physical episode path, source policy/checkpoint, task, scene, split, and available trajectory/image files. Distinguish a reference from a physically present file. Verify archive receipts against the actual file location before declaring an input available.
+- Store newly produced per-episode JEPA features / VLA latents under `train|eval/<source-policy-checkpoint>/<outcome>/<episode_id>/` with an `episode.json` linking to the original episode and source arrays. These are Rollout artifacts, selectable as `feature`; they must not live in `logs/`, `metrics/`, or `checkpoints/`, and deleting training history must not remove them. Use `unknown` when the source checkpoint/outcome cannot be verified.
+- Put model weights and their index in `checkpoints/`, training/evaluation scalar metrics and plots in `metrics/`, logs in `logs/`, and resolved input/split/normalization configuration in `metadata/`. Keep third-party native diagnostics/code under `artifacts/` when no standard location applies. Multi-task JEPA uses `task=multi-task` with explicit `task_ids`; episode metadata retains its real task.
+- Source collection phase and downstream fitting split are separate. A source TRAIN rollout may be held out for JEPA validation; record fold membership explicitly. Group splits by physical scene across policy checkpoints/algorithms, not by trajectory file or window, and report independent risk scenes separately from risk episodes/windows. Exclude initialization risks from policy-risk fitting/evaluation.
+- If only trajectory/image/feature files are transferred, preserve their episode evidence and source references, verify exactly those files, and record their real location. Do not describe the destination as containing untransferred videos, checkpoints, or all source resources. Use `.partial`/`.incoming` until the write or transfer is verified, then atomically publish. External writers follow the same layout so the background index can reconcile them without a separate detailed replica-purpose registry.

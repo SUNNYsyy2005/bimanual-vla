@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -76,6 +77,10 @@ class DashboardEvalVideoManagementTest(unittest.TestCase):
             self.assertEqual(response.status_code, 201)
             self.assertTrue((Path(response.json["path"]) / "run.json").is_file())
             history = client.get('/api/artifact-runs?backend=future-trainer', headers=headers)
+            deadline = time.monotonic() + 5
+            while not history.json.get("ready", True) and time.monotonic() < deadline:
+                time.sleep(.01)
+                history = client.get('/api/artifact-runs?backend=future-trainer', headers=headers)
             self.assertEqual(history.json["total"], 1)
             bad = client.post('/api/artifact-runs', headers=headers, json={**payload, "task": "../../outside"})
             self.assertEqual(bad.status_code, 400)

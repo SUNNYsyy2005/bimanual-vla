@@ -1383,3 +1383,111 @@ SFT 与 RLinf 的训练提交接口均可附加 `artifact_identity`，内容为 
 视频条目含 `evaluation_video.v1` 分类字段、`catalog_relative_path` 和 provenance。任务成功与安全成功分开；训练曲线中的总体成功率不能当作某个视频成功的证据。RoboTwin 旧事件记录和人工修订继续保留。
 
 `POST /api/eval-videos/sync` 接受列表返回的 `source`、`root`、`relative_path`，支持已配置的 RLinf 视频源，写入规范目录并保存元数据 sidecar。同步后媒体接口支持 HTTP Range。视频聚合目录主要使用链接，删除索引链接保留原始 rollout。
+
+### 视频分组与按需对比（2026-10-23）
+
+- `GET /api/eval-videos/groups` 只读取后台任务/实验摘要，返回 ready、groups、total、updated_at；不扫描视频或读取逐回合事件。
+- group ID 精确标识环境来源、任务和实验组合。同名实验在不同任务中隔离，可按任务全选或跨实验多选。
+- `GET /api/eval-videos?browse=1&scope=<group-id>&scope=<another-id>&limit=25&offset=0` 返回所选实验的当前页；没有 scope 时返回空列表和 selection_required=true，不回退全量加载。多实验均衡分页，组内按时间倒序；保留阶段、任务结果、安全结果、事件、关键词过滤。
+- 只为当前页读取本地事件详情，点击播放时才加载媒体；浏览请求不做 SSH 扫描。远端缓存视频保留同步入口。
+- `POST /api/eval-videos/catalog/refresh` 在后台生成 browse-groups.json 和 browse-index.json；新视频在刷新后出现，界面显示索引时间。未带 browse=1 的旧列表接口保留兼容行为。
+- 页面先选任务或多个实验，再点击“加载所选视频”，可切换并排对比。改变选择会清除旧列表，取消旧请求，避免结果交叉。
+
+
+### 存储位置与 Rollout 产物管理（2026-10-23）
+
+仅管理实际文件位置，不要求登记副本用途、数据集合或备份完整性。训练页面管理模型、日志、配置和指标；Rollout 页面管理轨迹、图像和视频；数据集沿用独立管理入口。
+
+- `GET /api/storage-items?area=training|rollout|datasets&node=all&kind=all&offset=0&limit=25&q=`：只读 SQLite 目录摘要，包含节点、物理路径、文件数量、大小及更新时间；不会在请求中 SSH 或扫描文件树。
+- `GET /api/storage-items/<id>/files?offset=0&limit=100`：按需读取缓存文件清单。历史混合目录只提供摘要和最多 100 个示例，禁止据此批量删除整次实验。
+- `POST /api/storage-items/refresh`：后台完整核对已配置目录。规范目录另由定时任务轻量核对；数据集及历史混合目录不在每次页面请求或轻量核对时遍历。
+- `POST /api/storage-items/operate`：JSON 包含 `copy_id`（目录索引 ID）、`action`（copy/delete）、`area`。传输另含 `target`，删除另含与所选物理路径一致的 `confirm_path`。Rollout 可用 `kinds: ["trajectory", "image"]` 只传输或删除选定类型；必要的回合结果元数据随传输保留，删除选定类型时保留元数据。删除只影响所选节点/磁盘的所选文件。
+- 传输补齐缺少的文件，已有同名文件须内容一致，不覆盖冲突内容。传输执行 SHA-256 校验，校验记录由系统自动维护，不要求使用者填写清单。H100/H200 文件工作通过 CPU-only Slurm；同名路径不等于同一存储。
+- 文件状态：`verified` 为传输内容校验通过；`structure_checked` 为文件容器结构检查通过，未逐字节校验；`present_unverified` 为实体存在、完整性待核实；`incomplete` 为临时/未完成文件；`link` 显示实际目标。目录没有“备份完整”状态。
+- `GET /api/rollout-artifacts/groups` 和 `GET /api/rollout-artifacts?scope=...&offset=0&limit=25`：按实验加载本地回合产物，显示轨迹字段及远端引用；没有选中范围时返回空结果。NPZ 只读有界数组头，不反序列化张量或 pickle。
+- `GET /api/training-artifacts/models?backend=openpi|rlinf`：读取规范模型索引；SFT 和 RLinf 优先使用 checkpoint 索引，未迁移旧格式保留兼容入口。
+
+索引采用版本检查和删除操作记录。扫描不能覆盖更新中的记录，也不能重新加入已删除的旧文件。进程中断后保留失败/待核实状态；操作完成时刷新受影响位置。索引不是文件存在或完整性的最终证据，执行传输/删除前会再次核对源路径、状态和活跃引用。
+
+
+训练列表性能：`/api/rlinf/runs` 与 `/api/artifact-runs` 使用 30 秒后台刷新快照，返回 `ready`、`refreshing` 和索引时间；读取选定日志/曲线复用运行索引，不再重新扫描全部运行。规范运行的日志直接从 `logs/` 读取。`/api/status?compact=1` 复用数据集和模型目录摘要；任务状态仍单独刷新。索引刷新失败时保留上次成功结果，并明确标记过期状态。
+
+
+存储索引运行维护：`bimanual-vla-storage-index.timer` 每分钟检查 Dashboard 变更通知，规范目录约每 15 分钟刷新；历史混合目录只在显式全量刷新时扫描。Dashboard 完成上传、数据集改名或训练/评测/传输任务终态后标记受影响索引待更新；新存储操作在完成后直接核对位置。后台扫描错误不会抹去上次成功清单，界面显示核对时间和不可用目录。
+
+存储 worker 只使用 Python 标准库，集群目标可以设置 `storage_python` 独立于训练环境的 `openpi_python`。H200 使用节点本地日志加 Slurm sattach 回传目录结果，H100 使用已验证共享数据盘回执；均显式限制为单个 CPU worker。传输目标在搬运 staging 前先检查个人用量与峰值空间；失败 staging 保留路径用于恢复，成功后清理。返回的 `resources` 包含缓存磁盘容量及带采样时间的个人用量，不代表实时硬配额。
+
+### 训练、模型与 Rollout 管理（2026-10-24）
+
+- SFT / RLinf 的进程历史及模型管理分开；模型管理与日志/指标管理分开。删除历史仅清理运行诊断文件，保留模型、配置来源及 Rollout（含逐帧视频、图像、JEPA 特征、VLA latent）。活动运行或无法确认结束的运行不能删除。
+- `GET /api/checkpoints/discover?backend=openpi&node=local_4090&experiment=`：直接浅层读取模型目录，发现未登记到索引的新 checkpoint；不遍历权重内容。`backend=rlinf` 支持规范运行的 checkpoint 目录。返回检查时间、目录项数量及是否触及限额。可指定一个远端节点、实验；H100/H200 按节点访问规则使用共享目录或 CPU Slurm，调度延迟不代表索引过期。
+- `POST /api/checkpoints/inspect`，JSON `{"path":"绝对模型路径"}`：定向检查关键文件及有界大小统计，不触发全局索引。返回 `size_complete=false` 时不能把 `observed_bytes` 当作完整大小。
+- `POST /api/training/discover`，JSON `{"target":"local_4090"}`：发现当前用户在配置 OpenPI 工程启动的训练进程；指定集群 target 时查询该节点用户队列及训练脚本描述。不遍历实验数据。
+- `GET /api/training/discovery-sources`、`POST /api/rlinf/runs/discover`（JSON `{"source":"配置的 source ID"}`）：直接读取一个已配置的运行来源，发现新运行及曲线，不等后台全量索引。
+- `GET /api/rlinf/runs/<id>/metrics`：直接读取该运行的最新曲线/TensorBoard 数据。`GET /api/tasks/<id>/status?live=1`、`GET /api/rlinf/runs/<id>/status` 定向核对进程/Slurm 状态。
+- `GET /api/model-catalog?backend=openpi|rlinf&q=` 独立于历史墓碑。模型大小的全量计量在后台完成；列表读取不会递归计量权重。
+- RLinf 初始化候选：`GET /api/rlinf/model-options?target=...&profile=...`；`POST /api/rlinf/launch` 可传 `initial_model`（候选 ID，默认 `profile-default`）。同任务/数据集不足以证明格式兼容；未验证的旧 actor 快照显示不可用原因，不能直接作为另一后端权重加载。
+- Rollout 选择性传输/删除新增 `feature` 类型：VLA latent、JEPA embeddings/features、张量文件。不会反序列化张量/权重。一个 NPZ 同时含轨迹和 latent 时按整个文件管理，不隐式拆分数组。
+
+新实验组发现：`GET /api/training/discovery-sources` 返回已配置实验目录推导出的父目录。`POST /api/rlinf/runs/discover`（`source` 取父目录 ID）直接发现新建实验组，随后按返回的运行 ID 获取 `/metrics`，不要求登记新实验或刷新全量索引。`live-all` 仅覆盖可直接读取的目录；H200 节点本地目录必须单独选择 CPU Slurm 来源，耗时受调度影响。页面可见时每 10 秒探测，扫描排除权重、Rollout 和 latent 载荷目录，超出有界扫描范围会报告错误，需缩小目录范围。配置范围之外的任意目录不会自动发现。
+
+2026-10-24 发现修正：新实验探测包含各存储位置的规范 `simulation-artifacts` / `experiment_artifacts` 根；直接读取 `run.json` 后可在首个曲线点写出前显示运行，H100 作业状态由 Slurm 核对。读取主机使用绝对解释器路径，H200 在 login-server 上的指标镜像仍从镜像主机读取。规范目录与旧软链接指向同一运行时去重。探测跳过轨迹数据、模型、代码及缓存目录；达到本轮限额时保留已发现结果并提示范围限制。
+
+2026-10-24 模型分类与页面读取修正：`/api/status` 的 `base_models` 只包含 `pi05_base`、`pi0_base` 等原始预训练模型，训练权重保留在 `checkpoints`；初始化选择器分别展示两类。RLinf profile 的默认权重不再自动视为基础模型，未解析路径的配置标为类型待确认。所有 HTTP JSON 输出将 NaN / Infinity 转为 null，原始实验文件保持不变。运行列表按运行中优先排序；元数据子目录合并到所属运行，来源发现的历史记录不再标作“新实验”。
+
+### Checkpoint 单项管理与统一传输页（2026-10-24）
+
+SFT 和 RLinf 的 checkpoint 行均提供“同步到…”和“删除”；数据集、checkpoint、Rollout 的传输/删除任务统一放在导航“传输任务”，日志在该页查看。
+
+`POST /api/checkpoints/operate`（Bearer 认证）：
+```json
+{"backend":"rlinf","node":"h100","path":"/configured/root/experiment/run/checkpoints/actor.pt","action":"copy","target":"local_4090","confirm_path":"/configured/root/experiment/run/checkpoints/actor.pt"}
+```
+`action` 为 `copy` 或 `delete`；删除不需要 target。返回 202 和 transfer task；通过现有 task status/log API 查看终态。服务端限定配置根目录、单个 SFT Orbax step / RLinf 权重文件，拒绝链接、混合目录、活动任务引用和内容变化。操作只现场核对所选 checkpoint，不依赖全量索引刷新；源/目标索引单项维护，外部新增权重也可以操作。同步沿用 Slurm CPU worker、容量检查、SHA256 校验和冲突拒绝；源权重保留。删除只删除指定位置权重，保留日志、指标和 Rollout。
+
+手动 SFT 评测（2026-10-24）：`POST /api/tasks/eval` 只需提供待评测的 `checkpoint`，不再需要 `base_checkpoint`。旧客户端传入该字段也不会改变实际加载权重；本地评测及 Slurm 预检均使用所选 checkpoint。训练提交仍保留初始化权重选择。
+
+### 按任务场景关联权重（2026-10-24）
+
+训练初始化和 SFT 手动评测的权重选择按任务场景筛选，不再以数据集 ID 相同为条件。SFT/RLinf 是权重来源信息；直接加载仍需匹配格式、模型及动作配置。Orbax 和 PyTorch 不会自动转换；不可直接加载时显示原因。基础模型保持独立分类。未标注场景的历史权重保留显示，可以补标。
+
+`POST /api/task-scenes/bind`（Bearer 认证）支持 `{"kind":"dataset","key":"dataset-id","task_scene":"tsa-basket"}`，或 `{"kind":"model","key":"h100:/absolute/checkpoint/path","task_scene":"tsa-basket"}`。只写 workspace 下的场景关联文件，不修改数据集、权重或旧实验内容。模型显式关联优先于其数据集；新 SFT 运行记录场景，RLinf 不要求提供数据集。训练方案控制真实环境，RLinf 的权重场景筛选本身不修改环境配置。
+
+跨数据集手动评测仍验证动作契约；归一化使用 checkpoint 内与目标 ID 对应的资产，或唯一的训练归一化资产，多份资产无法确定时拒绝猜测。Slurm 评测携带当前评测器源码快照（仅内存加载），不覆盖远端代码，避免远端旧 helper 仍按数据集 ID 拒绝。此次没有实际启动 GPU 评测，未验证任意第三方权重转换。
+
+### Storage source loading (2026-10-24)
+
+Default storage reads prioritize 4090 and retain H100/H200 fixed indexes. Opening pages,
+background polling, and the scheduled storage refresh do not scan remote storage or
+submit remote inventory jobs. `POST /api/storage-items/refresh` with an empty body or
+`{"source":"all"}` refreshes local storage only. Pass one configured `source` to
+explicitly refresh that source. The storage CLI likewise requires `--node NAME` for
+remote refresh; `--scheduled` always limits work to local storage.
+
+`GET /api/checkpoints/remote` reads cached/fixed inventory; an explicit probe requires
+both `refresh=1` and `source=NAME`. `GET /api/dataset-locations` uses local directories
+and stored remote inventories; `source=NAME` loads only that remote source. This does
+not change active training process/curve monitoring. Unavailable Slurm nodes reject
+new read probes, and read-probe monitors cancel pending jobs on timeout/normal exit.
+
+### Model robot/action compatibility (2026-10-24)
+
+Checkpoint selection uses task scene together with `robot_type` (prefer explicit
+`robot_model`), `arm_mode`, and action output space (`joint` versus `eef_pose`).
+Action dimension, arm side, convention and gripper semantics are also checked when
+the target declares them. Different dataset IDs are allowed if these contracts
+match; a common scene or action dimension alone does not establish compatibility.
+Foundation models remain a separate category.
+
+Model responses include `model_identity` and `identity_conflicts`. Missing core
+identity or conflicting provenance is shown as pending verification and cannot be
+selected for initialization/manual evaluation. Exact dataset provenance can supply
+missing fields by reading its small local metadata file, without remote inventory
+refresh. Training/evaluation POST handlers repeat the checks before scheduling.
+
+RLinf profiles declare an `action_contract` for their environment. Existing runs
+may use their recorded contract or recorded launch-profile provenance; the generic
+evaluation fallback profile is never used as proof of a historical model's identity.
+Unknown historical runs require verified metadata before checkpoint reuse/evaluation.
+New run manifests persist the contract. New SFT checkpoint markers record the actual
+dataset robot type instead of the previous hardcoded Piper label.

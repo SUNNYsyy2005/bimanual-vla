@@ -49,6 +49,7 @@ def _build_config_args(args: argparse.Namespace) -> argparse.Namespace:
     # model/data contract as inference but builds a held-out transformed loader.
     return argparse.Namespace(
         command="serve",
+        allow_cross_dataset_checkpoint=True,
         dataset_id=args.dataset_id,
         arm_mode=args.arm_mode,
         arm_side=args.arm_side,
@@ -92,7 +93,9 @@ def _create_test_loader(
 
     # Use the exact training norm stats copied into this checkpoint. The test
     # split must never compute or substitute its own normalization statistics.
-    norm_stats = checkpoints.load_norm_stats(checkpoint / "assets", concrete.asset_id)
+    from selected_resource import evaluation_norm_asset
+    norm_asset = evaluation_norm_asset(checkpoint, concrete.asset_id)
+    norm_stats = checkpoints.load_norm_stats(checkpoint / "assets", norm_asset)
     concrete = dataclasses.replace(concrete, norm_stats=norm_stats)
     raw_dataset = piper._create_torch_dataset_for_episodes(
         concrete,

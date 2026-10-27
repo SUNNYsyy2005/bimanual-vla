@@ -150,9 +150,11 @@ class DashboardCheckpointManagementTest(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 200)
             models = response.get_json()["base_models"]
-            matching = [item for item in models if item.get("experiment") == experiment]
+            self.assertTrue(all(item["foundation"] for item in models))
+            self.assertFalse(any(item.get("experiment") == experiment for item in models))
+            matching = [item for item in response.json["checkpoints"] if item.get("experiment") == experiment]
             self.assertEqual(len(matching), 1)
-            self.assertEqual(matching[0]["checkpoint_step"], 10000)
+            self.assertEqual(matching[0]["step"], 10000)
             self.assertEqual(matching[0]["arm_mode"], "bimanual")
 
 

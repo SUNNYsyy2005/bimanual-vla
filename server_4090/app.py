@@ -619,7 +619,8 @@ MODEL_VARIANTS = {"pi05", "pi0"}
 def artifact_checkpoint_identity(path: Path) -> dict[str, Any] | None:
     """Read SFT identity after physical layout migration, independent of names."""
     path = Path(path)
-    if not path.name.isdigit():
+    step_match=re.fullmatch(r"(?:step[-_])?(\d+)",path.name)
+    if not step_match:
         return None
     for ancestor in path.parents:
         run = read_json(ancestor / "run.json", {}) or {}
@@ -633,7 +634,7 @@ def artifact_checkpoint_identity(path: Path) -> dict[str, Any] | None:
             for arm_mode in ("single", "bimanual"):
                 if config_name == policy_config_name(arm_mode, model_variant):
                     return {"config_name": config_name, "experiment": run["experiment"],
-                            "checkpoint_step": int(path.name), "model_variant": model_variant,
+                            "checkpoint_step": int(step_match[1]), "model_variant": model_variant,
                             "arm_mode": arm_mode}
     return None
 
@@ -1139,7 +1140,9 @@ def describe_dataset_schema(info: dict[str, Any]) -> dict[str, Any]:
         normalized_arm_base_offset = normalize_arm_base_offset(info.get("arm_base_offset"))
     except ValueError:
         normalized_arm_base_offset = None
+    from server_4090.model_identity import normalize_robot
     return {
+        "robot_type": normalize_robot(metadata.get("robot_model") or metadata.get("robot_type")),
         "schema": schema,
         "schema_label": schema_label,
         "arm_mode": arm_mode,
@@ -2126,6 +2129,10 @@ class TaskManager:
             task["finished_at"] = now_iso()
         atomic_json(self._path(task["id"]), task)
         self.processes.pop(task["id"], None)
+        callback = getattr(self, 'storage_change_callback', None)
+        if callback:
+            try: callback(task)
+            except Exception as exc: self._append_log(task, 'Storage index update pending: '+str(exc))
         return task
 
     @staticmethod
@@ -2215,6 +2222,10 @@ class TaskManager:
         task["systemd_exit_json_missing"] = True
         atomic_json(self._path(task["id"]), task)
         self.processes.pop(task["id"], None)
+        callback = getattr(self, 'storage_change_callback', None)
+        if callback:
+            try: callback(task)
+            except Exception as exc: self._append_log(task, 'Storage index update pending: '+str(exc))
         return task
 
     def _refresh_systemd_task(self, task: dict[str, Any]) -> dict[str, Any] | None:
@@ -2284,6 +2295,8 @@ class TaskManager:
             systemd_result = self._refresh_systemd_task(task)
             if systemd_result is not None:
                 return systemd_result
+        if task.get('metadata',{}).get('external_training') and task.get('metadata',{}).get('runtime')=='slurm':
+            return task
         if state not in PROCESS_STATES:
             return task
         exit_info = self._read_exit_info(task)
@@ -2806,6 +2819,13 @@ class TaskManager:
                 return task
             if task["state"] not in PROCESS_STATES:
                 return task
+            metadata=task.get('metadata') or {}
+            if metadata.get('external_training') and metadata.get('runtime')=='slurm':
+                job=str(metadata.get('slurm_job_id',''))
+                if not job.isdigit(): raise ValueError('Invalid external Slurm identity')
+                result=subprocess.run(['ssh','-T',metadata['slurm_submit_host'],shlex.join(['scancel',job])],capture_output=True,text=True,timeout=10)
+                if result.returncode: raise ValueError(result.stderr[-500:])
+                task['state']='stopping';atomic_json(self._path(task_id),task);return task
             unit = str(task.get("systemd_unit") or "")
             if unit:
                 sig = "SIGKILL" if force else "SIGTERM"
@@ -2844,40 +2864,10 @@ class TaskManager:
             return task
 
     def delete(self, task_id: str) -> dict[str, Any]:
-        """Delete a terminal task record and its log without touching outputs/checkpoints."""
-        with self.lock:
-            task = self.get(task_id)
-            state = task.get("state")
-            if state not in TERMINAL_STATES:
-                raise ValueError(f"cannot delete active task {task_id} in state {state}")
+        result = self.delete_many([task_id])
+        return {"deleted": True, "task": result["tasks"][0]}
 
-            process = self.processes.get(task_id)
-            if process is not None and process.poll() is None:
-                raise ValueError(f"cannot delete task {task_id} while its process is still alive")
-
-            active_dependents = []
-            for path in self.root.glob("*/task.json"):
-                dependent = read_json(path)
-                if not isinstance(dependent, dict) or dependent.get("id") == task_id:
-                    continue
-                dependency_id = (
-                    dependent.get("metadata", {}).get("depends_on")
-                    or dependent.get("dependency", {}).get("task_id")
-                )
-                if dependency_id != task_id:
-                    continue
-                if dependent.get("state") not in TERMINAL_STATES:
-                    active_dependents.append(str(dependent.get("id", path.parent.name)))
-            if active_dependents:
-                names = ", ".join(sorted(active_dependents))
-                raise ValueError(f"cannot delete task {task_id}; active dependent task(s): {names}")
-
-            task_dir = self._path(task_id).parent
-            self.processes.pop(task_id, None)
-            shutil.rmtree(task_dir)
-            return {"deleted": True, "task": task}
-
-    def delete_many(self, task_ids: list[str]) -> dict[str, Any]:
+    def delete_many(self, task_ids: list[str], *, validate_only=False) -> dict[str, Any]:
         """Delete multiple terminal task records and their logs as one validated batch.
 
         Outputs, checkpoints, and any external log paths are intentionally left
@@ -2915,6 +2905,9 @@ class TaskManager:
                 process = self.processes.get(task_id)
                 if process is not None and process.poll() is None:
                     raise ValueError(f"cannot delete task {task_id} while its process is still alive")
+                pid=int(task.get('pid') or 0)
+                if pid and pid_alive(pid) and process_matches_task(pid,task):
+                    raise ValueError('cannot delete task while its recorded process is alive')
                 selected_tasks[task_id] = task
 
             active_dependents: dict[str, list[str]] = {}
@@ -2948,9 +2941,20 @@ class TaskManager:
                 if not task_dir.is_dir():
                     raise FileNotFoundError(task_id)
 
+            if validate_only:
+                return {"tasks": list(selected_tasks.values()), "task_ids": normalized_ids}
+            callback = getattr(self, 'before_history_delete', None)
+            if callback:
+                callback(list(selected_tasks.values()))
+            from server_4090.storage_worker import history_cleanup
             for task_id, task_dir in task_dirs.items():
                 self.processes.pop(task_id, None)
-                shutil.rmtree(task_dir)
+                history_cleanup(dict(run_paths=[str(task_dir)], run={'state': selected_tasks[task_id]['state']}))
+                self._path(task_id).unlink()
+                if getattr(self,'live_mirror',None):self.live_mirror.forget('task:'+task_id)
+                # Unknown files (including nested rollout/weights) are preserved.
+                try: task_dir.rmdir()
+                except OSError: pass
 
             return {
                 "deleted": True,
@@ -3019,6 +3023,8 @@ class TaskManager:
         if not isinstance(target, dict):
             return None
         submit_host = str(metadata.get("slurm_submit_host") or target.get("submit_host") or "")
+        if metadata.get('external_training') and metadata.get('remote_stdout'):
+            return submit_host, {k:v for k,v in {'stdout':metadata.get('remote_stdout'),'stderr':metadata.get('remote_stderr')}.items() if v and v!='/dev/null'}
         job_id = self._slurm_job_id_from_log(local_log)
         job_name = self._slurm_job_name(task)
         workdir = str(target.get("workdir") or "")
@@ -4167,17 +4173,57 @@ def create_app(config_path: Path) -> Flask:
     login_user = os.environ.get("BIMANUAL_VLA_LOGIN_USER", "")
     login_password = os.environ.get("BIMANUAL_VLA_LOGIN_PASSWORD", "")
     app = Flask(__name__, template_folder=str(APP_DIR / "templates"))
+    from server_4090.json_response import FiniteJSONProvider
+    app.json = FiniteJSONProvider(app)
     dashboard_template_path = APP_DIR / "templates" / "index.html"
     dashboard_build_id = hashlib.sha256(dashboard_template_path.read_bytes()).hexdigest()[:12]
     app.config["MAX_CONTENT_LENGTH"] = int(config["max_chunk_mib"] * 1024**2) + 1024 * 1024
     tasks = TaskManager(config)
+    from server_4090.history_management import HistoryManager
+    histories = HistoryManager(config, tasks)
+    tasks.before_history_delete = histories.before_tasks_deleted
     rlinf_history_path = Path(config["workspace_root"]) / "rlinf_deleted_runs.json"
+
+    from server_4090.dashboard_snapshot import Snapshot
+    rlinf_list_snapshot = Snapshot(Path(config["workspace_root"]) / "rlinf-runs-index.json",
+                                    lambda: scan_runs(config, tasks.list()), ttl=30)
+
+    live_rlinf_overlay_path = Path(config['workspace_root']) / 'rlinf-discovered-runs.json'
+    live_rlinf_overlay = read_json(live_rlinf_overlay_path, {}) or {}
+    live_rlinf_overlay_lock = threading.Lock()
+    rlinf_discovery_snapshots = {}
+    rlinf_discovery_lock = threading.Lock()
 
     def visible_rlinf_runs():
         with tasks.lock:
             deleted = set(read_json(rlinf_history_path, []) or [])
             task_list = tasks.list()
-        return [run for run in scan_runs(config, task_list) if run["id"] not in deleted]
+        snapshot = rlinf_list_snapshot.get()
+        current_tasks = {task["id"]: task for task in task_list}
+        runs = []
+        combined={r["id"]:r for r in snapshot["data"] or []}
+        combined.update(live_rlinf_overlay)
+        for run in combined.values():
+            if run["id"] in deleted:
+                continue
+            run = dict(run)
+            linked = current_tasks.get(run.get("task_id"))
+            if linked:
+                run["state"] = linked["state"]
+            elif time.time() - snapshot["updated_at"] > 120 and run.get("state") in {"running", "queued"}:
+                run["state"] = "observed"
+                run["status_reason"] = "Cached status is stale; background refresh pending"
+            from server_4090.rlinf_identity import annotate_run
+            runs.append(annotate_run(config, run))
+        return runs
+
+    def selected_rlinf_run(run_id):
+        if run_id in set(read_json(rlinf_history_path, []) or []):
+            return None
+        run = live_rlinf_overlay.get(run_id)
+        from server_4090.rlinf_identity import annotate_run
+        run = dict(run) if run else rlinf_list_snapshot.find(run_id)
+        return annotate_run(config, run) if run else None
 
     def delete_rlinf_records(run_ids):
         if not isinstance(run_ids, list) or not run_ids or len(run_ids) > 200:
@@ -4188,15 +4234,23 @@ def create_app(config_path: Path) -> Flask:
         ids = list(dict.fromkeys(run_ids))
         if any(item not in runs or runs[item].get("state") == "unavailable" for item in ids):
             raise ValueError("unknown or unavailable RLinf run")
+        for ident in ids: runs[ident] = check_rlinf_run_now(runs[ident])
         with tasks.lock:
             if any(task.get("type") == "eval" and task.get("state") not in TERMINAL_STATES and task.get("metadata", {}).get("run_id") in ids for task in tasks.list()):
                 raise ValueError("该运行仍有正在执行的 rollout 评测，请先停止评测")
             task_ids = list(dict.fromkeys(runs[item]["task_id"] for item in ids if runs[item].get("task_id")))
-            # Reuse process/dependency checks and delete only dashboard-owned logs.
+            if task_ids: tasks.delete_many(task_ids, validate_only=True)
+            operations = [op for ident in ids for op in histories.run_operations(runs[ident])]
+            histories.cleanup(operations)
+            histories.remember([runs[ident] for ident in ids])
             if task_ids:
                 tasks.delete_many(task_ids)
             deleted = set(read_json(rlinf_history_path, []) or [])
             atomic_json(rlinf_history_path, sorted(deleted | set(ids)))
+        for ident in ids:live_mirror.forget('rlinf:'+ident)
+        rlinf_list_snapshot.invalidate()
+        artifact_history_snapshot.invalidate()
+        artifact_replicas.mark_dirty()
         return {"deleted": True, "run_ids": ids, "task_ids": task_ids}
     dataset_root = Path(config["dataset_root"])
     dataset_root.mkdir(parents=True, exist_ok=True)
@@ -4662,6 +4716,13 @@ def create_app(config_path: Path) -> Flask:
         return None
 
     @app.after_request
+    def compress_rlinf_response(response):
+        from server_4090.response_compression import compress_json_response
+        if request.path.startswith('/api/rlinf/'):
+            return compress_json_response(response, request)
+        return response
+
+    @app.after_request
     def attach_auth_cookie(response):
         if request.environ.get("BIMANUAL_VLA_SET_COOKIE"):
             response.set_cookie(
@@ -4695,6 +4756,7 @@ def create_app(config_path: Path) -> Flask:
             visible_dataset_origins=config.get("visible_dataset_origins", ["real", "unknown"]),
             enable_policy=bool(config.get("enable_policy", True)),
             dashboard_build=dashboard_build_id,
+            checkpoint_destinations=[dict(id=k, label=v["label"]) for k,v in artifact_replica_locations(config).items()],
         )
 
     @app.get("/healthz")
@@ -4812,6 +4874,8 @@ def create_app(config_path: Path) -> Flask:
         return jsonify({"ok": True, "service": service, "restart_requested": True}), 202
 
     def list_datasets() -> list[dict[str, Any]]:
+        from server_4090.task_scenes import dataset_scene, bindings
+        scene_bindings=bindings(config)
         datasets = []
         storage_root = Path(config["dataset_root"]).expanduser().resolve()
         roots = [Path(item).expanduser().resolve() for item in config.get("dataset_read_roots", [])]
@@ -4883,6 +4947,7 @@ def create_app(config_path: Path) -> Flask:
             datasets.append(
                 {
                     "id": directory.name,
+                    "task_scene": dataset_scene(directory.name,info,scene_bindings),
                     "path": str(directory),
                     "root": str(directory.parent),
                     "storage": writable,
@@ -4956,106 +5021,25 @@ def create_app(config_path: Path) -> Flask:
             return "unknown" in visible, dataset_ids, origins
         return any(origin in visible for origin in origins.values()), dataset_ids, origins
 
-    def list_base_models(
-        checkpoints: list[dict[str, Any]] | None = None,
-    ) -> list[dict[str, Any]]:
-        """List foundation weights and complete training checkpoints.
-
-        ``checkpoint_base_dir`` may contain experiment directories implemented
-        as symlinks (the 4x4090 simulation storage uses this layout).  A
-        recursive ``Path.rglob`` does not descend into directory symlinks, so
-        relying on that scan alone makes those checkpoints appear in the
-        checkpoint table but disappear from the training base-model selector.
-        Reuse the complete-checkpoint inventory, which already walks the
-        logical experiment tree, and carry its experiment metadata along.
-        """
-        candidates: set[Path] = {Path(config["base_checkpoint"]).resolve()}
-        checkpoint_metadata: dict[Path, dict[str, Any]] = {}
-        for item in checkpoints if checkpoints is not None else list_checkpoints():
-            raw_path = item.get("path")
-            if not raw_path:
-                continue
-            try:
-                path = Path(str(raw_path)).expanduser().resolve()
-            except (OSError, RuntimeError, ValueError):
-                continue
-            candidates.add(path)
-            checkpoint_metadata[path] = item
+    def list_base_models(checkpoints: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        """Original pretrained models only; checkpoints remain in their own catalog."""
+        from server_4090.model_catalog import is_foundation_path
+        default_path=Path(config['base_checkpoint']).resolve()
+        trained={Path(item['path']).resolve() for item in checkpoints or [] if item.get('path')}
+        candidates={default_path}
         for root in checkpoint_roots:
-            if not root.exists():
-                continue
-            for params_dir in root.rglob("params"):
-                if params_dir.is_dir() and any(
-                    (params_dir / marker).exists()
-                    for marker in ("manifest.ocdbt", "_METADATA", "_CHECKPOINT_METADATA")
-                ):
-                    candidates.add(params_dir.parent.resolve())
-        default_path = Path(config["base_checkpoint"]).resolve()
-        checkpoint_base_dir = Path(config["checkpoint_base_dir"]).resolve()
-        models = []
-        for path in sorted(candidates, key=str):
-            if not (path / "params").is_dir():
-                continue
-            model_variant = infer_model_variant(path)
-            if model_variant is None:
-                continue
-            checkpoint_info = checkpoint_metadata.get(path)
-            identity = training_checkpoint_identity(path, checkpoint_base_dir)
-            if identity is None and checkpoint_info is not None:
-                # The resolved target of a symlink is outside the configured
-                # logical root, so derive the standard identity from the
-                # already validated checkpoint inventory instead.
-                identity = {
-                    "config_name": checkpoint_info.get("config_name"),
-                    "experiment": checkpoint_info.get("experiment"),
-                    "checkpoint_step": checkpoint_info.get("step"),
-                    "model_variant": checkpoint_info.get("model_variant"),
-                    "arm_mode": checkpoint_info.get("arm_mode"),
-                }
-            foundation = bool(
-                path == default_path
-                or path.is_relative_to(Path.home() / ".cache/openpi")
-            )
-            dataset_ids: list[str] = []
-            dataset_origins: dict[str, str] = {}
-            if not foundation:
-                if checkpoint_info is not None:
-                    dataset_ids = list(checkpoint_info.get("dataset_ids") or [])
-                    dataset_origins = dict(checkpoint_info.get("dataset_origins") or {})
-                    visible_checkpoint = any(
-                        origin in visible_dataset_origin_set()
-                        for origin in dataset_origins.values()
-                    ) if dataset_ids else "unknown" in visible_dataset_origin_set()
-                else:
-                    visible_checkpoint, dataset_ids, dataset_origins = checkpoint_matches_visible_datasets(path)
-                if not visible_checkpoint:
-                    continue
-            models.append(
-                {
-                    "path": str(path),
-                    "name": path.name,
-                    "model_variant": model_variant,
-                    "default": path == default_path,
-                    "foundation": foundation,
-                    "source": "pretrained" if foundation else "checkpoint",
-                    "experiment": identity.get("experiment") if identity else None,
-                    "checkpoint_step": identity.get("checkpoint_step") if identity else None,
-                    "arm_mode": identity.get("arm_mode") if identity else None,
-                    "config_name": identity.get("config_name") if identity else None,
-                    "dataset_ids": dataset_ids,
-                    "dataset_origins": dataset_origins,
-                }
-            )
-        return sorted(
-            models,
-            key=lambda item: (
-                not item["default"],
-                item["model_variant"],
-                item["experiment"] or "",
-                -(item["checkpoint_step"] or 0),
-                item["path"],
-            ),
-        )
+            if not root.is_dir():continue
+            candidates.update(p.resolve() for p in [root,*root.iterdir()] if is_foundation_path(p) and p.is_dir())
+        models=[]
+        for path in candidates:
+            if path in trained or not is_foundation_path(path) or not (path/'params').is_dir():continue
+            variant=infer_model_variant(path)
+            if variant is None:continue
+            models.append(dict(path=str(path),name=path.name,model_variant=variant,default=path==default_path,
+                               foundation=True,source='pretrained',backend='foundation',format='orbax',
+                               experiment=None,checkpoint_step=None,arm_mode=None,config_name=None,
+                               dataset_ids=[],dataset_origins={},action_contract=None))
+        return sorted(models,key=lambda m:(not m['default'],m['model_variant'],m['path']))
 
     def resolve_base_model(payload: dict[str, Any]) -> tuple[Path, str]:
         requested_path = payload.get("base_checkpoint") or config["base_checkpoint"]
@@ -5152,75 +5136,132 @@ def create_app(config_path: Path) -> Flask:
                 + json.dumps(mismatches, ensure_ascii=False, sort_keys=True)
             )
 
+    def measure_checkpoint_sizes():
+        result = {}
+        roots = list(dict.fromkeys([config['checkpoint_base_dir'], *config.get('checkpoint_allowed_roots', [])]))
+        paths = {m['path'] for m in artifact_inventory.models('openpi')}
+        for root in roots:
+            for variant in ('pi05', 'pi0'):
+                for arm in ('single', 'bimanual'):
+                    base = Path(root) / policy_config_name(arm, variant)
+                    if not base.is_dir(): continue
+                    for exp in base.iterdir():
+                        if exp.is_dir():
+                            paths.update(str(p.resolve()) for p in exp.iterdir() if p.name.isdigit() and p.is_dir())
+        from server_4090.storage_worker import discover_models
+        canonical=[dict(path=str(r),layout='canonical') for r in artifact_inventory.roots() if r.name in {'simulation-artifacts','experiment_artifacts'}]
+        paths.update(m['path'] for m in discover_models(dict(roots=canonical,backend='openpi'))['models'])
+        for raw in sorted(paths):
+            path = Path(raw).resolve()
+            total = 0
+            for current, dirs, files in os.walk(path, followlinks=False):
+                dirs[:] = [d for d in dirs if not (Path(current)/d).is_symlink()]
+                for name in files:
+                    file = Path(current)/name
+                    if not file.is_symlink():
+                        try: total += file.stat().st_size
+                        except FileNotFoundError: pass
+            result[str(path)] = total
+        return result
+
+    checkpoint_sizes_snapshot = Snapshot(Path(config['workspace_root']) / 'checkpoint-sizes-index.json', measure_checkpoint_sizes, ttl=900)
+
     def list_checkpoints() -> list[dict[str, Any]]:
         checkpoints = []
         storage_root = Path(config["checkpoint_base_dir"]).expanduser().resolve()
         roots = [Path(item).expanduser().resolve() for item in config.get("checkpoint_allowed_roots", [])]
         if storage_root not in roots:
             roots.insert(0, storage_root)
-        seen_paths: set[str] = set()
+        roots += [p for p in artifact_inventory.roots() if p not in roots]
+        candidates = []
+        from server_4090.storage_worker import discover_models
+        live_roots=[dict(path=str(r),layout='canonical') for r in artifact_inventory.roots() if r.name in {'simulation-artifacts','experiment_artifacts'} or str(r)==config.get('experiment_artifact_root')]
+        live_roots += [dict(path=str(r),layout='legacy') for r in roots]
+        for entry in discover_models(dict(roots=live_roots,backend='openpi'))['models']:
+            step_dir=Path(entry['path'])
+            root=next((r for r in roots if step_dir.resolve().is_relative_to(r)),None)
+            if root is not None:
+                candidates.append((step_dir,entry['model_variant'],entry['arm_mode'],entry['config_name'],entry['experiment'],root,entry))
+        for entry in artifact_inventory.models("openpi"):
+            step_dir = Path(entry["path"])
+            if entry.get("complete") is not True or not step_dir.name.isdigit():
+                continue
+            identity = artifact_checkpoint_identity(step_dir)
+            if not identity:
+                continue
+            root = next((r for r in roots if step_dir.resolve().is_relative_to(r)), None)
+            if root is not None:
+                candidates.append((step_dir, identity["model_variant"], identity["arm_mode"], identity["config_name"], identity["experiment"], root, entry))
         for model_variant in ("pi05", "pi0"):
             for arm_mode in ("single", "bimanual"):
                 config_name = policy_config_name(arm_mode, model_variant)
                 for root in roots:
                     config_root = root / config_name
-                    if not config_root.exists():
+                    if not config_root.is_dir():
                         continue
                     for exp_dir in config_root.iterdir():
                         if not exp_dir.is_dir() or exp_dir.name.startswith("."):
                             continue
+                        if (exp_dir / "checkpoints/index.json").is_file():
+                            continue
                         for step_dir in exp_dir.iterdir():
-                            if not step_dir.is_dir() or not step_dir.name.isdigit():
-                                continue
-                            if not (step_dir / "params").is_dir() or not (step_dir / "_CHECKPOINT_METADATA").is_file():
-                                continue
-                            visible_checkpoint, dataset_ids, dataset_origins = checkpoint_matches_visible_datasets(step_dir)
-                            if not visible_checkpoint:
-                                continue
-                            mtime = step_dir.stat().st_mtime
-                            cache_key = str(step_dir.resolve())
-                            if cache_key in seen_paths:
-                                continue
-                            seen_paths.add(cache_key)
-                            cached = checkpoint_size_cache.get(cache_key)
-                            if cached is None or cached[0] != mtime:
-                                size_bytes = sum(path.stat().st_size for path in step_dir.rglob("*") if path.is_file())
-                                checkpoint_size_cache[cache_key] = (mtime, size_bytes)
-                            else:
-                                size_bytes = cached[1]
-                            action_contract = checkpoint_action_contract(step_dir)
-                            checkpoints.append(
-                                {
-                                "path": cache_key,
-                                "action_contract": action_contract,
-                                "contract_version": action_contract.get("contract_version") if action_contract else None,
-                                "raw_action_dim": action_contract.get("raw_action_dim") if action_contract else None,
-                                "model_action_dim": action_contract.get("model_action_dim") if action_contract else None,
-                                "model_action_convention": (
-                                    action_contract.get("model_action_convention")
-                                    if action_contract
-                                    else None
-                                ),
-                                "gripper_semantics": action_contract.get("gripper_semantics") if action_contract else None,
-                                "finetuning": (action_contract or {}).get("finetuning") or FinetuningSettings.legacy().to_dict(),
-                                "config_name": config_name,
-                                "model_variant": model_variant,
-                                "arm_mode": arm_mode,
-                                "experiment": exp_dir.name,
-                                "step": int(step_dir.name),
-                                "full_state_available": is_full_state_checkpoint(step_dir),
-                                "restore_capabilities": (["full_state"] if is_full_state_checkpoint(step_dir) else ["weights_only"]),
-                                "dataset_ids": dataset_ids,
-                                "dataset_origins": dataset_origins,
-                                "root": str(root),
-                                "storage": root == storage_root,
-                                "read_only": root != storage_root,
-                                "mtime": mtime,
-                                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)),
-                                "size_gib": round(size_bytes / (1024**3), 3),
-                                }
-                            )
-        return sorted(checkpoints, key=lambda item: (item["mtime"], item["step"]), reverse=True)
+                            if step_dir.is_dir() and step_dir.name.isdigit():
+                                candidates.append((step_dir, model_variant, arm_mode, config_name, exp_dir.name, root, {}))
+        with artifact_inventory.connect() as db:
+            indexed_sizes = {row['path']: row['size'] for row in db.execute(
+                "SELECT path,json_extract(data,'$.size_bytes') size FROM replicas WHERE status='present'")}
+        measured_sizes = checkpoint_sizes_snapshot.get()['data'] or {}
+        seen_paths: set[str] = set()
+        for step_dir, model_variant, arm_mode, config_name, experiment, root, entry in candidates:
+            if not (step_dir / "params").is_dir() or not (step_dir / "_CHECKPOINT_METADATA").is_file():
+                continue
+            visible_checkpoint, dataset_ids, dataset_origins = checkpoint_matches_visible_datasets(step_dir)
+            if not visible_checkpoint:
+                continue
+            mtime = step_dir.stat().st_mtime
+            cache_key = str(step_dir.resolve())
+            if cache_key in seen_paths:
+                continue
+            seen_paths.add(cache_key)
+            cached = checkpoint_size_cache.get(cache_key)
+            size_bytes = entry.get("size_bytes") or indexed_sizes.get(cache_key) or measured_sizes.get(cache_key) or (cached[1] if cached and cached[0] == mtime else None)
+            action_contract = checkpoint_action_contract(step_dir)
+            checkpoints.append(
+                {
+                "path": cache_key,
+                "backend": "openpi",
+                "format": "orbax",
+                "size_bytes": size_bytes,
+                "action_contract": action_contract,
+                "contract_version": action_contract.get("contract_version") if action_contract else None,
+                "raw_action_dim": action_contract.get("raw_action_dim") if action_contract else None,
+                "model_action_dim": action_contract.get("model_action_dim") if action_contract else None,
+                "model_action_convention": (
+                    action_contract.get("model_action_convention")
+                    if action_contract
+                    else None
+                ),
+                "gripper_semantics": action_contract.get("gripper_semantics") if action_contract else None,
+                "finetuning": (action_contract or {}).get("finetuning") or FinetuningSettings.legacy().to_dict(),
+                "config_name": config_name,
+                "model_variant": model_variant,
+                "arm_mode": arm_mode,
+                "experiment": experiment,
+                "step": int(entry.get("step") if entry.get("step") is not None else step_dir.name),
+                "full_state_available": is_full_state_checkpoint(step_dir),
+                "restore_capabilities": (["full_state"] if is_full_state_checkpoint(step_dir) else ["weights_only"]),
+                "dataset_ids": dataset_ids,
+                "dataset_origins": dataset_origins,
+                "root": str(root),
+                "storage": root == storage_root,
+                "read_only": root != storage_root,
+                "mtime": mtime,
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)),
+                "size_gib": round(size_bytes / (1024**3), 3) if size_bytes is not None else None,
+                }
+            )
+        from server_4090.model_identity import enrich
+        return enrich(sorted(checkpoints, key=lambda item: (item["mtime"], item["step"]), reverse=True), config)
 
     def checkpoint_active_references(path: Path) -> list[dict[str, Any]]:
         path = Path(path).expanduser().resolve()
@@ -5279,6 +5320,34 @@ def create_app(config_path: Path) -> Flask:
         response.headers["Cache-Control"] = "no-store"
         return response
 
+    def build_status_inventory():
+        checkpoints = list_checkpoints()
+        base_models = list_base_models(checkpoints)
+        visible_experiments = {item.get("experiment") for item in checkpoints if item.get("experiment")}
+        experiment_rows: dict[str, dict[str, Any]] = {}
+        experiment_roots = [Path(config["checkpoint_base_dir"])] + [
+            Path(item) for item in config.get("checkpoint_allowed_roots", [])
+            if Path(item) != Path(config["checkpoint_base_dir"])
+        ]
+        for experiment_root in experiment_roots:
+            for item in training_experiment_catalog(experiment_root):
+                if item.get("name") not in visible_experiments:
+                    continue
+                current = experiment_rows.get(item["name"])
+                if current is None:
+                    experiment_rows[item["name"]] = dict(item)
+                    continue
+                for key in ("model_variants", "arm_modes", "config_names"):
+                    current[key] = sorted(set(current.get(key, [])) | set(item.get(key, [])))
+                current["checkpoint_count"] = int(current.get("checkpoint_count", 0)) + int(item.get("checkpoint_count", 0))
+                current["latest_step"] = max(current.get("latest_step") or 0, item.get("latest_step") or 0) or None
+                current["mtime"] = max(float(current.get("mtime", 0)), float(item.get("mtime", 0)))
+                current["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(current["mtime"]))
+        experiments = sorted(experiment_rows.values(), key=lambda item: (-float(item.get("mtime", 0)), item["name"]))
+        return dict(checkpoints=checkpoints, base_models=base_models, experiments=experiments, datasets=list_datasets())
+
+    status_inventory_snapshot = Snapshot(Path(config["workspace_root"]) / "status-inventory-index.json", build_status_inventory, ttl=30)
+
     @app.get("/api/status")
     def status():
         tasks.discover_external_policies()
@@ -5313,32 +5382,22 @@ def create_app(config_path: Path) -> Flask:
                 except Exception:
                     pass
         latest_observation = observations.latest(task_list)
-        checkpoints = list_checkpoints()
-        base_models = list_base_models(checkpoints)
-        visible_experiments = {item.get("experiment") for item in checkpoints if item.get("experiment")}
-        experiment_rows: dict[str, dict[str, Any]] = {}
-        experiment_roots = [Path(config["checkpoint_base_dir"])] + [
-            Path(item) for item in config.get("checkpoint_allowed_roots", [])
-            if Path(item) != Path(config["checkpoint_base_dir"])
-        ]
-        for experiment_root in experiment_roots:
-            for item in training_experiment_catalog(experiment_root):
-                if item.get("name") not in visible_experiments:
-                    continue
-                current = experiment_rows.get(item["name"])
-                if current is None:
-                    experiment_rows[item["name"]] = dict(item)
-                    continue
-                for key in ("model_variants", "arm_modes", "config_names"):
-                    current[key] = sorted(set(current.get(key, [])) | set(item.get(key, [])))
-                current["checkpoint_count"] = int(current.get("checkpoint_count", 0)) + int(item.get("checkpoint_count", 0))
-                current["latest_step"] = max(current.get("latest_step") or 0, item.get("latest_step") or 0) or None
-                current["mtime"] = max(float(current.get("mtime", 0)), float(item.get("mtime", 0)))
-                current["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(current["mtime"]))
-        experiments = sorted(experiment_rows.values(), key=lambda item: (-float(item.get("mtime", 0)), item["name"]))
+        if request.args.get("compact") == "1":
+            cached_inventory = status_inventory_snapshot.get()
+            inventory = cached_inventory["data"] if cached_inventory["ready"] else build_status_inventory()
+        else:
+            inventory = build_status_inventory()
+        from server_4090.task_scenes import annotate, bindings, dataset_scene
+        scene_bindings=bindings(config)
+        checkpoints = [annotate(c,scene_bindings) for c in inventory["checkpoints"]]
+        scene_datasets=[dict(d,task_scene=dataset_scene(d["id"],d,scene_bindings)) for d in inventory["datasets"]]
+        from server_4090.model_catalog import is_foundation_path
+        # Also filter snapshots written by older versions that mixed both categories.
+        base_models = [m for m in inventory["base_models"] if m.get("foundation") and is_foundation_path(m.get("path")) and not m.get("experiment")]
+        experiments = inventory["experiments"]
         return jsonify(
             {
-                "datasets": list_datasets(),
+                "datasets": scene_datasets,
                 "checkpoints": checkpoints,
                 "experiments": experiments,
                 "base_models": base_models,
@@ -5422,7 +5481,9 @@ def create_app(config_path: Path) -> Flask:
 
     @app.post("/api/uploads/<upload_id>/complete")
     def upload_complete(upload_id: str):
-        return jsonify(uploads.complete(upload_id))
+        result = uploads.complete(upload_id)
+        artifact_replicas.mark_dirty()
+        return jsonify(result)
 
     @app.get("/api/datasets/<dataset_id>")
     def dataset_details(dataset_id: str):
@@ -5439,7 +5500,9 @@ def create_app(config_path: Path) -> Flask:
             payload.get("new_dataset_id") if isinstance(payload, dict) else None,
             "new dataset id",
         )
-        return jsonify(dataset_editor.rename_dataset(dataset_id, new_dataset_id))
+        result = dataset_editor.rename_dataset(dataset_id, new_dataset_id)
+        artifact_replicas.mark_dirty()
+        return jsonify(result)
 
     @app.patch("/api/datasets/<dataset_id>/origin")
     def set_dataset_origin(dataset_id: str):
@@ -5804,7 +5867,7 @@ def create_app(config_path: Path) -> Flask:
             "raw_gripper_semantics": model_contract["raw_gripper_semantics"],
             "model_gripper_semantics": model_contract["model_gripper_semantics"],
         }
-        return [
+        command = [
             str(runtime_config["openpi_python"]), eval_helper_for(runtime_config),
             "--checkpoint", str(checkpoint),
             "--result-json", str(result_path),
@@ -5821,6 +5884,10 @@ def create_app(config_path: Path) -> Flask:
             "--max-batches", str(max_batches),
             "--eval-seed", str(eval_seed),
         ] + action_contract_command_args(contract)
+        if runtime_config.get("submit_host"):
+            from server_4090.evaluation_snapshot import snapshot_command
+            return snapshot_command(command, APP_DIR)
+        return command
 
     def slurm_runner_command(
         *,
@@ -6360,6 +6427,249 @@ print(json.dumps(rows, ensure_ascii=False))
                 })
         return videos, errors
 
+    from server_4090.artifact_inventory import Inventory as ArtifactInventory
+    artifact_inventory = ArtifactInventory(config)
+
+    def artifact_assert_idle(path):
+        path = Path(path).resolve()
+        if checkpoint_active_references(path):
+            raise ValueError("Active tasks reference this checkpoint")
+        for task in tasks.list():
+            if task.get("state") in TERMINAL_STATES:
+                continue
+            for key in ("artifact_run_dir", "checkpoint", "checkpoint_dir", "rlinf_output_dir", "output_dir", "base_checkpoint", "resume_checkpoint"):
+                value = (task.get("metadata") or {}).get(key)
+                if not value:
+                    continue
+                ref = Path(str(value)).expanduser().resolve()
+                if ref == path or ref in path.parents or path in ref.parents:
+                    raise ValueError("Active task references this artifact")
+
+    from server_4090.storage_catalog import Replicas, locations as artifact_replica_locations
+    artifact_replicas = Replicas(config)
+
+    def storage_task_finished(task):
+        metadata = task.get('metadata') or {}
+        if str(metadata.get('transfer_kind', '')).startswith('artifact_') and not str(metadata.get('transfer_kind', '')).startswith('artifact_checkpoint_'):
+            return
+        if task.get('type') not in {'train', 'eval', 'transfer', 'collection', 'norm'}:
+            return
+        paths = [metadata[k] for k in ('artifact_run_dir', 'output_dir', 'checkpoint_dir', 'dataset_path') if metadata.get(k)]
+        artifact_replicas.invalidate_local_paths(paths)
+        artifact_replicas.mark_dirty()
+        status_inventory_snapshot.invalidate()
+        artifact_history_snapshot.invalidate()
+        rlinf_list_snapshot.invalidate()
+
+    tasks.storage_change_callback = storage_task_finished
+
+    def refresh_changed_storage(paths):
+        status_inventory_snapshot.invalidate()
+        artifact_history_snapshot.invalidate()
+        rlinf_list_snapshot.invalidate()
+        nodes = artifact_replicas.invalidate_local_paths(paths)
+        if nodes: artifact_replicas.mark_dirty(nodes)
+        for node in nodes:
+            tasks.start("transfer", [config["openpi_python"], "-m", "server_4090.storage_catalog", "--config", str(config_file),
+                "--action", "refresh", "--node", node, "--quick"], env=build_environment(config, None),
+                metadata={"transfer_kind": "artifact_index_after_mutation", "gpu_required": False})
+
+    @app.get("/api/checkpoints/discover")
+    def discover_live_checkpoints():
+        from server_4090.storage_worker import discover_models
+        from server_4090.storage_catalog import storage_worker
+        backend=request.args.get('backend','openpi')
+        if backend not in {'openpi','rlinf'}: raise ValueError('Unknown backend')
+        node=request.args.get('node','local_4090')
+        available=artifact_replica_locations(config)
+        if node not in available: raise ValueError('Unknown storage node')
+        location=available[node]
+        if location['local']:
+            roots=[dict(path=str(r),layout='canonical') for r in artifact_inventory.roots() if r.name in {'simulation-artifacts','experiment_artifacts'} or str(r)==config.get('experiment_artifact_root')]
+            roots += [dict(path=p,layout='legacy') for p in dict.fromkeys([config['checkpoint_base_dir'],*config.get('checkpoint_allowed_roots',[])])]
+        else:
+            roots=[dict(path=p,layout='canonical') for p in location['artifact_roots']]
+            roots += [dict(path=p,layout='legacy') for p in dict.fromkeys([location['checkpoint_base_dir'],*location.get('checkpoint_read_roots',[])])]
+        query=dict(action='discover_models',roots=roots,backend=backend,experiment=request.args.get('experiment',''))
+        data=discover_models(query) if location['local'] else storage_worker(location,query)
+        if backend=='openpi' and location['local']:
+            data['models']=[row for row in data['models'] if checkpoint_matches_visible_datasets(Path(row['path']))[0]]
+        for row in data['models']:
+            row['node']=node
+            if backend=='openpi' and location['local']:
+                contract=checkpoint_action_contract(Path(row['path'])) or row.get('action_contract') or {}
+                row['action_contract']=contract
+                row['finetuning']=contract.get('finetuning') or FinetuningSettings.legacy().to_dict()
+        from server_4090.task_scenes import annotate, bindings
+        scene_bindings=bindings(config)
+        from server_4090.model_identity import enrich
+        data['models']=enrich([annotate(m,scene_bindings) for m in data['models']], config)
+        response=jsonify(data);response.headers['Cache-Control']='no-store'
+        return response
+
+    @app.post("/api/checkpoints/inspect")
+    def inspect_selected_checkpoint():
+        from server_4090.selected_resource import inspect_checkpoint
+        payload=request.get_json(force=True)
+        path=Path(str(payload.get('path',''))).expanduser()
+        allowed=[Path(p).resolve() for p in config.get('checkpoint_allowed_roots', [])]
+        allowed += artifact_inventory.roots()
+        allowed.append(Path(config['base_checkpoint']).resolve())
+        resolved=path.resolve()
+        if not path.is_absolute() or not any(resolved==r or r in resolved.parents for r in allowed):
+            raise ValueError('Checkpoint is outside configured model roots')
+        result=inspect_checkpoint(path)
+        response=jsonify(result);response.headers['Cache-Control']='no-store'
+        return response
+
+    @app.post("/api/task-scenes/bind")
+    def bind_task_scene():
+        from server_4090.task_scenes import bind
+        payload=request.get_json(force=True)
+        scene=bind(config,payload.get('kind'),payload.get('key'),payload.get('task_scene'))
+        status_inventory_snapshot.invalidate()
+        return jsonify(task_scene=scene)
+
+    @app.get("/api/model-catalog")
+    def model_catalog():
+        from server_4090.model_catalog import indexed_models
+        return jsonify(models=indexed_models(artifact_replicas, request.args.get("backend"), request.args.get("q", "")))
+
+    @app.post("/api/checkpoints/operate")
+    def operate_selected_checkpoint():
+        from server_4090.checkpoint_operations import source_location
+        payload=request.get_json(force=True)
+        action=payload.get('action');backend=payload.get('backend')
+        if action not in {'copy','delete'} or backend not in {'openpi','rlinf'}:raise ValueError('Invalid checkpoint operation')
+        path=str(payload.get('path') or '')
+        location,_=source_location(config,payload.get('node'),path)
+        if payload.get('confirm_path')!=path:raise ValueError('Confirm the exact checkpoint path')
+        if location['local']:artifact_assert_idle(path)
+        target=payload.get('target')
+        if action=='copy' and (target not in artifact_replica_locations(config) or target==location['name']):raise ValueError('Choose another configured destination')
+        for task in tasks.list():
+            metadata=task.get('metadata',{})
+            if task.get('state') not in TERMINAL_STATES and metadata.get('source_path')==path and metadata.get('source')==location['name']:
+                raise ValueError('An operation on this checkpoint is already running')
+        command=[config['openpi_python'],'-m','server_4090.checkpoint_operations','--config',str(config_file),
+                 '--node',location['name'],'--path',path,'--backend',backend,'--action',action]
+        if action=='copy':command+=['--target',target]
+        return jsonify(tasks.start('transfer',command,env=build_environment(config,None),metadata={
+            'transfer_kind':'artifact_checkpoint_'+action,'source':location['name'],'source_path':path,
+            'target':target,'checkpoint_dir':path,'backend':backend,'gpu_required':False})),202
+
+    @app.get("/api/storage-locations")
+    def storage_locations_only():
+        return jsonify(locations=[dict(id=k,label=v['label'],local=v['local'],artifact_root=v.get('artifact_root'))
+            for k,v in artifact_replica_locations(config).items()])
+
+    @app.get("/api/storage-items")
+    def list_artifact_replicas():
+        return jsonify(artifact_replicas.page(int(request.args.get("offset", 0)), int(request.args.get("limit", 25)),
+            request.args.get("kind", "all"), False, request.args.get("q", ""), request.args.get("node", "all"), request.args.get("area", "all"), request.args.get("backend", "all")))
+
+    @app.get("/api/storage-items/<item_id>/files")
+    def storage_item_files(item_id):
+        item = artifact_replicas.get(item_id)
+        offset = int(request.args.get("offset", 0)); limit = int(request.args.get("limit", 100))
+        if not 0 <= offset <= 10000000 or not 1 <= limit <= 200:
+            raise ValueError("Invalid file page")
+        files = item.get("files", [])
+        return jsonify(files=files[offset:offset + limit], total=len(files), offset=offset, limit=limit,
+                       path=item["path"], updated_at=item["updated_at"], sampled=bool(item.get("sampled_file_list")))
+
+    @app.post("/api/storage-items/refresh")
+    def refresh_artifact_replicas():
+        source = (request.get_json(silent=True) or {}).get("source", "all")
+        if source != "all" and source not in artifact_replica_locations(config):
+            raise ValueError("Unknown storage source")
+        scope = ["--local-only"] if source == "all" else ["--node", source]
+        for task in tasks.list():
+            if task.get("state") not in TERMINAL_STATES and task.get("metadata", {}).get("transfer_kind") == "artifact_replica_inventory":
+                return jsonify(task), 202
+        return jsonify(tasks.start("transfer", [config["openpi_python"], "-m", "server_4090.storage_catalog",
+            "--config", str(config_file), "--action", "refresh", *scope], env=build_environment(config, None),
+            metadata={"transfer_kind": "artifact_replica_inventory", "gpu_required": False})), 202
+
+    @app.post("/api/storage-items/operate")
+    def operate_artifact_replica():
+        payload = request.get_json(force=True)
+        action = payload.get("action")
+        if action not in {"copy", "delete"}:
+            raise ValueError("action must be copy or delete")
+        copy = artifact_replicas.get(payload.get("copy_id"))
+        if copy["kind"] != "dataset" and payload.get("area") != ("training" if copy["kind"] in {"model", "logs", "metrics", "metadata"} else "rollout"):
+            raise ValueError("Use the corresponding training or rollout management area")
+        if action == "delete" and payload.get("confirm_path") != copy["path"]:
+            raise ValueError("Confirm the exact replica path")
+        available = artifact_replica_locations(config)
+        if copy["node"] not in available:
+            raise ValueError("Source storage is no longer configured")
+        if available[copy["node"]]["local"]:
+            artifact_assert_idle(copy["path"])
+        command = [config["openpi_python"], "-m", "server_4090.storage_catalog", "--config", str(config_file),
+                   "--action", action, "--copy-id", copy["id"]]
+        if action == "copy":
+            if payload.get("target") not in available:
+                raise ValueError("Unknown target storage")
+            target = available[payload["target"]]
+            target_root = target.get("dataset_root") if copy["kind"] == "dataset" else target["artifact_root"]
+            if not target_root:
+                raise ValueError("Target does not accept this artifact type")
+            if target["local"]:
+                artifact_assert_idle(Path(target_root) / copy["relative_path"])
+            command.extend(["--target", payload["target"]])
+        kinds = payload.get("kinds")
+        if kinds is not None:
+            if not kinds or copy["kind"] != "rollout" or not isinstance(kinds, list) or not set(kinds) <= {"video", "trajectory", "image", "feature"}:
+                raise ValueError("Invalid selected file types")
+            command.extend(["--kinds", json.dumps(kinds)])
+        for task in tasks.list():
+            if task.get("state") not in TERMINAL_STATES and task.get("metadata", {}).get("replica_id") == copy["id"]:
+                raise ValueError("An operation on this replica is already running")
+        return jsonify(tasks.start("transfer", command, env=build_environment(config, None), metadata={
+            "transfer_kind": "artifact_replica_" + action, "replica_id": copy["id"], "source_path": copy["path"],
+            "replica_target": payload.get("target"), "source": copy["node"], "target": payload.get("target"), "gpu_required": False})), 202
+
+    @app.get("/api/rollout-artifacts/groups")
+    def rollout_artifact_groups():
+        return jsonify(artifact_inventory.groups())
+
+    @app.get("/api/rollout-artifacts")
+    def rollout_artifact_page():
+        return jsonify(artifact_inventory.page(request.args.getlist("scope"),
+            int(request.args.get("offset", 0)), int(request.args.get("limit", 25)),
+            request.args.get("phase", "all"), request.args.get("kind", "all")))
+
+    @app.get("/api/training-artifacts/models")
+    def training_artifact_models():
+        return jsonify(models=artifact_inventory.models(request.args.get("backend")), **artifact_inventory.status())
+
+    @app.post("/api/rollout-artifacts/batch-delete")
+    def rollout_artifact_delete():
+        payload = request.get_json(force=True)
+        with tasks.lock:
+            result = artifact_inventory.delete_files(payload.get("ids"), artifact_assert_idle)
+        refresh_changed_storage([artifact_inventory.get(r["id"])["path"] for r in result["results"] if r["deleted"]])
+        return jsonify(result)
+
+    @app.post("/api/training-artifacts/models/batch-delete")
+    def training_artifact_delete():
+        payload = request.get_json(force=True)
+        with tasks.lock:
+            result = artifact_inventory.delete_files(payload.get("ids"), artifact_assert_idle, models=True)
+        refresh_changed_storage([artifact_inventory.get(r["id"])["path"] for r in result["results"] if r["deleted"]])
+        return jsonify(result)
+
+    @app.post("/api/artifact-index/refresh")
+    def refresh_artifact_inventory():
+        for task in tasks.list():
+            if task.get("state") not in TERMINAL_STATES and task.get("metadata", {}).get("transfer_kind") == "artifact_inventory":
+                return jsonify(task), 202
+        return jsonify(tasks.start("transfer", [config["openpi_python"], "-m", "server_4090.artifact_inventory",
+            "--config", str(config_file)], env=build_environment(config, None),
+            metadata={"transfer_kind": "artifact_inventory", "gpu_required": False})), 202
+
     @app.post("/api/artifact-runs")
     def allocate_artifact_run():
         payload = request.get_json(force=True)
@@ -6378,10 +6688,11 @@ print(json.dumps(rows, ensure_ascii=False))
         for name in row["artifacts"].values():
             (directory / name).mkdir(exist_ok=True)
         video_catalog.atomic_write(directory / "run.json", row)
+        artifact_replicas.mark_dirty(["local_4090"])
+        artifact_history_snapshot.invalidate()
         return jsonify(**row, path=str(directory), manifest_path=str(directory / "run.json")), 201
 
-    @app.get("/api/artifact-runs")
-    def artifact_runs():
+    def build_artifact_run_rows():
         path = Path(config["workspace_root"]) / "artifact-run-inventory.json"
         data = video_catalog.read_object(path, max_bytes=128 * 1024 * 1024)
         rows = list(data.get("runs", []))
@@ -6400,14 +6711,66 @@ print(json.dumps(rows, ensure_ascii=False))
                     rows.append({**row, "state": task["state"], "task_id": task["id"], "path": meta.get("artifact_run_dir")})
         unique = {row.get("path") or row.get("run_id"): row for row in rows}
         rows = list(unique.values())
+        return {"runs": rows, "updated_at": data.get("updated_at")}
+
+    artifact_history_snapshot = Snapshot(Path(config["workspace_root"]) / "artifact-history-index.json",
+                                         build_artifact_run_rows, ttl=30)
+
+    @app.post("/api/artifact-runs/delete-history")
+    def delete_artifact_history():
+        payload = request.get_json(force=True)
+        rows = build_artifact_run_rows()['runs']
+        run = next((r for r in rows if r.get('path') == payload.get('path')), None)
+        if not run: raise ValueError('Unknown run history')
+        task_id = run.get('task_id') or run.get('origin', {}).get('dashboard_id')
+        if task_id and tasks._path(task_id).is_file():
+            tasks.delete_many([task_id], validate_only=True)
+        histories.cleanup(histories.run_operations(run))
+        if task_id and tasks._path(task_id).is_file(): tasks.delete(task_id)
+        histories.remember([run])
+        artifact_history_snapshot.invalidate()
+        artifact_replicas.mark_dirty()
+        return jsonify(deleted=True, run_id=run.get('run_id'))
+
+    @app.get("/api/artifact-runs")
+    def artifact_runs():
+        snapshot = artifact_history_snapshot.get()
+        data = snapshot["data"] or {"runs": []}
+        deleted = histories.deleted()
+        rows = [row for row in data["runs"] if (row.get('path') or row.get('run_id')) not in deleted]
         for field in ("source", "task", "backend", "kind", "state", "experiment"):
             value = request.args.get(field, "")
             if value and value != "all":
                 rows = [r for r in rows if r.get(field) == value]
-        return jsonify(schema=experiment_artifacts.SCHEMA, runs=rows, total=len(rows), updated_at=data.get("updated_at"))
+        return jsonify(schema=experiment_artifacts.SCHEMA, runs=rows, total=len(rows), updated_at=snapshot["updated_at"], ready=snapshot["ready"], refreshing=snapshot["refreshing"])
+
+    try:
+        from .eval_video_browser import VideoBrowser
+    except ImportError:
+        from eval_video_browser import VideoBrowser
+    video_browser = VideoBrowser(video_catalog.catalog_root(config))
+
+    @app.get("/api/eval-videos/groups")
+    def eval_video_groups():
+        return jsonify(video_browser.groups())
 
     @app.get("/api/eval-videos")
     def list_eval_videos():
+        if request.args.get("browse") == "1":
+            result = video_browser.page(request.args)
+            for item in result["videos"]:
+                if item.get("remote"):
+                    continue
+                try:
+                    decode_video_id(item["id"])
+                    # Only this page gets per-episode event/annotation details.
+                    detail = eval_video_metadata(item["root"], item["relative_path"])
+                    routing = {"id", "group_id", "root", "relative_path", "url", "source", "remote", "playable", "syncable", "deletable",
+                               "video_source", "task", "experiment", "mtime", "updated_at"}
+                    item.update({key: value for key, value in detail.items() if key not in routing})
+                except (FileNotFoundError, OSError):
+                    item.update(playable=False, deletable=False, missing=True)
+            return jsonify(result)
         limit = safe_int(request.args.get("limit", 200), "limit", 1, 1000)
         offset = safe_int(request.args.get("offset", 0), "offset", 0, 10000000)
         include_remote = str(request.args.get("include_remote", "")).lower() in {"1", "true", "yes"}
@@ -6540,6 +6903,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 }
             )
 
+        video_browser.discard([item["id"] for item in deleted])
         return jsonify(
             {
                 "deleted": True,
@@ -6643,10 +7007,6 @@ print(json.dumps(rows, ensure_ascii=False))
                 "dataset_root": target.get("dataset_root"),
                 "openpi_python": target.get("openpi_python"),
                 "workdir": target.get("workdir"),
-                "openpi_python": target.get("openpi_python"),
-                "inventory_python": target.get("inventory_python"),
-                "log_transport": target.get("log_transport", "sattach"),
-                "cache_root": target.get("cache_root") or str(PurePosixPath(str(target.get("workdir") or "/tmp")).parent / "cache"),
                 "log_dir": target.get("log_dir"),
                 "remote_job_dir": target.get("remote_job_dir"),
                 "cache_root": target.get("cache_root"),
@@ -6698,7 +7058,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 "openpi_python": target.get("openpi_python"),
                 "inventory_python": target.get("inventory_python"),
                 "log_transport": target.get("log_transport", "sattach"),
-                "cache_root": target.get("cache_root"),
+                "cache_root": target.get("cache_root") or str(PurePosixPath(str(target.get("workdir") or "/tmp")).parent / "cache"),
                 "remote_job_dir": target.get("remote_job_dir"),
                 "log_dir": target.get("log_dir"),
                 "dataset_root": str(PurePosixPath(str(target["checkpoint_base_dir"]).rstrip("/")) / config_name),
@@ -6898,12 +7258,40 @@ print(json.dumps(rows, ensure_ascii=False))
             return [], f"invalid JSON from {host}: {exc}: {(result.stdout or '')[-500:]}"
         return rows if isinstance(rows, list) else [], None
 
-    def grouped_dataset_locations(*, origin_filter: str | None = None) -> dict[str, Any]:
+    def grouped_dataset_locations(*, origin_filter: str | None = None, source: str | None = None) -> dict[str, Any]:
         locations = dataset_location_configs()
+        if source and source not in locations:
+            raise ValueError("Unknown dataset source")
         groups: dict[str, dict[str, Any]] = {}
         errors = {}
+        cache_root = Path(config["workspace_root"]) / "dataset-location-cache"
         for name, location in locations.items():
-            rows, error = remote_dataset_inventory(location)
+            cache = cache_root / (safe_name(name, "source") + ".json")
+            if location.get("kind") in {"local", "local_archive"} or name == source:
+                rows, error = remote_dataset_inventory(location)
+                if not error and location.get("kind") not in {"local", "local_archive"}:
+                    cache_root.mkdir(parents=True, exist_ok=True)
+                    temporary = cache.with_suffix("." + uuid.uuid4().hex + ".tmp")
+                    temporary.write_text(json.dumps(rows), encoding="utf-8")
+                    temporary.replace(cache)
+            else:
+                rows, error = [], None
+                fixed = cache
+                configured = location.get("inventory_cache_path")
+                if not fixed.is_file() and configured and location.get("inventory_cache_host") in {None, "local", "local_4090", "4x4090"}:
+                    fixed = Path(configured).expanduser()
+                if fixed.is_file():
+                    try:
+                        payload = json.loads(fixed.read_text(encoding="utf-8"))
+                        rows = payload.get("datasets", []) if isinstance(payload, dict) else payload
+                    except (OSError, ValueError):
+                        rows = []
+                if not rows:
+                    with artifact_replicas.inventory.connect() as db:
+                        indexed = db.execute("SELECT data FROM replicas WHERE node=? AND status IN ('present','stale') AND json_extract(data,'$.kind')='dataset'", (name,)).fetchall()
+                    for indexed_row in indexed:
+                        item = json.loads(indexed_row['data'])
+                        rows.append(dict(id=Path(item['path']).name, path=item['path'], origin=item.get('origin', 'unknown'), mtime=item.get('updated_at', 0)))
             if error:
                 errors[name] = error
             for row in rows:
@@ -6936,7 +7324,7 @@ print(json.dumps(rows, ensure_ascii=False))
         origin = request.args.get("origin")
         if origin:
             origin = normalize_dataset_origin(origin)
-        return jsonify(grouped_dataset_locations(origin_filter=origin))
+        return jsonify(grouped_dataset_locations(origin_filter=origin, source=request.args.get("source")))
 
     @app.post("/api/datasets/<dataset_id>/delete-copy")
     def delete_dataset_copy(dataset_id: str):
@@ -6977,6 +7365,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 "execution_target": target_name, "runtime": "local_4090", "source": target_name,
             })
         return jsonify({"task": task, "dataset_id": dataset_id, "target": target_name}), 202
+
 
     @app.get("/api/cluster-resources")
     def cluster_resources():
@@ -7080,6 +7469,14 @@ print(json.dumps(rows, ensure_ascii=False))
     @app.get("/api/checkpoints/remote")
     def list_remote_checkpoints():
         locations = remote_checkpoints.snapshot(force=request.args.get("refresh") == "1", source=request.args.get("source"))
+        from server_4090.model_catalog import indexed_models
+        fixed_models = indexed_models(artifact_replicas, 'openpi')
+        for location in locations:
+            if not location['checkpoints']:
+                location['checkpoints'] = [dict(m, config_name=Path(m['path']).parent.parent.name,
+                    model_variant='pi05' if 'pi05' in m['path'] else 'pi0')
+                    for m in fixed_models if m.get('node') == location['source']]
+                location['index_mode'] = 'fixed'
         # Keep real/simulation Dashboard provenance filtering consistent.
         for location in locations:
             location["checkpoints"] = [row for row in location["checkpoints"]
@@ -7259,6 +7656,10 @@ print(json.dumps(rows, ensure_ascii=False))
                 if not path.is_dir():
                     raise FileNotFoundError(str(path))
                 shutil.rmtree(path)
+                status_inventory_snapshot.invalidate()
+                artifact_inventory.invalidate_missing(path)
+                artifact_replicas.invalidate_local_paths([path])
+                artifact_replicas.mark_dirty()
                 checkpoint_size_cache.pop(item["path_str"], None)
                 prune_empty_checkpoint_parents(path)
                 deleted.append(
@@ -7411,11 +7812,26 @@ print(json.dumps(rows, ensure_ascii=False))
         )
         return jsonify(task), 201
 
+    def validate_weight_identity(path, dataset_contract):
+        from server_4090.model_catalog import is_foundation_path
+        from server_4090.model_identity import enrich, mismatch
+        if is_foundation_path(path):
+            return
+        marker=checkpoint_action_contract(Path(path)) or {}
+        assets=Path(path)/'assets'
+        ids=[p.name for p in assets.iterdir() if p.is_dir()] if assets.is_dir() else []
+        if marker.get('dataset_id') and marker['dataset_id'] not in ids:ids.append(marker['dataset_id'])
+        model=enrich([dict(action_contract=marker,dataset_ids=ids)],config)[0]
+        reason=mismatch(model,dataset_contract)
+        if reason:raise ValueError('所选 checkpoint 不兼容：'+reason)
+
     @app.post("/api/tasks/train")
     def start_train():
         payload = request.get_json(force=True)
         dataset_id, arm_mode, arm_side, schema, dataset_contract = parse_dataset(payload)
         base_checkpoint, model_variant = resolve_base_model(payload)
+        from server_4090.task_scenes import dataset_scene, bindings
+        scene=dataset_scene(dataset_id,read_json(dataset_root_for_id(dataset_id)[0]/"meta/info.json") or {},bindings(config))
         exp_name = safe_name(payload.get("exp_name"), "experiment name")
         mode = str(payload.get("mode", "auto"))
         if mode not in {"auto", "new", "resume", "overwrite"}:
@@ -7437,6 +7853,8 @@ print(json.dumps(rows, ensure_ascii=False))
         # foundation-model run.  We decide between new/in-place/external resume
         # after reading the dataset norm manifest below.
         effective_mode = ("resume" if saved_steps else "new") if mode == "auto" else mode
+        if effective_mode in {'new','overwrite'}:
+            validate_weight_identity(base_checkpoint, action_contract_for_model(dataset_contract))
         resume_checkpoint: Path | None = None
         resume_kind = "none"
         requested_resume_checkpoint = payload.get("resume_checkpoint")
@@ -7584,6 +8002,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 "so the failed run remains available for audit"
             )
 
+        validate_weight_identity(resume_checkpoint or (checkpoint_dir if saved_steps and effective_mode == 'resume' else base_checkpoint), model_contract)
         settings_source = checkpoint_action_contract(resume_checkpoint) if resume_checkpoint is not None else marker
         requested_finetuning = {key: payload.get(key) for key in FinetuningSettings.__dataclass_fields__}
         weights = requested_finetuning["rtc_training_delay_weights"]
@@ -7845,7 +8264,9 @@ print(json.dumps(rows, ensure_ascii=False))
             "finetuning": finetuning.to_dict(),
             "base_checkpoint": str(base_checkpoint),
             "exp_name": exp_name,
-            "artifact_identity": payload.get("artifact_identity") or {"video_source": "robotwin" if "handover_mic" in dataset_id or "put_bottles" in dataset_id else "unknown", "task": "handover-mic" if "handover_mic" in dataset_id else "put-bottles-dustbin" if "put_bottles_dustbin" in dataset_id else "unknown", "experiment": video_catalog.slug(exp_name)},
+            "task_scene": scene or None,
+            "action_contract": dict(model_contract, model_variant=model_variant),
+            "artifact_identity": payload.get("artifact_identity") or {"video_source": "robotwin" if "handover_mic" in dataset_id or "put_bottles" in dataset_id else "unknown", "task": video_catalog.slug(scene or "unknown"), "experiment": video_catalog.slug(exp_name)},
             "gpu_ids": gpu_ids,
             "execution_target": execution_target,
             "runtime": "slurm" if is_cluster_target else "local_4090",
@@ -8032,7 +8453,6 @@ print(json.dumps(rows, ensure_ascii=False))
     def start_eval():
         payload = request.get_json(force=True)
         dataset_id, arm_mode, arm_side, schema, dataset_contract = parse_dataset(payload)
-        base_checkpoint, model_variant = resolve_base_model(payload)
         model_contract = action_contract_for_model(dataset_contract)
         execution_target = str(payload.get("execution_target", "local_4090") or "local_4090")
         cluster_target_config = runtime_config_for_target(execution_target)
@@ -8041,6 +8461,10 @@ print(json.dumps(rows, ensure_ascii=False))
         checkpoint = resolve_under(checkpoint_raw, checkpoint_roots)
         if not (checkpoint / "params").exists():
             raise ValueError("checkpoint does not contain params")
+        validate_weight_identity(checkpoint, model_contract)
+        # Evaluation restores the selected complete checkpoint. No separate
+        # foundation/initialization model is required, including Slurm preflight.
+        base_checkpoint, model_variant = resolve_base_model({**payload, "base_checkpoint": str(checkpoint)})
         batch_size = safe_int(payload.get("batch_size", 1), "batch_size", 1, 64)
         num_workers = safe_int(payload.get("num_workers", 2), "num_workers", 0, 16)
         max_batches = safe_int(payload.get("max_batches", 50), "max_batches", 1, 100_000)
@@ -8061,7 +8485,8 @@ print(json.dumps(rows, ensure_ascii=False))
             cluster_target_config["gpu_count"] = cluster_gpu_count
             gpu_ids = list(range(cluster_gpu_count))
             remote_checkpoint = translate_runtime_path(checkpoint, cluster_target_config)
-            remote_base_checkpoint = translate_runtime_path(base_checkpoint, cluster_target_config)
+            remote_base_checkpoint = remote_checkpoint
+            cluster_target_config["base_checkpoint"] = remote_checkpoint
             remote_result_path = str(PurePosixPath(str(cluster_target_config.get("remote_job_dir"))) / f"eval_{uuid.uuid4().hex[:8]}_result.json")
             remote_eval_command = build_eval_command(
                 cluster_target_config,
@@ -8130,7 +8555,6 @@ print(json.dumps(rows, ensure_ascii=False))
                 "raw_gripper_semantics": model_contract["raw_gripper_semantics"],
                 "wire_gripper_semantics": model_contract["wire_gripper_semantics"],
                 "model_variant": model_variant,
-                "base_checkpoint": str(base_checkpoint),
                 "checkpoint": str(checkpoint),
                 "gpu_ids": gpu_ids,
                 "execution_target": execution_target,
@@ -8722,24 +9146,61 @@ print(json.dumps(rows, ensure_ascii=False))
     @app.get("/api/tasks/<task_id>/status")
     def get_task_status(task_id: str):
         include_metrics = str(request.args.get("include_metrics", "")).lower() in {"1", "true", "yes"}
-        return jsonify({"task": task_status_summary(tasks.get(task_id), include_metrics=include_metrics)})
+        task=tasks.get(task_id)
+        checked={'checked_at':time.time()}
+        if request.args.get('live')=='1' and task.get('metadata',{}).get('runtime')=='slurm':
+            from server_4090.selected_resource import job_status
+            meta=task['metadata']; target=config.get('cluster_targets',{}).get(meta.get('slurm_target') or meta.get('cluster_target'),{})
+            job_id=meta.get('slurm_job_id') or tasks._slurm_job_id_from_log(tasks.log_tail(task_id))
+            if job_id:
+                checked.update(job_status(meta.get('slurm_submit_host') or target.get('submit_host'),job_id))
+                if meta.get('external_training') and checked['state']!='unknown':
+                    task['state']=checked['state'];atomic_json(tasks._path(task_id),task)
+        result=task_status_summary(task,include_metrics=include_metrics)
+        result.update(checked)
+        response=jsonify(task=result);response.headers['Cache-Control']='no-store'
+        return response
 
     @app.get("/api/tasks/<task_id>")
     def get_task(task_id: str):
         return jsonify(tasks.get(task_id))
 
+    from server_4090.live_mirror import LiveMirror
+    live_mirror=LiveMirror(Path(config['workspace_root'])/'live-log-mirrors',interval=3)
+    tasks.live_mirror=live_mirror
+    app.extensions["live_mirror"] = live_mirror
+
+    def task_for_live_read(task_id):
+        # Status polling owns refresh; curve/log reads must not wait on global task locks.
+        task = read_json(tasks._path(task_id))
+        if not isinstance(task, dict):
+            raise FileNotFoundError(task_id)
+        return task
+
+    def mirrored_task_log(task_id):
+        return live_mirror.get('task:'+task_id+':log',
+            lambda: dict(log=tasks.log_tail(task_id,1024*1024,include_remote_slurm=True)),
+            seed=dict(log=tasks.log_tail(task_id,131072)))
+
     @app.get("/api/tasks/<task_id>/log")
     def task_log(task_id: str):
         max_bytes = safe_int(request.args.get("max_bytes", 64 * 1024), "max_bytes", 1024, 1024 * 1024)
-        task = tasks.get(task_id)
-        return jsonify({"task": task, "log": tasks.log_tail(task_id, max_bytes, include_remote_slurm=True)})
+        task = task_for_live_read(task_id)
+        result=mirrored_task_log(task_id)
+        return jsonify({**result,"task":task,"log":result.get('log','')[-max_bytes:]})
 
     @app.get("/api/tasks/<task_id>/metrics")
     def task_metrics(task_id: str):
-        task = tasks.get(task_id)
+        task = task_for_live_read(task_id)
         if task.get("type") != "train":
             raise ValueError("metrics are only available for train tasks")
         max_points = safe_int(request.args.get("max_points", 1200), "max_points", 50, 5000)
+        return jsonify(live_mirror.get('task:'+task_id+':metrics:'+str(max_points),
+            lambda: build_task_metrics(task,max_points),
+            seed=dict(parse_training_metrics(tasks.log_tail(task_id,256*1024),max_points=max_points),task=task)))
+
+    def build_task_metrics(task,max_points):
+        task_id=task['id']
         result = parse_training_metrics(
             tasks.log_tail(task_id, 16 * 1024 * 1024, include_remote_slurm=True),
             max_points=max_points,
@@ -8765,7 +9226,126 @@ print(json.dumps(rows, ensure_ascii=False))
                 ),
             }
         )
-        return jsonify(result)
+        return result
+
+    @app.post("/api/training/discover")
+    def discover_training_processes():
+        from server_4090.training_discovery import local_training_processes, cluster_training_processes
+        payload=request.get_json(silent=True) or {}
+        target_id=payload.get('target','local_4090')
+        if target_id!='local_4090':
+            target=config.get('cluster_targets',{}).get(target_id)
+            if not target: raise ValueError('Unknown training target')
+            rows=cluster_training_processes(target_id,target)
+        else: rows=None
+        with tasks.lock:
+            existing=tasks.list()
+            known={int(t.get('pid') or 0) for t in existing}
+            known_jobs={(str((t.get('metadata') or {}).get('cluster_target') or (t.get('metadata') or {}).get('slurm_target')),str((t.get('metadata') or {}).get('slurm_job_id'))) for t in existing if not (t.get('metadata') or {}).get('external_training')}
+            if rows is None: rows=local_training_processes(config,known)
+            else: rows=[r for r in rows if (target_id,str(r['metadata'].get('slurm_job_id'))) not in known_jobs]
+            for row in rows:
+                task_path=tasks._path(row['id']);task_path.parent.mkdir(parents=True,exist_ok=True)
+                row['log_path']=str(task_path.parent/'task.log')
+                previous=read_json(task_path,{}) or {}
+                atomic_json(task_path,{**previous,**row})
+        return jsonify(tasks=rows,checked_at=time.time())
+
+    @app.get("/api/training/discovery-sources")
+    def training_discovery_sources():
+        from server_4090.training_discovery import experiment_parent_sources
+        parents=experiment_parent_sources(config)
+        sources=[dict(id='live-all',label='发现可直接读取目录的新实验（节点内目录请单独选择）',target='可直接读取的实验父目录')]
+        sources += [dict(id=s['id'],label=s.get('label',s['id']),target=s.get('target'),root=s.get('root'),requires_slurm=bool(s.get('storage_location'))) for s in parents]
+        sources += [dict(id=s['id'],label=s.get('label',s['id']),target=s.get('target'),root=s.get('root'))
+                 for s in config.get('rlinf_dashboard',{}).get('sources',[]) if s.get('enabled',True)]
+        return jsonify(sources=sources)
+
+    def rlinf_discovery_snapshot(source_id='live-all'):
+        from server_4090.training_discovery import experiment_parent_sources
+        import hashlib
+        with rlinf_discovery_lock:
+            if source_id in rlinf_discovery_snapshots:
+                return rlinf_discovery_snapshots[source_id]
+            parents=experiment_parent_sources(config)
+            sources=[s for s in parents if not s.get('storage_location')] if source_id=='live-all' else [s for s in parents+config.get('rlinf_dashboard',{}).get('sources',[]) if s.get('id')==source_id and s.get('enabled',True)]
+            if not sources: raise ValueError('请选择需要实时发现的实验父目录')
+            path=Path(config['workspace_root'])/'rlinf-discovery'/ (hashlib.sha256(source_id.encode()).hexdigest()+'-summary.json')
+            snapshot=Snapshot(path,lambda: discover_rlinf_sources(sources),ttl=15)
+            rlinf_discovery_snapshots[source_id]=snapshot
+            return snapshot
+
+    @app.post("/api/rlinf/runs/discover")
+    def discover_rlinf_source():
+        payload=request.get_json(force=True)
+        snapshot=rlinf_discovery_snapshot(payload.get('source','live-all')).get()
+        data=snapshot['data'] or {}
+        deleted=set(read_json(rlinf_history_path,[]) or [])
+        return jsonify(runs=public_runs([r for r in data.get('runs',[]) if r['id'] not in deleted]),checked_at=snapshot['updated_at'],
+                       ready=snapshot['ready'],refreshing=snapshot['refreshing'],error=snapshot['error'])
+
+    def discover_rlinf_sources(sources):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        task_rows=tasks.list()
+        def read_source(source):
+            scoped=dict(config,rlinf_dashboard=dict(config.get('rlinf_dashboard',{}),sources=[source]))
+            return scan_runs(scoped,task_rows)
+        rows=[]
+        base_runs=rlinf_list_snapshot.get()['data'] or []
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            for future in as_completed([pool.submit(read_source,source) for source in sources]):
+                rows.extend(future.result())
+                publish_discovered_rlinf_runs(rows,base_runs)
+        return dict(runs=public_runs(publish_discovered_rlinf_runs(rows,base_runs,persist=True)),scopes=[s['root'] for s in sources])
+
+    def publish_discovered_rlinf_runs(rows,base_runs,persist=False):
+        deleted=set(read_json(rlinf_history_path,[]) or [])
+        def identities(row):
+            target=str(row.get('target','')).lower()
+            paths=[row.get('path'),row.get('_physical_path'),*row.get('_aliases',[])]
+            return {(target,p) for p in paths if p}
+        # Canonical metadata and a legacy symlink can describe the same run.
+        # Prefer the canonical record and preserve established IDs for selections.
+        known={key:r for r in base_runs+list(live_rlinf_overlay.values()) for key in identities(r)}
+        unique=[];seen=set()
+        for row in sorted(rows,key=lambda r:not r.get('_canonical')):
+            keys=identities(row)
+            if keys & seen:continue
+            seen.update(keys)
+            previous=next((known[key] for key in keys if key in known),None)
+            if previous:
+                preserve={'id','launch_profile','task_id','evaluation_cohort'}
+                if not row.get('_canonical') and not str(previous.get('source_id','')).startswith('live-'):preserve.update({'name','source_id','_source'})
+                row.update({k:v for k,v in previous.items() if k in preserve and v is not None})
+            if row['id'] not in deleted:unique.append(row)
+        rows=unique
+        with live_rlinf_overlay_lock:
+            live_rlinf_overlay.update({r['id']:r for r in rows})
+            if persist:atomic_json(live_rlinf_overlay_path,live_rlinf_overlay)
+        return rows
+
+    def selected_rlinf_options(target_id,profile_id,run_id=None,task_scene=None):
+        from server_4090.model_catalog import rlinf_options
+        from server_4090.model_identity import mismatch, rlinf_run_contract
+        expected=config.get('rlinf_dashboard',{}).get('targets',{}).get(target_id,{}).get('profiles',{}).get(profile_id,{}).get('action_contract',{})
+        options=rlinf_options(config,artifact_replicas,target_id,profile_id,task_scene)
+        if run_id:
+            run=next((r for r in visible_rlinf_runs()+list(histories.deleted().values()) if r.get('id')==run_id),None)
+            if not run: raise ValueError('Unknown checkpoint run')
+            if '_source' not in run:
+                run['_source']=next((s for s in config.get('rlinf_dashboard',{}).get('sources',[]) if s.get('id')==run.get('source_id')),{})
+            from server_4090.task_scenes import normalize
+            scene=normalize(run.get('task_scene') or run.get('task') or run.get('task_name'))
+            matched=(str(run.get('execution_target') or run.get('target','')).lower()==target_id and (not normalize(task_scene) or not scene or scene==normalize(task_scene)))
+            reason=mismatch({'action_contract':rlinf_run_contract(config,run)},expected)
+            for cp in checkpoints_for_run(run):
+                options.append(dict(cp,action_contract=rlinf_run_contract(config,run),id='run:'+run_id+':'+cp['id'],compatible=matched and not reason,foundation=False,task_scene=scene,task_scenes=[scene] if scene else [],
+                                    label=run['name']+' / step '+str(cp['step']),reason=reason or (None if matched else '运行所在服务器 / 任务场景尚未匹配')))
+        return options
+
+    @app.get("/api/rlinf/model-options")
+    def rlinf_model_options():
+        return jsonify(models=selected_rlinf_options(request.args.get('target'),request.args.get('profile'),request.args.get('run_id'),request.args.get('task_scene')))
 
     @app.get("/api/rlinf/config")
     def rlinf_dashboard_config():
@@ -8776,33 +9356,82 @@ print(json.dumps(rows, ensure_ascii=False))
         # Run roots may live on the 4x4090 host, H100's shared filesystem, or
         # a NAS-backed H200 export.  The source map is server-owned; clients
         # can select a run but can never submit an arbitrary filesystem path.
-        return jsonify({"runs": public_runs(visible_rlinf_runs())})
+        runs = visible_rlinf_runs()
+        snapshot = rlinf_list_snapshot.get()
+        return jsonify({"runs": public_runs(runs), "index_updated_at": snapshot["updated_at"],
+                        "refreshing": snapshot["refreshing"], "ready": snapshot["ready"], "error": snapshot["error"]})
+
+    def check_rlinf_run_now(run):
+        from server_4090.selected_resource import job_status
+        if run.get('task_id') and tasks._path(run['task_id']).is_file():
+            task=tasks.get(run['task_id']);run=dict(run,state=task['state'])
+        job_id=run.get('job_id') or run.get('origin',{}).get('job_id')
+        if job_id:
+            source=run.get('_source') or {}
+            target=config.get('rlinf_dashboard',{}).get('targets',{}).get(str(run.get('target','')).lower(),{})
+            host=source.get('ssh_host') or target.get('submit_host')
+            if not host: raise ValueError('Cannot resolve Slurm submit host')
+            run=dict(run,**job_status(host,job_id))
+        return dict(run, checked_at=time.time())
+
+    @app.get("/api/rlinf/runs/<run_id>/status")
+    def rlinf_selected_status(run_id):
+        run=selected_rlinf_run(run_id)
+        if not run: raise ValueError('Unknown RLinf run')
+        response=jsonify(run=public_runs([check_rlinf_run_now(run)])[0]);response.headers['Cache-Control']='no-store'
+        return response
+
+    def mirrored_rlinf_metrics(run):
+        from server_4090.rlinf_dashboard import live_metrics_for_run, metrics_for_run
+        def build():
+            if (run.get('_source') or {}).get('storage_location'):
+                raise ValueError('该来源尚无 Dashboard 日志同步；保留已同步曲线，不提交 Slurm 扫描')
+            return live_metrics_for_run(run)
+        seed=metrics_for_run([dict(run,_event_files=[])],run['id'])
+        return live_mirror.get('rlinf:'+run['id']+':metrics',build,seed=seed)
+
+    def mirrored_rlinf_log(run):
+        def build():
+            if run.get('task_id'):return dict(log=tasks.log_tail(run['task_id'],131072,include_remote_slurm=True))
+            if (run.get('_source') or {}).get('storage_location'):
+                raise ValueError('该来源尚无 Dashboard 日志同步，不提交 Slurm 扫描')
+            return native_log_for_run(run)
+        return live_mirror.get('rlinf:'+run['id']+':log',build,seed=dict(log=''))
 
     @app.get("/api/rlinf/runs/<run_id>/metrics")
     def rlinf_dashboard_run_metrics(run_id: str):
-        return jsonify(metrics_for_run(visible_rlinf_runs(), run_id))
+        run=selected_rlinf_run(run_id)
+        if not run:raise ValueError('Unknown RLinf run')
+        return jsonify(mirrored_rlinf_metrics(run))
 
     @app.get("/api/rlinf/runs/<run_id>/log")
     def rlinf_run_log(run_id: str):
-        run = next((item for item in visible_rlinf_runs() if item["id"] == run_id), None)
-        if not run or run.get("state") == "unavailable":
-            raise ValueError("unknown or unavailable RLInf run")
-        if run.get("task_id"):
-            result = {"log": tasks.log_tail(run["task_id"], 131072, include_remote_slurm=True)}
-        else:
-            result = native_log_for_run(run)
-        return jsonify({"run": public_runs([run])[0], **result})
+        run=selected_rlinf_run(run_id)
+        if not run or run.get('state')=='unavailable':raise ValueError('unknown or unavailable RLInf run')
+        return jsonify(run=public_runs([run])[0],**mirrored_rlinf_log(run))
 
     @app.get("/api/rlinf/runs/<run_id>/checkpoints")
     def rlinf_run_checkpoints(run_id: str):
-        run = next((item for item in visible_rlinf_runs() if item["id"] == run_id), None)
+        runs = visible_rlinf_runs() + list(histories.deleted().values())
+        run = next((item for item in runs if item.get("id") == run_id), None)
         if not run or run.get("state") == "unavailable":
             raise ValueError("unknown or unavailable RLInf run")
+        if '_source' not in run:
+            run['_source'] = next((s for s in config.get('rlinf_dashboard', {}).get('sources', []) if s.get('id') == run.get('source_id')), {})
         try:
             target_id, _, profile_id, _ = evaluation_profile(config, run)
         except ValueError as exc:
             return jsonify({"checkpoints": [], "error": str(exc)})
-        return jsonify({"checkpoints": checkpoints_for_run(run), "target": target_id, "profile": profile_id})
+        from server_4090.model_identity import mismatch, rlinf_run_contract
+        expected=config['rlinf_dashboard']['targets'][target_id]['profiles'][profile_id].get('action_contract',{})
+        reason=mismatch({'action_contract':rlinf_run_contract(config,run)},expected)
+        return jsonify({"checkpoints": [dict(cp,compatible=not reason,reason=reason) for cp in checkpoints_for_run(run)], "target": target_id, "profile": profile_id})
+
+    @app.get("/api/rlinf/model-runs")
+    def rlinf_model_runs():
+        runs=visible_rlinf_runs()+list(histories.deleted().values())
+        unique={r.get('id'):r for r in runs if r.get('id') and r.get('state')!='unavailable'}
+        return jsonify(runs=public_runs(list(unique.values())))
 
     @app.get("/api/rlinf/evaluations")
     def rlinf_evaluation_tasks():
@@ -8813,13 +9442,18 @@ print(json.dumps(rows, ensure_ascii=False))
         payload = request.get_json(force=True)
         if not isinstance(payload, dict):
             raise ValueError("request body must be an object")
-        run = next((item for item in visible_rlinf_runs() if item["id"] == payload.get("run_id")), None)
+        run = next((item for item in visible_rlinf_runs()+list(histories.deleted().values()) if item.get("id") == payload.get("run_id")), None)
+        if run and '_source' not in run:
+            run['_source']=next((s for s in config.get('rlinf_dashboard',{}).get('sources',[]) if s.get('id')==run.get('source_id')),{})
         if not run or run.get("state") == "unavailable":
             raise ValueError("unknown or unavailable RLInf run")
         target_id, target, profile_id, profile = evaluation_profile(config, run)
         checkpoint = next((item for item in checkpoints_for_run(run) if item["id"] == payload.get("checkpoint_id")), None)
         if not checkpoint:
             raise ValueError("请选择实际存在且权重完整的 RLInf checkpoint")
+        from server_4090.model_identity import mismatch, rlinf_run_contract
+        reason=mismatch({'action_contract':rlinf_run_contract(config,run)},profile.get('action_contract',{}))
+        if reason:raise ValueError('评测模型不兼容：'+reason)
         episodes = safe_int(payload.get("episodes", 5), "episodes", 1, 1000)
         horizon = safe_int(payload.get("max_steps", 512), "max_steps", 1, 2000)
         seed = safe_int(payload.get("seed", 43), "seed", 0, 2147483647)
@@ -8896,6 +9530,21 @@ print(json.dumps(rows, ensure_ascii=False))
     def launch_rlinf_training():
         payload = request.get_json(force=True)
         spec = build_launch_spec(config, payload)
+        selected_model=payload.get('initial_model', 'profile-default')
+        if selected_model != 'profile-default':
+            from server_4090.model_catalog import rlinf_options
+            options=selected_rlinf_options(spec['target_id'],spec['profile_id'],payload.get('initial_run'),payload.get('weight_task_scene'))
+            model=next((m for m in options if m['id']==selected_model and m.get('compatible')),None)
+            if not model: raise ValueError('所选初始化模型不兼容或已不在模型目录中')
+            if not re.fullmatch(r'/[A-Za-z0-9_./-]+',model['path']): raise ValueError('Unsupported model path')
+            if spec['target'].get('kind','local')=='local':
+                from server_4090.selected_resource import inspect_checkpoint
+                if not inspect_checkpoint(model['path'])['available']: raise ValueError('所选模型的关键文件已不可用')
+            overrides=['actor.model.model_path='+model['path'],'rollout.model.model_path='+model['path']]
+            if spec['command'][:2]==['bash','-lc']:
+                spec['command'][2]=re.sub(r'(?:actor|rollout)\.model\.model_path=\S+', '', spec['command'][2])+' '+shlex.join(overrides)
+            else:
+                spec['command']=[arg for arg in spec['command'] if not arg.startswith(('actor.model.model_path=','rollout.model.model_path='))]+overrides
         target = spec["target"]
         profile = spec["profile"]
         output_dir = spec["output_dir"]
@@ -8982,6 +9631,7 @@ print(json.dumps(rows, ensure_ascii=False))
             "artifact_identity": payload.get("artifact_identity") or {"video_source": "libero-safety", "task": "unknown", "experiment": video_catalog.slug(spec["run_name"])},
             "algorithm": spec["algorithm"],
             "launch_profile": spec["profile_id"],
+            "action_contract": profile.get('action_contract'),
             "run_name": spec["run_name"],
             "rlinf_output_dir": output_dir,
             "rlinf_run_root": spec["run_root"],
@@ -9003,6 +9653,21 @@ print(json.dumps(rows, ensure_ascii=False))
                 raise FileExistsError(f"RLinf run already reserved: {output_dir}") from exc
         return jsonify(tasks.start("train", command, env=env, metadata=metadata)), 201
 
+
+    if config.get('live_metrics_sync',{}).get('enabled',False):
+        def keep_active_logs_synced():
+            while True:
+                try:
+                    rlinf_discovery_snapshot().get()
+                    for run in [r for r in visible_rlinf_runs() if r.get('state')=='running'][:16]:
+                        mirrored_rlinf_metrics(run);mirrored_rlinf_log(run)
+                    for task in [t for t in tasks.list() if t.get('type')=='train' and t.get('state')=='running'][:16]:
+                        mirrored_task_log(task['id'])
+                        live_mirror.get('task:'+task['id']+':metrics:1200',lambda t=task:build_task_metrics(t,1200))
+                except Exception:
+                    app.logger.exception('Live log synchronization registration failed')
+                time.sleep(3)
+        threading.Thread(target=keep_active_logs_synced,daemon=True,name='dashboard-active-log-sync').start()
 
     return app
 

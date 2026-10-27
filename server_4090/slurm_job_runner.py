@@ -14,6 +14,7 @@ import json
 import math
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -74,6 +75,8 @@ def slurm_header(target: dict[str, Any], job_name: str, log_dir: str) -> str:
         f"#SBATCH --job-name={job_name}",
         f"#SBATCH -p {target['partition']}",
     ]
+    if "ntasks" in target:
+        lines.append(f"#SBATCH --ntasks={int(target['ntasks'])}")
     node = target.get("node")
     if node:
         lines.append(f"#SBATCH -w {node}")
@@ -164,7 +167,7 @@ def build_script(target: dict[str, Any], job_name: str, commands: list[list[str]
         label = command_labels[idx] if idx < len(command_labels) else f"command_{idx + 1}"
         body += [
             f"echo '[dashboard] start {label}: '$(date -Is)",
-            "srun " + shell_join(command),
+            "srun " + (f"--ntasks={int(target['ntasks'])} " if "ntasks" in target else "") + shell_join(command),
             f"echo '[dashboard] done {label}: '$(date -Is)",
         ]
     return "\n".join(prelude + [""] + body + [""])
@@ -302,6 +305,8 @@ def main() -> int:
     parser.add_argument("--command-labels-json", default="", help="urlsafe-base64 encoded labels")
     parser.add_argument("--job-name", required=True)
     parser.add_argument("--poll-interval", type=float, default=20.0)
+    parser.add_argument("--cancel-on-exit", action="store_true", help="Cancel this read-only probe when its monitor exits")
+    parser.add_argument("--max-pending-seconds", type=float, default=0)
     args = parser.parse_args()
 
     target = b64_json(args.target_json)
@@ -328,6 +333,14 @@ def main() -> int:
         return submit.returncode
     job_id = parse_job_id(submit.stdout)
     print(f"[dashboard] slurm_job_id={job_id}", flush=True)
+    if args.cancel_on_exit:
+        def cancel_probe():
+            try:run_ssh(host, "scancel " + shlex.quote(job_id), timeout=15)
+            except Exception as exc:print(f"[dashboard] probe cleanup pending for {job_id}: {exc}",flush=True)
+        atexit.register(cancel_probe)
+        def stop_probe(signum, frame):raise SystemExit(128+signum)
+        signal.signal(signal.SIGTERM,stop_probe)
+    submitted_at=time.monotonic()
     log_paths = slurm_output_paths(target, args.job_name, job_id)
     for label, path in log_paths.items():
         print(f"[dashboard] slurm_{label}_log={path}", flush=True)
@@ -350,6 +363,11 @@ def main() -> int:
         qout = q.stdout.strip()
         if q.returncode == 0 and qout:
             transport_failures = 0
+            if args.max_pending_seconds and qout.startswith('PENDING|') and (
+                time.monotonic()-submitted_at>=args.max_pending_seconds or 'ReqNodeNotAvail' in qout
+            ):
+                print(f"[dashboard] read-only probe {job_id} cannot start promptly; cancelling",flush=True)
+                return 124
             if qout != last_state:
                 print(f"[dashboard] squeue {job_id}: {qout}", flush=True)
                 last_state = qout

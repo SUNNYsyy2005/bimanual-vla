@@ -21,7 +21,7 @@ function dashboard(remoteFailure = false) {
   const elements = new Map();
   const gpus = [{ index: 0, processes: [], memory_total_mib: 24564, memory_used_mib: 16 }];
   const context = {
-    console: { warn() {} }, Date, tokenInput: { value: 'test' },
+    console: { warn() {} }, Date, URLSearchParams, tokenInput: { value: 'test' },
     DASHBOARD_PROFILE: 'simulation', DASHBOARD_BUILD: 'test-build',
     latestStatus: null, latestDatasetLocations: null,
     datasetLocationsRequest: null, datasetLocationsFetchedAt: 0,
@@ -44,7 +44,7 @@ function dashboard(remoteFailure = false) {
         if (context.gpuFailure) throw new Error('GPU query timed out');
         return {gpus};
       }
-      if (endpoint === '/api/status') {
+      if (endpoint === '/api/status?compact=1') {
         if (context.statusPending) return new Promise(() => {});
         return { gpus: [], datasets: [], config: {} };
       }
@@ -57,7 +57,7 @@ function dashboard(remoteFailure = false) {
     show: message => { throw new Error(message); },
   };
   for (const name of [
-    'fillDatasets', 'fillTrainingExperiments', 'fillBaseModels',
+    'mergeLiveCheckpoints', 'loadEvalVideoScopes', 'fillDatasets', 'fillTrainingExperiments', 'fillBaseModels',
     'fillExecutionTargets', 'fillCheckpoints', 'fillTasks', 'fillTrainingTasks',
     'fillTransferTasks', 'refreshSelectedLogs', 'fillObservation', 'loadRemoteCheckpoints',
     'loadTransferTasks',

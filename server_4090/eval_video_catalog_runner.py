@@ -15,9 +15,11 @@ import time
 
 try:
     from . import eval_video_catalog as catalog
+    from .eval_video_browser import publish_index
     from .dataset_transfer_runner import clean_transport_env
 except ImportError:
     import eval_video_catalog as catalog
+    from eval_video_browser import publish_index
     from dataset_transfer_runner import clean_transport_env
 
 
@@ -74,8 +76,10 @@ def refresh(config: dict, *, apply: bool, local_only: bool = False) -> dict:
         return {**summary, "plan": [{k: r.get(k) for k in ("root", "relative_path", "catalog_relative_path", "video_source", "task", "experiment", "run_id", "phase", "success", "success_evidence")} for r in rows]}
     destination.mkdir(parents=True, exist_ok=True)
     registry = catalog.read_object(destination / "registry.json", max_bytes=128 * 1024 * 1024)
+    indexed_rows = []
     for row in rows:
-        organize_row(row, destination, registry)
+        if organize_row(row, destination, registry) == "indexed":
+            indexed_rows.append({**row, "root": str(destination), "relative_path": row["catalog_relative_path"]})
     catalog.atomic_write(destination / "registry.json", registry)
     inventory_path = destination / "remote-inventory.json"
     old_inventory = catalog.read_object(inventory_path, max_bytes=128 * 1024 * 1024)
@@ -104,6 +108,7 @@ def refresh(config: dict, *, apply: bool, local_only: bool = False) -> dict:
         enabled = {s["storage_source"] for s in sources if s.get("ssh_host")}
         by_source = {k: v for k, v in by_source.items() if k in enabled}
         catalog.atomic_write(inventory_path, {"sources": by_source, "errors": errors, "updated_at": time.time()})
+    publish_index(destination, indexed_rows, by_source)
     summary.update(remote_videos=sum(len(v["videos"]) for v in by_source.values()), errors=errors, updated_at=time.time())
     catalog.atomic_write(destination / "status.json", summary)
     return summary

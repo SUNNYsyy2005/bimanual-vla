@@ -24,7 +24,7 @@ class RemoteCheckpointsTest(unittest.TestCase):
 
     def test_h200_uses_compute_node_slurm_not_login_filesystem(self):
         payload=base64.urlsafe_b64encode(zlib.compress(json.dumps({'checkpoints':[{'step':20000}]}).encode())).decode()
-        with patch('server_4090.remote_checkpoints.ssh',side_effect=['123\n','JobState=RUNNING Comment=checkpoint_inventory:'+payload]) as ssh:
+        with patch('server_4090.cluster_read_guard.admit_read'), patch('server_4090.remote_checkpoints.ssh',side_effect=['123\n','JobState=RUNNING Comment=checkpoint_inventory:'+payload]) as ssh:
             rows=probe({'access_mode':'slurm_only','checkpoint_base_dir':'/independent/checkpoints','submit_host':'login-server',
                         'openpi_python':'/conda/bin/python','partition':'h200','node':'h200-ali-01'})
             self.assertEqual(rows,[{'step':20000}])
