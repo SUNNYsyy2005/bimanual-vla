@@ -7765,37 +7765,4 @@ if (tokenInput.value) {
 setInterval(() => { if (tokenInput.value) refreshAll(); }, 8000);
 setInterval(refreshObservation, 1500);
 
-let remoteCheckpointRows = [];
-let remoteCheckpointPoll;
-async function loadRemoteCheckpointRows(force = false) {
-  clearTimeout(remoteCheckpointPoll);
-  try {
-    const result = await api('/api/checkpoints/remote' + (force ? '?refresh=1' : ''));
-    remoteCheckpointRows = [];
-    document.getElementById('remoteCheckpointRows').innerHTML = (result.locations || []).map(location => {
-      const rows = (location.checkpoints || []).map(row => {
-        const index = remoteCheckpointRows.push({...row, source:location.source}) - 1;
-        return `<p>${esc(row.experiment)} · ${Number(row.step)} <button type="button" data-sync-remote="${index}">回传 4090</button></p>`;
-      }).join('');
-      return `<div><strong>${esc(location.label)}</strong> · ${esc(location.state)} ${location.error ? esc(location.error) : ''}${rows}</div>`;
-    }).join('');
-    if ((result.locations || []).some(row => row.state === 'loading') && document.getElementById('remoteCheckpointPanel').open)
-      remoteCheckpointPoll = setTimeout(() => loadRemoteCheckpointRows(), 1500);
-  } catch (error) { show(error.message); }
-}
-document.getElementById('refreshRemoteCheckpoints').onclick = () => loadRemoteCheckpointRows(true);
-document.getElementById('remoteCheckpointPanel').addEventListener('toggle', event => {
-  if (event.target.open) loadRemoteCheckpointRows(); else clearTimeout(remoteCheckpointPoll);
-});
-document.getElementById('remoteCheckpointRows').onclick = async event => {
-  const button = event.target.closest('[data-sync-remote]');
-  if (!button) return;
-  const row = remoteCheckpointRows[Number(button.dataset.syncRemote)];
-  button.disabled = true;
-  try {
-    const task = await api('/api/checkpoints/sync', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:row.source,target:'local_4090',config_name:row.config_name,exp_name:row.experiment,step:row.step})});
-    show(`已提交权重回传：${task.id}`, false);
-  } catch (error) { show(error.message); }
-  finally { button.disabled = false; }
-};
 </script></body></html>
