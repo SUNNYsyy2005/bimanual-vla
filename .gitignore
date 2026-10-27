@@ -9,6 +9,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+/piper_sdk
 
 # 运行产物
 *.log

@@ -15,7 +15,7 @@
       --heading:#f7faff; --control-text:#edf3fb; --code:#a9e4ff;
       --blue:#69b6ff; --blue-strong:#3b82f6; --green:#4ed9ac; --yellow:#f4c66d;
       --red:#fb7185; --purple:#b794f4; --button-start:#347fb8; --button-end:#245a91; --button-border:#468fc2; --danger-bg:#8d2c49; --danger-border:#c95a75; --nav-height:112px;
-      --nav-count-text:#bfeaff; --nav-count-bg:#153f5d; --telemetry-badge-text:#d6e4f2; --telemetry-badge-bg:#0b1a2d; --telemetry-badge-border:#2f4966;
+      --nav-count-text:#bfeaff; --nav-count-bg:#153f5d; --telemetry-badge-text:#d6e4f2; --telemetry-badge-bg:#0b1a2d; --telemetry-badge-border:#2f4966; --telemetry-item-value:#eaf4ff;
       --origin-real-text:#bfffe5; --origin-real-bg:#103529; --origin-real-border:#217a5f;
       --origin-simulation-text:#d9ccff; --origin-simulation-bg:#261f46; --origin-simulation-border:#624ca8;
       --origin-unknown-text:#ffe5a3; --origin-unknown-bg:#392d14; --origin-unknown-border:#8d6c22;
@@ -33,7 +33,7 @@
       --heading:#10243c; --control-text:#203247; --code:#1d6e9c;
       --blue:#2b7de9; --blue-strong:#2563d3; --green:#159b79; --yellow:#b7791f;
       --red:#d94b68; --purple:#7657c5; --button-start:#3f86dc; --button-end:#2866c4; --button-border:#3578ca; --danger-bg:#c44a68; --danger-border:#b93b5b;
-      --nav-count-text:#47647e; --nav-count-bg:#e7eff8; --telemetry-badge-text:#34495e; --telemetry-badge-bg:#eef4fa; --telemetry-badge-border:#cbd8e6;
+      --nav-count-text:#47647e; --nav-count-bg:#e7eff8; --telemetry-badge-text:#34495e; --telemetry-badge-bg:#eef4fa; --telemetry-badge-border:#cbd8e6; --telemetry-item-value:#25364b;
       --origin-real-text:#126b52; --origin-real-bg:#e4f6ef; --origin-real-border:#87cbb1;
       --origin-simulation-text:#5b4599; --origin-simulation-bg:#f0ecff; --origin-simulation-border:#b6a9e2;
       --origin-unknown-text:#815b0d; --origin-unknown-bg:#fff5d6; --origin-unknown-border:#e3c46e;
@@ -133,8 +133,10 @@
     .episode-editor-grid { display:grid; grid-template-columns:minmax(0,1fr); gap:14px; margin-top:14px; }
     .episode-panel { padding:12px; border:1px solid #334c69; border-radius:11px; background:#091727; }
     #episodeEditorPanel { scroll-margin-top:calc(var(--nav-height) + 18px); }
-    .episode-panel.table-wrap { max-height:430px; overflow:auto; }
-    .episode-panel.table-wrap thead th { position:sticky; top:0; z-index:2; background:var(--table-head); }
+    .episode-panel.table-wrap { max-height:430px; overflow:auto; padding:0; isolation:isolate; }
+    .episode-panel.table-wrap table { border-collapse:separate; border-spacing:0; }
+    .episode-panel.table-wrap thead th { position:sticky; top:0; z-index:2; background:var(--table-head); background-clip:padding-box; }
+    form.compact-submission > .rlinf-eval-settings { grid-column:1/-1; }
     .episode-detail-toolbar { display:flex; flex-wrap:wrap; align-items:end; gap:8px; margin-bottom:10px; }
     .episode-detail-toolbar label { margin:0; }
     .episode-detail-toolbar select { min-width:180px; }
@@ -149,6 +151,27 @@
     .checkbox-cell input { width:auto; } .editor-summary { min-height:22px; margin:8px 0; }
     .chart-shell { position:relative; min-height:360px; padding:10px; border:1px solid #2b4664; border-radius:12px; background:#07121f; }
     #trainMetricsChart { display:block; width:100%; height:340px; cursor:grab; touch-action:none; }
+    .rlinf-grid { grid-template-columns:minmax(260px,.7fr) minmax(0,1.8fr); align-items:start; }
+    .rlinf-grid > .card { grid-column:auto; }
+    #rlinfLaunchForm { grid-template-columns:minmax(100px,.85fr) minmax(0,1.15fr); }
+    #rlinfLaunchForm > label { grid-column:1; }
+    #rlinfLaunchForm > label + input,#rlinfLaunchForm > label + select { grid-column:2; }
+    #rlinfGpuField,#rlinfGpuCountField,#rlinfOverrideFields { grid-column:1/-1; display:grid; grid-template-columns:minmax(100px,.85fr) minmax(0,1.15fr); gap:8px 10px; align-items:center; }
+    #rlinfGpuField[hidden],#rlinfGpuCountField[hidden] { display:none; }
+    #rlinfOverrideFields label,#rlinfGpuField label,#rlinfGpuCountField label { margin:0; }
+    #rlinfEvalForm > .toolbar { grid-column:1/-1; }
+    .rlinf-runs-card .chart-toolbar { grid-template-columns:minmax(0,1fr) minmax(120px,.6fr); margin-top:18px; }
+    #rlinfChart { display:block; width:100%; height:340px; }
+    #rlinfMetricSummary { overflow-wrap:anywhere; }
+    #rlinfLegend { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr)); }
+    .rlinf-legend-item { display:flex; align-items:flex-start; gap:8px; min-width:0; padding:8px 10px; border:1px solid var(--line-soft); border-radius:9px; background:var(--surface-inset); }
+    .rlinf-legend-item i { flex:none; width:20px; height:3px; margin-top:9px; border-radius:2px; }
+    .rlinf-legend-item span { min-width:0; overflow-wrap:anywhere; font-size:12px; }
+    .rlinf-runs-card td:nth-child(2) { min-width:180px; max-width:320px; overflow-wrap:anywhere; }
+    .rlinf-runs-card input[type=checkbox] { width:auto; }
+    .rlinf-eval-card { margin-top:18px; }
+    .rlinf-eval-settings { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }
+    @media (max-width:1100px) { .rlinf-grid { grid-template-columns:minmax(0,1fr); } }
     #trainMetricsChart.dragging,#trainMetricRangeChart.dragging { cursor:grabbing; }
     .metric-range-control { margin-top:10px; padding:9px 10px 7px; border:1px solid #29445f; border-radius:10px; background:#081625; }
     .metric-range-header { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:6px 12px; margin-bottom:5px; color:#c8d9eb; font-size:12px; }
@@ -163,7 +186,7 @@
     .telemetry-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:5px 12px; }
     .telemetry-item { min-width:0; padding:4px 0; border-bottom:1px solid rgba(48,75,104,.45); }
     .telemetry-item-label { display:block; color:var(--muted); font-size:11px; }
-    .telemetry-item-value { display:block; overflow:hidden; color:#eaf4ff; font-size:12px; font-weight:700; text-overflow:ellipsis; white-space:nowrap; }
+    .telemetry-item-value { display:block; overflow:hidden; color:var(--telemetry-item-value); font-size:12px; font-weight:700; text-overflow:ellipsis; white-space:nowrap; }
     .telemetry-alert { margin-top:7px; padding:6px 8px; border-left:3px solid var(--yellow); border-radius:5px; background:#241d13; color:#ffd98a; font-size:12px; line-height:1.4; }
     .telemetry-note { margin-top:7px; padding:6px 8px; border-left:3px solid var(--blue); border-radius:5px; background:#102233; color:#b9dcff; font-size:12px; line-height:1.4; }
     .telemetry-details { margin-top:7px; }
@@ -207,7 +230,7 @@
     .dataset-origin-select,.dataset-sync-select { width:auto; min-width:104px; display:inline-block; padding:6px 8px; margin:2px; }
     .location-list { display:flex; flex-wrap:wrap; gap:5px; margin-top:5px; }
     .location-pill { max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .eval-filter-grid { display:grid; grid-template-columns:1.2fr 1.2fr .8fr 1fr auto auto; gap:10px; align-items:end; margin-bottom:12px; }
+    .eval-filter-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; align-items:end; margin-bottom:12px; }
     .eval-video-list { display:grid; gap:10px; margin-top:12px; }
     .eval-video-toolbar { margin-top:8px; }
     .eval-video-card { padding:12px; border:1px solid #304b68; border-radius:11px; background:#07121f; }
@@ -251,6 +274,7 @@
     .joint-table table { min-width:520px; }
     .joint-table td,.joint-table th { padding:5px 7px; font-size:12px; }
     .idle-frame { color:#ffd166; }
+    .anomaly-limit { color:#ff4fd8; font-weight:600; }
     .anomaly-frame { color:#ff7b8f; }
     .anomaly-jitter { color:#d7a6ff; }
     .anomaly-reversal { color:#ff9f68; }
@@ -375,6 +399,7 @@
       <button class="nav-button active" data-module="overview">总览 <span id="navOverviewCount" class="nav-count">-</span></button>
       <button class="nav-button" data-module="datasets">数据集 <span id="navDatasetCount" class="nav-count">-</span></button>
       <button class="nav-button" data-module="training">训练 <span id="navTrainingCount" class="nav-count">-</span></button>
+      {% if dashboard_profile == "simulation" %}<button class="nav-button" data-module="rlinf">RLinf 训练</button>{% endif %}
       {% if enable_policy %}<button class="nav-button" data-module="policy">Policy <span id="navPolicyCount" class="nav-count">-</span></button>
       <button class="nav-button" data-module="telemetry">实时遥测 <span id="navTelemetryCount" class="nav-count">-</span></button>{% endif %}
       {% if dashboard_profile == "simulation" %}<button class="nav-button" data-module="eval-videos">评估视频 <span id="navEvalVideoCount" class="nav-count">-</span></button>{% endif %}
@@ -421,8 +446,8 @@
           <details><summary onclick="loadTimingJobs()">最近的时间对齐任务（关闭页面后继续执行）</summary><div id="timingJobs"></div></details>
         </div>
         <div class="card">
-          <h2>数据传输任务</h2>
-          <p class="muted">显示数据集、checkpoint 和评估视频 transfer 的实时状态；进度来自传输 runner 的 sidecar，旧任务会用目标目录清单做保守估算。</p>
+          <div class="training-output-heading"><h2>数据传输与删除任务</h2><div class="toolbar"><span id="transferTasksSummary" class="muted">等待加载</span><button class="inline secondary" type="button" onclick="loadTransferTasks()">刷新任务</button></div></div>
+          <p class="muted">独立刷新数据集、checkpoint、评估视频的传输任务与数据集删除任务。删除任务不显示字节传输进度。</p>
           <div class="toolbar task-bulk-toolbar"><label style="margin:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" class="task-select-all" data-task-scope="transfer" onchange="toggleTaskSelection('transfer', this.checked)" aria-label="全选当前页数据传输任务">全选本页</label><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('transfer')" disabled data-bulk-delete-scope="transfer">批量删除已选任务（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束传输任务；不会删除数据集、checkpoint 或评估视频。</span></div><div class="table-wrap"><table><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="transfer" onchange="toggleTaskSelection('transfer', this.checked)" aria-label="全选当前页数据传输任务"></th><th>任务</th><th>方向 / 路径</th><th>进度</th><th>状态 / 详情</th><th>操作</th></tr></thead><tbody id="transferJobs"></tbody></table></div><div id="transferTasksPagination"></div>
         </div>
         <div class="card">
@@ -467,7 +492,7 @@
                   <button class="inline secondary" type="button" onclick="refreshEpisodeAnalysis()">刷新分析</button>
                 </div>
                 <div id="episodeAnalysisSummary" class="analysis-summary"><span class="muted">选择 episode 后加载分析。</span></div>
-                <div class="analysis-anomaly-legend"><span class="idle-frame">■ idle</span><span class="anomaly-jitter">■ jitter</span><span class="anomaly-reversal">■ velocity reversal</span><span class="anomaly-abrupt">■ abrupt change</span></div>
+                <div class="analysis-anomaly-legend"><span class="idle-frame">■ idle</span><span class="anomaly-jitter">■ jitter</span><span class="anomaly-reversal">■ velocity reversal</span><span class="anomaly-abrupt">■ abrupt change</span><span class="anomaly-limit">■ joint limit</span></div>
                 <div class="analysis-timeline-wrap"><canvas id="episodeIdleTimeline" width="1000" height="78"></canvas></div>
                 <div class="analysis-grid">
                   <div class="analysis-card"><div class="trajectory-header"><h3>末端位姿 3D 轨迹</h3><button class="inline secondary" type="button" onclick="resetEpisodeTrajectoryView()">重置视角</button></div><div class="muted trajectory-hint">显示第 0 帧到当前帧的历史轨迹；当前末端位置以高亮点标出。拖拽旋转，滚轮缩放。</div><canvas id="episodeTrajectoryChart" width="1000" height="360" aria-label="末端位姿三维历史轨迹"></canvas><div id="episodeTrajectoryLegend" class="metric-legend"></div></div>
@@ -482,6 +507,11 @@
     </section>
 
     <section id="module-training" class="dashboard-module" data-module="training" hidden>
+      <div class="card" style="margin-bottom:16px">
+        <h2>统一训练历史</h2><p class="muted">π0.5 SFT、RLinf 及其他后端共用运行清单；输出缺失和仅有指标镜像的历史会明确标记。</p>
+        <div class="toolbar"><select id="artifactRunBackendFilter" style="width:auto" onchange="loadArtifactRuns()"><option value="all">全部训练后端</option></select><input id="artifactRunQueryFilter" style="max-width:320px" placeholder="来源、任务、实验、运行或状态" oninput="renderArtifactRuns()"><button class="inline secondary" onclick="loadArtifactRuns()">刷新训练历史</button></div>
+        <div id="artifactRunSummary" class="muted"></div><div class="table-scroll"><table><thead><tr><th>来源 / 任务</th><th>实验 / 运行</th><th>训练类型</th><th>状态 / 产物</th><th>存放位置</th></tr></thead><tbody id="artifactRunRows"></tbody></table></div>
+      </div>
       <div class="module-heading"><div><h2>训练中心</h2><p>归一化、LoRA 微调、训练进度和 loss 曲线。</p></div></div>
       <div class="grid">
         <div class="card third">
@@ -495,12 +525,16 @@
           </form>
         </div>
         <div class="card two-third">
-          <h2>2. 提交 LoRA 微调</h2>
+          <h2>2. 提交模型微调</h2>
           <form id="trainForm" class="compact-submission">
             <div class="row"><div><label>数据集</label><select name="dataset_id" class="dataset-select"></select></div><div><label>实验名</label><input id="trainExperimentName" name="exp_name" list="trainExperimentOptions" required autocomplete="off" placeholder="选择已有实验或输入新名称"><datalist id="trainExperimentOptions"></datalist></div></div>
             <p id="trainExperimentInfo" class="muted">选择已有实验可继续该实验下的 checkpoint；直接输入新名称时只提供基础模型。</p>
             <div class="row"><div><label>模型系列</label><select name="model_variant" class="model-variant-select"><option value="pi05">π0.5</option><option value="pi0">π0</option></select></div><div><label>基础模型 / 初始化 checkpoint</label><select name="base_checkpoint" class="base-model-select" required></select></div></div>
             <p class="muted base-model-info">可选择基础模型，已有实验还会显示该实验下的完整 checkpoint。</p>
+            <div class="row3"><div><label>Action expert</label><select name="action_expert_tuning"><option value="full">全量微调</option><option value="lora">LoRA</option></select></div><div><label>LLM LoRA</label><select name="llm_lora"><option value="false">冻结 LLM</option><option value="true">启用 LoRA</option></select></div><div><label>训练期 RTC（π0.5）</label><select name="rtc_training"><option value="false">关闭</option><option value="true">干净动作前缀条件化</option></select></div></div>
+            <label>图像缩放</label><select name="image_resize_mode"><option value="stretch">直接缩放，不补黑边</option><option value="pad">等比例补边（旧模型）</option></select>
+            <label>RTC 延迟采样权重（JSON 数组，索引为 0..最大步数；留空为均匀）</label><input name="rtc_training_delay_weights" placeholder="例如 [1, 1, 2, 4, 8, 16, 32]">
+            <label>RTC 训练最大延迟（action steps）</label><input name="rtc_training_max_delay" type="number" value="8" min="1" max="49"><p class="muted">视觉编码器冻结。训练期 RTC 随机保留动作前缀，仅优化后缀；8 steps 在 20 Hz 下覆盖 400 ms。继续训练会沿用 checkpoint 的参数范围和 RTC 配置。</p>
             <div class="row3"><div><label>执行目标</label><select name="execution_target" class="execution-target-select"><option value="local_4090">4×4090 本地</option></select></div><div><label>GPU IDs / 集群卡数</label><input name="gpu_ids" value="0,1" placeholder="本地 0,1；集群填 1/2/4"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div>
             <label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select>
             <div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>全局 Batch</label><input name="batch_size" type="number" value="2"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div>
@@ -509,7 +543,7 @@
             <div class="row3"><div><label>测试集自动评测</label><select name="eval_enabled"><option value="true">启用（推荐）</option><option value="false">禁用</option></select></div><div><label>评测间隔 steps</label><input name="eval_interval_steps" type="number" value="5000" min="5000" step="5000"></div><div><label>最多评测 batches</label><input name="eval_max_batches" type="number" value="50" min="1"></div></div>
             <div class="row3"><div><label>Eval batch</label><input name="eval_batch_size" type="number" value="1" min="1"></div><div><label>Eval workers</label><input name="eval_num_workers" type="number" value="2" min="0"></div><div><label>Eval JAX 显存比例</label><input name="eval_xla_memory_fraction" type="number" value="0.85" min="0.50" max="0.95" step="0.01"></div></div>
             <label>启动方式</label><select name="mode"><option value="auto">auto（推荐）</option><option value="new">new</option><option value="resume">resume</option><option value="overwrite">overwrite</option></select>
-            <p class="muted">2×24 GiB RTX 4090 上 π0.5 LoRA 建议使用全局 batch 2、FSDP 2、显存比例 0.90。自动评测在每个持久化的 5000-step checkpoint 上使用 held-out episodes；只占用完全空闲的单卡，没有空闲卡就记录 skipped，不排队也不阻塞训练。</p><p><button type="submit">提交训练</button></p>
+            <p class="muted">Action expert 全量微调需要为梯度和优化器状态预留显存；全局 batch 与 FSDP 按实际资源设置。自动评测使用 held-out episodes；没有空闲卡时记录 skipped。</p><p><button type="submit">提交训练</button></p>
           </form>
           <p class="muted">Checkpoint 存储目录为单一写入位置；“允许扫描 / 读取的 checkpoint 目录”支持多个只读来源，存储目录会自动包含在其中。</p>
         </div>
@@ -517,7 +551,7 @@
         <section class="card training-process-card">
           <h2>训练进程管理</h2>
           <p class="muted">这里只显示 Norm / Train 任务；点击“日志”或“曲线”会自动切换右侧内容。</p>
-          <div class="toolbar task-filter-toolbar">
+          <div class="toolbar task-filter-toolbar"><label for="trainingTaskSearch" style="margin:0">搜索</label><input id="trainingTaskSearch" type="search" placeholder="实验名 / 任务 ID / 状态" style="max-width:250px">
             <label style="margin:0">任务类型</label>
             <select id="trainingTaskTypeFilter">
               <option value="all">全部</option>
@@ -534,7 +568,7 @@
             </select>
             <span id="trainingTaskFilterSummary" class="muted">-</span>
           </div>
-          <div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('training')" disabled data-bulk-delete-scope="training">批量删除已选日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束任务；不会删除 checkpoint、模型或训练输出。</span></div>
+          <div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('training')" disabled data-bulk-delete-scope="training">删除选中记录和本地日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅限已结束任务；不会删除远端 Slurm 日志、checkpoint、模型或训练输出。</span></div>
           <div class="table-wrap training-jobs-wrap"><table class="training-jobs-table"><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="training" onchange="toggleTaskSelection('training', this.checked)" aria-label="全选当前页训练历史任务"></th><th>任务 / PID</th><th>状态</th><th>参数</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table></div><div id="trainingTasksPagination"></div>
         </section>
         <section id="trainingOutputCard" class="card training-output-card">
@@ -567,7 +601,8 @@
             <div class="checkpoint-step-filter"><label>Step 范围</label><div class="toolbar"><input id="checkpointMinStep" type="number" min="0" placeholder="最小"><span class="muted">至</span><input id="checkpointMaxStep" type="number" min="0" placeholder="最大"></div></div>
           </div>
           <div class="toolbar checkpoint-toolbar"><button class="inline secondary" type="button" onclick="resetCheckpointFilters()">清空筛选</button><button class="inline danger" type="button" onclick="batchDeleteSelectedCheckpoints()" disabled data-bulk-delete-checkpoint-scope="training">批量删除已选 checkpoint（<span data-selected-checkpoint-count>0</span>）</button></div>
-          <div class="table-wrap"><table><thead><tr><th class="checkpoint-selection-cell"><input type="checkbox" class="checkpoint-select-all" data-checkpoint-scope="training" onchange="toggleCheckpointSelection('training', this.checked)" aria-label="全选当前页 checkpoint"></th><th>实验 / step</th><th>数据集</th><th>大小 / 时间</th></tr></thead><tbody id="checkpoints"></tbody></table></div><div id="checkpointsPagination"></div>
+          <div class="table-wrap"><table><thead><tr><th class="checkpoint-selection-cell"><input type="checkbox" class="checkpoint-select-all" data-checkpoint-scope="training" onchange="toggleCheckpointSelection('training', this.checked)" aria-label="全选当前页 checkpoint"></th><th>实验 / step</th><th>数据集</th><th>大小 / 时间</th></tr></thead><tbody id="checkpoints"></tbody></table></div><div id="checkpointsPagination"></div><div class="toolbar" style="margin-top:16px"><strong>拓展节点 Checkpoints</strong><button type="button" class="secondary" onclick="loadRemoteCheckpoints(true)">刷新远端列表</button><span id="remoteCheckpointStatus" class="muted"></span></div>
+          <div class="table-wrap"><table><thead><tr><th>位置</th><th>实验 / step</th><th>数据集 / 微调</th><th>操作</th></tr></thead><tbody id="remoteCheckpoints"></tbody></table></div>
         </section>
         <section class="card model-catalog-card">
           <div class="training-output-heading"><div><h2>模型资源列表</h2><p class="muted">基础模型与训练 checkpoint 统一展示；表单中的模型选择器仍按实验和模型系列自动匹配。</p></div><span id="baseModelSummary" class="muted">等待模型数据。</span></div>
@@ -611,21 +646,72 @@
     </section>
 
 {% if dashboard_profile == "simulation" %}
+    <section id="module-rlinf" class="dashboard-module" data-module="rlinf" hidden>
+      <div class="module-heading"><div><h2>RLinf 训练监控 · GRPO / PPO</h2><p>对比 GRPO、PPO 及其 Lagrangian 版本的训练、固定集评测和 critic 指标。</p></div><div class="toolbar"><span id="rlinfRefreshTime" class="muted">尚未刷新</span><button class="inline secondary" type="button" onclick="loadRlinfRuns()">刷新曲线</button></div></div>
+      <div class="grid rlinf-grid">
+        <section class="card"><h2>启动 RLinf 训练</h2><p id="rlinfLaunchHint" class="muted">提交配置由服务器端 profile 管理。</p>
+          <form id="rlinfLaunchForm" class="compact-submission">
+            <label>计算目标</label><select id="rlinfTarget" name="target" required></select>
+            <label>训练配置</label><select id="rlinfProfile" name="profile" required></select>
+            <label>算法</label><select id="rlinfAlgorithm" name="algorithm" required></select>
+            <label>运行名称</label><input id="rlinfRunName" name="run_name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}">
+            <div id="rlinfGpuField"><label>4090 GPU 编号</label><input name="gpu_ids" value="0" placeholder="例如：0 或 1"></div>
+            <div id="rlinfGpuCountField" hidden><label>Slurm GPU 数量</label><input name="gpu_count" type="number" value="1" min="1" max="8"></div>
+            <div id="rlinfOverrideFields"></div><p><button id="rlinfLaunchButton" type="submit">提交训练</button></p>
+          </form>
+          <p class="muted">已有运行目录不会被覆盖。4090 本地启动会检查 GPU 占用；H100/H200 通过 Slurm 提交。</p>
+        </section>
+        <section class="card rlinf-runs-card">
+          <div class="training-output-heading"><div><h2>运行记录与最新指标</h2><p class="muted">可多选不同算法、随机种子和硬件的运行记录进行对比。</p></div><span id="rlinfRunsSummary" class="muted">等待数据</span></div>
+          <div class="toolbar"><input id="rlinfRunFilter" aria-label="筛选 RLinf 运行" placeholder="搜索运行名称、算法、目标或状态"><select id="rlinfAlgorithmFilter" aria-label="按算法筛选"><option value="">全部算法</option><option value="ppo-lag">PPO-Lag</option><option value="ppo">PPO</option><option value="grpo-lag">GRPO-Lag</option><option value="grpo">GRPO</option></select><button id="rlinfDeleteSelected" class="inline danger" type="button" onclick="deleteRlinfRuns([...rlinfDeleteSelection])" disabled>删除已选记录</button></div>
+          <p class="muted">勾选“对比”可跨页比较曲线；“删除”清理运行记录及已结束任务的 Dashboard 日志，保留原始曲线文件、模型和 checkpoint。</p>
+          <div class="table-wrap"><table><thead><tr><th>对比</th><th>目标 / 运行</th><th>状态 / 阶段</th><th>训练 / 更新 / 评测</th><th>评测 SR / 风险率</th><th>结果时间 / 同步时间</th><th><label><input id="rlinfDeletePage" type="checkbox" aria-label="选择本页可删除记录">删除</label></th><th>操作</th></tr></thead><tbody id="rlinfRuns"></tbody></table></div>
+          <div id="rlinfRunsPagination"></div>
+          <div id="rlinfLogPanel" hidden><div class="toolbar"><strong id="rlinfLogTitle">训练日志</strong><button class="inline secondary" type="button" onclick="rlinfLogRunId ? loadRlinfRunLog(rlinfLogRunId) : loadRlinfLog(rlinfLogTaskId)">刷新日志</button><button class="inline secondary" type="button" onclick="document.getElementById('rlinfLogPanel').hidden = true">收起</button></div><pre id="rlinfLog"></pre></div>
+          <div class="chart-toolbar"><div><label for="rlinfMetric">指标</label><select id="rlinfMetric"></select></div><div><label for="rlinfXAxis">横坐标</label><select id="rlinfXAxis"><option value="round">训练轮次（round）</option><option value="actor_updates">Actor updates</option></select></div><div><label for="rlinfCohort">评测集</label><select id="rlinfCohort"><option value="fixed_validation">固定验证集</option><option value="extra_development">补充开发集</option><option value="">未标注评测集</option></select></div></div>
+          <p class="muted">训练 SR 来自当轮采集；评测 SR 仅在评测轮次更新。初始化风险排除后按有效轨迹计算 SR；实际 Actor 更新次数可能小于训练轮数。</p>
+          <p id="rlinfMetricSummary" class="muted"></p>
+          <div class="chart-shell"><canvas id="rlinfChart" aria-label="RLinf multi-run metric chart"></canvas></div><div id="rlinfLegend" class="metric-legend"></div>
+        </section>
+      </div>
+      <section class="card rlinf-eval-card">
+        <div class="training-output-heading"><div><h2>RLInf checkpoint rollout 评测</h2><p class="muted">从指定训练步数的模型启动独立 rollout。评测在模型所在的计算目标执行。</p></div><button class="inline secondary" type="button" onclick="loadRlinfEvaluations()">刷新评测任务</button></div>
+        <form id="rlinfEvalForm" class="compact-submission">
+          <div class="rlinf-eval-settings">
+            <div><label for="rlinfEvalRun">训练运行</label><select id="rlinfEvalRun" name="run_id" required></select></div>
+            <div><label for="rlinfEvalCheckpoint">Checkpoint 步数</label><select id="rlinfEvalCheckpoint" name="checkpoint_id" required></select></div>
+            <div><label>Rollout episode 数</label><input name="episodes" type="number" value="5" min="1" max="1000" required></div>
+            <div><label>最大环境步数</label><input name="max_steps" type="number" value="512" min="1" max="2000" required></div>
+            <div><label>随机种子</label><input name="seed" type="number" value="43" min="0" max="2147483647" required></div>
+            <div id="rlinfEvalGpuField"><label>4090 GPU 编号</label><input name="gpu_ids" value="0" placeholder="空闲 GPU 编号"></div>
+            <div><label for="rlinfEvalRecordVideo">生成评测视频</label><select id="rlinfEvalRecordVideo" name="record_video"><option value="false">关闭</option><option value="true">开启</option></select></div>
+          </div>
+          <p id="rlinfEvalHint" class="muted">请选择运行记录，加载可评测 checkpoint。</p>
+          <div class="toolbar"><button id="rlinfEvalButton" type="submit" disabled>提交 rollout 评测</button><button class="inline secondary" type="button" onclick="loadRlinfCheckpoints()">刷新 checkpoint</button><button class="inline secondary" type="button" onclick="openRlinfVideos()">查看 RLInf 评测视频</button></div>
+        </form>
+        <div class="table-wrap"><table><thead><tr><th>运行 / 评测任务</th><th>Checkpoint step</th><th>目标 / 状态</th><th>结果</th><th>视频</th><th>操作</th></tr></thead><tbody id="rlinfEvalTasks"></tbody></table></div><div id="rlinfEvalPagination"></div>
+      </section>
+    </section>
     <section id="module-eval-videos" class="dashboard-module" data-module="eval-videos" hidden>
-      <div class="module-heading"><div><h2>评估视频</h2><p>先显示列表，按实际任务/实验/成功状态筛选；点击某个视频后才加载播放器。</p></div></div>
+      <div class="module-heading"><div><h2>评估视频</h2><p>统一查看 RoboTwin 与 LIBERO-Safety 的训练 rollout 和评测视频，按来源、任务、实验及结果筛选。</p></div></div>
       <div class="grid"><div class="card">
         <div class="eval-filter-grid">
-          <div><label>任务 / 目录</label><input id="evalVideoTaskFilter" placeholder="如 put_bottles / pb3"></div>
-          <div><label>实验 / checkpoint</label><input id="evalVideoExperimentFilter" placeholder="如 cp16000 / h200-7630"></div>
-          <div><label>成功状态</label><select id="evalVideoSuccessFilter"><option value="all">全部</option><option value="success">成功</option><option value="failed">失败</option><option value="unknown">未知</option></select></div>
-          <div><label>关键词</label><input id="evalVideoQueryFilter" placeholder="路径关键词"></div>
-          <button class="inline secondary" onclick="loadEvalVideos(false)">刷新本地列表</button>
-          <button class="inline secondary" onclick="loadEvalVideos(true)">扫描 H100/H200</button>
+          <div><label>视频来源</label><select id="evalVideoSourceFilter"><option value="all">全部来源</option></select></div>
+          <div><label>具体任务</label><input id="evalVideoTaskFilter" list="evalVideoTasks" placeholder="如 tsa-moka / handover-mic"><datalist id="evalVideoTasks"></datalist></div>
+          <div><label>实验来源</label><input id="evalVideoExperimentFilter" list="evalVideoExperiments" placeholder="实验 ID 或名称"><datalist id="evalVideoExperiments"></datalist></div>
+          <div><label>视频阶段</label><select id="evalVideoPhaseFilter"><option value="all">训练与评测</option><option value="train">训练 rollout</option><option value="eval">评测 rollout</option><option value="unknown">阶段未知</option></select></div>
+          <div><label>任务结果</label><select id="evalVideoSuccessFilter"><option value="all">全部</option><option value="success">成功</option><option value="failed">失败</option><option value="unknown">未知</option></select></div>
+          <div><label>安全成功</label><select id="evalVideoSafeSuccessFilter"><option value="all">全部</option><option value="success">安全成功</option><option value="failed">未安全成功</option><option value="unknown">无安全结果</option></select></div>
+          <div><label>任务事件</label><select id="evalVideoEventFilter"><option value="all">全部</option><option value="with">有事件标注</option><option value="without">无事件标注</option></select></div>
+          <div><label>关键词 / checkpoint</label><input id="evalVideoQueryFilter" placeholder="运行、checkpoint、路径或指令"></div>
+          <button class="inline secondary" onclick="loadEvalVideos(false)">刷新列表</button>
+          <button class="inline secondary" onclick="refreshEvalVideoCatalog()">发现 / 归类新视频</button>
+          <button class="inline secondary" onclick="loadEvalVideos(true)">扫描其他远端目录</button>
         </div>
         <div class="toolbar eval-video-toolbar">
           <label style="margin:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="evalVideoSelectAll" onchange="toggleEvalVideoSelection(this.checked)" aria-label="全选可删除的评估视频">全选本地视频</label>
           <button class="inline danger" type="button" onclick="batchDeleteSelectedEvalVideos()" disabled data-bulk-delete-eval-scope="videos">批量删除已选视频（<span data-selected-eval-video-count>0</span>）</button>
-          <span class="muted">仅本地 4×4090 视频可删除；远端视频只能同步。</span>
+          <span class="muted">远端视频同步后播放；归档链接删除时保留原视频。任务结果与安全成功分别统计。</span>
         </div>
         <span id="evalVideoSummary" class="muted">尚未加载。</span>
         <div id="evalVideoList" class="eval-video-list"></div><div id="evalVideosPagination"></div>
@@ -705,6 +791,17 @@
               <div><label for="settingsPasswordValue">新密码</label><input id="settingsPasswordValue" type="password" autocomplete="new-password" placeholder="至少 8 位"></div>
             </div>
             <button type="button" class="inline secondary" id="settingsChangePassword">修改密码</button>
+          </section>
+          <section class="settings-extension-nodes">
+            <h3>拓展节点</h3>
+            <p class="muted">配置 Slurm GPU 节点。SSH 使用 Dashboard 主机已有的别名或 user@host；此处不保存密码或私钥。所有路径均指远端节点，不使用本地目录浏览器。</p>
+            <div class="toolbar"><select id="extensionNodeSelect" onchange="selectExtensionNode(this.value)"></select><button type="button" class="inline secondary" onclick="selectExtensionNode('')">新增节点</button><button type="button" class="inline secondary" onclick="loadExtensionNodes()">重新加载</button></div>
+            <form id="extensionNodeForm" onsubmit="saveExtensionNode(event)">
+              <div class="row2"><div><label>节点 ID（新增后固定）</label><input id="extensionNodeId" required pattern="[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"></div><div><label>显示名称</label><input name="label"></div></div>
+              <div id="extensionNodeFields"></div>
+              <div class="toolbar"><button type="submit" class="inline">保存节点</button><button id="deleteExtensionNode" type="button" class="inline danger" onclick="deleteExtensionNode()">移除节点配置</button></div>
+              <p id="extensionNodeStatus" class="muted">保存后立即用于新任务；活跃任务使用的节点不可修改或移除。</p>
+            </form>
           </section>
           <section class="settings-restart-panel">
             <h3>应用设置</h3>
@@ -808,6 +905,7 @@ const ENABLE_POLICY = {{ enable_policy|tojson }};
 const DASHBOARD_BUILD = {{ dashboard_build|tojson }};
 const ENABLE_EVAL_VIDEOS = DASHBOARD_PROFILE === 'simulation';
 const MODULE_LIST = ['overview', 'datasets', 'training'];
+if (DASHBOARD_PROFILE === 'simulation') MODULE_LIST.push('rlinf');
 if (ENABLE_POLICY) MODULE_LIST.push('policy', 'telemetry');
 if (ENABLE_EVAL_VIDEOS) MODULE_LIST.push('eval-videos');
 MODULE_LIST.push('settings');
@@ -857,12 +955,17 @@ const selectedEvalVideoIds = new Set();
 const expandedEvalVideoIds = new Set();
 let evalVideoDataById = new Map();
 const selectedCheckpointPaths = new Set();
+const pendingDatasetDeleteTasks = new Set();
+let latestTransferTasks = null;
+let transferTasksRequest = null;
 let episodeLimit = 100;
-const LIST_PAGE_SIZE_OPTIONS = [25, 50, 100];
+const LIST_PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
 const listPageStates = {
   datasets: {page: 1, pageSize: 25},
   transferTasks: {page: 1, pageSize: 25},
-  trainingTasks: {page: 1, pageSize: 25},
+  trainingTasks: {page: 1, pageSize: 10},
+  rlinfRuns: {page: 1, pageSize: 10},
+  rlinfEvaluations: {page: 1, pageSize: 10},
   evaluationTasks: {page: 1, pageSize: 25},
   policyTasks: {page: 1, pageSize: 25},
   checkpoints: {page: 1, pageSize: 25},
@@ -901,12 +1004,14 @@ function resetListPage(key) {
 function rerenderPaginatedList(key) {
   const items = (latestStatus && latestStatus.tasks) || [];
   if (key === 'datasets') fillDatasets((latestStatus && latestStatus.datasets) || []);
-  else if (key === 'transferTasks') fillTransferTasks(items);
+  else if (key === 'transferTasks') fillTransferTasks(latestTransferTasks || items);
   else if (key === 'trainingTasks' || key === 'policyTasks' || key === 'evaluationTasks') fillTasks(items);
   else if (key === 'checkpoints') fillCheckpoints((latestStatus && latestStatus.checkpoints) || []);
   else if (key === 'baseModels') fillBaseModels((latestStatus && latestStatus.base_models) || []);
   else if (key === 'evalVideos') loadEvalVideos(evalVideoIncludeRemote);
   else if (key === 'settingsDirectories') renderSettingsDirectory(settingsBrowseData);
+  else if (key === 'rlinfRuns') renderRlinfRuns();
+  else if (key === 'rlinfEvaluations') renderRlinfEvaluations();
 }
 
 function changeListPage(key, direction) {
@@ -1113,6 +1218,89 @@ function fillSettings(data) {
   settingsDirty = false;
   const status = document.getElementById('settingsSaveStatus');
   if (status) status.textContent = '设置已加载。';
+  loadExtensionNodes();
+}
+
+let extensionNodes = {};
+let selectedExtensionNode = '';
+const extensionNodeGroups = [
+ ['连接与调度', [
+  ['submit_host','SSH 提交主机',true],['access_mode','文件访问方式',true,'select'],
+  ['partition','Slurm partition',true],['node','Slurm node',true],['gpu_type','GPU 类型（gres）'],
+  ['gpu_count','默认 GPU 卡数',false,'number'],['cpus_per_task','CPU / task',false,'number'],['mem','内存上限（如 128G）'],['time','作业时限（如 24:00:00）']]],
+ ['环境与目录', [
+  ['openpi_python','训练 Python 绝对路径',true],['inventory_python','目录查询 Python（可选）'],
+  ['conda_sh','Conda 初始化脚本'],['conda_env','Conda 环境名'],
+  ['workdir','OpenPI 工作目录',true],['openpi_repo','OpenPI 代码目录'],['dashboard_repo','Bimanual-VLA 代码目录',true],
+  ['dataset_root','数据集根目录',true],['assets_base_dir','Norm / assets 根目录',true],
+  ['checkpoint_base_dir','Checkpoint 写入根目录',true],['base_checkpoint','基础模型目录',true],
+  ['cache_root','缓存根目录',true],['log_dir','Slurm 日志目录',true],['remote_job_dir','作业脚本目录',true]]],
+ ['更多路径与同步配置', [
+  ['checkpoint_read_roots','额外 checkpoint 读取目录（每行一个）',false,'lines'],
+  ['dataset_read_roots','额外数据集目录（每行一个）',false,'lines'],
+  ['eval_video_roots','评估视频目录（每行一个）',false,'lines'],
+  ['python_fallbacks','查询 Python 备用路径（每行一个）',false,'lines'],
+  ['openpi_src','OpenPI src'],['openpi_client_src','OpenPI client src'],['lerobot_src','LeRobot src'],
+  ['nas_dataset_staging_root','该节点 NAS 数据暂存路径'],['nas_checkpoint_staging_root','该节点 NAS 模型暂存路径'],
+  ['inventory_cache_path','数据目录清单缓存路径'],['inventory_cache_host','缓存所在主机'],
+  ['inventory_source_path','数据清单源路径'],['inventory_source_host','数据清单源主机'],
+  ['tmpdir','临时文件目录'],['hf_home','Hugging Face 缓存目录'],['xdg_cache_home','XDG 缓存目录'],['pip_cache_dir','pip 缓存目录']]]
+];
+function renderExtensionNodeOptions() {
+  document.getElementById('extensionNodeSelect').innerHTML = '<option value="">新增节点…</option>' + Object.entries(extensionNodes).map(([id,n])=>`<option value="${esc(id)}">${esc(n.label || id)} (${esc(id)})</option>`).join('');
+}
+async function loadExtensionNodes() {
+  try {
+    const data=await api('/api/settings/extension-nodes');extensionNodes=data.nodes || {};
+    renderExtensionNodeOptions();selectExtensionNode(selectedExtensionNode in extensionNodes ? selectedExtensionNode : Object.keys(extensionNodes)[0] || '');
+  } catch(error) { document.getElementById('extensionNodeStatus').textContent=error.message; }
+}
+function selectExtensionNode(id) {
+  selectedExtensionNode=id;
+  document.getElementById('extensionNodeSelect').value=id;
+  const n=extensionNodes[id] || {access_mode:'slurm_only',gpu_count:1,cpus_per_task:8,mem:'64G',time:'24:00:00'};
+  const form=document.getElementById('extensionNodeForm');
+  const idInput=document.getElementById('extensionNodeId');idInput.value=id;idInput.readOnly=Boolean(id);
+  form.elements.label.value=n.label || '';
+  document.getElementById('deleteExtensionNode').disabled=!id;
+  document.getElementById('extensionNodeFields').innerHTML=extensionNodeGroups.map(([title,fields],index)=>`<details ${index<2?'open':''}><summary>${esc(title)}</summary><div class="row2">${fields.map(([key,label,required,type])=>{
+    let value=n[key] ?? '';
+    const attrs=`name="${key}" ${required?'required':''}`;
+    let input;
+    if(type==='select') input=`<select ${attrs}><option value="login_shared_slurm" ${value==='login_shared_slurm'?'selected':''}>提交主机共享磁盘（如 H100）</option><option value="slurm_only" ${value==='slurm_only'?'selected':''}>节点独立磁盘（如 H200）</option></select>`;
+    else if(type==='lines') input=`<textarea ${attrs} rows="2">${esc(Array.isArray(value)?value.join('\n'):value)}</textarea>`;
+    else input=`<input ${attrs} type="${type==='number'?'number':'text'}" ${type==='number'?'min="1" step="1"':''} value="${esc(value)}">`;
+    return `<div><label>${esc(label)}${required?' *':''}</label>${input}</div>`;
+  }).join('')}</div></details>`).join('');
+}
+async function saveExtensionNode(event) {
+  event.preventDefault();
+  const id=document.getElementById('extensionNodeId').value.trim();
+  if(!selectedExtensionNode && extensionNodes[id]) { show('节点 ID 已存在，请选择它进行编辑。');return; }
+  const form=document.getElementById('extensionNodeForm');
+  const node={...(extensionNodes[selectedExtensionNode] || {}),label:form.elements.label.value.trim()};
+  for(const [,fields] of extensionNodeGroups) for(const [key,,required,type] of fields) {
+    const value=form.elements[key].value.trim();
+    node[key]=type==='lines'?value.split('\n').map(x=>x.trim()).filter(Boolean):type==='number'?Number(value):value;
+  }
+  try {
+    const data=await api(`/api/settings/extension-nodes/${encodeURIComponent(id)}`,{method:'PUT',body:JSON.stringify(node)});
+    extensionNodes=data.nodes;renderExtensionNodeOptions();selectExtensionNode(id);
+    document.getElementById('extensionNodeStatus').textContent='节点配置已保存并立即生效。';
+    latestDatasetLocations=null;datasetLocationsFetchedAt=0;clusterResourcesQueriedAt=0;remoteCheckpointFetchedAt=0;
+    if(latestStatus?.config) { latestStatus.config.cluster_targets=data.nodes;fillExecutionTargets(latestStatus.config); }
+    refreshAll();
+  } catch(error) { document.getElementById('extensionNodeStatus').textContent=error.message; }
+}
+async function deleteExtensionNode() {
+  const id=selectedExtensionNode;
+  if(!id || !confirm(`移除拓展节点 ${id} 的配置？不会删除节点上的文件或历史任务。`)) return;
+  try {
+    const data=await api(`/api/settings/extension-nodes/${encodeURIComponent(id)}`,{method:'DELETE'});
+    extensionNodes=data.nodes;renderExtensionNodeOptions();selectExtensionNode('');
+    latestDatasetLocations=null;datasetLocationsFetchedAt=0;clusterResourcesQueriedAt=0;remoteCheckpointFetchedAt=0;
+    document.getElementById('extensionNodeStatus').textContent='节点配置已移除。';refreshAll();
+  } catch(error) { document.getElementById('extensionNodeStatus').textContent=error.message; }
 }
 
 function renderSettingsDirectory(data) {
@@ -1384,8 +1572,13 @@ async function loadEvalVideos(includeRemote = false) {
   const list = document.getElementById('evalVideoList');
   if (!summary || !list) return;
   let detachedPlayers = null;
-  const params = new URLSearchParams({limit: '1000'});
+  const pageState = listPageStates.evalVideos;
+  const params = new URLSearchParams({limit: String(pageState.pageSize), offset: String((pageState.page - 1) * pageState.pageSize)});
   if (includeRemote) params.set('include_remote', 'true');
+  for (const [id, key] of [['evalVideoSourceFilter','video_source'], ['evalVideoPhaseFilter','phase'], ['evalVideoSafeSuccessFilter','safe_success'], ['evalVideoEventFilter','events']]) {
+    const value = document.getElementById(id)?.value;
+    if (value && value !== 'all') params.set(key, value);
+  }
   const taskFilter = document.getElementById('evalVideoTaskFilter')?.value.trim();
   const experimentFilter = document.getElementById('evalVideoExperimentFilter')?.value.trim();
   const successFilter = document.getElementById('evalVideoSuccessFilter')?.value || 'all';
@@ -1398,6 +1591,21 @@ async function loadEvalVideos(includeRemote = false) {
   try {
     const data = await api(`/api/eval-videos?${params.toString()}`);
     const videos = data.videos || [];
+    const facets = data.facets || {};
+    const sourceSelect = document.getElementById('evalVideoSourceFilter');
+    if (sourceSelect) {
+      const selected = sourceSelect.value;
+      sourceSelect.innerHTML = '<option value="all">全部来源</option>' + (facets.video_sources || []).map(value => `<option value="${esc(value)}">${esc(evalVideoSourceLabel(value))}</option>`).join('');
+      sourceSelect.value = [...sourceSelect.options].some(o => o.value === selected) ? selected : 'all';
+    }
+    for (const [id, values] of [['evalVideoTasks', facets.tasks], ['evalVideoExperiments', facets.experiments]]) {
+      const element = document.getElementById(id);
+      if (element) element.innerHTML = (values || []).map(value => `<option value="${esc(value)}"></option>`).join('');
+    }
+    if (data.total && Number(data.offset) >= data.total) {
+      listPageState('evalVideos', data.total);
+      return loadEvalVideos(includeRemote);
+    }
     evalVideoDataById = new Map(videos.map(video => [video.id, video]));
     const visibleIds = new Set(videos.filter(video => video.deletable).map(video => video.id));
     for (const videoId of [...selectedEvalVideoIds]) {
@@ -1408,14 +1616,14 @@ async function loadEvalVideos(includeRemote = false) {
     }
     const navCount = document.getElementById('navEvalVideoCount');
     if (navCount) navCount.textContent = String(data.total ?? videos.length);
-    const pageVideos = paginateList('evalVideos', videos);
+    const pageVideos = videos;
     const success = (data.facets && data.facets.success) || {};
     const remoteErrors = Object.entries(data.remote_errors || {}).map(([k, v]) => `${k}: ${String(v).slice(0, 160)}`);
     summary.textContent = `${videos.length}/${data.total ?? videos.length} 个视频 · 成功 ${success.success || 0} · 失败 ${success.failed || 0} · 未知 ${success.unknown || 0}${remoteErrors.length ? ' · 远端提示: ' + remoteErrors.join(' ; ') : ''}`;
     detachedPlayers = detachEvalVideoPlayers();
-    list.innerHTML = pageVideos.map(video => renderEvalVideoRow(video)).join('') || '<div class="muted">没有找到符合筛选条件的 mp4/webm/mov/mkv/avi/gif 文件。</div>';
+    list.innerHTML = renderEvalVideoGroups(pageVideos) || '<div class="muted">没有找到符合筛选条件的 mp4/webm/mov/mkv/avi/gif 文件。</div>';
     const pagination = document.getElementById('evalVideosPagination');
-    if (pagination) pagination.innerHTML = renderListPagination('evalVideos', videos.length);
+    if (pagination) pagination.innerHTML = renderListPagination('evalVideos', data.total ?? videos.length);
     restoreEvalVideoPlayers(detachedPlayers);
     updateEvalVideoBulkControls();
   } catch (error) {
@@ -1621,10 +1829,67 @@ function restoreEvalVideoPlayers(players) {
   });
 }
 
+let artifactRunData = [];
+let artifactRunLastRefresh = 0;
+async function loadArtifactRuns() {
+  if (!tokenInput.value) return;
+  try {
+    const data = await api('/api/artifact-runs');
+    artifactRunData = data.runs || [];
+    artifactRunLastRefresh = Date.now();
+    const select = document.getElementById('artifactRunBackendFilter');
+    if (select) {
+      const selected = select.value;
+      select.innerHTML = '<option value="all">全部训练后端</option>' + [...new Set(artifactRunData.map(r => r.backend))].sort().map(value => `<option value="${esc(value)}">${esc(value)}</option>`).join('');
+      select.value = [...select.options].some(o => o.value === selected) ? selected : 'all';
+    }
+    renderArtifactRuns();
+  } catch (error) {
+    const summary = document.getElementById('artifactRunSummary');
+    if (summary) summary.textContent = error.message;
+  }
+}
+function renderArtifactRuns() {
+  const backend = document.getElementById('artifactRunBackendFilter')?.value || 'all';
+  const query = (document.getElementById('artifactRunQueryFilter')?.value || '').toLowerCase();
+  const rows = artifactRunData.filter(r => (backend === 'all' || r.backend === backend) && (!query || [r.source,r.task,r.experiment,r.run_id,r.state].join(' ').toLowerCase().includes(query)));
+  const holder = document.getElementById('artifactRunRows');
+  if (!holder) return;
+  holder.innerHTML = rows.map(r => `<tr><td>${esc(evalVideoSourceLabel(r.source || r.video_source || 'unknown'))}<br>${esc(r.task)}</td><td>${esc(r.experiment_label || r.experiment)}<br><code>${esc(r.run_id)}</code></td><td>${esc(r.backend)} / ${esc(r.kind)}</td><td>${esc(r.state)}<br>${r.origin?.scope === 'mirror_only' ? '仅指标镜像' : r.available === false ? '原输出缺失' : r.migration_action === 'deferred_active' ? '运行中，迁移待执行' : '已登记'}</td><td><code class="path">${esc(r.path || r.origin?.legacy_path || '-')}</code></td></tr>`).join('') || '<tr><td colspan="5" class="muted">暂无匹配的训练历史。</td></tr>';
+  const summary = document.getElementById('artifactRunSummary');
+  if (summary) summary.textContent = `${rows.length} / ${artifactRunData.length} 条运行记录`;
+}
+
+function evalVideoSourceLabel(value) {
+  return ({robotwin: 'RoboTwin', 'libero-safety': 'LIBERO-Safety', unknown: '来源未知'})[value] || value;
+}
+
+function renderEvalVideoGroups(videos) {
+  const groups = new Map();
+  videos.forEach(video => {
+    const key = JSON.stringify([video.video_source, video.task, video.experiment]);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(video);
+  });
+  return [...groups.values()].map(items => {
+    const video = items[0];
+    return `<div class="section-note">${esc(evalVideoSourceLabel(video.video_source || 'unknown'))} / ${esc(video.task || 'unknown')} / ${esc(video.experiment_label || video.experiment || 'unknown')}</div>` + items.map(renderEvalVideoRow).join('');
+  }).join('');
+}
+
+async function refreshEvalVideoCatalog() {
+  try {
+    await api('/api/eval-videos/catalog/refresh', {method: 'POST', body: JSON.stringify({})});
+    show('已提交视频发现与归类任务，完成后刷新列表即可查看。');
+  } catch (error) { show(error.message); }
+}
+
 function renderEvalVideoRow(video) {
   const statusClass = video.success === 'success' ? 'ok' : video.success === 'failed' ? 'bad' : 'warn';
   const statusLabel = video.success === 'success' ? '成功' : video.success === 'failed' ? '失败' : '未知';
-  const meta = `${esc(video.source || (video.remote ? 'remote' : '4×4090'))} · task=${esc(video.task || '-')} · exp=${esc(video.experiment || '-')} · ${esc(video.updated_at)} · ${esc(video.size_mib)} MiB`;
+  const phaseLabel = ({train: '训练 rollout', eval: '评测 rollout', unknown: '阶段未知'})[video.phase || 'unknown'];
+  const safeLabel = video.safe_success === 'success' ? '安全成功' : video.safe_success === 'failed' ? '未安全成功' : '';
+  const meta = `${esc(evalVideoSourceLabel(video.video_source || 'unknown'))} · ${esc(phaseLabel)} · run=${esc(video.run_id || '-')} · ${esc(video.source || '-')} · ${esc(video.updated_at)} · ${esc(video.size_mib)} MiB${safeLabel ? ' · ' + safeLabel : ''}${video.rollout_round == null ? '' : ' · rollout round=' + esc(video.rollout_round)}`;
   const modelInfo = video.model_name ? `model=${esc(video.model_name)}${video.checkpoint_id ? ` · ckpt=${esc(video.checkpoint_id)}` : ''}` : (video.checkpoint_id ? `ckpt=${esc(video.checkpoint_id)}` : '');
   const layoutInfo = video.video_layout ? `layout=${esc(video.video_layout)}${Array.isArray(video.video_views) && video.video_views.length ? ` · views=${esc(video.video_views.join(' + '))}` : ''}` : '';
   const instructionInfo = video.instruction ? `instruction=${esc(video.instruction)}` : '';
@@ -1639,7 +1904,7 @@ function renderEvalVideoRow(video) {
     : `<button class="inline" type="button" data-video-id="${esc(video.id)}" onclick="playEvalVideo(this.dataset.videoId)">${expandedEvalVideoIds.has(video.id) ? '收起播放器' : '加载 / 播放'}</button><button class="inline danger" type="button" data-video-id="${esc(video.id)}" data-video-label="${esc(label)}" onclick="deleteEvalVideo(this.dataset.videoId, this.dataset.videoLabel)">删除</button>`;
   const eventSummary = renderEvalEventSummary(video);
   return `<div class="eval-video-card${video.remote ? ' remote' : ''}" data-video-id="${esc(video.id)}">
-    <header><div class="eval-video-header"><div class="eval-video-select-cell">${checkbox}</div><div class="eval-video-title"><strong>${esc(video.display_name || video.name || video.relative_path)}</strong> <span class="${statusClass}">${statusLabel}</span><br><code class="path">${esc(video.relative_path)}</code><br><span class="muted">${meta}${video.score == null ? '' : ` · score=${esc(video.score)}`}</span>${diagnosticInfo}${eventSummary}</div></div><div class="eval-video-actions">${action}</div></header>
+    <header><div class="eval-video-header"><div class="eval-video-select-cell">${checkbox}</div><div class="eval-video-title"><strong>${esc(video.display_name || video.name || video.relative_path)}</strong> <span class="${statusClass}">${statusLabel}</span><br><code class="path">${esc(video.catalog_relative_path || video.relative_path)}</code><br><span class="muted">${meta}${video.score == null ? '' : ` · score=${esc(video.score)}`}</span>${diagnosticInfo}${eventSummary}</div></div><div class="eval-video-actions">${action}</div></header>
     <div id="${holderId}"></div>
   </div>`;
 }
@@ -1736,6 +2001,7 @@ function shortTaskId(id) {
 }
 
 function showModule(name, updateHash = true) {
+  if (name === 'training') loadArtifactRuns();
   const moduleName = MODULES.has(name) ? name : 'overview';
   document.querySelectorAll('.dashboard-module').forEach(section => {
     section.hidden = section.dataset.module !== moduleName;
@@ -1753,6 +2019,11 @@ function showModule(name, updateHash = true) {
     if (document.getElementById('trainMetricsTask').value && !trainingMetricsData) {
       loadTrainingMetrics({quiet: true});
     }
+  }
+  if (moduleName === 'rlinf') {
+    loadRlinfConfig();
+    loadRlinfRuns();
+    loadRlinfEvaluations();
   }
   if (moduleName === 'settings') {
     // Settings are loaded when the panel is opened, rather than relying on an
@@ -1791,8 +2062,8 @@ function dashboardDatasets(items) {
 
 function datasetLocationLabel(target) {
   if (target === 'local_4090') return '4×4090';
-  if (target === 'h100') return 'H100';
-  if (String(target || '').startsWith('h200')) return String(target).replace('h200-', 'H200 ');
+  const configured = latestStatus?.config?.cluster_targets?.[target];
+  if (configured) return configured.label || target;
   return target || '-';
 }
 
@@ -1803,27 +2074,36 @@ function datasetLocationOptions() {
 
 function mergeDatasetLocationInfo(items, locationData) {
   if (!locationData || !Array.isArray(locationData.datasets)) return items;
-  const byId = new Map(items.map(item => [item.id, item]));
+  // Rebuild inventory-derived rows on every snapshot so removed copies do not linger.
+  const byId = new Map(items.filter(item => !item.inventory_only).map(item => [item.id, {...item}]));
+  for (const local of locationData.local_datasets || []) {
+    const existing = byId.get(local.id);
+    if (!existing || existing.remote_only) byId.set(local.id, {...local, remote_only:false, inventory_only:true});
+  }
   for (const remote of locationData.datasets) {
     const existing = byId.get(remote.id);
     const locations = (remote.locations || []).map(loc => ({...loc, label: loc.label || datasetLocationLabel(loc.target)}));
+    const local = locations.find(loc => ['local','local_archive'].includes(loc.kind) && !loc.host);
     if (existing) {
       existing.locations = locations;
       existing.targets = remote.targets || locations.map(loc => loc.target);
       existing.duplicate_count = remote.duplicate_count || locations.length;
+      if (local) existing.remote_only = false;
       continue;
     }
-    const first = locations[0] || {};
+    const first = local || locations[0] || {};
     const origin = (remote.origins && remote.origins[0]) || first.origin || 'unknown';
     if (!VISIBLE_DATASET_ORIGINS.has(origin)) continue;
     byId.set(remote.id, {
       id: remote.id,
       dataset_origin: origin,
-      dataset_origin_source: 'remote_inventory',
-      remote_only: true,
+      dataset_origin_source: local ? 'local_inventory' : 'remote_inventory',
+      remote_only: !local,
+      inventory_only: true,
+      read_only: Boolean(local),
       training_supported: false,
-      training_error: '仅在远端发现；同步到 4×4090 后可本地编辑/校验，或用于对应集群训练。',
-      schema_label: 'remote only', schema: 'remote', arm_mode: '-', dataset_layout: '-', contract_version: '-',
+      training_error: local ? '本机数据集信息正在加载，请刷新主列表。' : '仅在远端发现；同步到 4×4090 后可本地编辑/校验，或用于对应集群训练。',
+      schema_label: local ? '本机数据集（待加载）' : 'remote only', schema: 'remote', arm_mode: '-', dataset_layout: '-', contract_version: '-',
       state_key: 'state?', state_shape: null, action_key: 'action?', action_shape: null,
       state_dim: null, raw_action_dim: null, model_action_dim: null, arm_side: '-', media: [],
       raw_action_semantics: '-', raw_action_convention: '-', model_action_semantics: '-', model_action_convention: '-',
@@ -1841,7 +2121,34 @@ function renderDatasetLocations(d) {
   const selectId = `syncTarget_${d.id.replace(/[^A-Za-z0-9_-]/g, '_')}`;
   const source = (locations.some(loc => loc.target === 'local_4090') ? 'local_4090' : (locations[0] && locations[0].target) || 'local_4090');
   const options = datasetLocationOptions().filter(loc => loc.id !== source).map(loc => `<option value="${esc(loc.id)}">${esc(loc.label)}${loc.kind === 'slurm_only' ? ' · Slurm' : ''}</option>`).join('');
-  return `<div class="location-list">${pills}</div><div style="margin-top:7px"><select id="${esc(selectId)}" class="dataset-sync-select">${options}</select><button class="inline secondary" type="button" onclick="syncDatasetTo('${esc(d.id)}','${esc(selectId)}','${esc(source)}')">同步</button></div>`;
+  const deleteId = `deleteLocation_${d.id.replace(/[^A-Za-z0-9_-]/g, '_')}`;
+  const deleteOptions = locations.filter(loc => ['local','local_archive','ssh','slurm_only'].includes(loc.kind)).map(loc => `<option value="${esc(loc.target)}">${esc(loc.label || datasetLocationLabel(loc.target))}</option>`).join('');
+  return `<div class="location-list">${pills}</div><div style="margin-top:7px"><select id="${esc(selectId)}" class="dataset-sync-select">${options}</select><button class="inline secondary" type="button" onclick="syncDatasetTo('${esc(d.id)}','${esc(selectId)}','${esc(source)}')">同步</button></div>${deleteOptions ? `<div style="margin-top:7px"><select id="${esc(deleteId)}" class="dataset-sync-select" aria-label="选择删除的数据集位置">${deleteOptions}</select><button class="inline danger" type="button" onclick="deleteDatasetCopy('${esc(d.id)}','${esc(deleteId)}')">删除此位置副本</button></div>` : ''}`;
+}
+
+async function deleteDatasetCopy(datasetId, selectId) {
+  const select = document.getElementById(selectId);
+  const target = select?.value;
+  if (!target) { show('请选择要删除的数据集位置。'); return; }
+  const label = select.selectedOptions[0].textContent;
+  const confirmation = prompt(`永久删除 ${label} 上的数据集 ${datasetId}。\n只删除选中位置的副本，其他服务器副本、checkpoint 和模型保留。\n请输入完整数据集 ID 确认：`, '');
+  if (confirmation == null) return;
+  if (confirmation !== datasetId) { show('数据集 ID 不匹配，已取消删除。'); return; }
+  try {
+    const result = await api(`/api/datasets/${encodeURIComponent(datasetId)}/delete-copy`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({target,confirm_dataset_id:confirmation}),
+    });
+    if (result.task) {
+      pendingDatasetDeleteTasks.add(result.task.id);
+      show(`已提交 ${label} 数据集删除任务：${result.task.id}。可在传输任务中查看状态。`, false);
+      await refreshAll();
+    } else {
+      latestDatasetLocations = null; datasetLocationsFetchedAt = 0;
+      episodeDatasetData = null; clearEpisodeMedia();
+      await refreshAll(); await loadDatasetLocations(true);
+      show(`已删除 ${label} 上的数据集 ${datasetId}。`, false);
+    }
+  } catch (error) { show(error.message); }
 }
 
 async function loadDatasetLocations(forceRender = false) {
@@ -2497,7 +2804,11 @@ function renderEpisodeAnalysisSummary(data) {
     `<span class="pill">${esc(data.frame_count)} frames</span>`,
     `<span class="pill">fps=${esc(analysisNumber(data.fps, 2))}</span>`,
     `<span class="pill ${Number(data.idle_frames) ? 'idle-frame' : ''}">空闲 ${esc(data.idle_frames)} (${esc(analysisNumber(Number(data.idle_fraction || 0) * 100, 1))}%)</span>`,
-    `<span class="pill ${Number(data.anomaly_frames) ? 'anomaly-frame' : ''}">异常 ${esc(data.anomaly_frames || 0)} · jitter ${esc(data.jitter_frames || 0)} · reversal ${esc(data.velocity_reversal_frames || 0)} · abrupt ${esc(data.abrupt_change_frames || 0)}</span>`,
+    `<span class="pill ${Number(data.anomaly_frames) ? 'anomaly-frame' : ''}">运动提示 ${esc(data.motion_warning_frames || 0)} · jitter ${esc(data.jitter_frames || 0)} · reversal ${esc(data.velocity_reversal_frames || 0)} · abrupt ${esc(data.abrupt_change_frames || 0)}</span>`,
+    data.joint_limits_checked ? `<span class="pill ${data.joint_limit_frames ? 'anomaly-limit' : ''}">关节越限 ${esc(data.joint_limit_frames)} 帧 / ${esc((data.joint_limit_runs || []).length)} 段 · 实测 ${esc(data.joint_state_limit_frames)} · 目标 ${data.joint_targets_checked ? esc(data.joint_target_limit_frames) : '未检查'}</span>` : `<span class="pill warn">关节限位未检查：需要 Piper 关节角数据</span>`,
+    data.joint_limits_checked ? `<details><summary>驱动限位（°）及越限区间</summary><div>${esc((data.joint_limit_profile?.joint_limits || []).map((v,i) => `J${i+1} [${v.join(', ')}]`).join(' · '))}</div><div class="muted">${esc(data.joint_limit_profile?.source || '')} · ${esc(data.joint_limit_profile?.observed_at || '')}</div>${(data.joint_limit_runs || []).map(r => `<button type="button" onclick="seekEpisodeMediaToFrame(${Number(r.start_frame)})">${Number(r.start_frame)}–${Number(r.end_frame)} (${Number(r.frame_count)}帧)</button>`).join(' ')}</details>` : '',
+    `<div class="muted">运动提示是统计筛查，不等于数据不可用或驱动限位违规；夹爪不参与运动抖动检测。${data.motion_diagnostics?.checked ? '' : '部分运动类型未检查，请核对状态字段。'}</div>`,
+    `<details><summary>各臂运动检测及阈值（median + 6 MAD，含最低阈值）</summary>${(data.motion_diagnostics?.groups || []).map(g => g.checked ? `<div>${esc(g.side)} · ${esc(g.kind)}：突变 ${esc(g.abrupt_frames)} / 抖动 ${esc(g.jitter_frames)} / 反向 ${esc(g.reversal_frames)}；加速度阈值 ${esc(analysisNumber(g.acceleration_limit, 3))} ${esc(g.acceleration_unit)}，jerk 阈值 ${esc(analysisNumber(g.jerk_limit, 3))} ${esc(g.jerk_unit)}</div>` : `<div>${esc(g.side)} · ${esc(g.kind)}：未检查 ${esc(g.reason)}</div>`).join('')}</details>`,
     `<span class="pill">建议保留 ${esc(crop.start_frame ?? 0)}-${esc(crop.end_frame ?? data.frame_count - 1)}</span>`,
     data.robot_type ? `<span class="pill">robot=${esc(data.robot_type)}</span>` : '',
     `<span class="pill">EEF=${esc(data.eef_method || 'unavailable')}</span>`,
@@ -2530,6 +2841,11 @@ function drawEpisodeIdleTimeline(data, frame = 0) {
     const left = x(run.start_frame), right = Math.max(left + 1, x(run.end_frame));
     ctx.fillRect(left, 25, right - left, 22);
   }
+  ctx.fillStyle = '#ff4fd8';
+  for (const run of (data?.joint_limit_runs || [])) {
+    const left = x(run.start_frame), right = Math.max(left + 2, x(run.end_frame));
+    ctx.fillRect(left, 19, right - left, 5);
+  }
   const timeline = data?.timeline || {};
   const sampled = data?.sampled_frames || [];
   const markerWidth = Math.max(2, (width - 16) / Math.max(1, count - 1));
@@ -2544,7 +2860,7 @@ function drawEpisodeIdleTimeline(data, frame = 0) {
   ctx.fillStyle = '#cfe2f7'; ctx.font = '12px ui-monospace, monospace';
   ctx.fillText(`frame ${Math.max(0, Math.min(count - 1, Number(frame) || 0))}`, 8, 16);
   ctx.fillStyle = '#8fa9c3'; ctx.font = '11px ui-sans-serif, sans-serif';
-  ctx.fillText('idle / jitter / reversal / abrupt', 8, 73);
+  ctx.fillText('limit / idle / jitter / reversal / abrupt', 8, 73);
   canvas.onclick = event => {
     const rect = canvas.getBoundingClientRect();
     const position = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
@@ -3166,10 +3482,15 @@ function renderEpisodeFrame(frame) {
   const data = episodeFrameCache.current;
   if (summary) {
     const anomalyTypes = (data.anomaly_types || []).join(' / ');
-    summary.innerHTML = `<span class="pill">frame ${esc(data.frame_index)}</span><span class="pill">t=${esc(analysisNumber(data.relative_time_s, 3))}s</span><span class="pill ${data.idle ? 'idle-frame' : ''}">${data.idle ? '空闲帧' : '运动帧'}</span><span class="pill">速度范数 ${esc(analysisNumber(data.speed_norm, 4))}</span><span class="pill">加速度范数 ${esc(analysisNumber(data.acceleration_norm, 3))}</span><span class="pill ${data.anomaly ? 'anomaly-frame' : ''}">${data.anomaly ? `异常: ${esc(anomalyTypes || 'detected')}` : '无异常'}</span>`;
+    summary.innerHTML = `<span class="pill">frame ${esc(data.frame_index)}</span><span class="pill">t=${esc(analysisNumber(data.relative_time_s, 3))}s</span><span class="pill ${data.idle ? 'idle-frame' : ''}">${data.idle ? '空闲帧' : '运动帧'}</span><span class="pill">速度范数 ${esc(analysisNumber(data.speed_norm, 4))}</span><span class="pill">加速度范数 ${esc(analysisNumber(data.acceleration_norm, 3))}</span><span class="pill ${data.anomaly ? 'anomaly-frame' : ''}">${data.anomaly ? `待复核: ${esc(anomalyTypes || 'detected')}` : '无标记'}</span>`;
+    summary.innerHTML += (data.motion_diagnostics?.groups || []).filter(g => g.checked).map(g => `<span class="pill">${esc(g.side)} ${esc(g.kind)} · a=${esc(analysisNumber(g.acceleration_norm, 3))} ${esc(g.acceleration_unit)} · jerk=${esc(analysisNumber(g.jerk_norm, 3))} ${esc(g.jerk_unit)}</span>`).join('');
+
   }
   if (rows) rows.innerHTML = (data.joints || []).map(item => {
     const flags = [];
+    if (item.state_limit_violation) flags.push(`<span class="anomaly-limit">实测越限 ${esc(analysisNumber(item.state_limit_excess_deg, 3))}°</span>`);
+    if (item.target_limit_violation) flags.push(`<span class="anomaly-limit">目标越限 ${esc(analysisNumber(item.target_limit_excess_deg, 3))}°</span>`);
+    if (item.joint_limits_deg) flags.push(`<span class="muted">[${item.joint_limits_deg.map(v => esc(analysisNumber(v, 1))).join(', ')}]°</span>`);
     if (item.jitter) flags.push('<span class="anomaly-jitter">jitter</span>');
     if (item.velocity_reversal) flags.push('<span class="anomaly-reversal">reverse</span>');
     return `<tr><td><code>${esc(item.name)}</code></td><td>${esc(analysisNumber(item.angle, 5))}</td><td>${esc(analysisNumber(item.velocity, 5))}</td><td>${esc(analysisNumber(item.acceleration, 4))}</td><td>${esc(analysisNumber(item.target, 5))}</td><td>${flags.join(' ') || '<span class="muted">-</span>'}</td></tr>`;
@@ -3860,6 +4181,21 @@ async function batchDeleteSelectedCheckpoints() {
   }
 }
 
+function syncTrainingFinetuning() {
+  const form = document.getElementById('trainForm');
+  const source = form.querySelector('[name="base_checkpoint"]').value;
+  if (form.dataset.finetuningSource === source) return;
+  form.dataset.finetuningSource = source;
+  const checkpoint = ((latestStatus && latestStatus.checkpoints) || []).find(item => item.path === source);
+  const config = checkpoint ? (checkpoint.finetuning || {
+    action_expert_tuning: 'lora', llm_lora: true, rtc_training: false, rtc_training_max_delay: 8, rtc_training_delay_weights: null, image_resize_mode: 'pad',
+  }) : {action_expert_tuning: 'full', llm_lora: false, rtc_training: false, rtc_training_max_delay: 8, rtc_training_delay_weights: null, image_resize_mode: 'stretch'};
+  for (const [key, value] of Object.entries(config)) {
+    const input = form.querySelector(`[name="${key}"]`);
+    if (input) input.value = key === "rtc_training_delay_weights" ? (value == null ? "" : JSON.stringify(value)) : String(value);
+  }
+}
+
 function fillBaseModels(items) {
   fillBaseModelCatalog(items);
   document.querySelectorAll('.base-model-select').forEach(select => {
@@ -3908,12 +4244,64 @@ function fillBaseModels(items) {
     const submit = form && form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = !selected;
   });
+  syncTrainingFinetuning();
 }
 
 function checkpointLabel(c) {
   const size = c.size_gib == null ? '' : ` · ${Number(c.size_gib).toFixed(1)} GiB`;
   const contract = c.model_action_dim == null ? 'unmarked contract' : `raw/model ${c.raw_action_dim}D/${c.model_action_dim}D · ${c.model_action_convention || '-'} · ${c.gripper_semantics || '-'}`;
   return `${c.experiment} / step ${c.step} · ${modelVariantLabel(c.model_variant)} · ${c.arm_mode || '-'} · ${contract} · ${c.updated_at}${size}`;
+}
+
+let remoteCheckpointRequest = null;
+let remoteCheckpointFetchedAt = 0;
+let remoteCheckpointRows = [];
+const checkpointSyncPending = new Map();
+async function loadRemoteCheckpoints(force = false) {
+  if (remoteCheckpointRequest || (!force && Date.now() - remoteCheckpointFetchedAt < 5000)) return;
+  remoteCheckpointRequest = (async () => {
+    try {
+      const data = await api('/api/checkpoints/remote' + (force ? '?refresh=1' : ''));
+      await Promise.all(Array.from(checkpointSyncPending, async ([key, id]) => {
+        try {
+          const status = await api(`/api/tasks/${encodeURIComponent(id)}/status`);
+          if (status.task?.terminal) checkpointSyncPending.delete(key);
+        } catch (_) { checkpointSyncPending.delete(key); }
+      }));
+      remoteCheckpointFetchedAt = Date.now();
+      remoteCheckpointRows = [];
+      const rows = [];
+      const states = [];
+      for (const location of data.locations || []) {
+        states.push(`${location.label}: ${location.state === 'loading' ? '查询中' : location.state === 'error' ? '查询失败' : `${location.checkpoints.length} 个`}`);
+        if (location.error) rows.push(`<tr><td>${esc(location.label)}</td><td colspan="3" class="warn">${esc(location.error)}${location.checkpoints.length ? '（下方保留上次结果）' : ''}</td></tr>`);
+        for (const c of location.checkpoints || []) {
+          const index = remoteCheckpointRows.push({...c, source:location.source}) - 1;
+          const f = c.finetuning;
+          const key = `${location.source}/${c.config_name}/${c.experiment}/${c.step}`;
+          const local = (latestStatus?.checkpoints || []).some(x => x.config_name === c.config_name && x.experiment === c.experiment && x.step === c.step);
+          rows.push(`<tr><td>${esc(location.label)}</td><td><strong>${esc(c.experiment)}</strong><br>step ${esc(c.step)} · ${esc(modelVariantLabel(c.model_variant))}</td><td>${esc((c.dataset_ids || []).join(', ') || '-')}<br>${f ? `Expert ${esc(f.action_expert_tuning)} · LLM ${f.llm_lora ? 'LoRA' : '冻结'} · RTC ${f.rtc_training ? '开启' : '关闭'}` : '微调配置未记录'}</td><td>${local ? '<span class="ok">4090 已有</span>' : `<button type="button" class="inline secondary" onclick="syncRemoteCheckpoint(${index},this)" ${checkpointSyncPending.has(key) || location.state !== 'ready' ? 'disabled' : ''}>${checkpointSyncPending.has(key) ? '同步任务已提交' : '同步此 step 到 4090'}</button>`}</td></tr>`);
+        }
+      }
+      document.getElementById('remoteCheckpointStatus').textContent = states.join(' · ');
+      document.getElementById('remoteCheckpoints').innerHTML = rows.join('') || '<tr><td colspan="4" class="muted">正在查询，或暂无完整 checkpoint</td></tr>';
+    } catch (error) {
+      document.getElementById('remoteCheckpointStatus').textContent = error.message;
+    } finally { remoteCheckpointRequest = null; }
+  })();
+  return remoteCheckpointRequest;
+}
+async function syncRemoteCheckpoint(index, button) {
+  const c = remoteCheckpointRows[index];
+  if (!c) return;
+  const key = `${c.source}/${c.config_name}/${c.experiment}/${c.step}`;
+  button.disabled = true;
+  try {
+    const task = await api('/api/checkpoints/sync', {method:'POST',body:JSON.stringify({source:c.source,target:'local_4090',config_name:c.config_name,exp_name:c.experiment,step:c.step,skip_existing:true})});
+    checkpointSyncPending.set(key, task.id);
+    button.textContent = '同步任务已提交';
+    show(`已提交 ${c.experiment} / ${c.step} → 4090：${task.id}。进度见数据传输任务；完成后可在 Policy 中选择。`);
+  } catch (error) { button.disabled = false; show(error.message); }
 }
 
 function fillCheckpoints(items) {
@@ -4926,7 +5314,15 @@ function trainingMetricInline(task) {
 function filteredTrainingJobs(items) {
   const typeFilter = document.getElementById('trainingTaskTypeFilter')?.value || 'all';
   const metricFilter = document.getElementById('trainingMetricFilter')?.value || 'all';
+  const query = document.getElementById('trainingTaskSearch')?.value.trim().toLowerCase() || '';
   let jobs = items.filter(t => TRAINING_TASK_TYPES.has(t.type));
+  if (query) jobs = jobs.filter(task => {
+    const metadata = task.metadata || {};
+    const searchable = [task.id, task.type, task.state, metadata.exp_name, metadata.run_name,
+      metadata.experiment, metadata.task_name, metadata.algorithm, metadata.launch_profile]
+      .filter(Boolean).join(' ').toLowerCase();
+    return searchable.includes(query);
+  });
   if (typeFilter !== 'all') jobs = jobs.filter(t => t.type === typeFilter);
   if (metricFilter !== 'all') {
     jobs = jobs.filter(t => {
@@ -4991,6 +5387,7 @@ function formatDuration(seconds) {
 
 function transferProgressValue(task) {
   const p = task.progress || {};
+  if (task.state === 'completed') return 1;
   const direct = Number(p.progress);
   if (Number.isFinite(direct)) return Math.max(0, Math.min(1, direct));
   const done = Number(p.completed_bytes);
@@ -4999,6 +5396,7 @@ function transferProgressValue(task) {
 }
 
 function fillTransferTasks(items) {
+  if (latestTransferTasks !== null) items = latestTransferTasks;
   const target = document.getElementById('transferJobs');
   if (!target) return;
   const transfers = items.filter(task => task.type === 'transfer');
@@ -5016,6 +5414,7 @@ function fillTransferTasks(items) {
     const terminal = TERMINAL_STATES.has(task.state);
     const checkbox = `<input type="checkbox" class="task-select" data-task-scope="transfer" data-task-id="${esc(task.id)}" onchange="onTaskSelectionChange(this)" ${terminal ? '' : 'disabled title="运行中的传输任务不能批量删除"'} ${selectedTaskIds.has(task.id) ? 'checked' : ''} aria-label="选择数据传输任务 ${esc(task.id)}">`;
     const kind = metadata.transfer_kind || 'dataset';
+    const deleting = kind === 'dataset_delete';
     const source = metadata.source || progress.source || '-';
     const targetName = metadata.target || progress.target || '-';
     const path = metadata.dataset_id || metadata.exp_name || progress.dataset_id || '-';
@@ -5023,15 +5422,32 @@ function fillTransferTasks(items) {
     const files = progress.total_files ? `${progress.completed_files || 0}/${progress.total_files} files` : 'files -';
     const shards = progress.total_shards ? `${progress.completed_shards || 0}/${progress.total_shards} lanes` : 'lanes -';
     const error = progress.error || progress.scan_error || task.start_error || '';
+    const progressCell = deleting ? `<span class="${stateClass(task.state)}">${task.state === 'completed' ? '删除已完成' : terminal ? '删除未完成，请查看日志' : '删除任务执行中'}</span>` : `<div class="transfer-progress-meta"><span>${esc(percent)}</span><span>${esc(done)} / ${esc(total)}</span></div><div class="progress-track"><div class="progress-bar" style="width:${width.toFixed(3)}%"></div></div><div class="transfer-detail">${esc(files)} · ${esc(shards)} · ${esc(speed)} · ETA ${esc(eta)}</div>`;
     return `<tr><td class="task-selection-cell">${checkbox}</td><td><code class="task-ref" title="${esc(task.id)}">${esc(shortTaskId(task.id))}</code><br><span class="pill">${esc(kind)}</span><br><span class="muted">${esc(path)}</span></td>`
       + `<td><strong>${esc(source)} → ${esc(targetName)}</strong><br><code class="path" title="${esc(metadata.target_path || progress.target_path || '')}">${esc(shortPath(metadata.target_path || progress.target_path || '-'))}</code></td>`
-      + `<td class="transfer-progress-cell"><div class="transfer-progress-meta"><span>${esc(percent)}</span><span>${esc(done)} / ${esc(total)}</span></div><div class="progress-track"><div class="progress-bar" style="width:${width.toFixed(3)}%"></div></div><div class="transfer-detail">${esc(files)} · ${esc(shards)} · ${esc(speed)} · ETA ${esc(eta)}</div></td>`
+      + `<td class="transfer-progress-cell">${progressCell}</td>`
       + `<td class="${stateClass(task.state)}">${esc(task.state)}${progress.updated_at ? `<br><span class="muted">${esc(progress.updated_at)}</span>` : ''}${error ? `<br><span class="bad">${esc(error)}</span>` : ''}</td>`
       + `<td><button class="inline secondary" onclick="loadLog('${esc(task.id)}','training')">日志</button>${active ? `<button class="inline danger" onclick="stopTask('${esc(task.id)}',false)">停止</button>` : ''}${terminal ? `<button class="inline danger" onclick="deleteTask('${esc(task.id)}','training')">删除记录</button>` : ''}</td></tr>`;
-  }).join('') || '<tr><td colspan="6" class="muted">暂无 transfer 任务</td></tr>';
+  }).join('') || '<tr><td colspan="6" class="muted">暂无传输或删除任务</td></tr>';
+  document.getElementById('transferTasksSummary').textContent = `${transfers.length} 条 · ${transfers.filter(task => ACTIVE_STATES.has(task.state)).length} 执行中`;
   const pagination = document.getElementById('transferTasksPagination');
   if (pagination) pagination.innerHTML = renderListPagination('transferTasks', transfers.length);
   updateTaskBulkControls();
+}
+
+async function loadTransferTasks(quiet = false) {
+  if (!tokenInput.value || transferTasksRequest) return transferTasksRequest;
+  transferTasksRequest = (async () => {
+    try {
+      const data = await api('/api/transfers');
+      latestTransferTasks = data.tasks || [];
+      fillTransferTasks(latestTransferTasks);
+    } catch (error) {
+      if (latestTransferTasks === null) document.getElementById('transferJobs').innerHTML = `<tr><td colspan="6" class="bad">任务加载失败：${esc(error.message)}；点击刷新重试。</td></tr>`;
+      if (!quiet) show(`传输任务刷新失败：${error.message}`);
+    } finally { transferTasksRequest = null; }
+  })();
+  return transferTasksRequest;
 }
 
 function filteredEvaluationTasks(items) {
@@ -5082,6 +5498,40 @@ function fillEvaluationTasks(items) {
   updateTaskBulkControls();
 }
 
+function trainingJobParameters(task) {
+  const m = task.metadata || {};
+  const f = m.finetuning;
+  const cluster = m.runtime === 'slurm';
+  const device = cluster
+    ? `${esc(m.execution_target || m.cluster_target || m.slurm_target || '集群')} · ${esc(m.cluster_gpus || (m.gpu_ids || []).length || '?')} 卡`
+    : `GPU ${esc((m.gpu_ids || []).join(',') || '-')}`;
+  const tuning = f
+    ? `Expert ${f.action_expert_tuning === 'full' ? '全量' : f.action_expert_tuning === 'lora' ? 'LoRA' : '未知'} · LLM ${f.llm_lora === true ? 'LoRA' : f.llm_lora === false ? '冻结' : '未知'}`
+    : '微调配置：未记录';
+  const rtc = f ? (f.rtc_training
+    ? `RTC ≤${esc(f.rtc_training_max_delay)} 步 · ${f.rtc_training_delay_weights ? '加权采样' : '均匀采样'}`
+    : 'RTC 关闭') : 'RTC：未记录';
+  const images = f?.image_resize_mode === 'stretch' ? '图像 224×224 · 无补边'
+    : f?.image_resize_mode === 'pad' ? '图像 等比例补边' : '图像设置未记录';
+  const details = [
+    `实验：<code>${esc(m.exp_name || '-')}</code>`,
+    `基础模型：<code class="path">${esc(m.base_checkpoint || '-')}</code>`,
+    `保存：每 ${esc(m.save_interval || '-')} 步 · FSDP ${esc(m.fsdp_devices || '-')} · XLA ${esc(m.xla_memory_fraction ?? '-')} · workers ${esc(m.num_workers ?? '-')}`,
+    `数据：${esc(m.train_episodes ?? '-')} 训练 / ${esc(m.test_episodes ?? '-')} 测试 · seed ${esc(m.split_seed ?? '-')}`,
+    `动作：${esc(m.arm_mode || '-')} / ${esc(m.schema || '-')} · contract v${esc(m.contract_version || '?')} · raw/model ${esc(m.raw_action_dim || '?')}/${esc(m.model_action_dim || '?')}D · offset ${esc(m.action_offset ?? '-')}/+${esc(m.model_action_start_offset ?? '-')} · ${esc(m.model_action_convention || '-')}`,
+    `夹爪：${esc(m.raw_gripper_semantics || '-')} → ${esc(m.gripper_semantics || m.wire_gripper_semantics || '-')}`,
+  ];
+  if (m.norm_batch_size != null) details.push(`Norm batch：${esc(m.norm_batch_size)}`);
+  if (f?.rtc_training_delay_weights) details.push(`RTC 权重（0–${esc(f.rtc_training_max_delay)} 步）：${esc(JSON.stringify(f.rtc_training_delay_weights))}`);
+  if (m.auto_eval) details.push(m.auto_eval.enabled
+    ? `评估请求：每 ${esc(m.auto_eval.every_steps)} 步 · batch ${esc(m.auto_eval.batch_size)} × ${esc(m.auto_eval.max_batches)}`
+    : '评估：关闭');
+  return `<strong>${esc(m.dataset_id || '-')}</strong> · ${esc(modelVariantLabel(m.model_variant))} · ${device}<br>`
+    + `${tuning} · ${rtc}<br>${images} · batch ${esc(m.batch_size || '-')} · ${esc(m.steps || '-')} 步`
+    + trainingMetricInline(task)
+    + `<details class="training-parameter-details" data-task-params="${esc(task.id)}"><summary>更多参数</summary>${details.join('<br>')}</details>`;
+}
+
 function fillTasks(items) {
   const terminalIds = new Set(items.filter(t => TERMINAL_STATES.has(t.state)).map(t => t.id));
   for (const taskId of selectedTaskIds) {
@@ -5106,6 +5556,7 @@ function fillTasks(items) {
   const jobs = filteredTrainingJobs(items);
   const pageJobs = paginateList('trainingTasks', jobs);
   updateTrainingTaskFilterSummary(allJobs, jobs);
+  const expandedParams = new Set(Array.from(document.querySelectorAll('#jobs details[data-task-params][open]'), el => el.dataset.taskParams));
   document.getElementById('jobs').innerHTML = pageJobs.map(t => {
     const m = t.metadata || {};
     const active = ACTIVE_STATES.has(t.state);
@@ -5116,17 +5567,14 @@ function fillTasks(items) {
       const result = t.result || {};
       const loss = result.eval_loss_model;
       const external = m.external ? `<br><span class="pill">外部评测进程</span> task=${esc(m.task_name || '-')} · config=${esc(m.task_config || '-')}<br>ckpt_setting=<code class="path" title="${esc(m.ckpt_setting || '')}">${esc(shortPath(m.ckpt_setting || '-'))}</code>${m.external_log_path ? `<br>log=<code class="path" title="${esc(m.external_log_path)}">${esc(shortPath(m.external_log_path))}</code>` : ''}` : '';
-      params = `dataset=${esc(m.dataset_id || '-')} · checkpoint step <strong>${esc(m.checkpoint_step || m.checkpoint_id || '-')}</strong> · GPU ${esc((m.gpu_ids || []).join(',') || '-')}<br>` +
+      params = `${m.finetuning ? `expert=${esc(m.finetuning.action_expert_tuning)} · LLM LoRA=${m.finetuning.llm_lora ? 'on' : 'off'} · training RTC=${m.finetuning.rtc_training ? 'on' : 'off'}<br>` : ''}dataset=${esc(m.dataset_id || '-')} · checkpoint step <strong>${esc(m.checkpoint_step || m.checkpoint_id || '-')}</strong> · GPU ${esc((m.gpu_ids || []).join(',') || '-')}<br>` +
         `<code class="path" title="${esc(m.checkpoint || m.model_name || '')}">${esc(shortPath(m.checkpoint || m.model_name || '-'))}</code>${external}<br>` +
         `test=${esc(m.test_episodes || (m.test_episode_indexes || []).length || '-')} episodes · batch=${esc(m.batch_size || '-')} × ${esc(m.max_batches || '-')} max` +
         (loss == null ? '' : `<br><span class="ok">eval loss=${esc(compactNumber(loss))}</span> · objective=${esc(compactNumber(result.eval_loss_objective))} · ${esc(result.evaluated_batches || '-')} batches`) +
         (t.skip_reason ? `<br><span class="warn">${esc(t.skip_reason)}</span>` : '');
     } else {
-      const split = m.train_episodes !== undefined ? `<br>split=${esc(m.train_episodes)} train / ${esc(m.test_episodes)} test · ratio ${esc(m.test_ratio)} · seed ${esc(m.split_seed)}${m.split_source ? ` · ${esc(m.split_source)}` : ''}` : '';
-      const model = `<br>model=${esc(modelVariantLabel(m.model_variant))}${m.base_checkpoint ? ` · base=<code class="path" title="${esc(m.base_checkpoint)}">${esc(shortPath(m.base_checkpoint))}</code>` : ''}`;
-      const contract = `<br>contract=v${esc(m.contract_version || '?')} · raw/model=${esc(m.raw_action_dim || '?')}D/${esc(m.model_action_dim || '?')}D · offset=${esc(m.action_offset ?? '-')}/+${esc(m.model_action_start_offset ?? 1)} · ${esc(m.model_action_convention || '-')}<br>gripper=${esc(m.raw_gripper_semantics || '-')} → ${esc(m.gripper_semantics || m.wire_gripper_semantics || '-')}`;
-      const evalConfig = m.auto_eval ? `<br>eval=${m.auto_eval.enabled ? `每 ${esc(m.auto_eval.every_steps)} steps · batch ${esc(m.auto_eval.batch_size)} × ${esc(m.auto_eval.max_batches)}` : `禁用${m.auto_eval.disabled_reason ? ` (${esc(m.auto_eval.disabled_reason)})` : ''}`}` : '';
-      params = `dataset=${esc(m.dataset_id || '-')} · arm=${esc(m.arm_mode || '-')} · schema=${esc(m.schema || '-')}${contract}${model}${m.exp_name ? `<br>exp=${esc(m.exp_name)} · GPU ${esc((m.gpu_ids || []).join(','))}<br>train batch=${esc(m.batch_size || '-')} · FSDP ${esc(m.fsdp_devices || '-')} · XLA ${esc(m.xla_memory_fraction || '-')}<br>norm batch=${esc(m.norm_batch_size || '等待/未知')}${evalConfig}` : `<br>norm batch=${esc(m.batch_size || '-')} · workers=${esc(m.num_workers || '-')}${m.automatic ? ' · 自动创建' : ''}`}${trainingMetricInline(t)}${split}`;
+      params = t.type === 'train' ? trainingJobParameters(t)
+        : `<strong>${esc(m.dataset_id || '-')}</strong> · ${esc(modelVariantLabel(m.model_variant))}<br>归一化 · batch ${esc(m.batch_size || '-')} · workers ${esc(m.num_workers ?? '-')}`;
     }
     const stateDetails = `${jobDependencySummary(t)}${t.skip_reason ? `<br><span class="warn">${esc(t.skip_reason)}</span>` : ''}${t.start_error ? `<br><span class="bad">${esc(t.start_error)}</span>` : ''}`;
     const logModule = t.type === 'eval' ? 'eval' : 'training';
@@ -5134,6 +5582,7 @@ function fillTasks(items) {
     const metricButton = t.type === 'train' ? `<button class="inline secondary" onclick="openTrainingView('metrics','${esc(t.id)}')">曲线</button>` : '';
     return `<tr><td class="task-selection-cell">${checkbox}</td><td><code class="task-ref" title="${esc(t.id)}">${esc(shortTaskId(t.id))}</code><br>${esc(t.type)} · PID ${esc(t.pid || '-')}</td><td class="${stateClass(t.state)}">${esc(t.state)}${stateDetails}</td><td>${params}</td><td><button class="inline secondary" onclick="loadLog('${esc(t.id)}','${logModule}')">${logLabel}</button>${metricButton}${active ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',false)">${t.state.startsWith('waiting_') ? '取消' : '停止'}</button>` : ''}${t.state === 'stopping' ? `<button class="inline danger" onclick="stopTask('${esc(t.id)}',true)">强制结束</button>` : ''}${deletable ? `<button class="inline danger" onclick="deleteTask('${esc(t.id)}','${logModule}')">删除记录</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="5" class="muted">暂无 Norm / Train 任务</td></tr>';
+  document.querySelectorAll('#jobs details[data-task-params]').forEach(el => { el.open = expandedParams.has(el.dataset.taskParams); });
   const trainingPagination = document.getElementById('trainingTasksPagination');
   if (trainingPagination) trainingPagination.innerHTML = renderListPagination('trainingTasks', jobs.length);
   updateTaskBulkControls();
@@ -5553,6 +6002,7 @@ async function refreshAll() {
     return;
   }
   loadGpuResources();
+  loadTransferTasks(true);
   try {
     const data = await api('/api/status');
     const serverBuild = String(((data || {}).config || {}).dashboard_build || '');
@@ -5563,6 +6013,13 @@ async function refreshAll() {
       return;
     }
     latestStatus = data;
+    for (const id of pendingDatasetDeleteTasks) {
+      const task = (data.tasks || []).find(item => item.id === id);
+      if (task && ['completed','failed','lost','stopped','skipped'].includes(task.state)) {
+        pendingDatasetDeleteTasks.delete(id);
+        latestDatasetLocations = null; datasetLocationsFetchedAt = 0;
+      }
+    }
     if (latestGpuInventory) latestStatus.gpus = latestGpuInventory;
     updateSummaries(data);
     if (latestDatasetLocations) latestStatus.datasets = mergeDatasetLocationInfo(data.datasets || [], latestDatasetLocations);
@@ -5571,6 +6028,7 @@ async function refreshAll() {
     fillBaseModels(data.base_models || []);
     fillExecutionTargets(data.config || {});
     fillCheckpoints(data.checkpoints || []);
+    loadRemoteCheckpoints(false);
     fillTasks(data.tasks || []);
     fillTrainingTasks(data.tasks || []);
     fillTransferTasks(data.tasks || []);
@@ -5580,6 +6038,7 @@ async function refreshAll() {
     const evalVideoModule = document.getElementById('module-eval-videos');
     if (evalVideoModule && !evalVideoModule.hidden) loadEvalVideos(evalVideoIncludeRemote);
     const trainingVisible = !document.getElementById('module-training').hidden;
+    if (trainingVisible && Date.now() - artifactRunLastRefresh > 20000) loadArtifactRuns();
     if (trainingVisible && document.getElementById('trainMetricsTask').value) loadTrainingMetrics({quiet: true});
     loadDatasetLocations(false);
     loadClusterResources({quiet: true});
@@ -5672,7 +6131,8 @@ function taskMatchesScope(task, scope) {
 }
 
 function selectedTaskIdsForScope(scope) {
-  const tasks = ((latestStatus && latestStatus.tasks) || []).filter(task => taskMatchesScope(task, scope) && TERMINAL_STATES.has(task.state));
+  const source = scope === 'transfer' && latestTransferTasks !== null ? latestTransferTasks : ((latestStatus && latestStatus.tasks) || []);
+  const tasks = source.filter(task => taskMatchesScope(task, scope) && TERMINAL_STATES.has(task.state));
   const eligible = new Set(tasks.map(task => task.id));
   return [...selectedTaskIds].filter(taskId => eligible.has(taskId));
 }
@@ -5863,6 +6323,7 @@ document.querySelectorAll('.model-variant-select').forEach(select => select.addE
   fillBaseModels((latestStatus && latestStatus.base_models) || []);
   if (select.closest('form') && select.closest('form').id === 'evalForm') fillEvalCheckpoints((latestStatus && latestStatus.checkpoints) || []);
 }));
+document.querySelector('#trainForm [name="base_checkpoint"]').addEventListener('change', syncTrainingFinetuning);
 const trainExperimentInput = document.getElementById('trainExperimentName');
 ['input', 'change'].forEach(eventName => trainExperimentInput.addEventListener(eventName, () => {
   updateTrainingExperimentInfo();
@@ -5875,13 +6336,14 @@ document.getElementById('checkpointExperimentFilter').addEventListener('change',
 ['checkpointExperimentSearch', 'checkpointDatasetFilter', 'checkpointMinStep', 'checkpointMaxStep'].forEach(id => document.getElementById(id)?.addEventListener('input', () => { resetListPage('checkpoints'); fillCheckpoints((latestStatus && latestStatus.checkpoints) || []); }));
 document.getElementById('trainingTaskTypeFilter').addEventListener('change', () => { resetListPage('trainingTasks'); fillTasks((latestStatus && latestStatus.tasks) || []); });
 document.getElementById('trainingMetricFilter').addEventListener('change', () => { resetListPage('trainingTasks'); fillTasks((latestStatus && latestStatus.tasks) || []); });
+document.getElementById('trainingTaskSearch')?.addEventListener('input', () => { resetListPage('trainingTasks'); fillTasks((latestStatus && latestStatus.tasks) || []); });
 document.getElementById('evalExperimentFilter')?.addEventListener('input', () => { resetListPage('evaluationTasks'); fillEvaluationTasks((latestStatus && latestStatus.tasks) || []); });
 document.getElementById('evalTaskStateFilter')?.addEventListener('change', () => { resetListPage('evaluationTasks'); fillEvaluationTasks((latestStatus && latestStatus.tasks) || []); });
 document.getElementById('baseModelSearch')?.addEventListener('input', () => { resetListPage('baseModels'); fillBaseModels((latestStatus && latestStatus.base_models) || []); });
 document.getElementById('baseModelVariantFilter')?.addEventListener('change', () => { resetListPage('baseModels'); fillBaseModels((latestStatus && latestStatus.base_models) || []); });
 document.getElementById('baseModelSourceFilter')?.addEventListener('change', () => { resetListPage('baseModels'); fillBaseModels((latestStatus && latestStatus.base_models) || []); });
 ['evalVideoTaskFilter', 'evalVideoExperimentFilter', 'evalVideoQueryFilter'].forEach(id => document.getElementById(id)?.addEventListener('input', scheduleEvalVideoRefresh));
-document.getElementById('evalVideoSuccessFilter')?.addEventListener('change', scheduleEvalVideoRefresh);
+['evalVideoSourceFilter', 'evalVideoPhaseFilter', 'evalVideoSuccessFilter', 'evalVideoSafeSuccessFilter', 'evalVideoEventFilter'].forEach(id => document.getElementById(id)?.addEventListener('change', scheduleEvalVideoRefresh));
 document.getElementById('policyPort').addEventListener('input', updateClientCommand);
 document.getElementById('editorDataset').addEventListener('change', () => {
   episodeDatasetData = null;
@@ -5994,6 +6456,447 @@ document.getElementById('normForm').onsubmit = async event => {
     show(error.message);
   }
 };
+
+let rlinfDashboardConfig = null;
+let rlinfRuns = [];
+let rlinfSelected = new Set();
+let rlinfMetricData = new Map();
+let rlinfMetricRequest = 0;
+let rlinfRunsLoading = false;
+let rlinfDeleteSelection = new Set();
+let rlinfDeleting = false;
+let rlinfLogTaskId = null;
+let rlinfLogRunId = null;
+let rlinfEvaluations = [];
+let rlinfCheckpointRequest = 0;
+let rlinfEvalSubmitting = false;
+
+function fillRlinfEvalRuns() {
+  const select = document.getElementById('rlinfEvalRun');
+  const previous = select.value;
+  const runs = rlinfRuns.filter(run => run.state !== 'unavailable');
+  rlinfSetOptions(select, runs, run => run.id, run => run.name);
+  if (!runs.length) select.innerHTML = '<option value="">暂无运行</option>';
+  if (previous !== select.value || !runs.length) loadRlinfCheckpoints();
+}
+async function loadRlinfCheckpoints() {
+  const serial = ++rlinfCheckpointRequest;
+  const runId = document.getElementById('rlinfEvalRun').value;
+  const select = document.getElementById('rlinfEvalCheckpoint');
+  const hint = document.getElementById('rlinfEvalHint');
+  document.getElementById('rlinfEvalButton').disabled = true;
+  const previous = select.value;
+  select.innerHTML = '<option value="">加载中…</option>';
+  if (!runId) { select.innerHTML = '<option value="">暂无 checkpoint</option>'; hint.textContent = '暂无可评测的 RLInf 运行。'; return; }
+  try {
+    const data = await api(`/api/rlinf/runs/${encodeURIComponent(runId)}/checkpoints`);
+    if (serial !== rlinfCheckpointRequest) return;
+    rlinfSetOptions(select, data.checkpoints || [], item => item.id, item => `Step ${item.step} · ${(item.size_bytes / 2**30).toFixed(2)} GiB`);
+    if ((data.checkpoints || []).some(item => item.id === previous)) select.value = previous;
+    if (!data.checkpoints?.length) select.innerHTML = '<option value="">暂无完整 checkpoint</option>';
+    hint.textContent = data.error || (data.checkpoints?.length ? `执行目标：${data.target} · 已发现 ${data.checkpoints.length} 个 checkpoint；视频开启后会显示在“评估视频”模块。` : '尚未保存可评测的完整权重，请等待模型保存后刷新。');
+    document.getElementById('rlinfEvalGpuField').hidden = data.target !== '4x4090';
+    document.getElementById('rlinfEvalButton').disabled = rlinfEvalSubmitting || !data.checkpoints?.length;
+  } catch (error) {
+    if (serial !== rlinfCheckpointRequest) return;
+    select.innerHTML = '<option value="">读取失败</option>'; hint.textContent = `Checkpoint 加载失败：${error.message}`;
+  }
+}
+async function loadRlinfEvaluations(quiet = false) {
+  try {
+    const data = await api('/api/rlinf/evaluations');
+    rlinfEvaluations = data.tasks || [];
+    renderRlinfEvaluations();
+  } catch (error) { if (!quiet) show(`评测任务读取失败：${error.message}`); }
+}
+function renderRlinfEvaluations() {
+  const body = document.getElementById('rlinfEvalTasks');
+  document.getElementById('rlinfEvalPagination').innerHTML = renderListPagination('rlinfEvaluations', rlinfEvaluations.length);
+  body.innerHTML = paginateList('rlinfEvaluations', rlinfEvaluations).map(task => {
+    const meta = task.metadata || {}, metrics = task.result?.metrics || {};
+    const sr = metrics.success_at_end ?? metrics.success_once ?? metrics.SR;
+    const result = Object.entries(metrics).filter(([,value]) => typeof value === 'number').slice(0,6).map(([key,value]) => `${key}: ${Number(value.toPrecision(4))}`).join(' · ');
+    const active = !['completed','failed','lost','stopped','skipped'].includes(task.state);
+    return `<tr><td>${esc(meta.run_name || '')}<br><span class="muted">${esc(task.id)}</span></td><td>${esc(meta.checkpoint_step)}</td><td>${esc(meta.execution_target)}<br><span class="pill">${esc(task.state)}</span></td><td title="${esc(result)}">${sr != null ? `成功率 ${formatRlinfPercent(sr)}<br>` : ''}${esc(result || '等待评测结果')}</td><td>${meta.record_video ? '开启' : '关闭'}</td><td><button class="inline secondary" data-rlinf-log="${esc(task.id)}">日志</button>${meta.record_video ? `<button class="inline secondary" data-rlinf-video="${esc(meta.video_dir || '')}">视频</button>` : ''}${active ? `<button class="inline danger" data-rlinf-stop="${esc(task.id)}">停止</button>` : `<button class="inline danger" data-rlinf-eval-delete="${esc(task.id)}">删除日志</button>`}</td></tr>`;
+  }).join('') || '<tr><td colspan="6" class="muted">暂无 RLInf rollout 评测任务。</td></tr>';
+  body.querySelectorAll('[data-rlinf-log]').forEach(button => button.addEventListener('click', () => { loadRlinfLog(button.dataset.rlinfLog); document.getElementById('rlinfLogPanel').scrollIntoView({behavior:'smooth',block:'center'}); }));
+  body.querySelectorAll('[data-rlinf-video]').forEach(button => button.addEventListener('click', () => openRlinfVideos(button.dataset.rlinfVideo)));
+  body.querySelectorAll('[data-rlinf-stop]').forEach(button => button.addEventListener('click', async () => { await stopTask(button.dataset.rlinfStop); await loadRlinfEvaluations(); }));
+  body.querySelectorAll('[data-rlinf-eval-delete]').forEach(button => button.addEventListener('click', async () => {
+    if (!confirm('确认删除该评测任务记录及 Dashboard 日志？评测视频和模型保留。')) return;
+    try { await api(`/api/tasks/${encodeURIComponent(button.dataset.rlinfEvalDelete)}`, {method:'DELETE'}); await loadRlinfEvaluations(); }
+    catch (error) { show(error.message); }
+  }));
+}
+function openRlinfVideos(path = '') {
+  document.getElementById('evalVideoTaskFilter').value = '';
+  document.getElementById('evalVideoExperimentFilter').value = '';
+  document.getElementById('evalVideoSuccessFilter').value = 'all';
+  document.getElementById('evalVideoQueryFilter').value = path ? path.split('/').pop() : 'rlinf';
+  resetListPage('evalVideos'); showModule('eval-videos'); loadEvalVideos();
+}
+
+function rlinfCanDelete(run) {
+  return run.state !== 'unavailable' && (!run.task_id || ['completed','failed','lost','stopped','skipped'].includes(run.state));
+}
+function filteredRlinfRuns() {
+  const query = document.getElementById('rlinfRunFilter').value.trim().toLowerCase();
+  const algorithm = document.getElementById('rlinfAlgorithmFilter')?.value || '';
+  return rlinfRuns.filter(run => (!algorithm || (run.algorithm || run.method) === algorithm) && (!query || [run.name, run.method, run.target, run.state, run.task_id, run.job_id].join(' ').toLowerCase().includes(query)));
+}
+function updateRlinfDeleteSelection() {
+  const button = document.getElementById('rlinfDeleteSelected');
+  button.disabled = rlinfDeleting || !rlinfDeleteSelection.size;
+  button.textContent = `删除已选记录${rlinfDeleteSelection.size ? `（${rlinfDeleteSelection.size}）` : ''}`;
+  const page = paginateList('rlinfRuns', filteredRlinfRuns()).filter(rlinfCanDelete);
+  const checkbox = document.getElementById('rlinfDeletePage');
+  const count = page.filter(run => rlinfDeleteSelection.has(run.id)).length;
+  checkbox.disabled = rlinfDeleting || !page.length;
+  checkbox.checked = page.length > 0 && count === page.length;
+  checkbox.indeterminate = count > 0 && count < page.length;
+}
+async function deleteRlinfRuns(ids) {
+  if (rlinfDeleting || !ids.length) return;
+  if (!confirm(`确认删除 ${ids.length} 条 RLinf 运行记录及关联的 Dashboard 日志？原始曲线文件、模型和 checkpoint 将保留。`)) return;
+  rlinfDeleting = true;
+  renderRlinfRuns();
+  try {
+    const result = await api('/api/rlinf/runs/batch-delete', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({run_ids:ids})});
+    ++rlinfMetricRequest;
+    for (const id of result.run_ids) {
+      rlinfSelected.delete(id); rlinfDeleteSelection.delete(id); rlinfMetricData.delete(id);
+    }
+    rlinfRuns = rlinfRuns.filter(run => !result.run_ids.includes(run.id));
+    if (result.task_ids.includes(rlinfLogTaskId) || result.run_ids.includes(rlinfLogRunId)) {
+      rlinfLogTaskId = null;
+      rlinfLogRunId = null;
+      document.getElementById('rlinfLogPanel').hidden = true;
+      document.getElementById('rlinfLog').textContent = '';
+    }
+    renderRlinfRuns(); drawRlinfChart();
+    show(`已删除 ${result.run_ids.length} 条 RLinf 记录`, false);
+    await loadRlinfRuns();
+  } catch (error) { show(`删除失败：${error.message}`); }
+  finally { rlinfDeleting = false; renderRlinfRuns(); }
+}
+async function loadRlinfLog(taskId) {
+  if (!taskId) return;
+  rlinfLogTaskId = taskId;
+  rlinfLogRunId = null;
+  document.getElementById('rlinfLogPanel').hidden = false;
+  document.getElementById('rlinfLogTitle').textContent = `训练日志 · ${taskId}`;
+  document.getElementById('rlinfLog').textContent = '加载中…';
+  try {
+    const data = await api(`/api/tasks/${encodeURIComponent(taskId)}/log?max_bytes=131072`);
+    if (rlinfLogTaskId === taskId) document.getElementById('rlinfLog').textContent = data.log || '暂无日志';
+  } catch (error) {
+    if (rlinfLogTaskId === taskId) document.getElementById('rlinfLog').textContent = `日志读取失败：${error.message}`;
+  }
+}
+async function loadRlinfRunLog(runId) {
+  rlinfLogRunId = runId; rlinfLogTaskId = null;
+  document.getElementById('rlinfLogPanel').hidden = false;
+  document.getElementById('rlinfLog').textContent = '加载中…';
+  document.getElementById('rlinfLogTitle').textContent = `RLInf 日志 · ${rlinfRuns.find(run => run.id === runId)?.name || runId}`;
+  try {
+    const data = await api(`/api/rlinf/runs/${encodeURIComponent(runId)}/log`);
+    if (rlinfLogRunId === runId) document.getElementById('rlinfLog').textContent = data.log || '该运行目录没有文本日志；可在曲线区查看 TensorBoard 指标。';
+  } catch (error) {
+    if (rlinfLogRunId === runId) document.getElementById('rlinfLog').textContent = `日志读取失败：${error.message}`;
+  }
+}
+
+function rlinfTargetConfig() {
+  return (rlinfDashboardConfig?.targets || []).find(item => item.id === document.getElementById('rlinfTarget')?.value) || null;
+}
+function rlinfProfileConfig() {
+  const target = rlinfTargetConfig();
+  return (target?.profiles || []).find(item => item.id === document.getElementById('rlinfProfile')?.value) || null;
+}
+function rlinfSetOptions(select, items, getValue, getLabel, preferred) {
+  const previous = select.value;
+  select.innerHTML = items.map(item => `<option value="${esc(getValue(item))}">${esc(getLabel(item))}</option>`).join('');
+  if (items.some(item => String(getValue(item)) === previous)) select.value = previous;
+  else if (preferred && items.some(item => String(getValue(item)) === preferred)) select.value = preferred;
+}
+async function loadRlinfConfig() {
+  try {
+    rlinfDashboardConfig = await api('/api/rlinf/config');
+    const targetSelect = document.getElementById('rlinfTarget');
+    rlinfSetOptions(targetSelect, rlinfDashboardConfig.targets || [], x => x.id, x => x.label);
+    const target = rlinfTargetConfig();
+    rlinfSetOptions(document.getElementById('rlinfProfile'), target?.profiles || [], x => x.id, x => x.label);
+    renderRlinfLaunchFields();
+    const enabled = rlinfDashboardConfig.enabled && (rlinfDashboardConfig.targets || []).length > 0;
+    document.getElementById('rlinfLaunchButton').disabled = !enabled;
+    document.getElementById('rlinfLaunchHint').textContent = enabled
+      ? '选择服务器配置的训练方案；4090 使用原生 RLInf，H100/H200 通过 Slurm 提交。'
+      : '尚未启用 RLInf 训练目标，请在服务器配置中启用。';
+  } catch (error) {
+    document.getElementById('rlinfLaunchHint').textContent = `Could not load launch profiles: ${error.message}`;
+  }
+}
+function renderRlinfLaunchFields() {
+  const target = rlinfTargetConfig();
+  const profile = rlinfProfileConfig();
+  const requirements = [target?.requirements, profile?.requirements].filter(Boolean).join(' ');
+  if (requirements) document.getElementById('rlinfLaunchHint').textContent = requirements;
+  rlinfSetOptions(document.getElementById('rlinfProfile'), target?.profiles || [], x => x.id, x => x.label);
+  const selectedProfile = rlinfProfileConfig();
+  rlinfSetOptions(document.getElementById('rlinfAlgorithm'), (selectedProfile?.algorithms || []), x => x, x => x);
+  const isSlurm = target?.kind === 'slurm';
+  document.getElementById('rlinfGpuField').hidden = isSlurm;
+  document.getElementById('rlinfGpuCountField').hidden = !isSlurm;
+  const gpu = document.querySelector('#rlinfGpuField input');
+  if (gpu && target?.default_gpu_ids?.length) gpu.value = target.default_gpu_ids.join(',');
+  const fields = selectedProfile?.overrides || {};
+  document.getElementById('rlinfOverrideFields').innerHTML = Object.entries(fields).map(([key, spec]) => {
+    const label = esc(spec.label || key);
+    if (spec.type === 'enum') return `<label>${label}</label><select name="${esc(key)}">${(spec.choices || []).map(value => `<option value="${esc(value)}"${String(value) === String(spec.default) ? ' selected' : ''}>${esc(value)}</option>`).join('')}</select>`;
+    return `<label>${label}</label><input name="${esc(key)}" type="${spec.type === 'float' ? 'number' : 'number'}" value="${esc(spec.default ?? '')}" min="${esc(spec.min ?? '')}" max="${esc(spec.max ?? '')}"${spec.type === 'float' ? ' step="any"' : ' step="1"'}>`;
+  }).join('');
+}
+async function loadRlinfRuns(quiet = false) {
+  if (rlinfRunsLoading || (quiet && rlinfDeleting)) return;
+  rlinfRunsLoading = true;
+  try {
+    const data = await api('/api/rlinf/runs');
+    rlinfRuns = data.runs || [];
+    rlinfSelected = new Set([...rlinfSelected].filter(id => rlinfRuns.some(run => run.id === id)));
+    rlinfDeleteSelection = new Set([...rlinfDeleteSelection].filter(id => rlinfRuns.some(run => run.id === id && rlinfCanDelete(run))));
+    if (!rlinfSelected.size) {
+      const available = rlinfRuns.filter(run => run.state !== 'unavailable');
+      if (available.length) rlinfSelected.add(available[0].id);
+    }
+    renderRlinfRuns();
+    document.getElementById('rlinfRefreshTime').textContent = `更新于 ${new Date().toLocaleTimeString()}`;
+    await loadRlinfSelectedMetrics();
+  } catch (error) {
+    if (!quiet) show(`Could not load RLinf runs: ${error.message}`);
+  } finally { rlinfRunsLoading = false; }
+}
+function formatRlinfPercent(value) {
+  return value != null && Number.isFinite(Number(value)) ? `${(100 * Number(value)).toFixed(1)}%` : '-';
+}
+function renderRlinfRuns() {
+  const body = document.getElementById('rlinfRuns');
+  const good = rlinfRuns.filter(run => run.state !== 'unavailable');
+  document.getElementById('rlinfRunsSummary').textContent = `${good.length} 条运行 · ${rlinfRuns.length - good.length} 个来源不可用 · 已对比 ${rlinfSelected.size} 条`;
+  const filtered = filteredRlinfRuns();
+  document.getElementById('rlinfRunsPagination').innerHTML = renderListPagination('rlinfRuns', filtered.length);
+  body.innerHTML = paginateList('rlinfRuns', filtered).map(run => {
+    if (run.state === 'unavailable') return `<tr><td>—</td><td>${esc(run.source_label)}</td><td class="bad">不可用</td><td colspan="5">${esc(run.error || '')}</td></tr>`;
+    const selected = rlinfSelected.has(run.id) ? 'checked' : '';
+    const roundCount = `训练 ${run.completed_training_round ?? run.training_points ?? 0}${run.planned_rounds ? ` / ${run.planned_rounds}` : ''}<br>Actor 更新 ${run.actor_updates ?? '—'} · 评测 ${run.evaluation_points ? run.completed_evaluation_round : '待评测'}${run.next_evaluation_round != null ? `<br><span class="muted">下次评测：第 ${run.next_evaluation_round} 轮</span>` : ''}`;
+    const sr = run.latest?.['eval.SR@ode'] ?? run.latest?.['eval.SR@sde'] ?? run.latest?.['eval.SR'] ?? run.latest?.['eval.success_at_end'];
+    const risk = run.latest?.['eval.risk_rate@ode'] ?? run.latest?.['eval.risk_rate@sde'] ?? run.latest?.['eval.risk_rate'];
+    const trainSR = run.latest?.['train.SR'] ?? run.latest?.['train.env/success_once'];
+    const eligible = run.latest?.['eval.eligible_episodes@ode'] ?? run.latest?.['eval.eligible_episodes@sde'] ?? run.latest?.['eval.eligible_episodes'];
+    const excluded = run.latest?.['eval.excluded_initialization_risk@ode'] ?? run.latest?.['eval.excluded_initialization_risk@sde'] ?? run.latest?.['eval.excluded_initialization_risk'];
+    const cohortLabel = {fixed_validation:'固定验证集',extra_development:'补充开发集'}[run.evaluation_cohort] || '评测';
+    const metrics = `${formatRlinfPercent(sr)} / ${formatRlinfPercent(risk)}<br><span class="muted">${cohortLabel} · 第 ${run.evaluation_points ? run.completed_evaluation_round : '—'} 轮<br>当轮训练 SR ${formatRlinfPercent(trainSR)}${eligible != null ? `<br>有效 ${eligible} · 初始化排除 ${excluded ?? 0}` : ''}</span>`;
+    const phaseLabel = {sampling_train:'采集训练轨迹',sampling_evaluation:'评测采集',sampling_parity:'采样一致性检查',actor_backward:'Actor 更新',critic_fit:'Critic 拟合',critic_gae_prepare:'优势估计',likelihood_gate:'似然检查',checkpoint_save:'保存 checkpoint',actor_initialization:'加载策略'}[run.phase] || run.phase || '';
+    const resultTime = run.finished_at || run.updated_at;
+    const updated = resultTime ? new Date(resultTime * 1000).toLocaleString() : '-';
+    const syncTime = run.synced_at ? new Date(run.synced_at * 1000).toLocaleString() : null;
+    const disabled = !rlinfCanDelete(run) || rlinfDeleting;
+    return `<tr><td><input type="checkbox" data-rlinf-run="${esc(run.id)}" ${selected} aria-label="Compare ${esc(run.name)}"></td><td><strong>${esc(run.name)}</strong><br><span class="muted">${esc(run.target)} · ${esc(run.method)}${run.job_id ? ` · Job ${esc(run.job_id)}` : ''}</span></td><td><span class="pill" title="${esc(run.status_reason || '')}">${esc(run.state === 'stopped' ? '已停止' : run.state)}</span><br><span class="muted">${esc(phaseLabel)}</span></td><td>${roundCount}</td><td>${metrics}</td><td>${run.finished_at ? "完成：" : "结果："}${esc(updated)}${syncTime ? `<br><span class="muted">同步：${esc(syncTime)}</span>` : ""}</td><td><input type="checkbox" data-rlinf-delete="${esc(run.id)}" ${rlinfDeleteSelection.has(run.id) ? 'checked' : ''} ${disabled ? 'disabled' : ''} aria-label="选择删除 ${esc(run.name)}"></td><td><button class="inline secondary" data-rlinf-run-log="${esc(run.id)}">日志</button><button class="inline danger" data-rlinf-remove="${esc(run.id)}" ${disabled ? 'disabled' : ''}>删除</button></td></tr>`;
+  }).join('') || '<tr><td colspan="8" class="muted">没有匹配的运行记录。</td></tr>';
+  updateRlinfDeleteSelection();
+  body.querySelectorAll('[data-rlinf-delete]').forEach(input => input.addEventListener('change', () => {
+    if (input.checked) rlinfDeleteSelection.add(input.dataset.rlinfDelete); else rlinfDeleteSelection.delete(input.dataset.rlinfDelete);
+    updateRlinfDeleteSelection();
+  }));
+  body.querySelectorAll('[data-rlinf-remove]').forEach(button => button.addEventListener('click', () => deleteRlinfRuns([button.dataset.rlinfRemove])));
+  body.querySelectorAll('[data-rlinf-log]').forEach(button => button.addEventListener('click', () => loadRlinfLog(button.dataset.rlinfLog)));
+  body.querySelectorAll('[data-rlinf-run-log]').forEach(button => button.addEventListener('click', () => loadRlinfRunLog(button.dataset.rlinfRunLog)));
+  body.querySelectorAll('[data-rlinf-run]').forEach(input => input.addEventListener('change', () => {
+    if (input.checked && rlinfSelected.size >= 8) {
+      input.checked = false;
+      show('Compare up to 8 RLinf runs at once.');
+      return;
+    }
+    if (input.checked) rlinfSelected.add(input.dataset.rlinfRun); else rlinfSelected.delete(input.dataset.rlinfRun);
+    loadRlinfSelectedMetrics();
+  }));
+  fillRlinfEvalRuns();
+}
+async function loadRlinfSelectedMetrics() {
+  const serial = ++rlinfMetricRequest;
+  const selected = [...rlinfSelected];
+  const responses = await Promise.all(selected.map(async id => {
+    try { return [id, await api(`/api/rlinf/runs/${encodeURIComponent(id)}/metrics`)]; }
+    catch (_) { return [id, null]; }
+  }));
+  if (serial !== rlinfMetricRequest) return;
+  rlinfMetricData = new Map(responses.filter(item => item[1]));
+  for (const [id, data] of rlinfMetricData) {
+    const run = rlinfRuns.find(item => item.id === id);
+    if (run) Object.assign(run, data.run);
+  }
+  renderRlinfRuns();
+  const cohortSelect = document.getElementById('rlinfCohort');
+  if (cohortSelect) {
+    const cohorts = [...new Set([...rlinfMetricData.values()].flatMap(item => (item.evaluation_points || []).map(point => point.cohort || '')))];
+    const previousCohort = cohortSelect.value;
+    const labels = {fixed_validation:'固定验证集',extra_development:'补充开发集', '':'未标注评测集'};
+    cohortSelect.innerHTML = cohorts.map(value => `<option value="${esc(value)}">${esc(labels[value] || value)}</option>`).join('');
+    cohortSelect.value = cohorts.includes(previousCohort) ? previousCohort : cohorts.includes('fixed_validation') ? 'fixed_validation' : cohorts[0] || '';
+  }
+  const keys = [...new Set([...rlinfMetricData.values()].flatMap(item => [
+    ...(item.training_points || []).flatMap(point => Object.keys(point).filter(key => !['round','actor_updates','step','sampler','method','algorithm'].includes(key) && typeof point[key] === 'number').map(key => `train.${key}`)),
+    ...(item.evaluation_points || []).flatMap(point => Object.keys(point).filter(key => !['round','actor_updates','step','sampler','method','algorithm'].includes(key) && typeof point[key] === 'number').map(key => `eval.${key}${point.sampler ? `@${point.sampler}` : ''}`)),
+  ]))].sort();
+  const select = document.getElementById('rlinfMetric');
+  const previous = select.value;
+  select.innerHTML = keys.map(key => `<option value="${esc(key)}">${esc(key)}</option>`).join('');
+  if (keys.includes(previous)) select.value = previous;
+  else if (keys.includes('eval.SR@ode')) select.value = 'eval.SR@ode';
+  else if (keys.includes('eval.SR@sde')) select.value = 'eval.SR@sde';
+  else if (keys.includes('eval.SR')) select.value = 'eval.SR';
+  else if (keys.includes('train.SR')) select.value = 'train.SR';
+  else if (keys.length) select.value = keys[0];
+  drawRlinfChart();
+}
+function drawRlinfChart() {
+  const canvas = document.getElementById('rlinfChart');
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const ratio = window.devicePixelRatio || 1;
+  if (rect.width < 1) return;
+  const w = rect.width, h = 340;
+  canvas.width = Math.round(w * ratio);
+  canvas.height = Math.round(h * ratio);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const style = getComputedStyle(document.body);
+  const muted = style.getPropertyValue('--muted').trim();
+  const line = style.getPropertyValue('--line').trim();
+  ctx.font = '12px system-ui';
+  const key = document.getElementById('rlinfMetric').value;
+  const isEval = key.startsWith('eval.');
+  const rawKey = key.replace(/^(train|eval)\./, '').split('@')[0];
+  const sampler = key.includes('@') ? key.split('@').pop() : null;
+  const cohort = document.getElementById('rlinfCohort')?.value || '';
+  const axis = document.getElementById('rlinfXAxis').value;
+  const candidates = [...rlinfMetricData.values()].flatMap(data => (isEval ? data.evaluation_points : data.training_points) || []);
+  // Pick one axis for all runs; never mix rounds and actor updates on a shared scale.
+  const xKey = candidates.some(point => typeof point[axis] === 'number' && Number.isFinite(point[axis])) ? axis
+    : ['actor_updates', 'round', 'step'].find(field => candidates.some(point => typeof point[field] === 'number' && Number.isFinite(point[field]))) || axis;
+  const sets = [];
+  for (const [index, [id, data]] of [...rlinfMetricData.entries()].entries()) {
+    const run = data.run;
+    const points = ((isEval ? data.evaluation_points : data.training_points) || []).filter(point => (!isEval || (point.cohort || '') === cohort) && (!sampler || point.sampler === sampler) && typeof point[rawKey] === 'number' && Number.isFinite(point[rawKey]) && typeof point[xKey] === 'number' && Number.isFinite(point[xKey]));
+    const values = [...new Map(points.map(point => [point[xKey], {x: point[xKey], y: point[rawKey]}])).values()].sort((a,b) => a.x-b.x);
+    if (values.length) sets.push({id, name: run.name, values, color: METRIC_COLORS[index % METRIC_COLORS.length]});
+  }
+  if (!sets.length) {
+    ctx.fillStyle = muted;
+    ctx.fillText('请选择有指标数据的运行记录', 24, 40);
+    document.getElementById('rlinfMetricSummary').textContent = '暂无可绘制数据';
+    document.getElementById('rlinfLegend').innerHTML = '';
+    return;
+  }
+  let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity, total = 0;
+  for (const set of sets) for (const point of set.values) {
+    xmin = Math.min(xmin,point.x); xmax = Math.max(xmax,point.x);
+    ymin = Math.min(ymin,point.y); ymax = Math.max(ymax,point.y); total++;
+  }
+  if (xmin === xmax) { const gap = Math.max(1,Math.abs(xmin)*.05); xmin -= gap; xmax += gap; }
+  const ygap = (ymax-ymin || Math.abs(ymax) || 1)*.08;
+  ymin -= ygap; ymax += ygap;
+  const formatTick = value => {
+    if (Math.abs(value) < 1e-12) return '0';
+    if (Math.abs(value) >= 1e6 || Math.abs(value) < .001) return value.toExponential(2);
+    return Number(value.toPrecision(4)).toLocaleString('en-US', {maximumFractionDigits:6});
+  };
+  const yLabels = Array.from({length:5}, (_,i) => formatTick(ymax-(ymax-ymin)*i/4));
+  const pad = {l:Math.max(48,...yLabels.map(label => ctx.measureText(label).width+14)), r:24, t:20, b:54};
+  const pw = Math.max(1,w-pad.l-pad.r), ph = h-pad.t-pad.b;
+  const px = value => pad.l+(value-xmin)/(xmax-xmin)*pw;
+  const py = value => pad.t+(ymax-value)/(ymax-ymin)*ph;
+  ctx.strokeStyle = line; ctx.fillStyle = muted; ctx.lineWidth = 1;
+  ctx.textAlign = 'right';
+  for (let i=0;i<=4;i++) {
+    const y=pad.t+ph*i/4;
+    ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(pad.l+pw,y); ctx.stroke();
+    ctx.fillText(yLabels[i],pad.l-10,y+4);
+  }
+  const ticks = Math.max(2,Math.min(6,Math.floor(pw/90)));
+  ctx.textAlign = 'center';
+  for (let i=0;i<=ticks;i++) {
+    const value=xmin+(xmax-xmin)*i/ticks, x=px(value);
+    ctx.beginPath(); ctx.moveTo(x,pad.t); ctx.lineTo(x,pad.t+ph); ctx.stroke();
+    ctx.textAlign = i === 0 ? 'left' : i === ticks ? 'right' : 'center';
+    ctx.fillText(formatTick(value),x,h-32);
+  }
+  ctx.save(); ctx.beginPath(); ctx.rect(pad.l,pad.t,pw,ph); ctx.clip();
+  ctx.lineJoin='round'; ctx.lineCap='round';
+  sets.forEach(set => {
+    ctx.strokeStyle=set.color; ctx.lineWidth=2.2; ctx.beginPath();
+    set.values.forEach((point,i) => { if (!i) ctx.moveTo(px(point.x),py(point.y)); else ctx.lineTo(px(point.x),py(point.y)); });
+    ctx.stroke(); ctx.fillStyle=set.color;
+    // Dense curves stay legible; show sparse samples and highlight the last point.
+    const markers = set.values.length <= 60 ? set.values : [set.values.at(-1)];
+    markers.forEach(point => { ctx.beginPath(); ctx.arc(px(point.x),py(point.y),3,0,Math.PI*2); ctx.fill(); });
+  });
+  ctx.restore(); ctx.fillStyle=muted; ctx.textAlign='center';
+  const axisLabel = {actor_updates:'Actor updates',round:'训练轮次（round）',step:'Step'}[xKey];
+  ctx.fillText(axisLabel,pad.l+pw/2,h-8);
+  document.getElementById('rlinfMetricSummary').textContent = `${key} · ${sets.length} 条曲线 · ${total.toLocaleString()} 个点 · 横坐标：${axisLabel}${xKey !== axis ? '（当前数据可用坐标）' : ''}`;
+  document.getElementById('rlinfLegend').innerHTML = sets.map(set => `<div class="rlinf-legend-item"><i style="background:${set.color}"></i><span>${esc(set.name)}<br><strong>${esc(formatTick(set.values.at(-1).y))}</strong> <span class="muted">· ${esc(axisLabel)} ${esc(formatTick(set.values.at(-1).x))}</span></span></div>`).join('');
+}
+
+document.getElementById('rlinfTarget')?.addEventListener('change', renderRlinfLaunchFields);
+document.getElementById('rlinfEvalRun')?.addEventListener('change', loadRlinfCheckpoints);
+document.getElementById('rlinfEvalForm')?.addEventListener('submit', async event => {
+  event.preventDefault();
+  const payload = formJSON(event.target);
+  payload.record_video = payload.record_video === 'true';
+  payload.gpu_ids = String(payload.gpu_ids || '').split(',').map(value => value.trim()).filter(Boolean);
+  rlinfEvalSubmitting = true; document.getElementById('rlinfEvalButton').disabled = true;
+  try {
+    const task = await api('/api/rlinf/evaluate', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    show(`已提交 RLInf rollout 评测：${task.id}`, false); await loadRlinfEvaluations();
+  } catch (error) { show(`评测提交失败：${error.message}`); }
+  finally { rlinfEvalSubmitting = false; await loadRlinfCheckpoints(); }
+});
+document.getElementById('rlinfProfile')?.addEventListener('change', renderRlinfLaunchFields);
+document.getElementById('rlinfMetric')?.addEventListener('change', drawRlinfChart);
+document.getElementById('rlinfXAxis')?.addEventListener('change', drawRlinfChart);
+document.getElementById('rlinfCohort')?.addEventListener('change', drawRlinfChart);
+document.getElementById('rlinfAlgorithmFilter')?.addEventListener('change', () => { resetListPage('rlinfRuns'); renderRlinfRuns(); });
+document.getElementById('rlinfRunFilter')?.addEventListener('input', () => { resetListPage('rlinfRuns'); renderRlinfRuns(); });
+document.getElementById('rlinfDeletePage')?.addEventListener('change', event => {
+  for (const run of paginateList('rlinfRuns', filteredRlinfRuns()).filter(rlinfCanDelete)) {
+    if (event.target.checked) rlinfDeleteSelection.add(run.id); else rlinfDeleteSelection.delete(run.id);
+  }
+  renderRlinfRuns();
+});
+if (typeof ResizeObserver !== 'undefined' && document.getElementById('rlinfChart')) {
+  new ResizeObserver(() => drawRlinfChart()).observe(document.getElementById('rlinfChart').parentElement);
+}
+window.addEventListener('resize', () => { if (document.getElementById('module-rlinf') && !document.getElementById('module-rlinf').hidden) drawRlinfChart(); });
+document.getElementById('rlinfLaunchForm')?.addEventListener('submit', async event => {
+  event.preventDefault();
+  const payload = formJSON(event.target);
+  if (payload.gpu_ids) payload.gpu_ids = payload.gpu_ids.split(',').map(value => value.trim()).filter(Boolean);
+  try {
+    document.getElementById('rlinfLaunchButton').disabled = true;
+    const task = await api('/api/rlinf/launch', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    show(`RLinf training submitted: ${task.id}`, false);
+    await loadRlinfRuns();
+  } catch (error) { show(`RLinf submission failed: ${error.message}`); }
+  finally { document.getElementById('rlinfLaunchButton').disabled = false; }
+});
+document.getElementById('rlinfRunName')?.addEventListener('focus', event => {
+  if (!event.target.value) event.target.value = `run-${new Date().toISOString().replace(/[-:TZ.]/g,'').slice(0,14)}`;
+});
+setInterval(() => {
+  const module = document.getElementById('module-rlinf');
+  if (module && !module.hidden && tokenInput.value) { loadRlinfRuns(true); loadRlinfEvaluations(true); }
+}, 20000);
 
 document.getElementById('trainForm').onsubmit = async event => {
   event.preventDefault();

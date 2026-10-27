@@ -1348,6 +1348,7 @@ class DatasetEditor:
             state,
             action,
             timestamps,
+            action_is_absolute="absolute_joint" in str(contract.get("action_semantics") or info.get("action_semantics") or ""),
             state_names=state_names,
             action_names=action_names,
             fps=info.get("fps", 20),

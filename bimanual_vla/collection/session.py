@@ -97,6 +97,20 @@ class CollectionConfig:
         if len(set(can_names)) != len(can_names):
             raise ValueError("bimanual CAN interface names must be distinct")
 
+    @property
+    def camera_devices(self) -> dict[str, str]:
+        devices = {"cam_high": self.cam_high_device}
+        if self.arm_mode == BIMANUAL:
+            devices.update(cam_left_wrist=self.cam_left_wrist_device,
+                           cam_right_wrist=self.cam_right_wrist_device)
+        else:
+            wrist = self.cam_wrist_device.strip()
+            if wrist.lower() == "auto":
+                wrist = (self.cam_left_wrist_device if self.arm_side == "left"
+                         else self.cam_right_wrist_device)
+            devices[f"cam_{self.arm_side}_wrist"] = wrist
+        return devices
+
 
 @dataclass(frozen=True)
 class EpisodeLabel:
@@ -186,11 +200,6 @@ class CollectionSession:
     def connect(self) -> dict[str, dict]:
         if self.state is not SessionState.DISCONNECTED:
             raise RuntimeError(f"cannot connect while session is {self.state.value}")
-        contract = EpisodeContract(
-            schema=self.config.schema,
-            arm_mode=self.config.arm_mode,
-            arm_side=self.config.arm_side,
-        )
         connected: list[Any] = []
         try:
             if self.config.arm_mode == SINGLE_ARM:
@@ -204,17 +213,7 @@ class CollectionSession:
                 connected.append(right)
                 piper = {"left": left, "right": right}
             self._wait_for_robot_feedback(piper)
-            if self.config.arm_mode == BIMANUAL:
-                camera_ids = {
-                    "cam_high": self.config.cam_high_device,
-                    "cam_left_wrist": self.config.cam_left_wrist_device,
-                    "cam_right_wrist": self.config.cam_right_wrist_device,
-                }
-            else:
-                camera_ids = {
-                    "cam_high": self.config.cam_high_device,
-                    contract.camera_keys[1]: self.config.cam_wrist_device,
-                }
+            camera_ids = self.config.camera_devices
             cameras = self._camera_factory(
                 cam_ids=camera_ids,
                 fps=self.config.camera_fps,
@@ -249,23 +248,7 @@ class CollectionSession:
         """
         if self.state is SessionState.DISCONNECTED or self.piper is None:
             raise RuntimeError("cannot reconnect cameras while devices are disconnected")
-        contract = EpisodeContract(
-            schema=self.config.schema,
-            arm_mode=self.config.arm_mode,
-            arm_side=self.config.arm_side,
-        )
-        camera_ids = {
-            "cam_high": self.config.cam_high_device,
-        }
-        if self.config.arm_mode == BIMANUAL:
-            camera_ids.update(
-                {
-                    "cam_left_wrist": self.config.cam_left_wrist_device,
-                    "cam_right_wrist": self.config.cam_right_wrist_device,
-                }
-            )
-        else:
-            camera_ids[contract.camera_keys[1]] = self.config.cam_wrist_device
+        camera_ids = self.config.camera_devices
 
         old_cameras = self.cameras
         if old_cameras is not None:

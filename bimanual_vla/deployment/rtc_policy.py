@@ -26,6 +26,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import inspect
 import logging
+import math
 import threading
 import time
 import types
@@ -87,7 +88,9 @@ class RTCConfig:
     """Runtime RTC parameters shared by the server and client handshake."""
 
     enabled: bool = True
-    execution_horizon: int = 8
+    mode: str = "guided"
+    training_max_delay: int = 0
+    execution_horizon: int = 12
     max_guidance_weight: float = 5.0
     prefix_attention_schedule: str = "linear"
     physical_action_dim: int | None = None
@@ -99,6 +102,10 @@ class RTCConfig:
     parallel_image_resize_enabled: bool = True
 
     def __post_init__(self) -> None:
+        if self.mode not in {"guided", "trained"}:
+            raise ValueError("RTC mode must be guided or trained")
+        if self.mode == "trained" and self.training_max_delay <= 0:
+            raise ValueError("trained RTC requires a checkpoint with clean-prefix RTC training")
         if self.execution_horizon <= 0:
             raise ValueError("RTC execution_horizon must be positive")
         if self.max_guidance_weight <= 0:
@@ -519,6 +526,12 @@ def patch_pytorch_model(model: Any, config: RTCConfig) -> None:
     """Install RTC sampling on one OpenPI PyTorch model instance."""
     if not hasattr(model, "denoise_step") or not hasattr(model, "_preprocess_observation"):
         raise TypeError("RTC requires an OpenPI PyTorch flow-matching model")
+    if config.mode == "trained":
+        if not bool(getattr(model, "_rtc_trained_sampling", False)):
+            raise ValueError("trained RTC requires an installed clean-prefix PyTorch sampler")
+        if int(getattr(model, "rtc_training_max_delay", 0)) != config.training_max_delay:
+            raise ValueError("trained RTC delay does not match the loaded model")
+        return
     model._rtc_processor = RTCProcessor(config)
     model._rtc_original_sample_actions = getattr(model, "sample_actions", None)
     # Assigning a bound function on the instance avoids changing unrelated
@@ -758,6 +771,10 @@ def patch_jax_model(model: Any, config: RTCConfig) -> None:
     required = ("embed_prefix", "embed_suffix", "PaliGemma", "action_out_proj")
     if not all(hasattr(model, name) for name in required):
         raise TypeError("RTC requires an OpenPI Pi0 JAX/NNX flow-matching model")
+    if config.mode == "trained":
+        if int(getattr(model, "rtc_training_max_delay", 0)) != config.training_max_delay:
+            raise ValueError("trained RTC delay does not match the loaded model")
+        return
     model._rtc_max_guidance_weight = float(config.max_guidance_weight)
     model._rtc_prefix_attention_schedule = str(config.prefix_attention_schedule)
     model._rtc_physical_action_dim = config.physical_action_dim
@@ -992,7 +1009,7 @@ class RTCAwarePolicy:
         return getattr(self.policy, "metadata", {})
 
     def _normalize_rtc_config(self, raw: dict[str, Any]) -> dict[str, Any]:
-        """Validate a client RTC update against the server capability ceiling."""
+        """Use client-owned RTC configuration; model dimensions remain authoritative."""
         enabled = bool(raw.get("enabled", False)) and bool(self.config.enabled)
         try:
             requested_horizon = int(raw.get("execution_horizon", self.config.execution_horizon))
@@ -1004,6 +1021,8 @@ class RTCAwarePolicy:
             )
         except (TypeError, ValueError):
             requested_weight = self.config.max_guidance_weight
+        if not math.isfinite(requested_weight) or requested_weight <= 0:
+            requested_weight = self.config.max_guidance_weight
         schedule = str(
             raw.get("prefix_attention_schedule", self.config.prefix_attention_schedule)
             or self.config.prefix_attention_schedule
@@ -1012,10 +1031,13 @@ class RTCAwarePolicy:
             schedule = self.config.prefix_attention_schedule
         return {
             "enabled": enabled,
-            "execution_horizon": max(1, min(requested_horizon, self.config.execution_horizon)),
-            "max_guidance_weight": max(
-                0.001, min(requested_weight, self.config.max_guidance_weight)
-            ),
+            "execution_horizon": max(1, requested_horizon),
+            # The client owns runtime RTC strength.  The server-side value is
+            # only the default used when the client omits a config; silently
+            # clamping an explicitly requested weight makes the handshake lie
+            # and prevents per-client tuning.  Keep only the finite positive
+            # domain check here; the sampler itself still bounds NaN/Inf.
+            "max_guidance_weight": max(0.001, requested_weight),
             "prefix_attention_schedule": schedule,
         }
 
@@ -1070,6 +1092,11 @@ class RTCAwarePolicy:
         reanchored_first = None
         reanchored = False
         reanchor_error = None
+        prefix_fallback_reason = None
+        prefix_source = str(rtc.get("prefix_source", "server_previous_chunk"))
+        client_plan_id = None
+        if prefix_source not in {"server_previous_chunk", "client_planner"}:
+            raise ValueError("unsupported RTC prefix source")
 
         lock_requested = time.monotonic() if self._diagnostics_enabled else None
         with self._lock:
@@ -1093,6 +1120,30 @@ class RTCAwarePolicy:
             rtc_config = session.rtc_config or self._normalize_rtc_config({})
             enabled = bool(rtc_config["enabled"])
             execution_horizon = int(rtc_config["execution_horizon"])
+            # A trained joint checkpoint is conditioned on the executable
+            # prefix. Reusing the server's previous raw model chunk mixes a
+            # different origin and can make the policy chase an unexecuted
+            # trajectory. Fail closed instead of silently accepting that
+            # legacy prefix source.
+            if (enabled and self.config.mode == "trained"
+                    and self.config.reanchor_action_mask is not None
+                    and prefix_source != "client_planner"):
+                raise ValueError(
+                    "trained joint RTC requires prefix_source=client_planner; "
+                    "server_previous_chunk is unsafe"
+                )
+            model_horizon = getattr(getattr(self.policy, "_model", None), "action_horizon", None)
+            if model_horizon is not None and execution_horizon > int(model_horizon):
+                raise ValueError("RTC execution horizon exceeds model action chunk")
+            if enabled and self.config.mode == "trained":
+                model_horizon = int(getattr(self.policy._model, "action_horizon"))
+                maximum = self.config.training_max_delay
+                if maximum >= model_horizon or execution_horizon > model_horizon:
+                    raise ValueError("trained RTC prefix/horizon must fit the model action chunk")
+                if delay > maximum or delay < 0:
+                    raise ValueError(f"RTC inference delay {delay} exceeds trained maximum {maximum}")
+                if delay > execution_horizon:
+                    raise ValueError("RTC inference delay exceeds the configured execution horizon")
             self._apply_model_runtime_config(rtc_config)
 
             prompt = observation.get("prompt")
@@ -1128,7 +1179,42 @@ class RTCAwarePolicy:
                 and session.generation is not None
                 and client_previous_generation == session.generation
             )
-            if enabled and generation_matches:
+            if enabled and prefix_source == "client_planner":
+                if self.config.mode != "trained" or self.config.reanchor_action_mask is None:
+                    raise ValueError("client planner prefixes require trained joint RTC")
+                supplied = rtc.get("planned_prefix")
+                # Explicitly absent means startup/hold: never fall back to the
+                # server's unexecuted model output in this protocol.
+                if supplied is not None:
+                    if not isinstance(supplied, dict):
+                        raise ValueError("invalid client planner prefix envelope")
+                    absolute_prefix = np.asarray(supplied.get("actions"), dtype=np.float32)
+                    dim = len(self.config.reanchor_action_mask)
+                    if (delay <= 0 or absolute_prefix.shape != (delay, dim)
+                            or not np.isfinite(absolute_prefix).all()):
+                        raise ValueError("client planner prefix must be finite delay_steps x physical_action_dim")
+                    hz = float(supplied.get("action_hz", 0))
+                    offsets = np.asarray(supplied.get("sample_offsets_s"), dtype=float)
+                    policy_hz = float(getattr(self.policy, "metadata", {}).get("action_hz", hz))
+                    if (not np.isfinite(hz) or hz <= 0 or abs(hz-policy_hz) > 1e-6
+                            or offsets.shape != (delay,)
+                            or not np.allclose(offsets, (np.arange(delay)+1)/hz, rtol=0, atol=1e-7)):
+                        raise ValueError("client planner prefix has an incompatible action time grid")
+                    client_plan_id = supplied.get("plan_id")
+                    if not isinstance(client_plan_id, str) or not client_plan_id:
+                        raise ValueError("client planner prefix requires a plan_id")
+                    model_dim = int(getattr(self.policy._model, "action_dim",
+                                           previous.shape[1] if previous is not None else dim))
+                    # Encode ALL supplied dimensions, including the newly
+                    # planned gripper. This is not joint-only re-anchoring of
+                    # the old server chunk's normalized values.
+                    previous_left_over = _reanchor_normalized_actions(
+                        self.policy, model_observation,
+                        np.zeros((delay, model_dim), dtype=np.float32),
+                        absolute_prefix, tuple(True for _ in range(dim)))
+                    expected_absolute_first = absolute_prefix[0].copy()
+                    reanchored = True
+            elif enabled and generation_matches:
                 offset = min(offset, len(previous))
                 previous_left_over = previous[offset:].copy()
                 if previous_left_over.size and self.config.reanchor_action_mask is not None:
@@ -1170,27 +1256,60 @@ class RTCAwarePolicy:
                 # chunk directly would trigger a new jit compilation whenever
                 # the client offset changes.  The explicit step count keeps
                 # padded rows out of RTC guidance.
-                padded_previous = np.zeros_like(previous)
+                horizon = int(getattr(self.policy._model, "action_horizon",
+                                      len(previous) if previous is not None else previous_steps))
+                padded_previous = np.zeros((horizon, previous_left_over.shape[1]), dtype=np.float32)
                 padded_previous[:previous_steps] = previous_left_over
                 previous_left_over = padded_previous
 
             sample_kwargs = dict(getattr(self.policy, "_sample_kwargs", {}) or {})
             if enabled and previous_left_over is not None and previous_steps:
-                sample_kwargs.update(
-                    {
-                        "prev_chunk_left_over": previous_left_over,
-                        "previous_left_over_steps": previous_steps,
-                        "inference_delay": delay,
-                        "execution_horizon": execution_horizon,
-                        "rtc_max_guidance_weight": float(rtc_config["max_guidance_weight"]),
-                        "rtc_prefix_attention_schedule_id": {
-                            "zeros": 0,
-                            "ones": 1,
-                            "linear": 2,
-                            "exp": 3,
-                        }[str(rtc_config["prefix_attention_schedule"])],
-                    }
-                )
+                if self.config.mode == "trained" and previous_steps < delay:
+                    # A request can arrive after the robot has consumed more
+                    # of the previous chunk than the client could report in
+                    # its prefix.  Rejecting the whole RPC causes a reconnect
+                    # and leaves the actuator without a fresh target.  Drop
+                    # RTC guidance for this sample instead; the freshly
+                    # inferred chunk is still a valid ordinary policy output
+                    # and the next request can resume RTC once a full prefix
+                    # is available.  Never fabricate or pad an executed
+                    # prefix to satisfy the trained sampler.
+                    prefix_fallback_reason = (
+                        "previous action prefix is shorter than the measured RTC delay"
+                    )
+                    logger.warning(
+                        "RTC prefix unavailable for session %s generation %s: "
+                        "have %s steps, measured delay %s; running unguided inference",
+                        session_id,
+                        requested_generation,
+                        previous_steps,
+                        delay,
+                    )
+                    for key in (
+                        "prev_chunk_left_over",
+                        "previous_left_over_steps",
+                        "inference_delay",
+                        "execution_horizon",
+                        "rtc_max_guidance_weight",
+                        "rtc_prefix_attention_schedule_id",
+                    ):
+                        sample_kwargs.pop(key, None)
+                else:
+                    sample_kwargs.update(
+                        {
+                            "prev_chunk_left_over": previous_left_over,
+                            "previous_left_over_steps": previous_steps,
+                            "inference_delay": delay,
+                            "execution_horizon": execution_horizon,
+                            "rtc_max_guidance_weight": float(rtc_config["max_guidance_weight"]),
+                            "rtc_prefix_attention_schedule_id": {
+                                "zeros": 0,
+                                "ones": 1,
+                                "linear": 2,
+                                "exp": 3,
+                            }[str(rtc_config["prefix_attention_schedule"])],
+                        }
+                    )
             else:
                 sample_kwargs.pop("prev_chunk_left_over", None)
                 sample_kwargs.pop("previous_left_over_steps", None)
@@ -1316,10 +1435,19 @@ class RTCAwarePolicy:
         )
 
         result["rtc"] = {
-            "enabled": bool(enabled and previous_left_over is not None and previous_steps),
-            "algorithm": "real_time_chunking_prefix_guidance",
+            "enabled": bool(
+                enabled and previous_left_over is not None and previous_steps
+                and prefix_fallback_reason is None
+            ),
+            "mode": self.config.mode,
+            "prefix_source": prefix_source,
+            "client_plan_id": client_plan_id,
+            "training_max_delay": self.config.training_max_delay,
+            "algorithm": ("real_time_chunking_clean_prefix" if self.config.mode == "trained" else
+                          "real_time_chunking_prefix_guidance"),
             "reanchored": reanchored,
             "reanchor_error": reanchor_error,
+            "fallback_reason": prefix_fallback_reason,
             "physical_action_dim": self.config.physical_action_dim,
             "old_generation": old_generation,
             "new_generation": requested_generation,
@@ -1332,8 +1460,13 @@ class RTCAwarePolicy:
             "client_config": dict(rtc_config),
             "client_config_revision": session.rtc_config_revision,
             "server_limits": {
-                "execution_horizon": self.config.execution_horizon,
-                "max_guidance_weight": self.config.max_guidance_weight,
+                # These are structural/model limits, not runtime values.  The
+                # client config above is intentionally reported separately.
+                "model_execution_horizon": (
+                    int(getattr(getattr(self.policy, "_model", None), "action_horizon", 0))
+                    or None
+                ),
+                "training_max_delay": self.config.training_max_delay,
             },
             "old_origin_state": (
                 old_origin_state.tolist() if old_origin_state is not None else None

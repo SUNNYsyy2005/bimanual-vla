@@ -4,9 +4,9 @@
 它用于补偿相机采集、网络传输和模型推理造成的 action chunk 延迟：
 
 - 服务端在 **flow-matching denoising 内部**读取上一 chunk 尚未执行的 normalized prefix；
-- 用 prefix guidance 让新 chunk 的前缀连续地贴近上一 chunk；
+- 普通 checkpoint 用 prefix guidance；训练过 RTC 的 Pi05 checkpoint 用干净前缀条件化；
 - 客户端只上传 session、generation、已执行 offset 和 latency 估计，不上传或插值 normalized action；
-- 客户端仍负责 20 Hz 安全执行、队列消费和必要的 fail-closed 保护。
+- 客户端以 20 Hz 消费目标和检查授权，可选独立 100 Hz Ruckig 伺服执行。
 
 服务端实现位于 `bimanual_vla/deployment/rtc_policy.py`，同时支持 OpenPI 的 PyTorch `model.safetensors`
 和 JAX/Orbax `params` checkpoint。Dashboard 创建 Policy 时默认带上
@@ -36,10 +36,10 @@ bin/bimanual-vla rtc-client \
 
 客户端会根据 Policy metadata 自动协商 RTC 参数。常用参数：
 
-- `--rtc-execution-horizon 8`：RTC 前缀融合范围；必须不大于 action horizon；
+- `--rtc-execution-horizon 12`：RTC 前缀融合范围；必须不大于 action horizon；
 - `--rtc-max-guidance-weight 5.0`：denoising guidance 上限；
 - `--rtc-prefix-attention-schedule linear`：可选 `zeros`、`ones`、`linear`、`exp`；
-- `--rtc-client-blend-steps 0`：默认关闭额外的客户端 old/new blend，避免把延迟重新加回来；
+- `--rtc-inference-delay-steps 8`：客户端显式配置服务端 RTC 前缀延迟步数；RTC 额外客户端混合已移除，旧 blend 参数仅兼容接收并忽略；
 - `--no-rtc-enabled`：显式关闭客户端 RTC 协议。服务端也必须发布 `rtc_enabled=false` 才会完全关闭。
 
 ## 推理图像预缩放
@@ -76,6 +76,7 @@ bin/bimanual-vla rtc-client \
   --hz 4 \
   --control-hz 20 \
   --rtc-enabled \
+  --servo-backend ruckig --servo-hz 100 \
   --allow-execution
 ```
 
@@ -84,18 +85,142 @@ telemetry 断开或任一逐周期安全检查失败时，客户端只会保持�
 
 ## 控制与 RTC 时序
 
+### 可选关节参考规划器
+
+`--servo-backend ruckig` 使用本地 Ruckig 0.12.2 的在线轨迹生成，默认独立
+100 Hz 下发；`off` 直接发送目标，`legacy` 保留旧整形算法以便对照。GUI
+的 Enable reference planner 总开关关闭时等价于 `off`。为兼容已有配置，
+命令行和保存项仍保留 `servo` 名称；这里不是电机位置/速度/电流闭环。
+
+规划核心 `RuckigJointPlanner.advance()` 只根据持续保存的参考位置、速度、
+加速度生成下一周期位置指令。Piper 驱动器负责实际跟踪。执行层独立检查
+实测反馈的新鲜度、驱动状态及实测位置与已生成参考的偏差，超限阻止下发；
+不把反馈噪声直接注入规划状态，也不在这一层增加 PID 或误差积分。
+
+Ruckig 每周期延续生成轨迹的位置、速度和加速度，并联合使用
+`--trajectory-max-speed-rad-s`、`--trajectory-max-acceleration-rad-s2` 和
+`--trajectory-max-jerk-rad-s3` 三个正数约束。旧 lowpass、tracking、spike、
+lookahead 算法不参与 Ruckig 关节轨迹生成；不能用旧的单项开关关闭其约束。
+默认关闭相邻目标末速估算（`--no-servo-waypoint-velocity`）。普通逐点路径仍使用
+零末速点到点规划；trained joint RTC 使用下面的多点规划路径。
+
+推理的 Piper 驱动速度百分比默认为 100%，GUI 启动命令显式传入
+`--speed-pct 100`。启用规划器时，轨迹速度、加速度和 jerk 由界面中的参数控制，
+并受读取到的驱动限值约束，不再隐式使用旧的 10% 默认值。
+启动日志及运行记录同时保存驱动速度百分比、请求轨迹速度和生效轨迹速度。
+命令行仍可显式指定较低的 `--speed-pct`，此时会相应降低生效轨迹限速。
+
+### trained RTC 的客户端规划前缀
+
+当 joint policy 公布 `rtc_mode=trained`、`rtc_capabilities.client_planner_prefix=true`，
+且客户端开启 RTC 和 Ruckig 时，客户端会先生成整段带时间的可执行参考。规划采用
+三点平滑、保形三次插值及两步前视，从未来参考曲线取得目标速度，再由本地 Ruckig
+生成有界的 100 Hz q/v/a 序列。它是多点前视规划，不是全局最优轨迹求解器，也不是
+原先从两个已经接收的目标反推到达速度。使用现有速度、加速度、jerk 设置。
+
+发起推理时，从这份同样用于下发的计划取 `capture+(i+1)/action_hz` 的位置，
+发送 `client_metadata.rtc.prefix_source=client_planner` 与 `planned_prefix`。
+前缀包含 plan_id、按 policy action_hz 采样的时间偏移和完整动作：关节绝对 rad，夹爪按协议转换成
+开度。服务端对全部维度重新执行训练对应的 DeltaActions/Normalize，不再复制
+上一次模型 chunk。启动/保持时没有有效计划就显式发送空前缀，不回退到旧模型输出。
+旧服务端没有这项能力时客户端会明确报错，不能静默忽略规划前缀。
+
+新 chunk 无法接入现有计划时，本代动作改由逐目标 Ruckig 执行，保留上述客户端
+前缀协议，作废旧计划及其前缀承诺。下一次没有可用执行计划就发送空前缀，从新
+观测重新预测；不会把尚未执行到的旧模型预测传回服务端作为 RTC 前缀。
+每个新 generation 都会重新尝试安装计划，失败代不重复尝试。
+
+`inference_delay_steps` 仍由用户手动设置，没有增加延迟预测。发送的前缀时间范围
+被保留；新结果提前到达时，仅替换保留段之后的轨迹，并从边界 q/v/a 接续，不对
+保留段再次平滑。规划计算在发送锁之外进行，预留至少 50 ms 准备窗口；超时不安装
+未经及时验证的计划。暂停、hold、故障、时钟超差会使旧 plan_id 作废，依赖它的
+推理结果不能接纳。实际返回超出固定前缀时仍按实际时间选点，不能保证没有接续偏差。
+
+夹爪也提前规划并限速（默认不超过 0.08 m/s，并受原单步上限换算的速度约束），
+该路径不再使用会事后改变计划的逐点夹爪低通/端点确认。位置仍钳到合法开度。
+已有完整计划不会因为网络等待 0.15 秒而制动；计划末尾包含受约束停车段，正常
+安全门仍可立即中断它。发布线程按当前单调时钟取计划样本，跳过已经错过的样本，
+不逐点追赶、不突发补发。如果一次跳过两个或更多中间样本，会作废待返回结果所
+依赖的前缀并记录 timing_invalidations，但不会仅因调度迟到永久锁死健康的线程。
+下发前仍检查反馈到当前计划目标的误差；反馈、驱动或位置越界故障仍阻止下发。
+普通 Linux 不能保证硬实时、零时间误差或物理执行与计划完全一致。
+
+规划时除 Ruckig 的位置极值接口外，还对各段多项式求速度零点并检查位置，覆盖
+0.12.2 版本可能漏报的匀加速内部极值。若带末速轨迹越界，尝试零末速重规划；
+仍不可行则拒绝计划，不能直接钳位生成状态破坏速度/加速度连续性。
+关节位置极值、输出和 chunk 接续使用统一的 `1e-7 rad` 绝对数值容差，
+仅用于吸收浮点残差（小于 Piper 0.001° 指令分辨率的 1/170）；不重置或
+裁剪内部 q/v/a，也不修改机械限位。超过该数值容差仍拒绝；夹爪容差不变。
+尚未安装的新 chunk 如果有未来点越界或离线规划不可行，按候选轨迹拒绝处理：
+丢弃该 chunk，健康的发布线程受控制动，同时作废其旧 RTC 前缀承诺。
+制动完成后可接纳新的合法 chunk，不将候选校验失败变成永久硬暂停。
+新计划准备超时仍保留原计划并延后重试；驱动、反馈、实际发布线程故障仍阻断。
+
+`--servo-target-timeout-s` 默认 0.15 秒。目标超时、正常 hold 和关闭时，
+健康的规划/下发线程生成受约束制动；反馈或驱动故障时停止下发。这里的
+超时指执行队列停止提供参考，不是推理网络等待；已有 chunk 仍在供给目标
+时会继续规划执行。退出后只有确认
+生成轨迹已经静止才允许回零控制接管。双臂共用 12 关节轨迹计算和唯一发送
+线程；普通 Linux 调度不保证硬实时，迟到周期不突发补发。
+
+运行记录的 `servo_commands.jsonl` 保存高频轨迹及下发时间：`reference` 是输入
+目标，`command_qpos` 是规划后的下发位置，`feedback_qpos` 是本周期读取的实测
+位置，`feedback_read_monotonic` 是本机读取时间（不是传感器采样时间）。旧字段
+`qpos` 继续表示下发位置，不能当作实测反馈；`role=joint_reference_planner`
+标明层级。`plan_id` 和 `planned_monotonic` 标明材料化计划及对应的计划时间。
+20 Hz 控制记录仍
+用于模型队列与安全门诊断。运动界限约束的是生成指令，实际机械臂跟踪效果
+仍需实机验证。算法来源及边界见
+[开源控制参考](OPEN_SOURCE_CONTROL_REFERENCES.md)。
+
+### 训练 RTC
+
+训练时 RTC 与原有推理 guidance 分开选择：服务端默认 `--rtc-mode auto`，
+按 checkpoint 元数据自动选择 `trained` 或 `guided`。训练选项、恢复兼容性
+和 API 示例见 [训练 API](../../server_4090/API_USAGE.md#72-启动训练)。
+模型目标仍按 action rate 消费，高频伺服独立完成插值与运动约束。
+
+### 推理完成通知与延迟目标
+
+推理线程完成后通过事件唤醒控制线程，在周期之间接纳结果，不再等下一次
+20 Hz 轮询。只有控制线程修改动作队列。Ruckig 模式接纳新计划后额外执行
+一次完整反馈/授权/安全检查，立即刷新当前伺服参考；普通目标消费仍沿用原
+20 Hz 时间轴，不把整个旧队列加速消费。实际 CAN 发布仍由唯一伺服线程按
+`servo-hz` 发送。`off`/`legacy` 模式仅提前接纳结果，保留原下发节奏。
+
+处理链路以 150 ms 为优化目标，包含观测准备、编解码、模型处理、接纳和
+首次下发，网络传输另计；不是触发机器人故障的硬超时。运行配置会记录
+`inference_completion=event_wakeup` 和 `immediate_reference_refresh`。
+
+客户端现在直接记录 `client_pack_ms`、`client_send_ms`、
+`client_wait_response_ms`、`client_unpack_ms`、请求/响应大小及图像尺寸。
+服务端记录 `server_unpack_ms`、`server_policy_ms`，并在下一次响应的
+`previous_response_timing` 中按 generation 返回上次打包与发送耗时。
+`response_to_admission_ms` 衡量结果返回后等待接纳的时间；首次下发指标使用
+实际命令完成时间。`unattributed_rpc_ms` 是未拆分残差，仍包含网络、调度和
+响应处理，不能直接当成纯网络延迟从 150 ms 目标中扣除。
+
+本机无硬件验证可运行：
+
+```bash
+python -m scripts.smoke.benchmark_rtc_wakeup --samples 30 --model-ms 109.5
+```
+
+该脚本只连接本机临时 WebSocket 服务，以 sleep 模拟模型处理，使用内存
+反馈/发布回调验证 Ruckig 调度。它不验证真实模型、相机、CAN 或机械臂性能。
+
 - 相机和 Piper 反馈持续运行；
 - 异步推理默认使用 `--inference-trigger-mode periodic`，以 `--hz 4` **尝试发起**请求，单次只允许一个在途请求；
 - 可改用 `--inference-trigger-mode chunk_step --inference-trigger-step 10`：每个已接受 chunk 的原始第 10 步成功下发后发起下一次请求，旧 chunk 在推理期间继续执行。若新 chunk 跳过了前缀，仍按其原始步号判断触发点；每个 chunk 只触发一次；
 - `chunk_step` 模式下 `--hz` 是首次请求、失败及队列耗尽时的重试频率，不限制正常的步号触发。触发步号必须小于服务端公布的 action horizon；
-- `--control-hz` 控制机器人下发频率，必须与服务端公布的 action rate 一致；GUI 左侧 Policy and task 的 Inference timing 区域可设置触发模式、步号、请求频率和控制频率；
+- `--control-hz` 控制模型目标消费频率，必须与服务端公布的 action rate 一致；Ruckig 模式下，实际下发由独立的 `--servo-hz` 控制（默认 100 Hz）。GUI 左侧 Policy and task 的 Inference timing 区域设置目标消费频率；Joint servo 区域选择伺服后端和频率；
 - 周期模式的 4 Hz 是调度目标，不是实际吞吐保证；若 capture-to-result 为 550 ms，实际频率上限约为 `1/0.55=1.82 Hz`；
 - 客户端 telemetry 分开上报 `configured_inference_hz`、`inference_launch_hz`、`inference_result_hz`，并上报单在途上限；
-- 客户端根据上一轮 capture-to-result latency 估计本次 `inference_delay_steps`；
+- 客户端使用显式配置的 `inference_delay_steps`，不根据上一轮延迟改写；
 - 客户端根据 active chunk 的 `source_index` 发送 `previous_chunk_offset_steps`；
 - 服务端按 WebSocket session 保存上一轮 normalized chunk，并在 denoising 时应用 RTC guidance；
 - 新 action chunk 到达后，客户端继续用旧 chunk 消费，按实际 capture/launch/arrival 时间丢弃过期前缀；
-- RTC 模式默认不做额外客户端轨迹插值；只有显式设置 `--rtc-client-blend-steps` 才启用安全 fallback；
+- RTC 模式不做额外客户端轨迹混合；按实际经过时间选择接续点，延迟超过配置步数时记录 WARNING；
 - 推理失败、generation 不匹配、连接断开或队列耗尽时 fail closed 并保持最后安全目标；
 - `monitoring_data/<session>/events.jsonl` 和模型结果记录中包含 RTC telemetry。
 
@@ -186,7 +311,7 @@ used for joint or delivery policies:
 - `--blend-profile smootherstep` removes the velocity jump at an accepted
   chunk boundary. RTC already performs model-side overlap guidance, so the
   default extra client blend is zero while RTC is active; opt in with
-  `--rtc-client-blend-steps 2`, `3`, or `4` when needed.
+  the non-RTC blend controls only when RTC is disabled (legacy RTC blend flags are ignored).
 - `--gripper-open-lookahead-steps 30` advances only opening requests. Closing
   is never anticipated, and the resulting command still goes through the
   independent gripper low-pass, hysteresis, and rate limits.
@@ -206,3 +331,21 @@ Tune the shaper with `--trajectory-max-speed-rad-s`,
 JAX servers by default and can be controlled with the server-side
 `--rtc-temporal-consistency` and `--rtc-temporal-seed` options. All of these
 states and decisions are emitted in the per-session monitoring telemetry.
+
+
+### 2026-10-19 RTC 参数归属更新
+
+GUI 增加 `Inference delay steps`（默认8），保留 `Execution horizon`（默认12）、
+引导权重和 schedule，移除 `Extra blend with RTC`。`Blend profile` 仅在关闭RTC且启用混合时可用。
+要求 `0 <= delay <= horizon <= 模型chunk长度`。服务端不再按启动时的horizon默认值截断客户端配置；
+模型chunk长度和trained RTC训练支持的最大delay仍是真实能力约束，不可通过GUI绕过。
+RTC返回后按实际时间选取目标；非RTC保留原有进度不足时重计时逻辑。
+超过delay时客户端日志输出 `RTC delay exceeded`，包含实际毫秒数、步数及配置horizon。
+默认值是配置初值，不代表已为当前网络和机器人标定。旧GUI保存的额外RTC混合设置不再生效。
+
+### Ruckig 默认运动约束（2026-10-19）
+
+速度 / 加速度 / jerk 默认值调整为 **1.20 rad/s / 8.0 rad/s² / 60.0 rad/s³**，
+替代之前的 0.60 / 3.0 / 20.0；同步 ServoConfig、客户端命令行和 GUI 默认值。
+这是已做离线回放的调试起点，用于减轻过紧约束造成的跟踪与制动滞后，尚未实机标定。
+GUI 已保存的自定义数值仍优先于默认值；使用旧偏好时应检查界面实际显示的三个上限。

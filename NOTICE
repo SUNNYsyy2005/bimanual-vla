@@ -1,0 +1,28 @@
+Open-source adaptations in bimanual_vla/training/openpi_model.py:
+
+OpenPI
+Copyright 2025 Physical Intelligence
+Source: https://github.com/Physical-Intelligence/openpi
+License: Apache License, Version 2.0
+Reference commit: 215abfb217dbac7d5f1273282331b9b1866c0479
+Adapted portions: flow-matching loss, action sampling, adaptive RMSNorm,
+and Gemma module conditioning. Changes add independent frozen/trainable
+partitions, physical-action loss selection, token-specific flow time,
+random clean prefixes, postfix-only loss and hard-prefix Euler sampling.
+
+Big Vision
+Copyright 2024 Big Vision Authors.
+The Gemma adaptive RMSNorm and module implementation adapted through
+OpenPI retains its Apache License, Version 2.0 attribution to Big Vision.
+
+LeRobot
+Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+Source: https://github.com/huggingface/lerobot
+License: Apache License, Version 2.0
+Reference commit: 146d8474932c8b566717eb2738ba459337ab71c4
+Reference: src/lerobot/policies/pi05/modeling_pi05.py
+The training-time action conditioning method has been adapted from its
+PyTorch implementation to this project's OpenPI JAX/Flax model interface.
+
+The Apache 2.0 license text for these adaptations is provided in
+docs/licenses/APACHE-2.0.txt.

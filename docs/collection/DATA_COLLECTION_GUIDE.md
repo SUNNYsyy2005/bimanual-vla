@@ -190,7 +190,7 @@ episodes_batches/20260801_pick_cube_02
 ## 5. 回放和现场质量检查
 
 1. 在 `Saved Episodes` 中选择一个文件。
-2. 点击 `Replay Selected`。
+2. 点击 `Replay episode`，再点 `Video preview`；双击文件也可直接预览。
 3. 检查第三视角、腕部视角和关节数据是否同步变化。
 
 至少抽查以下内容：
@@ -201,6 +201,8 @@ episodes_batches/20260801_pick_cube_02
 - 夹爪开合状态有记录。
 - instruction 与画面中的任务一致。
 - 成功/失败标签正确。
+
+需要机械臂执行记录轨迹时，使用回放配置中的 **Start hardware replay**。支持最新 v3 数据的关节角和末端位姿回放、独立平滑开关；先自动低速平滑到首帧，再开始 episode 计时。执行要求、停止行为和参数见 [Episode 真机回放](EPISODE_HARDWARE_REPLAY.md)。
 
 ## 6. 原始 NPZ 数据格式
 

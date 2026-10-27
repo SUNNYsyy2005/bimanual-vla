@@ -104,12 +104,8 @@ def build_script(target: dict[str, Any], job_name: str, commands: list[list[str]
     openpi_client_src = target.get(
         "openpi_client_src", workdir.rstrip("/") + "/packages/openpi-client/src"
     )
-    # The H100 checkout keeps LeRobot as a sibling source checkout under
-    # <root>/src/lerobot_src/<revision>.  Add the conventional location as a
-    # fallback; nonexistent PYTHONPATH entries are harmless and this keeps
-    # the target config backward compatible.
-    inferred_lerobot_src = str(Path(workdir).parent / "lerobot_src/a445d9c")
-    lerobot_src = target.get("lerobot_src", inferred_lerobot_src)
+    lerobot_src = target.get("lerobot_src", "")
+    source_paths = ":".join(str(path) for path in (openpi_src, openpi_client_src, lerobot_src) if path)
     prelude = [
         slurm_header(target, job_name, log_dir),
         f"mkdir -p {shlex.quote(log_dir)}",
@@ -122,7 +118,7 @@ def build_script(target: dict[str, Any], job_name: str, commands: list[list[str]
         # remote helper can import openpi, openpi_client, and LeRobot after
         # `cd` without relying on a login-shell activation.
         "export PYTHONPATH="
-        f"{shlex.quote(str(openpi_src))}:{shlex.quote(str(openpi_client_src))}:{shlex.quote(str(lerobot_src))}"
+        f"{shlex.quote(source_paths)}"
         "${PYTHONPATH:+:$PYTHONPATH}",
         f"export XDG_CACHE_HOME={shlex.quote(target.get('xdg_cache_home', cache_root))}",
         f"export PIP_CACHE_DIR={shlex.quote(target.get('pip_cache_dir', cache_root + '/pip/cache'))}",

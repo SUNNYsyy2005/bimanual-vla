@@ -49,6 +49,7 @@ from bimanual_vla.deployment.client import (
     GRIPPER_OPENING_METRES,
     InferenceLaunch,
     InferenceWorkerResult,
+    TimedTarget,
     ManualInferenceTrigger,
     MonitoringRecorder,
     PeriodicSchedule,
@@ -444,6 +445,67 @@ class ContinuousIKTest(unittest.TestCase):
                 max_nfev=50,
             )
 
+    def test_soft_joint_preference_does_not_reject_a_reachable_pose(self):
+        class SmallTranslationFK:
+            def CalFK(self, q):
+                return [[10 * q[0], 0., 0., 0., 0., 0.]]
+        solver = PiperContinuousIK(fk=SmallTranslationFK())
+        desired = self.joints.copy()
+        desired[0] += .25
+        xyz, rotation = solver.pose(desired)
+        result = solver.solve_with_diagnostics(self.joints, xyz,
+            Rotation.from_matrix(rotation).as_euler('xyz', degrees=True),
+            max_joint_step_rad=.3, position_tolerance_m=.0015,
+            rotation_tolerance_rad=.02, max_nfev=100)
+        self.assertLessEqual(result.solution_position_error_m, .0015)
+        self.assertLessEqual(float(np.max(abs(result.solution_joints_rad - self.joints))), .3)
+
+    def test_retries_local_task_solve_when_regularized_wrist_solution_misses_tolerance(self):
+        """A wrist-limit local minimum must not reject a reachable EEF target."""
+        solver = PiperContinuousIK()
+        current = np.array([1.9673001766, 1.6102057695, -1.8361561298,
+                            0.4228758216, 1.2048182487, -1.0162004238])
+        target_xyz = np.array([-0.2349500060, 0.2537649870, 0.4338020086])
+        target_rpy = np.array([-158.2720005, 38.7960001, 6.92699994])
+        result = solver.solve_with_diagnostics(
+            current, target_xyz, target_rpy, max_joint_step_rad=.02,
+            search_joint_radius_rad=.30, joint_regularization_weight=1.0,
+            position_tolerance_m=.0015, rotation_tolerance_rad=.02, max_nfev=100,
+        )
+        self.assertLessEqual(result.solution_position_error_m, .0015)
+        self.assertLessEqual(result.solution_rotation_error_rad, .02)
+
+    def test_accepts_bounded_local_ik_miss_without_stopping(self):
+        solver = PiperContinuousIK()
+        current = np.array([2.00527859, 1.61161947, -1.83366036,
+                            .42395791, 1.215168, -1.02628851])
+        target_xyz = np.array([-0.269265, .244955, .412784])
+        target_rpy = np.array([-161.36899948, 36.379999, 8.58599997])
+        result = solver.solve_with_diagnostics(
+            current, target_xyz, target_rpy, max_joint_step_rad=.30,
+            search_joint_radius_rad=.30, joint_regularization_weight=1.0,
+            position_tolerance_m=.0015, rotation_tolerance_rad=.02, max_nfev=100,
+        )
+        self.assertTrue(result.tolerance_relaxed)
+        self.assertLessEqual(result.solution_position_error_m, .005)
+        self.assertLessEqual(result.solution_rotation_error_rad, .08)
+
+    def test_uses_effective_driver_limits_for_ik(self):
+        solver = PiperContinuousIK()
+        limits = np.array([
+            [-2.6179, 2.6179], [0.0, 3.14], [-2.967, 0.0],
+            [-1.745, 1.745], [-1.220, 1.10], [-2.0944, 2.0944],
+        ])
+        current = np.array([.2, 1., -1., .2, 1.0, .2])
+        xyz, rotation = solver.pose(current)
+        result = solver.solve_with_diagnostics(
+            current, xyz, Rotation.from_matrix(rotation).as_euler('xyz', degrees=True),
+            max_joint_step_rad=.08, search_joint_radius_rad=.30,
+            position_tolerance_m=.0015, rotation_tolerance_rad=.02, max_nfev=100,
+            joint_limits=limits,
+        )
+        self.assertTrue(np.all(result.solution_joints_rad <= limits[:, 1] + 1e-9))
+
     def test_rate_limits_a_reachable_future_pose_and_still_makes_progress(self):
         xyz, rotation = self.solver.pose(self.joints)
         target_xyz = xyz + np.array([0.05, 0.0, 0.0])
@@ -503,6 +565,30 @@ class ContinuousIKTest(unittest.TestCase):
 
 
 class EnableHoldTest(unittest.TestCase):
+    def test_default_firmware_speed_does_not_silently_throttle_visible_trajectory_limit(self):
+        piper = FakePiper()
+        piper._vla_joint_speeds = np.full(6, 3.0)
+        args = execution_args(trajectory_max_speed_rad_s=0.6, servo_backend="ruckig")
+        del args.speed_pct  # Exercise the inference default used without a CLI override.
+        execution = ExecutionController(piper, args)
+        self.assertAlmostEqual(execution._servo_config().max_velocity, 0.6)
+        servo = execution.run_configuration()["servo"]
+        self.assertEqual(servo["firmware_speed_pct"], 100)
+        self.assertAlmostEqual(servo["requested_max_velocity_rad_s"], 0.6)
+        self.assertAlmostEqual(servo["max_velocity"], 0.6)
+        execution._enable_robot("right", piper, np.array([0., .2, -.2, 0., 0., 0., .01]))
+        mode_calls = [call for call in piper.calls if call[0] == "ModeCtrl"]
+        self.assertTrue(mode_calls)
+        self.assertTrue(all(call[3] == 100 for call in mode_calls))
+
+    def test_explicit_cli_firmware_speed_still_bounds_trajectory_reference(self):
+        piper = FakePiper()
+        piper._vla_joint_speeds = np.full(6, 3.0)
+        execution = ExecutionController(piper, execution_args(
+            trajectory_max_speed_rad_s=0.6, servo_backend="ruckig", speed_pct=10))
+        self.assertAlmostEqual(execution._servo_config().max_velocity, 0.24)
+        self.assertEqual(execution.run_configuration()["servo"]["firmware_speed_pct"], 10)
+
     def test_enable_holds_measured_zero_offset_without_clipping(self):
         piper = FakePiper()
         execution = ExecutionController(piper, execution_args())
@@ -723,6 +809,21 @@ class MetadataCompatibilityTest(unittest.TestCase):
 
 
 class ActionQueueDecodeTest(unittest.TestCase):
+    def test_finite_gripper_overshoot_saturates_without_dropping_chunk(self):
+        protocol = validate_policy_metadata(DELIVERY_METADATA, "right")
+        actions = np.zeros((4, 7), dtype=np.float64)
+        actions[:, 6] = [-0.02792, 1.05, -100, 100]
+        original = actions.copy()
+        _, decoded = decode_action_queue(actions, protocol,
+            delivery_state(opening_fraction=.5), np.array([0, 1, -1, 0, 0, 0, .035]))
+        self.assertEqual(len(decoded), 4)
+        np.testing.assert_allclose([x.absolute_target[-1] for x in decoded], [0, 1, 0, 1])
+        np.testing.assert_array_equal(actions, original)
+        for value in (np.nan, np.inf, -np.inf):
+            actions[0, 6] = value
+            with self.assertRaises(ExecutionBlocked):
+                decode_action_queue(actions, protocol, delivery_state(), np.zeros(7))
+
     def test_resolves_five_20hz_actions_per_4hz_compatibility_interval(self):
         self.assertEqual(resolve_action_chunk_steps(action_hz=20, command_hz=4), 5)
         self.assertEqual(resolve_action_chunk_steps(action_hz=20, command_hz=10), 2)
@@ -830,6 +931,15 @@ class ActionQueueDecodeTest(unittest.TestCase):
         self.assertEqual(used, 3)
         self.assertAlmostEqual(preview[0], 0.006)
         self.assertAlmostEqual(preview[6], 0.3)
+
+    def test_policy_image_size_defaults_to_openpi_and_accepts_lingbot(self):
+        self.assertEqual(validate_policy_metadata(JOINT_METADATA, "right").image_size, 224)
+        self.assertEqual(
+            validate_policy_metadata(dict(JOINT_METADATA, image_size=256), "right").image_size,
+            256,
+        )
+        with self.assertRaisesRegex(RuntimeError, "image_size"):
+            validate_policy_metadata(dict(JOINT_METADATA, image_size=0), "right")
 
 
 class ObservationConventionTest(unittest.TestCase):
@@ -1043,7 +1153,8 @@ class TargetSafetyTest(unittest.TestCase):
                 build_checked_target(state, bad, **self.delivery_kwargs)
         bad = action.copy()
         bad[6] = 1.5
-        with self.assertRaisesRegex(ExecutionBlocked, "gripper target"):
+        # Saturation accepts the endpoint; the independent step gate remains.
+        with self.assertRaisesRegex(ExecutionBlocked, "gripper step"):
             build_checked_target(state, bad, **self.delivery_kwargs)
 
     def test_8_3_64eps_default_envelope_accepts_observed_maxima(self):
@@ -1146,6 +1257,20 @@ class TargetSafetyTest(unittest.TestCase):
                 joint_limit_tolerance_rad=0.05,
                 gripper_semantics=GRIPPER_OPENING_FRACTION,
             )
+
+    def test_recorded_joint2_overshoot_projects_to_bound_but_large_error_rejects(self):
+        from bimanual_vla.deployment.client import DEFAULT_JOINT_LIMIT_TOLERANCE_RAD
+        target = self.qpos.copy()
+        target[6] = .5
+        for value in (-.07312, -.1):
+            target[1] = value
+            joints, _ = build_checked_joint_target(self.qpos, target,
+                max_joint_step_rad=2., joint_limit_tolerance_rad=DEFAULT_JOINT_LIMIT_TOLERANCE_RAD)
+            self.assertEqual(joints[1], 0.)
+        target[1] = -.101
+        with self.assertRaisesRegex(ExecutionBlocked, 'joint2 target'):
+            build_checked_joint_target(self.qpos, target, max_joint_step_rad=2.,
+                joint_limit_tolerance_rad=DEFAULT_JOINT_LIMIT_TOLERANCE_RAD)
 
 
 class ClientTransportTimingTest(unittest.TestCase):
@@ -1265,6 +1390,254 @@ class ClientTransportTimingTest(unittest.TestCase):
 
 
 class AsyncInferencePipelineTest(unittest.TestCase):
+    def test_invalid_future_chunk_point_is_dropped_without_pausing_writer(self):
+        from unittest.mock import Mock
+        protocol = replace(self.joint_protocol, rtc_supported=True, rtc_mode="trained",
+                           rtc_client_planner_prefix=True)
+        execution, piper = self.configured_execution(protocol, servo_backend="ruckig")
+        actions = self.joint_chunk(50, .02)
+        # 10:01 failure: a future joint3 target, not the current command.
+        actions[31, 2] = .10799222439527512
+        result = execution_result(actions)
+        result['rtc'] = {'prefix_source': 'client_planner', 'client_plan_id': None}
+        self.assertTrue(execution.queue_result(result, self.raw_state, self.qpos, protocol,
+                                              {"cam_high": time.time(), "cam_wrist": time.time()}, .01))
+        loop = Mock()
+        loop.has_chunk.return_value = False
+        execution.servo_loop = loop
+        self.assertFalse(execution.execute_next(self.raw_state, self.qpos, protocol,
+                                                feedback_captured_at=time.time()))
+        self.assertEqual(execution.state, 'ready')
+        self.assertFalse(execution.pending_actions)
+        self.assertTrue(execution.unsafe_active)
+        self.assertIn('source_index=31', execution.blocked_reason)
+        self.assertIn('joint3 target 0.10799', execution.blocked_reason)
+        loop.hold.assert_called_once()
+        loop.pause.assert_not_called()
+        loop.install_chunk.assert_not_called()
+        loop.submit.assert_not_called()
+        self.assertNotIn('JointCtrl', [call[0] for call in piper.calls])
+
+    def test_unpublished_compilation_failure_uses_recoverable_rejection(self):
+        from unittest.mock import Mock
+        from bimanual_vla.deployment.servo import ChunkPlanRejected
+        execution, _ = self.configured_execution(servo_backend="ruckig")
+        execution.queue_result(execution_result(self.joint_chunk(20, .02)),
+                               self.raw_state, self.qpos, self.joint_protocol,
+                               {"cam_high": time.time(), "cam_wrist": time.time()}, .01)
+        loop = Mock(); execution.servo_loop = loop
+        with patch.object(execution, '_servo_publish_target', side_effect=ChunkPlanRejected('planned minimum')):
+            self.assertFalse(execution.execute_next(self.raw_state, self.qpos, self.joint_protocol,
+                                                    feedback_captured_at=time.time()))
+        self.assertFalse(execution.pending_actions)
+        self.assertEqual(execution.state, 'ready')
+        loop.hold.assert_called_once()
+        loop.pause.assert_not_called()
+
+    def test_chunk_deferral_preserves_queue_and_does_not_safety_pause(self):
+        from unittest.mock import Mock
+        from bimanual_vla.deployment.servo import ChunkPlanDeferred, ServoError
+        execution, _ = self.configured_execution(servo_backend="ruckig")
+        now = time.time()
+        execution.queue_result(execution_result(self.joint_chunk(20, .02)),
+                               self.raw_state, self.qpos, self.joint_protocol,
+                               {"cam_high": now, "cam_wrist": now}, .01)
+        loop = Mock()
+        execution.servo_loop = loop
+        with patch.object(execution, '_servo_publish_target', side_effect=ChunkPlanDeferred('splice deadline')):
+            self.assertFalse(execution.execute_next(self.raw_state, self.qpos, self.joint_protocol,
+                                                    feedback_captured_at=time.time()))
+        self.assertTrue(execution.pending_actions)
+        self.assertEqual(execution.state, 'ready')
+        self.assertIn('deferred', execution.blocked_reason)
+        loop.pause.assert_not_called()
+        loop.hold.assert_not_called()
+        # Hardware/tracking failures must still stop publication, not retry.
+        with patch.object(execution, '_servo_publish_target', side_effect=ServoError('tracking fault')):
+            self.assertFalse(execution.execute_next(self.raw_state, self.qpos, self.joint_protocol,
+                                                    feedback_captured_at=time.time()))
+        loop.pause.assert_called_once()
+        self.assertEqual(execution.state, 'blocked')
+        self.assertFalse(execution.pending_actions)
+
+    def test_planner_prefix_uses_wire_gripper_units_and_keeps_fixed_delay(self):
+        protocol = replace(self.joint_protocol, rtc_supported=True, rtc_mode="trained",
+                           rtc_client_planner_prefix=True)
+        execution, _ = self.configured_execution(protocol, servo_backend="ruckig",
+                                                 rtc_inference_delay_steps=5)
+        positions = np.tile(self.qpos, (5, 1))
+        positions[:, 6] = np.linspace(0, GRIPPER_MAX_M, 5)
+        execution.servo_loop = SimpleNamespace(rtc_prefix=lambda capture, steps, hz: {
+            "plan_id": "1:2", "positions": positions.copy(), "action_hz": hz,
+            "sample_offsets_s": ((np.arange(steps)+1)/hz).tolist()})
+        payload = execution.rtc_request_metadata(protocol, observation_monotonic=100.)
+        self.assertEqual(payload["prefix_source"], "client_planner")
+        self.assertIsNone(payload["previous_chunk_generation"])
+        self.assertEqual(payload["inference_delay_steps"], 5)
+        np.testing.assert_allclose(np.array(payload["planned_prefix"]["actions"])[:, 6],
+                                   np.linspace(0, 1, 5))
+
+    def test_result_conditioned_on_invalidated_planner_prefix_is_rejected(self):
+        protocol = replace(self.joint_protocol, rtc_supported=True, rtc_mode="trained",
+                           rtc_client_planner_prefix=True)
+        execution, _ = self.configured_execution(protocol, servo_backend="ruckig")
+        execution.servo_loop = SimpleNamespace(prefix_is_valid=lambda token: False)
+        launch, arrived = inference_launch(self.raw_state, self.qpos, generation=15)
+        launch = replace(launch, observation_snapshot=SimpleNamespace(
+            rtc_metadata={"planned_prefix": {"plan_id": "1:2"}}))
+        result = execution_result(self.joint_chunk(50))
+        result["rtc"] = {"prefix_source": "client_planner", "client_plan_id": "1:2"}
+        self.assertFalse(execution.accept_inference_result(result, launch, protocol,
+                         arrived_at=arrived, arrived_monotonic=time.monotonic()))
+        self.assertEqual(execution.pending_action_count, 0)
+
+    def test_old_server_cannot_silently_ignore_client_planner_prefix(self):
+        protocol = replace(self.joint_protocol, rtc_supported=True, rtc_mode="trained")
+        with self.assertRaisesRegex(RuntimeError, "client_planner_prefix"):
+            self.configured_execution(protocol, servo_backend="ruckig")
+
+    def test_rtc_prefix_offset_advances_with_observation_time_without_dispatch(self):
+        execution, _ = self.configured_execution(self.joint_protocol)
+        execution.active_generation = 119
+        execution.active_chunk_capture_monotonic = 100.
+        metadata = execution.rtc_request_metadata(self.joint_protocol, observation_monotonic=100.30)
+        self.assertEqual(metadata['previous_chunk_offset_steps'], 6)
+        self.assertEqual(metadata['previous_chunk_generation'], 119)
+        execution.unsafe_active = True
+        metadata = execution.rtc_request_metadata(self.joint_protocol, observation_monotonic=100.30)
+        self.assertIsNone(metadata['previous_chunk_generation'])
+
+    def test_unsafe_plan_is_not_reused_as_rtc_prefix(self):
+        execution, _ = self.configured_execution(self.joint_protocol)
+        execution.active_generation = 119
+        execution.unsafe_active = True
+        metadata = execution.rtc_request_metadata(self.joint_protocol)
+        self.assertIsNone(metadata['previous_chunk_generation'])
+        self.assertEqual(metadata['previous_chunk_offset_steps'], 0)
+        execution.unsafe_active = False
+        execution.active_generation = 120
+        self.assertEqual(execution.rtc_request_metadata(self.joint_protocol)['previous_chunk_generation'], 120)
+
+    def test_rejected_client_splice_clears_server_prefix_metadata(self):
+        execution, _ = self.configured_execution(self.joint_protocol)
+        execution.active_generation = 119
+        execution.planner_prefix_fallback_reason = "candidate chunk could not be spliced"
+        metadata = execution.rtc_request_metadata(self.joint_protocol)
+        self.assertIsNone(metadata["previous_chunk_generation"])
+        self.assertEqual(metadata["previous_chunk_offset_steps"], 0)
+        self.assertEqual(
+            execution.metadata(compact=False)["rtc"]["planner_prefix_fallback_reason"],
+            "candidate chunk could not be spliced",
+        )
+
+    def test_ruckig_never_advertises_raw_model_prefix_even_with_source_progress(self):
+        protocol = replace(self.joint_protocol, rtc_supported=True, rtc_mode="trained",
+                           rtc_client_planner_prefix=True)
+        execution, _ = self.configured_execution(protocol, servo_backend="ruckig")
+        execution.active_generation = 119
+        execution.active_chunk_capture_monotonic = 100.0
+        # Source row 2 was consumed, but its raw model endpoint may still be far
+        # ahead of the bounded writer. Neither the index nor elapsed time makes
+        # the server's raw model curve a valid execution prefix.
+        execution.last_safe_target = TimedTarget(
+            queue_index=2,
+            wire_action=np.zeros(7),
+            absolute_target=np.zeros(7),
+            target_monotonic=100.1,
+            generation=119,
+            source_index=2,
+        )
+        metadata = execution.rtc_request_metadata(protocol, observation_monotonic=100.6)
+        self.assertEqual(metadata["prefix_source"], "client_planner")
+        self.assertIsNone(metadata["previous_chunk_generation"])
+        self.assertIsNone(metadata["planned_prefix"])
+        self.assertEqual(metadata["previous_chunk_offset_steps"], 0)
+
+    def test_repeated_splice_rejection_cannot_enable_raw_server_rtc(self):
+        from unittest.mock import Mock
+        from bimanual_vla.deployment.servo import ChunkPlanRejected
+        protocol = replace(self.joint_protocol, rtc_supported=True, rtc_mode="trained",
+                           rtc_client_planner_prefix=True)
+        execution, _ = self.configured_execution(protocol, servo_backend="ruckig")
+        loop = Mock()
+        loop.has_chunk.return_value = False
+        loop.rtc_prefix.return_value = None
+        loop.install_chunk.side_effect = ChunkPlanRejected("no bounded continuous splice")
+        execution.servo_loop = loop
+        prepared = {"right": (self.qpos[:6].copy(), float(self.qpos[6]))}
+        for generation, delay in enumerate((.25, .30, .35), start=1):
+            with self.subTest(generation=generation):
+                capture = 100.0 + generation
+                request = execution.rtc_request_metadata(protocol, observation_monotonic=capture)
+                self.assertEqual(request["prefix_source"], "client_planner")
+                self.assertIsNone(request["previous_chunk_generation"])
+                self.assertIsNone(request["planned_prefix"])
+                launch, wall = inference_launch(self.raw_state, self.qpos,
+                                               generation=generation, captured_monotonic=capture)
+                result = execution_result(self.joint_chunk(50, .02))
+                result["rtc"] = {"prefix_source": "client_planner", "enabled": False}
+                self.assertTrue(execution.accept_inference_result(
+                    result, launch, protocol, arrived_at=wall, arrived_monotonic=capture+delay))
+                execution._servo_publish_target(
+                    self.qpos, prepared, ("right",), hold=False,
+                    context={"generation": generation}, protocol=protocol)
+                self.assertTrue(execution.planner_prefix_enabled)
+                self.assertEqual(execution.planner_prefix_fallback_generation, generation)
+                self.assertTrue(loop.submit.call_args.kwargs["discard_chunk"])
+                # Do not retry a known rejected chunk on every control tick.
+                installs = loop.install_chunk.call_count
+                execution._servo_publish_target(
+                    self.qpos, prepared, ("right",), hold=False,
+                    context={"generation": generation}, protocol=protocol)
+                self.assertEqual(loop.install_chunk.call_count, installs)
+
+        # A new generation may recover materialized planning and supply a real
+        # writer prefix again; fallback is not a permanent loss of RTC.
+        loop.install_chunk.side_effect = None
+        execution.pending_actions = [replace(r, generation=4) for r in execution.pending_actions]
+        execution._servo_publish_target(self.qpos, prepared, ("right",), hold=False,
+                                       context={"generation": 4}, protocol=protocol)
+        self.assertIsNone(execution.planner_prefix_fallback_reason)
+        self.assertIsNone(execution.planner_prefix_fallback_generation)
+
+    def test_fixed_rtc_delay_and_actual_time_selection(self):
+        from dataclasses import replace
+        protocol = replace(self.joint_protocol, rtc_supported=True,
+                           rtc_max_execution_horizon=3)
+        execution, _ = self.configured_execution(protocol, rtc_inference_delay_steps=6,
+                                                  rtc_execution_horizon=10)
+        self.assertEqual(execution.rtc_execution_horizon, 10)
+        for latency in (0.1, 0.9):
+            execution.inference_latency_s = latency
+            self.assertEqual(execution.rtc_request_metadata(protocol)["inference_delay_steps"], 6)
+        launch, wall = inference_launch(self.raw_state, self.qpos, captured_monotonic=100.)
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertTrue(execution.accept_inference_result(
+                execution_result(self.joint_chunk(50, .01)), launch, protocol,
+                arrived_at=wall, arrived_monotonic=100.41))
+        self.assertIn("RTC delay exceeded", " ".join(logs.output))
+        self.assertEqual(execution.inference_skip_steps, 8)
+        self.assertFalse(execution.inference_timeline_resynced)
+        self.assertEqual(execution.blend_steps, 0)
+
+
+    def test_event_admission_does_not_bypass_execution_safety(self):
+        execution, piper = self.configured_execution()
+        worker = AsyncPolicyInference()
+        self.addCleanup(worker.shutdown)
+        launch, _ = inference_launch(self.raw_state, self.qpos, generation=23)
+        worker.launch_callable(lambda: execution_result(self.joint_chunk(50, 0.01)), launch)
+        def accept(completion):
+            return execution.accept_inference_result(
+                completion.result, completion.launch, self.joint_protocol,
+                arrived_at=completion.arrived_at, arrived_monotonic=completion.arrived_monotonic)
+        self.assertTrue(worker.wait_until(time.monotonic() + 0.2, accept))
+        self.assertFalse(any(call[0] == "JointCtrl" for call in piper.calls))
+        execution.args.allow_execution = False
+        self.assertFalse(execution.execute_next(self.raw_state, self.qpos, self.joint_protocol,
+                                                feedback_captured_at=time.time()))
+        self.assertFalse(any(call[0] == "JointCtrl" for call in piper.calls))
+
     def setUp(self):
         self.raw_state = delivery_state(opening_fraction=0.5)
         self.qpos = np.array([0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.035])

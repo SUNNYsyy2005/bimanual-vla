@@ -3,7 +3,8 @@
 
 This executable owns the physical control path: Piper CAN feedback and command
 I/O, camera capture, OpenPI WebSocket inference, timestamped action chunks, an
-independent 20 Hz servo loop, and fail-closed safety gates.
+20 Hz reference consumption, an optional independent Ruckig actuator clock,
+and fail-closed safety gates.
 The ``bin/bimanual-vla legacy-bridge`` command is a compatibility alias that
 forwards to this module and cannot select a different implementation.
 
@@ -48,6 +49,17 @@ from scipy.spatial.transform import Rotation
 
 from bimanual_vla.collection.camera import CameraCapture, CameraFrameSet, CameraPreview
 from bimanual_vla.deployment.recording import DeploymentRunRecorder
+from bimanual_vla.deployment.servo import ChunkPlanDeferred, ChunkPlanRejected, ServoConfig, ServoError, ServoLoop, RuckigJointServo
+from bimanual_vla.deployment.pose_trajectory import PoseTrajectory, PoseTrajectoryConfig
+from bimanual_vla.deployment.execution_defaults import (
+    DEFAULT_ACTION_HZ, DEFAULT_SERVO_HZ, DEFAULT_INFERENCE_SPEED_PCT, DEFAULT_FEEDBACK_MAX_AGE_S,
+    DEFAULT_TRAJECTORY_MAX_SPEED_RAD_S, DEFAULT_TRAJECTORY_MAX_ACCELERATION_RAD_S2,
+    DEFAULT_TRAJECTORY_MAX_JERK_RAD_S3, DEFAULT_TRAJECTORY_MAX_TRACKING_ERROR_RAD,
+    DEFAULT_GRIPPER_SPEED_M_S,
+)
+from bimanual_vla.deployment.hardware_safety import (
+    query_limits, effective_limits, effective_speed, recover_return_faults,
+)
 from bimanual_vla.collection.output import require_can_interface_up
 from bimanual_vla.collection.can_identity import resolve_can_selector, resolve_can_pair
 from bimanual_vla.data.action_conventions import (
@@ -70,6 +82,7 @@ from bimanual_vla.data.contract import (
     STATE_NAMES,
     build_delivery_state,
 )
+from bimanual_vla.deployment.gripper_limits import GRIPPER_MAX_M as GRIPPER_EXECUTION_MAX_M
 from bimanual_vla.deployment.trajectory import (
     JerkLimitedJointTrajectory,
     TrajectoryTrackingError,
@@ -97,7 +110,6 @@ JOINT_ACTION_SEMANTICS = frozenset(
 )
 DEFAULT_POLICY_HOST = "192.168.101.9"
 DEFAULT_POLICY_PORT = 8000
-DEFAULT_ACTION_HZ = 20.0
 DEFAULT_INFERENCE_HZ = 4.0
 DEFAULT_INFERENCE_TRIGGER_STEP = 10
 DEFAULT_CAMERA_FPS = 30
@@ -105,26 +117,21 @@ DEFAULT_OPENPI_CHUNK_STEPS = 50
 DEFAULT_MIN_ACTION_CHUNK_STEPS = 16
 DEFAULT_BLEND_STEPS = 3
 DEFAULT_SYNC_WAIT_STEPS = 8
-DEFAULT_RTC_EXECUTION_HORIZON = 8
+DEFAULT_RTC_EXECUTION_HORIZON = 12
 DEFAULT_RTC_MAX_GUIDANCE_WEIGHT = 5.0
 INFERENCE_RATE_HISTORY_SIZE = 32
 DEFAULT_ACTUATOR_DELAY_S = 0.0
 DEFAULT_GRIPPER_LOWPASS_ALPHA = 0.5
 DEFAULT_GRIPPER_HYSTERESIS = 0.05
 DEFAULT_GRIPPER_CONFIRM_STEPS = 2
-DEFAULT_FEEDBACK_MAX_AGE_S = 0.5
-DEFAULT_MAX_IMAGE_STATE_SKEW_S = 0.100  # 放宽到100ms，避免频繁跳过
+DEFAULT_MAX_IMAGE_STATE_SKEW_S = 0.100  # Allow 100 ms to avoid frequent frame drops.
 DEFAULT_TRACKING_LAG_THRESHOLD_RAD = 0.10
 DEFAULT_TRACKING_LAG_CONFIRM_CYCLES = 3
 DEFAULT_ARM_HOLD_TOLERANCE_RAD = 0.05
-DEFAULT_JOINT_LIMIT_TOLERANCE_RAD = 0.05
-DEFAULT_TRAJECTORY_MAX_SPEED_RAD_S = 0.30
-DEFAULT_TRAJECTORY_MAX_ACCELERATION_RAD_S2 = 0.80
-DEFAULT_TRAJECTORY_MAX_JERK_RAD_S3 = 4.0
+DEFAULT_JOINT_LIMIT_TOLERANCE_RAD = 0.10
 DEFAULT_TRAJECTORY_SMOOTHING_CUTOFF_HZ = 3.0
 DEFAULT_TRAJECTORY_TRACKING_TIME_CONSTANT_S = 0.25
 DEFAULT_TRAJECTORY_COMMAND_LOOKAHEAD_RAD = 0.02
-DEFAULT_TRAJECTORY_MAX_TRACKING_ERROR_RAD = 0.35
 DEFAULT_GRIPPER_OPEN_LOOKAHEAD_STEPS = 30
 DEFAULT_RETURN_HZ = 20.0
 DEFAULT_RETURN_TIMEOUT_S = 30.0
@@ -149,9 +156,11 @@ DEFAULT_MAX_ROTATION_STEP_RAD = 0.18  # observed max 0.15766 rad
 DEFAULT_MAX_GRIPPER_STEP = 0.30  # observed max 0.261 opening fraction
 DEFAULT_WORKSPACE_X_M = (-0.05, 0.30)  # observed [-0.03815, 0.27987]
 DEFAULT_WORKSPACE_Y_M = (0.01, 0.50)  # observed [0.02183, 0.47802]
+DEFAULT_WORKSPACE_Y_LEFT_M = (0.01, 0.50)
+DEFAULT_WORKSPACE_Y_RIGHT_M = (-0.50, -0.01)
 DEFAULT_WORKSPACE_Z_M = (0.14, 0.52)  # observed [0.14706, 0.50322]
 DEFAULT_GRIPPER_RANGE_TOLERANCE = 0.02
-PIPER_FEEDBACK_MAX_AGE_S = 0.5
+PIPER_FEEDBACK_MAX_AGE_S = DEFAULT_FEEDBACK_MAX_AGE_S
 IK_JOINT_LIMIT_MARGIN_RAD = 0.002
 # Piper feedback can sit a few degrees beyond the SDK's nominal zero-angle
 # limits while the controller reports a healthy, non-limit status.  This is a
@@ -167,6 +176,15 @@ DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT = 1.0
 IK_JOINT_REGULARIZATION_SCALE_RAD = 0.08
 DEFAULT_IK_POSITION_TOLERANCE_M = 0.0015
 DEFAULT_IK_ROTATION_TOLERANCE_RAD = 0.02
+# A numerical IK step can miss the nominal orientation gate by a few
+# hundredths of a radian near a joint limit.  This is a bounded execution
+# fallback, not a new target planner: the candidate must still be finite,
+# remain on the same local joint branch, and improve task-space error.
+# A local numerical solve can miss the exact pose at a joint bound even when
+# the resulting Piper target is visually/physically close.  Keep this bounded
+# and local: it does not alter driver limits or the search radius.
+DEFAULT_IK_FALLBACK_POSITION_TOLERANCE_M = 0.010
+DEFAULT_IK_FALLBACK_ROTATION_TOLERANCE_RAD = 0.12
 DEFAULT_IK_MAX_NFEV = 100
 DEFAULT_MONITORING_DIR = "monitoring_data"
 PIPER_CTRL_MODE_CAN = 0x01
@@ -441,6 +459,10 @@ class PolicyProtocol:
     state_gripper_semantics: str = GRIPPER_OPENING_FRACTION
     metadata_gripper_semantics_explicit: bool = False
     contract_version: int | None = None
+    image_resize_mode: str = "pad"
+    image_size: int = 224
+    image_transport: str = "raw"
+    image_jpeg_quality: int = 90
     action_horizon: int = DEFAULT_OPENPI_CHUNK_STEPS
     # RTC capability advertised by the server. Runtime values remain
     # client-owned and are not copied from server defaults.
@@ -448,6 +470,8 @@ class PolicyProtocol:
     rtc_max_execution_horizon: int = DEFAULT_RTC_EXECUTION_HORIZON
     rtc_max_guidance_weight: float = DEFAULT_RTC_MAX_GUIDANCE_WEIGHT
     rtc_supported_schedules: tuple[str, ...] = ("zeros", "ones", "linear", "exp")
+    rtc_mode: str = ""
+    rtc_client_planner_prefix: bool = False
 
     @property
     def rtc_enabled(self) -> bool:
@@ -507,6 +531,11 @@ def connect_piper(can_name: str) -> Any:
     )
     piper.ConnectPort(can_init=True, piper_init=True)
     time.sleep(0.5)
+    try:
+        query_limits(piper)
+    except Exception:
+        piper.DisconnectPort()
+        raise
     return piper
 
 
@@ -594,6 +623,10 @@ class PiperIKSolveResult:
     optimizer_success: bool | None = None
     optimizer_status: int | None = None
     optimizer_nfev: int | None = None
+    tolerance_relaxed: bool = False
+    accepted_position_tolerance_m: float | None = None
+    accepted_rotation_tolerance_rad: float | None = None
+    solve_elapsed_s: float | None = None
 
 
 class PiperContinuousIK:
@@ -628,6 +661,7 @@ class PiperContinuousIK:
         max_nfev: int,
         search_joint_radius_rad: float | None = None,
         joint_regularization_weight: float = DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT,
+        joint_limits: np.ndarray | None = None,
     ) -> np.ndarray:
         return self.solve_with_diagnostics(
             current_joints_rad,
@@ -640,6 +674,7 @@ class PiperContinuousIK:
             max_nfev=max_nfev,
             search_joint_radius_rad=search_joint_radius_rad,
             joint_regularization_weight=joint_regularization_weight,
+            joint_limits=joint_limits,
         ).command_joints_rad.copy()
 
     def solve_with_diagnostics(
@@ -655,7 +690,9 @@ class PiperContinuousIK:
         max_nfev: int,
         search_joint_radius_rad: float | None = None,
         joint_regularization_weight: float = DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT,
+        joint_limits: np.ndarray | None = None,
     ) -> PiperIKSolveResult:
+        solve_started = time.perf_counter()
         current = np.asarray(current_joints_rad, dtype=np.float64)
         target_xyz = np.asarray(target_xyz_m, dtype=np.float64)
         target_rpy = np.asarray(target_rpy_deg, dtype=np.float64)
@@ -680,8 +717,11 @@ class PiperContinuousIK:
         if not math.isfinite(regularization_weight) or regularization_weight < 0:
             raise ExecutionBlocked("IK joint regularization weight must be non-negative")
 
-        hard_lower = JOINT_LIMITS_RAD[:, 0] + IK_JOINT_LIMIT_MARGIN_RAD
-        hard_upper = JOINT_LIMITS_RAD[:, 1] - IK_JOINT_LIMIT_MARGIN_RAD
+        limits = JOINT_LIMITS_RAD if joint_limits is None else np.asarray(joint_limits, dtype=np.float64)
+        if limits.shape != (6, 2) or not np.all(np.isfinite(limits)) or np.any(limits[:, 0] >= limits[:, 1]):
+            raise ExecutionBlocked("IK joint limits must be finite 6x2 intervals")
+        hard_lower = limits[:, 0] + IK_JOINT_LIMIT_MARGIN_RAD
+        hard_upper = limits[:, 1] - IK_JOINT_LIMIT_MARGIN_RAD
         if np.any(current < hard_lower - IK_FEEDBACK_LIMIT_TOLERANCE_RAD) or np.any(
             current > hard_upper + IK_FEEDBACK_LIMIT_TOLERANCE_RAD
         ):
@@ -704,7 +744,60 @@ class PiperContinuousIK:
         initial = np.clip(initial_source, lower + 1e-8, upper - 1e-8)
         target_rotation = Rotation.from_euler("xyz", target_rpy, degrees=True).as_matrix()
 
-        def residual(candidate: np.ndarray) -> np.ndarray:
+        # Adjacent 30 Hz EEF targets normally stay on one local IK branch.
+        # Try a bounded damped-Jacobian update first; the full scipy solve is
+        # retained as a fallback for larger changes or near-singular poses.
+        task_scales = np.asarray(
+            [position_tolerance_m] * 3 + [rotation_tolerance_rad] * 3,
+            dtype=np.float64,
+        )
+
+        def task_error(candidate: np.ndarray) -> np.ndarray:
+            xyz, rotation = self.pose(candidate)
+            rotation_error = Rotation.from_matrix(target_rotation @ rotation.T).as_rotvec()
+            return np.concatenate((xyz - target_xyz, rotation_error))
+
+        def fast_local_solve(seed: np.ndarray) -> np.ndarray:
+            """Solve the common small local update without scipy iteration."""
+            candidate = np.clip(np.asarray(seed, dtype=np.float64), lower, upper)
+            for _ in range(4):
+                error = task_error(candidate)
+                if np.max(np.abs(error / task_scales)) <= 0.25:
+                    break
+                jacobian = np.empty((6, 6), dtype=np.float64)
+                for column in range(6):
+                    step = 1e-4
+                    plus = min(float(candidate[column] + step), float(upper[column]))
+                    minus = max(float(candidate[column] - step), float(lower[column]))
+                    if plus <= minus:
+                        jacobian[:, column] = 0.0
+                        continue
+                    q_plus = candidate.copy()
+                    q_minus = candidate.copy()
+                    q_plus[column] = plus
+                    q_minus[column] = minus
+                    jacobian[:, column] = (
+                        task_error(q_plus) - task_error(q_minus)
+                    ) / (plus - minus)
+                scaled_jacobian = jacobian / task_scales[:, None]
+                scaled_error = error / task_scales
+                regularizer = regularization_weight / (IK_JOINT_REGULARIZATION_SCALE_RAD ** 2)
+                system = scaled_jacobian.T @ scaled_jacobian
+                system += (regularizer + 1e-4) * np.eye(6)
+                rhs = (
+                    -scaled_jacobian.T @ scaled_error
+                    + regularizer * (current - candidate)
+                )
+                try:
+                    delta = np.linalg.solve(system, rhs)
+                except np.linalg.LinAlgError:
+                    return candidate
+                if not np.all(np.isfinite(delta)):
+                    return candidate
+                candidate = np.clip(candidate + delta, lower, upper)
+            return candidate
+
+        def residual(candidate: np.ndarray, *, joint_weight=regularization_weight) -> np.ndarray:
             xyz, rotation = self.pose(candidate)
             rotation_error = Rotation.from_matrix(target_rotation @ rotation.T).as_rotvec()
             task_error = np.concatenate(
@@ -713,46 +806,139 @@ class PiperContinuousIK:
                     rotation_error / rotation_tolerance_rad,
                 )
             )
-            if regularization_weight == 0:
+            if joint_weight == 0:
                 return task_error
             joint_regularization = (
-                math.sqrt(regularization_weight)
+                math.sqrt(joint_weight)
                 * (candidate - current)
                 / IK_JOINT_REGULARIZATION_SCALE_RAD
             )
             return np.concatenate((task_error, joint_regularization))
 
-        # Numerical optimization is only needed for delivery control; keep
-        # joint-only deployments from importing scipy.optimize at startup.
-        from scipy.optimize import least_squares
+        def optimize(seed: np.ndarray, *, joint_weight: float):
+            """Run one bounded local solve from a seed on this joint branch."""
+            # Numerical optimization is only needed for delivery control; keep
+            # joint-only deployments from importing scipy.optimize at startup.
+            from scipy.optimize import least_squares
+            return least_squares(
+                lambda q: residual(q, joint_weight=joint_weight),
+                np.clip(np.asarray(seed, dtype=np.float64), lower + 1e-8, upper - 1e-8),
+                bounds=(lower, upper),
+                max_nfev=max_nfev,
+                # Jacobian scaling helps when a wrist joint is close to a
+                # bound and the translational/rotational residuals have very
+                # different numerical curvature.
+                x_scale="jac",
+                xtol=1e-8,
+                ftol=1e-8,
+                gtol=1e-8,
+            )
 
-        result = least_squares(
-            residual,
-            initial,
-            bounds=(lower, upper),
-            max_nfev=max_nfev,
-            xtol=1e-8,
-            ftol=1e-8,
-            gtol=1e-8,
+        def pose_errors(joints):
+            xyz, rotation = self.pose(joints)
+            return (float(np.linalg.norm(xyz - target_xyz)), float(np.linalg.norm(
+                Rotation.from_matrix(target_rotation @ rotation.T).as_rotvec())))
+
+        fast_candidate = fast_local_solve(initial)
+        fast_position_error, fast_rotation_error = pose_errors(fast_candidate)
+        fast_accepted = (
+            fast_position_error <= position_tolerance_m
+            and fast_rotation_error <= rotation_tolerance_rad
         )
-        solved = np.asarray(result.x, dtype=np.float64)
-        solved_xyz, solved_rotation = self.pose(solved)
-        position_error = float(np.linalg.norm(solved_xyz - target_xyz))
-        rotation_error = float(
-            np.linalg.norm(Rotation.from_matrix(target_rotation @ solved_rotation.T).as_rotvec())
-        )
+        if fast_accepted:
+            class _FastResult:
+                success = True
+                status = 1
+                nfev = 0
+
+                def __init__(self, x):
+                    self.x = x
+
+            result = _FastResult(fast_candidate)
+            solved = fast_candidate
+            optimizer_nfev = 0
+        else:
+            # The fast candidate is still a bounded, same-branch point.  Use
+            # it as the scipy seed when it did not quite meet tolerance; this
+            # reduces iterations for the difficult tail without changing the
+            # fallback's limits or acceptance gates.
+            result = optimize(fast_candidate, joint_weight=regularization_weight)
+            solved = np.asarray(result.x, dtype=np.float64)
+
+        position_error, rotation_error = pose_errors(solved)
+        tolerance_relaxed = False
+        accepted_position_tolerance = position_tolerance_m
+        accepted_rotation_tolerance = rotation_tolerance_rad
+        if position_error > position_tolerance_m or rotation_error > rotation_tolerance_rad:
+            # Proximity is a soft preference; it must not make a reachable
+            # target fail the hard pose tolerances.  A bounded least-squares
+            # solve can stop at a wrist bound from one seed even though the
+            # same local branch has a valid solution from another nearby seed.
+            # Retry only the local problem (never enlarge limits/radius) from
+            # a small, deterministic set of existing branch states.
+            seeds = [solved, current, initial]
+            if initial_joints_rad is not None:
+                seeds.append(np.asarray(initial_joints_rad, dtype=np.float64))
+            candidates = []
+            total_nfev = int(getattr(result, "nfev", 0))
+            for seed in seeds:
+                candidate_result = optimize(seed, joint_weight=0.0)
+                candidate = np.asarray(candidate_result.x, dtype=np.float64)
+                candidate_position_error, candidate_rotation_error = pose_errors(candidate)
+                candidates.append((candidate_position_error, candidate_rotation_error,
+                                   float(np.max(np.abs(candidate - current))), candidate,
+                                   candidate_result))
+                total_nfev += int(getattr(candidate_result, "nfev", 0))
+            feasible = [item for item in candidates
+                        if item[0] <= position_tolerance_m and item[1] <= rotation_tolerance_rad]
+            if feasible:
+                # Preserve continuity among feasible solutions while making
+                # pose tolerances the hard criterion.
+                _, _, _, solved, result = min(feasible, key=lambda item: item[2])
+                position_error, rotation_error = pose_errors(solved)
+            else:
+                # Keep the best task-space candidate for diagnostics.
+                _, _, _, solved, result = min(
+                    candidates, key=lambda item: (item[0] / position_tolerance_m
+                                                  + item[1] / rotation_tolerance_rad, item[2]))
+                position_error, rotation_error = pose_errors(solved)
+            # nfev is diagnostic only; report all bounded retries so a caller
+            # can distinguish a genuine local-limit failure from early stop.
+            optimizer_nfev = total_nfev
+        else:
+            optimizer_nfev = int(getattr(result, "nfev", 0))
         solved_joint_step = float(np.max(np.abs(solved - current)))
         if np.any(solved < hard_lower - IK_FEEDBACK_LIMIT_TOLERANCE_RAD) or np.any(
             solved > hard_upper + IK_FEEDBACK_LIMIT_TOLERANCE_RAD
         ):
             raise ExecutionBlocked("continuous IK target is outside tolerated joint limits")
         if position_error > position_tolerance_m or rotation_error > rotation_tolerance_rad:
-            raise ExecutionBlocked(
-                "continuous IK could not reach a nearby solution: "
-                f"position_error={position_error:.5f}m, "
-                f"rotation_error={rotation_error:.5f}rad, "
-                f"search_joint_step={solved_joint_step:.5f}rad"
+            # Do not stop for a small numerical miss at a joint limit.  Accept
+            # the best local candidate only under a deliberately wider,
+            # bounded tolerance and only when it improves the measured pose.
+            # This keeps replay/inference on the same online control path while
+            # avoiding a one-tick abort for errors such as 0.02048 rad vs the
+            # nominal 0.02000 rad gate.
+            fallback_position_tolerance = max(
+                position_tolerance_m, DEFAULT_IK_FALLBACK_POSITION_TOLERANCE_M
             )
+            fallback_rotation_tolerance = max(
+                rotation_tolerance_rad, DEFAULT_IK_FALLBACK_ROTATION_TOLERANCE_RAD
+            )
+            if (
+                position_error <= fallback_position_tolerance
+                and rotation_error <= fallback_rotation_tolerance
+            ):
+                tolerance_relaxed = True
+                accepted_position_tolerance = fallback_position_tolerance
+                accepted_rotation_tolerance = fallback_rotation_tolerance
+            else:
+                raise ExecutionBlocked(
+                    "continuous IK could not reach a nearby solution: "
+                    f"position_error={position_error:.5f}m, "
+                    f"rotation_error={rotation_error:.5f}rad, "
+                    f"search_joint_step={solved_joint_step:.5f}rad"
+                )
         if solved_joint_step > search_radius + 1e-6:
             raise ExecutionBlocked(
                 f"continuous IK search step {solved_joint_step:.5f}rad exceeds "
@@ -770,7 +956,11 @@ class PiperContinuousIK:
                 command_rotation_error_rad=rotation_error,
                 optimizer_success=bool(result.success),
                 optimizer_status=int(result.status),
-                optimizer_nfev=int(result.nfev),
+                optimizer_nfev=optimizer_nfev,
+                tolerance_relaxed=tolerance_relaxed,
+                accepted_position_tolerance_m=accepted_position_tolerance,
+                accepted_rotation_tolerance_rad=accepted_rotation_tolerance,
+                solve_elapsed_s=time.perf_counter() - solve_started,
             )
 
         # Follow the regularized solution direction with a bounded 20 Hz servo
@@ -817,7 +1007,11 @@ class PiperContinuousIK:
             command_rotation_error_rad=command_rotation_error,
             optimizer_success=bool(result.success),
             optimizer_status=int(result.status),
-            optimizer_nfev=int(result.nfev),
+            optimizer_nfev=optimizer_nfev,
+            tolerance_relaxed=tolerance_relaxed,
+            accepted_position_tolerance_m=accepted_position_tolerance,
+            accepted_rotation_tolerance_rad=accepted_rotation_tolerance,
+            solve_elapsed_s=time.perf_counter() - solve_started,
         )
 
 
@@ -1345,6 +1539,27 @@ def validate_policy_metadata(
         expected_camera_keys = [sorted(keys) for keys in expected_camera_key_sets]
         errors.append(f"camera_keys={camera_keys!r}, expected one of {expected_camera_keys!r}")
     capabilities = metadata.get("rtc_capabilities")
+    raw_image_size = metadata.get("image_size", 224)
+    try:
+        image_size = int(raw_image_size)
+        if image_size <= 0 or image_size != raw_image_size:
+            raise ValueError
+    except (TypeError, ValueError):
+        image_size = 224
+        errors.append(f"image_size={raw_image_size!r} must be a positive integer")
+    image_transport = str(metadata.get("image_transport", "raw")).strip().lower()
+    if image_transport not in {"raw", "jpeg_chw_v1"}:
+        errors.append(f"image_transport={image_transport!r} must be raw or jpeg_chw_v1")
+        image_transport = "raw"
+    raw_jpeg_quality = metadata.get("image_jpeg_quality", 90)
+    try:
+        image_jpeg_quality = int(raw_jpeg_quality)
+        if image_jpeg_quality != raw_jpeg_quality or not 1 <= image_jpeg_quality <= 100:
+            raise ValueError
+    except (TypeError, ValueError):
+        image_jpeg_quality = 90
+        if image_transport == "jpeg_chw_v1":
+            errors.append("image_jpeg_quality must be an integer in [1, 100]")
     capabilities = capabilities if isinstance(capabilities, dict) else {}
     rtc_supported = bool(metadata.get("rtc_supported", metadata.get("rtc_enabled", False)))
     raw_rtc_execution_horizon = capabilities.get(
@@ -1402,10 +1617,16 @@ def validate_policy_metadata(
         metadata_gripper_semantics_explicit=raw_gripper_semantics is not None,
         contract_version=contract_version,
         action_horizon=action_horizon,
+        image_resize_mode=str(metadata.get("image_resize_mode", "pad")),
+        image_size=image_size,
+        image_transport=image_transport,
+        image_jpeg_quality=image_jpeg_quality,
         rtc_supported=rtc_supported,
         rtc_max_execution_horizon=rtc_max_execution_horizon,
         rtc_max_guidance_weight=rtc_max_guidance_weight,
         rtc_supported_schedules=rtc_supported_schedules,
+        rtc_mode=str(metadata.get("rtc_mode", "")),
+        rtc_client_planner_prefix=bool(capabilities.get("client_planner_prefix", False)),
     )
 
 
@@ -1493,10 +1714,10 @@ def connect_policy(
     output_mode: str = "auto",
 ) -> tuple[Any, PolicyProtocol]:
     """Create the official OpenPI client and validate the server handshake."""
-    from openpi_client.websocket_client_policy import WebsocketClientPolicy
+    from bimanual_vla.deployment.transport import TimedWebsocketClientPolicy
 
     logging.info("Connecting to official OpenPI policy at ws://%s:%d ...", host, port)
-    policy = WebsocketClientPolicy(host=host, port=port)
+    policy = TimedWebsocketClientPolicy(host=host, port=port)
     try:
         _tune_policy_socket(policy)
         metadata = policy.get_server_metadata()
@@ -1592,10 +1813,11 @@ def _opening_fraction(
     tolerance: float,
 ) -> float:
     raw = float(value)
-    if raw < -tolerance or raw > 1.0 + tolerance:
-        raise ExecutionBlocked(
-            f"gripper target {raw:.5f} exceeds [0,1] tolerance {tolerance:.5f}"
-        )
+    if not math.isfinite(raw):
+        raise ExecutionBlocked("gripper target is non-finite")
+    # Opening fraction is a bounded actuator request, not a joint angle.
+    # Saturate endpoints independently so finite gripper overshoot cannot
+    # discard an otherwise valid arm trajectory.
     normalized = float(np.clip(raw, 0.0, 1.0))
     if semantics == GRIPPER_OPENING_FRACTION:
         return normalized
@@ -1603,12 +1825,12 @@ def _opening_fraction(
         return 1.0 - normalized
     if semantics == GRIPPER_OPENING_METRES:
         metre_tolerance = tolerance * GRIPPER_MAX_M
-        if raw < -metre_tolerance or raw > GRIPPER_MAX_M + metre_tolerance:
+        if raw < -metre_tolerance or raw > GRIPPER_EXECUTION_MAX_M + metre_tolerance:
             raise ExecutionBlocked(
-                f"gripper target {raw:.5f}m exceeds [0,{GRIPPER_MAX_M:.5f}]m "
+                f"gripper target {raw:.5f}m exceeds [0,{GRIPPER_EXECUTION_MAX_M:.5f}]m "
                 f"tolerance {metre_tolerance:.5f}m"
             )
-        return float(np.clip(raw, 0.0, GRIPPER_MAX_M) / GRIPPER_MAX_M)
+        return float(np.clip(raw, 0.0, GRIPPER_EXECUTION_MAX_M) / GRIPPER_MAX_M)
     raise ExecutionBlocked(f"unsupported gripper semantics: {semantics!r}")
 
 
@@ -1618,6 +1840,8 @@ def _gripper_value_from_opening_fraction(
     semantics: str,
 ) -> float:
     """Encode a normalized opening fraction in the policy's wire semantics."""
+    if semantics == GRIPPER_OPENING_METRES:
+        return float(np.clip(opening_fraction * GRIPPER_MAX_M, 0.0, GRIPPER_EXECUTION_MAX_M))
     opening = float(np.clip(opening_fraction, 0.0, 1.0))
     if semantics == GRIPPER_OPENING_FRACTION:
         return opening
@@ -1755,10 +1979,13 @@ def decode_action_queue(
     for arm_index in range(arm_count):
         gripper_index = arm_index * 7 + 6
         for row in wire:
-            _opening_fraction(
+            opening = _opening_fraction(
                 row[gripper_index],
                 semantics=protocol.gripper_semantics,
                 tolerance=gripper_range_tolerance,
+            )
+            row[gripper_index] = _gripper_value_from_opening_fraction(
+                opening, semantics=protocol.gripper_semantics,
             )
 
     anchor = policy_observation_state(raw_delivery_state, qpos_m, protocol).astype(np.float64)
@@ -1959,12 +2186,13 @@ class InferenceWorkerResult:
 
 
 class AsyncPolicyInference:
-    """Single-in-flight inference worker; polling never blocks the control loop."""
+    """Single-in-flight inference with event wakeup and control-thread admission."""
 
     def __init__(self) -> None:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="piper-policy")
         self._future: Future | None = None
         self._launch: InferenceLaunch | None = None
+        self._ready = threading.Event()
 
     @property
     def in_flight(self) -> bool:
@@ -1986,19 +2214,42 @@ class AsyncPolicyInference:
         """Submit capture/inference work without waiting on the control thread."""
         if self._future is not None:
             return False
+        self._ready.clear()
         self._launch = launch
         self._future = self._executor.submit(task)
+        # The callback only signals. Queue replacement and safety state remain
+        # owned by the control thread, including immediately-completed tasks.
+        self._future.add_done_callback(lambda _future: self._ready.set())
         return True
+
+    def wait_until(
+        self, deadline: float, on_completion: Callable[[InferenceCompletion], bool | None]
+    ) -> bool:
+        """Admit completed inference during the gap between actuator ticks.
+
+        A callback may request an early reference-refresh tick by returning
+        True. Otherwise keep waiting to the original absolute deadline. This
+        worker never issues commands or mutates the controller itself.
+        """
+        while (remaining := deadline - time.monotonic()) > 0:
+            if not self._ready.wait(timeout=remaining):
+                return False
+            completion = self.poll()
+            if completion is not None:
+                if on_completion(completion):
+                    return True
+        return False
 
     def poll(self) -> InferenceCompletion | None:
         future = self._future
         launch = self._launch
-        if future is None or launch is None or not future.done():
+        if future is None or launch is None or not self._ready.is_set():
             return None
         arrived_at = time.time()
         arrived_monotonic = time.monotonic()
         self._future = None
         self._launch = None
+        self._ready.clear()
         try:
             result = future.result()
         except BaseException as exc:  # surfaced on the 20 Hz control thread
@@ -2016,6 +2267,11 @@ class AsyncPolicyInference:
             payload = dict(result.result)
             if isinstance(result.client_timing, dict):
                 payload["_client_transport_timing"] = dict(result.client_timing)
+                received = result.client_timing.get("response_received_monotonic")
+                if isinstance(received, (float, int)) and math.isfinite(received):
+                    payload["_client_transport_timing"]["response_to_admission_ms"] = max(
+                        0.0, (arrived_monotonic - received) * 1000.0
+                    )
             result = payload
         return InferenceCompletion(launch, result, arrived_at, arrived_monotonic, error=None)
 
@@ -2243,9 +2499,9 @@ def _check_delivery_absolute_target(
     max_rotation_step_rad: float,
     max_gripper_step: float,
     gripper_range_tolerance: float,
-    workspace_x: tuple[float, float],
-    workspace_y: tuple[float, float],
-    workspace_z: tuple[float, float],
+    workspace_x: tuple[float, float] | None,
+    workspace_y: tuple[float, float] | None,
+    workspace_z: tuple[float, float] | None,
 ) -> tuple[np.ndarray, np.ndarray, float, float]:
     """Validate an already-decoded absolute EEF target against fresh feedback."""
     current_state = np.asarray(current_state, dtype=np.float64)
@@ -2271,6 +2527,8 @@ def _check_delivery_absolute_target(
             f"rotation step {rotation_step:.5f}rad exceeds {max_rotation_step_rad:.5f}rad"
         )
     for axis, value, bounds in zip("xyz", target_xyz, (workspace_x, workspace_y, workspace_z)):
+        if bounds is None:
+            continue
         if not bounds[0] <= float(value) <= bounds[1]:
             raise ExecutionBlocked(
                 f"target {axis}={value:.5f}m outside workspace "
@@ -2289,6 +2547,50 @@ def _check_delivery_absolute_target(
     target_gripper_m = opening_fraction * GRIPPER_MAX_M
     target_rpy_deg = Rotation.from_matrix(target_rotation).as_euler("xyz", degrees=True)
     return target_xyz.copy(), target_rpy_deg, target_gripper_m, opening_fraction
+
+
+def project_delivery_target_step(
+    current_state: np.ndarray,
+    target: np.ndarray,
+    *,
+    max_translation_step_m: float,
+    max_rotation_step_rad: float,
+) -> tuple[np.ndarray, bool]:
+    """Project a distant EEF target onto one bounded Cartesian control step.
+
+    Replanning can replace a 50-step chunk with a target several centimetres
+    away from the measured pose.  Rejecting that whole chunk makes a reachable
+    arm appear to have an IK failure.  Move only the translation/rotation
+    portion toward the target; gripper and target semantics remain unchanged.
+    """
+    state = np.asarray(current_state, dtype=np.float64)
+    output = np.asarray(target, dtype=np.float64).copy()
+    if state.shape != (10,) or output.shape != (10,):
+        raise ExecutionBlocked("delivery target projection requires 10D state/target")
+    changed = False
+    translation = output[:3] - state[:3]
+    distance = float(np.linalg.norm(translation))
+    if math.isfinite(max_translation_step_m) and distance > max_translation_step_m:
+        output[:3] = state[:3] + translation * (max_translation_step_m / distance)
+        changed = True
+    current_rotation = rotation_from_state(state)
+    target_rotation = rotation_from_state(output)
+    relative = Rotation.from_matrix(target_rotation @ current_rotation.T)
+    angle = float(relative.magnitude())
+    if math.isfinite(max_rotation_step_rad) and angle > max_rotation_step_rad:
+        step_rotation = Rotation.from_rotvec(relative.as_rotvec() * (max_rotation_step_rad / angle))
+        output[3:9] = matrix_to_rotation6d(step_rotation.as_matrix() @ current_rotation)
+        changed = True
+    return output, changed
+
+
+def delivery_workspace_y(args: argparse.Namespace, side: str) -> tuple[float, float] | None:
+    """Return an explicitly configured EEF Y envelope, if any."""
+    override = getattr(args, f"workspace_y_{side}", None)
+    if override is not None:
+        return tuple(float(value) for value in override)
+    generic = getattr(args, "workspace_y", None)
+    return None if generic is None else tuple(float(value) for value in generic)
 
 
 def build_checked_target(
@@ -2347,6 +2649,7 @@ def build_checked_joint_target(
     joint_limit_tolerance_rad: float = 0.0,
     gripper_range_tolerance: float = DEFAULT_GRIPPER_RANGE_TOLERANCE,
     gripper_semantics: str = GRIPPER_OPENING_FRACTION,
+    joint_limits: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float]:
     """Validate absolute joints + opening fraction and return Piper units in SI."""
     qpos = np.asarray(qpos, dtype=np.float64)
@@ -2359,17 +2662,16 @@ def build_checked_joint_target(
     if joint_limit_tolerance_rad < 0:
         raise ValueError("joint_limit_tolerance_rad must be non-negative")
     checked_joints = action[:6].copy()
-    for index, (value, bounds) in enumerate(zip(checked_joints, JOINT_LIMITS_RAD), start=1):
+    limits = JOINT_LIMITS_RAD if joint_limits is None else joint_limits
+    for index, (value, bounds) in enumerate(zip(checked_joints, limits), start=1):
         value = float(value)
         if value < bounds[0] - joint_limit_tolerance_rad or value > bounds[1] + joint_limit_tolerance_rad:
             raise ExecutionBlocked(
                 f"joint{index} target {value:.5f}rad outside "
                 f"[{bounds[0]:.5f}, {bounds[1]:.5f}]"
             )
-        # Policies can emit tiny numerical overshoots at a hard mechanical
-        # limit (the trained joint-3 baseline is exactly 0 rad).  Accept only
-        # the configured tolerance and clip to the physical limit before
-        # converting to Piper units.
+        # Project bounded model prediction overshoot onto the legal target
+        # range before planning. This tolerance never expands command bounds.
         checked_joints[index - 1] = np.clip(value, bounds[0], bounds[1])
     opening_fraction = _opening_fraction(
         action[6],
@@ -2481,6 +2783,21 @@ class ExecutionController:
             getattr(args, "gripper_open_lookahead_steps", 0)
         )
         self.joint_trajectory: JerkLimitedJointTrajectory | None = None
+        # Direct construction without new arguments retains legacy integration
+        # compatibility. CLI/GUI explicitly select the Ruckig backend.
+        self.servo_backend = str(getattr(args, "servo_backend", None) or (
+            "legacy" if self.trajectory_shaping else "off"
+        ))
+        self.servo_loop: ServoLoop | None = None
+        self._pose_trajectories: dict[str, PoseTrajectory] = {}
+        self._pose_reference_at: dict[str, float] = {}
+        self.planner_prefix_enabled = False
+        # If local planner splicing fails, the remote server must not reuse an
+        # unexecuted model chunk from the old observation time frame.
+        self.planner_prefix_fallback_reason: str | None = None
+        self.planner_prefix_fallback_generation: int | None = None
+        self._servo_stopped_safely = True
+        self.servo_sample_callback: Callable[[dict[str, Any]], None] | None = None
         self.last_command_monotonic: float | None = None
         self.external_control_checked = False
         self.latency_skip_compensation_steps = int(
@@ -2524,6 +2841,7 @@ class ExecutionController:
         self._gripper_extreme_count: dict[str, int] = {}
         self._gripper_extreme_latch: dict[str, str | None] = {}
         self.active_generation = 0
+        self.active_chunk_capture_monotonic: float | None = None
         self._next_inference_generation = 1
         self.waiting_fresh_after_enable = False
         self.fresh_inference_required_after_monotonic: float | None = None
@@ -2619,6 +2937,7 @@ class ExecutionController:
         self._ik_warm_starts: dict[str, np.ndarray] = {}
         self.feedback_diagnostics_stride = 5
         self.rtc_enabled = False
+        self.rtc_inference_delay_steps = int(getattr(args, "rtc_inference_delay_steps", 8))
         self.rtc_execution_horizon = DEFAULT_RTC_EXECUTION_HORIZON
         self.rtc_max_guidance_weight = DEFAULT_RTC_MAX_GUIDANCE_WEIGHT
         self.rtc_prefix_attention_schedule = "linear"
@@ -2626,6 +2945,7 @@ class ExecutionController:
         self._rtc_config_sent_revision: int | None = None
 
     def configure_protocol(self, protocol: PolicyProtocol) -> None:
+        self.close_servo()
         runtime_rates = resolve_client_runtime_rates(self.args, protocol)
         self.policy_action_hz = runtime_rates.action_hz
         self.control_hz = runtime_rates.control_hz
@@ -2636,13 +2956,21 @@ class ExecutionController:
         self.rtc_enabled = bool(
             getattr(self.args, "rtc_enabled", True) and protocol.rtc_enabled
         )
-        self.rtc_execution_horizon = max(
-            1, min(
-                int(getattr(self.args, "rtc_execution_horizon", DEFAULT_RTC_EXECUTION_HORIZON)),
-                int(protocol.rtc_max_execution_horizon),
-                int(protocol.action_horizon),
-            )
+        self.planner_prefix_enabled = bool(self.rtc_enabled and protocol.schema == "joint"
+                                           and protocol.rtc_mode == "trained"
+                                           and self.servo_backend == "ruckig")
+        self.planner_prefix_fallback_reason = None
+        self.planner_prefix_fallback_generation = None
+        if self.planner_prefix_enabled and not protocol.rtc_client_planner_prefix:
+            raise RuntimeError("trained RTC reference planning requires a policy server with "
+                               "client_planner_prefix support; update/restart the policy server")
+        self.rtc_execution_horizon = int(
+            getattr(self.args, "rtc_execution_horizon", DEFAULT_RTC_EXECUTION_HORIZON)
         )
+        if self.rtc_enabled and not 1 <= self.rtc_execution_horizon <= protocol.action_horizon:
+            raise ValueError("RTC execution_horizon must fit the model action chunk")
+        if self.rtc_enabled and not 0 <= self.rtc_inference_delay_steps <= self.rtc_execution_horizon:
+            raise ValueError("RTC requires 0 <= inference_delay_steps <= execution_horizon")
         self.rtc_max_guidance_weight = float(
             min(
                 float(getattr(self.args, "rtc_max_guidance_weight", DEFAULT_RTC_MAX_GUIDANCE_WEIGHT)),
@@ -2661,14 +2989,8 @@ class ExecutionController:
         # RTC configuration once. Subsequent requests carry only progress.
         self.rtc_config_revision += 1
         self._rtc_config_sent_revision = None
-        # Model-side RTC already aligns the new chunk during denoising.  A
-        # second default client trajectory blend would reintroduce avoidable
-        # latency; keep it opt-in through --rtc-client-blend-steps.
-        self.blend_steps = (
-            int(getattr(self.args, "rtc_client_blend_steps", 0))
-            if self.rtc_enabled
-            else requested_blend_steps
-        )
+
+        self.blend_steps = 0 if self.rtc_enabled else requested_blend_steps
         # Minimal programmatic/test callers predate the CLI option and retain
         # the historical linear profile.  The CLI always supplies the new
         # smootherstep default explicitly.
@@ -2702,6 +3024,8 @@ class ExecutionController:
         )
         self.joint_trajectory = None
         self._ik_warm_starts.clear()
+        self._pose_trajectories.clear()
+        self._pose_reference_at.clear()
         self.last_command_monotonic = None
         self.external_control_checked = False
         self.latency_skip_compensation_steps = int(
@@ -2777,6 +3101,15 @@ class ExecutionController:
             self.estimated_actuator_delay_s,
             self.latency_skip_compensation_steps,
         )
+        servo = self._servo_config()
+        logging.info(
+            "Piper execution: firmware speed=%d%% backend=%s "
+            "requested trajectory speed=%.3f rad/s effective trajectory speed=%.3f rad/s "
+            "acceleration=%.3f rad/s^2 jerk=%.3f rad/s^3",
+            int(getattr(self.args, "speed_pct", DEFAULT_INFERENCE_SPEED_PCT)), self.servo_backend,
+            self.trajectory_max_speed_rad_s, servo.max_velocity,
+            servo.max_acceleration, servo.max_jerk,
+        )
         if not math.isclose(
             self.policy_action_hz,
             self.control_hz,
@@ -2784,10 +3117,82 @@ class ExecutionController:
             abs_tol=1e-3,
         ):
             raise ValueError(
-                "control_hz must match policy_action_hz until trajectory resampling is "
-                f"implemented: control={self.control_hz:.6g}Hz "
+                "control_hz must match policy_action_hz (policy reference rate); configure servo-hz for "
+                f"actuator resampling: control={self.control_hz:.6g}Hz "
                 f"policy={self.policy_action_hz:.6g}Hz"
             )
+
+    def run_configuration(self) -> dict[str, Any]:
+        """Return stable effective settings for the deployment run record."""
+        return {
+            "servo": {
+                "backend": self.servo_backend,
+                "firmware_speed_pct": int(getattr(self.args, "speed_pct", DEFAULT_INFERENCE_SPEED_PCT)),
+                "requested_max_velocity_rad_s": self.trajectory_max_speed_rad_s,
+                **vars(self._servo_config()),
+            },
+            "pose_trajectory": {
+                "enabled": bool(getattr(self.args, "pose_trajectory", False)),
+                "kind": "online_cartesian_reference",
+                "rtc_prefix_modified": False,
+                "config": {name: float(getattr(self.args, "pose_" + name, default))
+                           for name, default in vars(PoseTrajectoryConfig()).items()},
+            },
+            "effective_joint_limits_rad": {side: effective_limits(piper, JOINT_LIMITS_RAD).tolist()
+                                           for side, piper in self.pipers.items()},
+            "inference_completion": "event_wakeup",
+            "immediate_reference_refresh": self.servo_backend == "ruckig",
+            "processing_latency_target_ms": 150.0,
+            "control_hz": float(self.control_hz),
+            "inference_hz": float(self.inference_hz),
+            "policy_action_hz": float(self.policy_action_hz),
+            "async_inference": bool(self.async_inference),
+            "inference_trigger_mode": self.inference_trigger_mode,
+            "inference_trigger_step": int(self.inference_trigger_step),
+            "sync_wait_steps": int(self.sync_wait_steps),
+            "auto_next_inference": bool(self.auto_next_inference),
+            "blend_steps": int(self.blend_steps),
+            "latency_skip_compensation_steps": int(self.latency_skip_compensation_steps),
+            "rtc": {
+                "enabled": bool(self.rtc_enabled),
+                "prefix_source": ("client_planner" if self.planner_prefix_enabled else "server_previous_chunk"),
+                "planner_prefix_enabled": bool(self.planner_prefix_enabled),
+                "planner_prefix_fallback_reason": self.planner_prefix_fallback_reason,
+                "planner_prefix_fallback_generation": self.planner_prefix_fallback_generation,
+                "inference_delay_steps": int(self.rtc_inference_delay_steps),
+                "execution_horizon": int(self.rtc_execution_horizon),
+                "max_guidance_weight": float(self.rtc_max_guidance_weight),
+                "prefix_attention_schedule": self.rtc_prefix_attention_schedule,
+            },
+            "trajectory_spike_suppression": {
+                "enabled": bool(getattr(self.args, "trajectory_spike_suppression", False)),
+                "horizon_steps": int(getattr(
+                    self.args, "rtc_execution_horizon", DEFAULT_RTC_EXECUTION_HORIZON
+                )),
+                "action_hz": float(self.policy_action_hz),
+                "algorithm": "local_joint_acceleration_spike_suppression",
+                "accel_floor_rad_s2": 1.2,
+                "outlier_sigma": 1.5,
+                "max_correction_rad": 0.03,
+                "passes": 2,
+            },
+            "trajectory_shaper": {
+                "enabled": self.trajectory_shaping and self.servo_backend == "legacy",
+                "lowpass_enabled": self.trajectory_lowpass,
+                "tracking_enabled": self.trajectory_tracking,
+                "speed_limit_enabled": self.trajectory_speed_limit,
+                "acceleration_limit_enabled": self.trajectory_acceleration_limit,
+                "jerk_limit_enabled": self.trajectory_jerk_limit,
+                "lookahead_enabled": self.trajectory_lookahead,
+                "max_speed_rad_s": self.trajectory_max_speed_rad_s,
+                "max_acceleration_rad_s2": self.trajectory_max_acceleration_rad_s2,
+                "max_jerk_rad_s3": self.trajectory_max_jerk_rad_s3,
+                "smoothing_cutoff_hz": self.trajectory_smoothing_cutoff_hz,
+                "tracking_time_constant_s": self.trajectory_tracking_time_constant_s,
+                "command_lookahead_rad": self.trajectory_command_lookahead_rad,
+                "max_tracking_error_rad": self.trajectory_max_tracking_error_rad,
+            },
+        }
 
     @property
     def pending_action_count(self) -> int:
@@ -2795,16 +3200,18 @@ class ExecutionController:
 
     def _trajectory_limits(self, qpos_m: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Build per-joint limits while leaving gripper dimensions unconstrained."""
-        qpos = np.asarray(qpos_m, dtype=np.float32)
-        lower = np.full(qpos.shape, -np.inf, dtype=np.float32)
-        upper = np.full(qpos.shape, np.inf, dtype=np.float32)
+        qpos = np.asarray(qpos_m, dtype=np.float64)
+        lower = np.full(qpos.shape, -np.inf, dtype=np.float64)
+        upper = np.full(qpos.shape, np.inf, dtype=np.float64)
         arm_count = len(qpos) // 7
         if len(qpos) != arm_count * 7 or arm_count not in {1, 2}:
             raise ExecutionBlocked(f"trajectory qpos must be 7D or 14D, got {qpos.shape}")
-        for arm_index in range(arm_count):
+        sides = ("left", "right") if arm_count == 2 else (self.arm_side,)
+        for arm_index, side in enumerate(sides):
             offset = arm_index * 7
-            lower[offset : offset + 6] = JOINT_LIMITS_RAD[:, 0]
-            upper[offset : offset + 6] = JOINT_LIMITS_RAD[:, 1]
+            limits = effective_limits(self.pipers[side], JOINT_LIMITS_RAD)
+            lower[offset : offset + 6] = limits[:, 0]
+            upper[offset : offset + 6] = limits[:, 1]
         return lower, upper
 
     def _shape_prepared_targets(
@@ -2817,7 +3224,7 @@ class ExecutionController:
         now_monotonic: float,
     ) -> list[int]:
         """Shape all arms as one vector so a bimanual boundary stays coordinated."""
-        if not self.trajectory_shaping:
+        if not self.trajectory_shaping or self.servo_backend != "legacy":
             return []
         qpos = np.asarray(qpos_m, dtype=np.float32)
         lower, upper = self._trajectory_limits(qpos)
@@ -2867,6 +3274,182 @@ class ExecutionController:
             ]
             command_pipeline[side]["commanded_joints_rad"] = target_joints.tolist()
         return held
+
+    def _servo_config(self) -> ServoConfig:
+        gripper_speed = DEFAULT_GRIPPER_SPEED_M_S
+        if self.planner_prefix_enabled:
+            step = getattr(self.args, "max_joint_gripper_step", None)
+            if step is None:
+                metres = getattr(self.args, "max_joint_gripper_step_m", None)
+                step = float(metres) / GRIPPER_MAX_M if metres is not None else 0.25
+            # A limit formerly applied per 20 Hz target is now a continuous
+            # rate bound on the materialized gripper plan.
+            gripper_speed = min(gripper_speed, float(step) * GRIPPER_MAX_M * self.policy_action_hz)
+        return ServoConfig(
+            hz=float(getattr(self.args, "servo_hz", DEFAULT_SERVO_HZ)),
+            max_velocity=effective_speed(self.pipers, self.trajectory_max_speed_rad_s,
+                speed_pct=int(getattr(self.args, 'speed_pct', DEFAULT_INFERENCE_SPEED_PCT))),
+            max_acceleration=self.trajectory_max_acceleration_rad_s2,
+            max_jerk=self.trajectory_max_jerk_rad_s3,
+            max_tracking_error=self.trajectory_max_tracking_error_rad,
+            target_timeout_s=float(getattr(self.args, "servo_target_timeout_s", 0.15)),
+            follow_waypoint_velocity=bool(getattr(self.args, "servo_waypoint_velocity", False)),
+            max_gripper_velocity=gripper_speed,
+        )
+
+    def close_servo(self) -> bool:
+        self._pose_trajectories.clear()
+        self._pose_reference_at.clear()
+        if self.servo_loop is not None:
+            self._servo_stopped_safely = self.servo_loop.close()
+            self.servo_loop = None
+        return self._servo_stopped_safely
+
+    def _shape_delivery_pose(self, side, current_state, target_xyz, target_rpy_deg, *, allow_reanchor=False):
+        """Shape only execution references; delivery RTC retains its wire schema."""
+        if not getattr(self.args, "pose_trajectory", False):
+            return target_xyz, target_rpy_deg, None
+        if self.servo_backend != "ruckig":
+            raise ExecutionBlocked("pose trajectory requires the guarded Ruckig writer")
+        now = time.monotonic()
+        try:
+            config = PoseTrajectoryConfig(**{
+                name: float(getattr(self.args, "pose_" + name, default))
+                for name, default in vars(PoseTrajectoryConfig()).items()
+            })
+            measured_rotation = rotation_from_state(current_state)
+            shaper = self._pose_trajectories.get(side)
+            if shaper is None:
+                shaper = PoseTrajectory(current_state[:3], measured_rotation, config)
+            dt = now - self._pose_reference_at[side] if side in self._pose_reference_at else 1.0 / self.control_hz
+            reanchored = False
+            if (not math.isfinite(float(dt)) or dt <= 0 or dt > config.max_update_dt_s) and allow_reanchor:
+                # A delayed inference is a new reference epoch.  Continuing
+                # the old Cartesian trajectory would integrate stale velocity
+                # for hundreds of milliseconds and then reject the target as
+                # a clock fault.  Re-anchor at fresh measured feedback and
+                # take one bounded control-period step instead.
+                shaper = PoseTrajectory(current_state[:3], measured_rotation, config)
+                dt = 1.0 / max(self.control_hz, 1.0)
+                reanchored = True
+            xyz, rotation, metrics = shaper.update(
+                target_xyz, Rotation.from_euler("xyz", target_rpy_deg, degrees=True).as_matrix(),
+                dt=dt, feedback_xyz=current_state[:3], feedback_rotation=measured_rotation)
+            for index, axis in enumerate("xyz"):
+                if axis == "y":
+                    bounds = delivery_workspace_y(self.args, side)
+                else:
+                    bounds = getattr(self.args, "workspace_" + axis, None)
+                if bounds is not None and not bounds[0] <= xyz[index] <= bounds[1]:
+                    raise ValueError("smoothed pose reference left the configured workspace")
+            self._pose_trajectories[side] = shaper
+            self._pose_reference_at[side] = now
+            if reanchored:
+                metrics["reference_reanchored_after_delay"] = True
+            metrics["reference_rotation6d"] = matrix_to_rotation6d(rotation).tolist()
+            metrics["raw_rpy_deg"] = np.asarray(target_rpy_deg).tolist()
+            return xyz, Rotation.from_matrix(rotation).as_euler("xyz", degrees=True), metrics
+        except ValueError as exc:
+            raise ExecutionBlocked(str(exc)) from exc
+
+    def _servo_publish_target(self, qpos: np.ndarray,
+                              prepared: dict[str, tuple[np.ndarray, float]],
+                              sides: tuple[str, ...], *, hold: bool,
+                              context: dict[str, Any], protocol: PolicyProtocol | None = None) -> dict[str, Any]:
+        if self.servo_loop is None:
+            if not self._servo_stopped_safely:
+                raise ServoError("previous servo did not stop safely; reinitialize the robot controller")
+            lower, upper = self._trajectory_limits(qpos)
+
+            def feedback() -> np.ndarray:
+                # Independently refresh hardware state on every servo cycle.
+                for side in sides:
+                    status = arm_status_dict(self.pipers[side])
+                    if not self._piper_can_joint_mode_ready(status):
+                        raise ServoError(f"{side} Piper left healthy CAN/MOVE_J mode")
+                    if driver_enable_status_dict(self.pipers[side])["ready"] is False:
+                        raise ServoError(f"{side} Piper driver enable was lost")
+                return np.concatenate([read_output_qpos(
+                    self.pipers[side], max_feedback_age_s=float(getattr(
+                        self.args, "max_feedback_age_s", DEFAULT_FEEDBACK_MAX_AGE_S
+                    ))) for side in sides])
+
+            def publish(command: np.ndarray) -> dict[str, Any]:
+                traces: dict[str, dict[str, Any]] = {side: {} for side in sides}
+                for side in sides:
+                    self.pipers[side].ModeCtrl(0x01, 0x01, int(getattr(self.args, "speed_pct", DEFAULT_INFERENCE_SPEED_PCT)), 0x00)
+                    traces[side]["mode_ctrl_monotonic"] = time.monotonic()
+                for index, side in enumerate(sides):
+                    raw = np.rint(command[index * 7:index * 7 + 6] * RAD_FACTOR).astype(np.int64)
+                    self.pipers[side].JointCtrl(*map(int, raw))
+                    traces[side].update(piper_jointctrl_units=raw.tolist(),
+                                        joint_ctrl_at=time.time(), joint_ctrl_monotonic=time.monotonic())
+                for index, side in enumerate(sides):
+                    raw = round(float(command[index * 7 + 6]) * GRIPPER_FACTOR)
+                    self.pipers[side].GripperCtrl(raw, int(getattr(self.args, "gripper_effort", 1000)), 0x01, 0)
+                    traces[side].update(piper_gripperctrl_units=raw,
+                                        gripper_ctrl_at=time.time(), gripper_ctrl_monotonic=time.monotonic())
+                return traces
+
+            self.servo_loop = ServoLoop(qpos, lower, upper, self._servo_config(), feedback,
+                                        publish, self.servo_sample_callback)
+        target = np.asarray(qpos, dtype=np.float64).copy()
+        for index, side in enumerate(sides):
+            joints, gripper = prepared[side]
+            target[index * 7:index * 7 + 6] = joints
+            target[index * 7 + 6] = gripper
+        discard_chunk = False
+        if (self.planner_prefix_enabled and not hold and protocol is not None
+                and self.planner_prefix_fallback_generation != context["generation"]
+                and not self.servo_loop.has_chunk(context["generation"])):
+            rows = [r for r in self.pending_actions if r.generation == context["generation"]]
+            if not rows:
+                raise ServoError("no queued chunk available for RTC reference planning")
+            planned_targets = []
+            for row in rows:
+                value = np.empty_like(target)
+                for index, side in enumerate(sides):
+                    sl = slice(index*7, index*7+7)
+                    try:
+                        joints, gripper = build_checked_joint_target(
+                            qpos[sl], np.asarray(row.absolute_target)[sl],
+                            joint_limits=effective_limits(self.pipers[side], JOINT_LIMITS_RAD),
+                            max_joint_step_rad=float("inf"),
+                            max_gripper_step=float("inf"),  # Future endpoint; rate bounded by the plan.
+                            joint_limit_tolerance_rad=float(getattr(self.args, "joint_limit_tolerance_rad",
+                                                                   DEFAULT_JOINT_LIMIT_TOLERANCE_RAD)),
+                            gripper_range_tolerance=float(getattr(self.args, "gripper_range_tolerance",
+                                                                 DEFAULT_GRIPPER_RANGE_TOLERANCE)),
+                            gripper_semantics=protocol.gripper_semantics)
+                    except ExecutionBlocked as exc:
+                        raise ChunkPlanRejected(
+                            f"candidate chunk {row.generation} {side} source_index={row.source_index}: {exc}"
+                        ) from exc
+                    value[index*7:index*7+6] = joints
+                    value[index*7+6] = gripper
+                planned_targets.append(value)
+            try:
+                self.servo_loop.install_chunk(
+                    np.asarray(planned_targets), np.array([r.target_monotonic for r in rows]),
+                    np.array([r.source_index for r in rows]), generation=context["generation"])
+                self.planner_prefix_fallback_reason = None
+                self.planner_prefix_fallback_generation = None
+            except ChunkPlanRejected as exc:
+                # Stream this generation through bounded single-target
+                # Ruckig. Keep the client-prefix protocol: without an installed
+                # plan the next request carries planned_prefix=None and the
+                # policy predicts afresh from measured state. Never promote
+                # the rejected raw model curve to a server RTC prefix.
+                logging.warning(
+                    "RTC chunk splice rejected; using single-target Ruckig for generation %s; "
+                    "client planner prefix protocol retained: %s", context["generation"], exc
+                )
+                self.planner_prefix_fallback_reason = str(exc)[:500]
+                self.planner_prefix_fallback_generation = int(context["generation"])
+                discard_chunk = True
+        if discard_chunk:
+            return self.servo_loop.submit(target, hold=hold, context=context, discard_chunk=True)
+        return self.servo_loop.submit(target, hold=hold, context=context)
 
     def allocate_inference_generation(self) -> int:
         generation = self._next_inference_generation
@@ -2955,6 +3538,17 @@ class ExecutionController:
             self.last_transport_first_command_generation = None
             return
         allowed = {
+            "client_pack_ms",
+            "client_send_ms",
+            "client_wait_response_ms",
+            "client_unpack_ms",
+            "client_transport_total_ms",
+            "request_bytes",
+            "response_bytes",
+            "response_to_admission_ms",
+            "client_codec_ms",
+            "server_unpack_ms",
+            "unattributed_rpc_ms",
             "camera_capture_ms",
             "observation_upload_ms",
             "model_inference_ms",
@@ -3169,6 +3763,7 @@ class ExecutionController:
                 "enabled": self.rtc_enabled,
                 "algorithm": "real_time_chunking_prefix_guidance",
                 "session_id": str(getattr(self.args, "rtc_session_id", "")),
+                "inference_delay_steps": self.rtc_inference_delay_steps,
                 "execution_horizon": self.rtc_execution_horizon,
                 "max_guidance_weight": self.rtc_max_guidance_weight,
                 "prefix_attention_schedule": self.rtc_prefix_attention_schedule,
@@ -3224,8 +3819,11 @@ class ExecutionController:
             "last_actuator_command": self.last_actuator_command,
             "last_command_feedback": self.last_command_feedback,
             "estimated_actuator_delay_s": self.estimated_actuator_delay_s,
+            "servo": (self.servo_loop.metrics() if self.servo_loop is not None else {
+                "backend": self.servo_backend, "configured_hz": self._servo_config().hz,
+            }),
             "trajectory_shaper": {
-                "enabled": self.trajectory_shaping,
+                "enabled": self.trajectory_shaping and self.servo_backend == "legacy",
                 "lowpass_enabled": self.trajectory_lowpass,
                 "tracking_enabled": self.trajectory_tracking,
                 "speed_limit_enabled": self.trajectory_speed_limit,
@@ -3304,9 +3902,12 @@ class ExecutionController:
                 "max_gripper_step": float(
                     getattr(self.args, "max_gripper_step", DEFAULT_MAX_GRIPPER_STEP)
                 ),
-                "workspace_x_m": list(getattr(self.args, "workspace_x", DEFAULT_WORKSPACE_X_M)),
-                "workspace_y_m": list(getattr(self.args, "workspace_y", DEFAULT_WORKSPACE_Y_M)),
-                "workspace_z_m": list(getattr(self.args, "workspace_z", DEFAULT_WORKSPACE_Z_M)),
+                "workspace_x_m": (list(getattr(self.args, "workspace_x"))
+                                  if getattr(self.args, "workspace_x", None) is not None else None),
+                "workspace_y_m": (list(getattr(self.args, "workspace_y"))
+                                  if getattr(self.args, "workspace_y", None) is not None else None),
+                "workspace_z_m": (list(getattr(self.args, "workspace_z"))
+                                  if getattr(self.args, "workspace_z", None) is not None else None),
                 "blend_targets_rechecked_each_control_step": True,
             },
         }
@@ -3317,13 +3918,13 @@ class ExecutionController:
         *,
         mark_config_sent: bool,
         include_config: bool = True,
+        observation_monotonic: float | None = None,
     ) -> dict[str, Any]:
-        """Describe the previous model chunk at the next inference launch.
+        """Describe prefix availability at the next inference launch.
 
-        The server keeps the previous normalized chunk per WebSocket session.
-        The client sends the source offset and latency-based delay on every
-        request, but sends the larger runtime RTC configuration only on the
-        first request after a connection/configuration revision.
+        Ruckig joint execution uses a reserved writer plan, never raw model
+        history. Legacy paths align server history by source offset and time.
+        Runtime RTC configuration is sent only after a connection/config change.
         """
         offset = 0
         previous_generation = self.active_generation or None
@@ -3343,18 +3944,35 @@ class ExecutionController:
             and self.last_safe_target.source_index is not None
         ):
             offset = max(offset, int(self.last_safe_target.source_index) + 1)
-
-        latency_s = self.inference_latency_s
-        if latency_s is None or not math.isfinite(float(latency_s)) or latency_s <= 0:
-            latency_s = 1.0 / max(self.inference_hz, 1.0)
-        delay = max(0, int(math.ceil(float(latency_s) * self.policy_action_hz)))
-        if protocol is not None:
-            delay = min(delay, max(0, int(protocol.action_horizon) - 1))
+        if (observation_monotonic is not None
+                and self.active_chunk_capture_monotonic is not None):
+            # Prefix offset is a time alignment, not the count of dispatched
+            # references. Holds/drops must not rewind the old trajectory.
+            elapsed = max(0.0, observation_monotonic - self.active_chunk_capture_monotonic)
+            offset = max(offset, int(math.ceil(elapsed * self.policy_action_hz - 1e-6)))
+        delay = self.rtc_inference_delay_steps
+        if self.unsafe_active:
+            # A rejected plan is not an executable prefix. Reusing it would
+            # clamp its unsafe targets into successive RTC generations.
+            previous_generation = None
+            offset = 0
+        if self.planner_prefix_enabled or self.planner_prefix_fallback_reason is not None:
+            # Ruckig execution and the raw model curve can have very different
+            # positions at the same source index. Only the reserved writer
+            # trajectory is a valid prefix, regardless of queue progress.
+            previous_generation = None
+            offset = 0
+        if not 0 <= delay <= self.rtc_execution_horizon:
+            raise ValueError("RTC requires 0 <= inference_delay_steps <= execution_horizon")
+        latency_s = delay / self.policy_action_hz
         payload = {
             "enabled": bool(self.rtc_enabled),
             "inference_delay_steps": delay,
             "previous_chunk_offset_steps": offset,
             "previous_chunk_generation": previous_generation,
+            "planner_prefix_enabled": bool(self.planner_prefix_enabled),
+            "planner_prefix_fallback_reason": self.planner_prefix_fallback_reason,
+            "planner_prefix_fallback_generation": self.planner_prefix_fallback_generation,
             "predicted_capture_to_result_s": float(latency_s),
         }
         if include_config and self._rtc_config_sent_revision != self.rtc_config_revision:
@@ -3369,20 +3987,48 @@ class ExecutionController:
                 self._rtc_config_sent_revision = self.rtc_config_revision
         return payload
 
-    def rtc_request_metadata(self, protocol: PolicyProtocol | None) -> dict[str, Any]:
+    def rtc_request_metadata(self, protocol: PolicyProtocol | None, *,
+                             observation_monotonic: float | None = None) -> dict[str, Any]:
         """Build request metadata and mark the RTC config as sent.
 
         This is intentionally the only method that mutates the sent-revision
         marker. Telemetry snapshots use the pure builder below so observing
         controller state cannot consume the first-request configuration.
         """
-        return self._build_rtc_request_metadata(
+        payload = self._build_rtc_request_metadata(
             protocol,
             mark_config_sent=True,
             include_config=True,
+            observation_monotonic=observation_monotonic,
         )
+        if self.planner_prefix_enabled:
+            payload["prefix_source"] = "client_planner"
+            payload["planned_prefix"] = None
+            payload["previous_chunk_generation"] = None
+            if self.servo_loop is not None and observation_monotonic is not None:
+                prefix = self.servo_loop.rtc_prefix(observation_monotonic,
+                                                    self.rtc_inference_delay_steps, self.policy_action_hz)
+                if prefix is not None:
+                    positions = prefix.pop("positions")
+                    for index in range(6, positions.shape[1], 7):
+                        positions[:, index] = [
+                            _gripper_value_from_opening_fraction(v / GRIPPER_MAX_M,
+                                                                semantics=protocol.gripper_semantics)
+                            for v in positions[:, index]]
+                    prefix["actions"] = positions.tolist()
+                    payload["planned_prefix"] = prefix
+        return payload
 
     def _block(self, state: str, reason: str) -> bool:
+        for side in self._pose_trajectories:
+            self._ik_warm_starts.pop(side, None)
+        self._pose_trajectories.clear()
+        self._pose_reference_at.clear()
+        if self.servo_loop is not None:
+            if state == "ready":
+                self.servo_loop.hold()
+            else:
+                self.servo_loop.pause()
         self.state = state
         self.blocked_reason = reason[:500]
         # Safety failures used to be visible only in Dashboard telemetry. Emit
@@ -3431,11 +4077,13 @@ class ExecutionController:
         hold_gripper_m: float,
     ) -> None:
         """Refresh CAN joint mode and the measured enable-time hold target."""
+        if not self.close_servo():
+            raise ExecutionBlocked("servo did not settle before enable-time actuator handoff")
         raw_joints = np.rint(hold_joints * RAD_FACTOR).astype(np.int64)
         piper.ModeCtrl(
             PIPER_CTRL_MODE_CAN,
             PIPER_MOVE_MODE_J,
-            int(getattr(self.args, "speed_pct", 10)),
+            int(getattr(self.args, "speed_pct", DEFAULT_INFERENCE_SPEED_PCT)),
             0x00,
         )
         piper.JointCtrl(*map(int, raw_joints))
@@ -3471,8 +4119,9 @@ class ExecutionController:
         hold_qpos = np.asarray(hold_qpos, dtype=np.float64)
         if hold_qpos.shape != (7,) or not np.all(np.isfinite(hold_qpos)):
             raise ExecutionBlocked(f"{side} Piper hold qpos is not finite 7D")
-        lower = JOINT_LIMITS_RAD[:, 0]
-        upper = JOINT_LIMITS_RAD[:, 1]
+        limits = effective_limits(piper, JOINT_LIMITS_RAD)
+        lower = limits[:, 0]
+        upper = limits[:, 1]
         excess = np.maximum(lower - hold_qpos[:6], hold_qpos[:6] - upper)
         if float(np.max(excess)) > IK_FEEDBACK_LIMIT_TOLERANCE_RAD:
             raise ExecutionBlocked(
@@ -3482,7 +4131,7 @@ class ExecutionController:
         # feedback value to the SDK's nominal limits would itself create an
         # unsolicited enable-time motion.
         hold_joints = hold_qpos[:6].copy()
-        hold_gripper_m = float(np.clip(hold_qpos[6], 0.0, GRIPPER_MAX_M))
+        hold_gripper_m = float(np.clip(hold_qpos[6], 0.0, GRIPPER_EXECUTION_MAX_M))
         enable_timeout_s = float(getattr(self.args, "enable_timeout_s", 3.0))
         deadline = time.monotonic() + enable_timeout_s
         ready_cycles = 0
@@ -3827,6 +4476,8 @@ class ExecutionController:
 
     @staticmethod
     def _opening_to_wire(opening: float, semantics: str) -> float:
+        if semantics == GRIPPER_OPENING_METRES:
+            return _gripper_value_from_opening_fraction(opening, semantics=semantics)
         opening = float(np.clip(opening, 0.0, 1.0))
         if semantics == GRIPPER_OPENING_FRACTION:
             return opening
@@ -3906,9 +4557,11 @@ class ExecutionController:
             qpos_slice = np.asarray(qpos_m, dtype=np.float64)[
                 arm_index * 7 : (arm_index + 1) * 7
             ]
-            current = float(np.clip(qpos_slice[6] / GRIPPER_MAX_M, 0.0, 1.0))
+            ceiling = GRIPPER_EXECUTION_MAX_M / GRIPPER_MAX_M if protocol.gripper_semantics == GRIPPER_OPENING_METRES else 1.0
+            current = float(np.clip(qpos_slice[6] / GRIPPER_MAX_M, 0.0, ceiling))
             previous = self._filtered_gripper_opening.get(side, current)
-            confirmed = self._confirmed_gripper_desired(side, desired, previous)
+            # Metre targets are physical positions, not normalized endpoints.
+            confirmed = desired if protocol.gripper_semantics == GRIPPER_OPENING_METRES else self._confirmed_gripper_desired(side, desired, previous)
             alpha = self.gripper_lowpass_alpha if self.gripper_lowpass else 1.0
             filtered = previous + alpha * (confirmed - previous)
             if protocol.schema == "delivery":
@@ -3928,7 +4581,7 @@ class ExecutionController:
             filtered = float(
                 np.clip(filtered, current - max_step, current + max_step)
             )
-            filtered = float(np.clip(filtered, 0.0, 1.0))
+            filtered = float(np.clip(filtered, 0.0, ceiling))
             self._filtered_gripper_opening[side] = filtered
             output[slot] = self._opening_to_wire(filtered, protocol.gripper_semantics)
         return replace(queued, absolute_target=output)
@@ -3939,6 +4592,7 @@ class ExecutionController:
         target_xyz_m: np.ndarray,
         target_rpy_deg: np.ndarray,
         *,
+        side: str | None = None,
         warm_start_joints_rad: np.ndarray | None = None,
     ) -> PiperIKSolveResult:
         """Run IK with diagnostics while preserving compatibility with test/custom solvers."""
@@ -3947,7 +4601,7 @@ class ExecutionController:
         kwargs = {
             "max_joint_step_rad": float(
                 getattr(self.args, "ik_max_joint_step_rad", DEFAULT_IK_MAX_JOINT_STEP_RAD)
-                if self.ik_rate_limit
+                if self.ik_rate_limit and self.servo_backend != "ruckig"
                 else getattr(
                     self.args, "ik_search_joint_radius_rad", DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD
                 )
@@ -3981,6 +4635,9 @@ class ExecutionController:
                 )
             ),
             "max_nfev": int(getattr(self.args, "ik_max_nfev", DEFAULT_IK_MAX_NFEV)),
+            "joint_limits": effective_limits(
+                self.pipers[self.arm_side if side is None else side], JOINT_LIMITS_RAD
+            ),
         }
         solve_with_diagnostics = getattr(self.ik_solver, "solve_with_diagnostics", None)
         if callable(solve_with_diagnostics):
@@ -4292,6 +4949,13 @@ class ExecutionController:
         self.inference_arrival_at = arrived_at
         self.inference_arrival_monotonic = arrived_monotonic
         self.inference_latency_s = latency_s
+        if self.rtc_enabled and latency_s * self.policy_action_hz > self.rtc_inference_delay_steps:
+            logging.warning(
+                "RTC delay exceeded: generation=%s actual=%.1f ms (%.2f steps), "
+                "configured delay=%s, horizon=%s; selecting by actual elapsed time",
+                launch.generation, latency_s * 1000, latency_s * self.policy_action_hz,
+                self.rtc_inference_delay_steps, self.rtc_execution_horizon,
+            )
         self.record_inference_completion(arrived_monotonic)
         self._record_client_transport_timing(result, generation=launch.generation)
         self.inference_old_remaining = len(self.pending_actions)
@@ -4310,6 +4974,20 @@ class ExecutionController:
             )
         if not isinstance(result, dict) or "actions" not in result:
             return self._reject_result(launch.generation, "result has no actions", arrived_at)
+
+        if self.planner_prefix_enabled:
+            snapshot = getattr(launch, "observation_snapshot", None)
+            request_rtc = snapshot.rtc_metadata if snapshot is not None else {}
+            prefix = request_rtc.get("planned_prefix")
+            response_rtc = result.get("rtc", {})
+            if response_rtc.get("prefix_source") != "client_planner":
+                return self._reject_result(launch.generation, "policy did not acknowledge planner RTC prefix", arrived_at)
+            if prefix is not None:
+                plan_id = prefix["plan_id"]
+                if (response_rtc.get("client_plan_id") != plan_id or self.servo_loop is None
+                        or not self.servo_loop.prefix_is_valid(plan_id)):
+                    return self._reject_result(launch.generation,
+                                               "RTC planner prefix invalidated by hold, fault or plan replacement", arrived_at)
 
         if self.waiting_fresh_after_enable:
             barrier = self.fresh_inference_required_after_monotonic
@@ -4400,6 +5078,7 @@ class ExecutionController:
                     arrived_at,
                 )
             self.inference_elapsed_prefix_steps = future_index
+            # RTC keeps the observation time axis; non-RTC recovery may retime.
             # Time passing alone isn't sufficient evidence that a delayed
             # prefix was executed.  In cold start, hold, blocked, or underrun
             # recovery, the robot may not have advanced at all.  Skip no more
@@ -4407,12 +5086,14 @@ class ExecutionController:
             # captured.  If execution lagged behind wall time, place the
             # retained rows on a fresh timeline so execute_next won't discard
             # them again on the following control tick.
-            skip_steps = min(future_index, self.inference_progress_steps)
+            skip_steps = (future_index if self.rtc_enabled else
+                          min(future_index, self.inference_progress_steps))
             retime_from_arrival = skip_steps < future_index
         self.inference_skip_steps = skip_steps
         fresh_actions = decoded[skip_steps:]
         if (
             bool(getattr(self.args, "trajectory_spike_suppression", False))
+            and self.servo_backend == "legacy"
             and protocol.schema == "joint"
             and len(fresh_actions) >= 5
         ):
@@ -4508,6 +5189,7 @@ class ExecutionController:
         self.pending_actions = candidate
         self.timeline_resync_active = retime_from_arrival
         self.active_generation = launch.generation
+        self.active_chunk_capture_monotonic = launch.captured_monotonic
         self.queue_anchor_state = anchor.tolist()
         self.queue_anchor_qpos_m = np.asarray(launch.qpos_m, dtype=np.float64).tolist()
         self.queue_anchor_at = launch.captured_at
@@ -4826,8 +5508,9 @@ class ExecutionController:
             ]
             for side in lost_control_mode:
                 logging.warning(
-                    "%s Piper left CAN/MOVE_J mode; restarting measured-pose enable hold",
-                    side,
+                    "%s Piper lost control readiness; measured-pose enable hold requires safe servo handoff; "
+                    "arm_status=%s driver_status=%s",
+                    side, statuses[side], active_driver_statuses[side],
                 )
                 self.robot_enabled.discard(side)
             if lost_control_mode:
@@ -4943,7 +5626,8 @@ class ExecutionController:
         target_prevalidation = False
         try:
             target_prevalidation = True
-            queued = self._filter_gripper_target(queued, qpos_m, protocol)
+            if not self.planner_prefix_enabled:
+                queued = self._filter_gripper_target(queued, qpos_m, protocol)
             prepared: dict[str, tuple[Any, ...]] = {}
             command_pipeline: dict[str, dict[str, Any]] = {}
             for index, side in enumerate(sides):
@@ -4951,6 +5635,31 @@ class ExecutionController:
                     index * 7 : (index + 1) * 7
                 ]
                 if protocol.schema == "delivery":
+                    # A queue underrun or an explicit safety hold must brake
+                    # the guarded writer from the measured state.  Re-running
+                    # IK for the previous Cartesian target here is unsafe: a
+                    # target that was already rejected can fail every tick,
+                    # while the Ruckig writer is trying to settle.  Holding
+                    # measured joints also avoids adding IK latency to the
+                    # recovery path.
+                    if holding or safety_hold_only:
+                        self._pose_trajectories.pop(side, None)
+                        self._pose_reference_at.pop(side, None)
+                        prepared[side] = (
+                            qpos_slice[:6].copy(),
+                            float(qpos_slice[6]),
+                        )
+                        command_pipeline[side] = {
+                            "control_path": "delivery_safety_hold",
+                            "pose_trajectory": None,
+                            "pre_ik_eef_target": None,
+                            "full_ik_solution_joints_rad": None,
+                            "commanded_joints_rad": qpos_slice[:6].tolist(),
+                            "commanded_gripper_m": float(qpos_slice[6]),
+                            "ik_rate_limited": None,
+                            "ik_diagnostics": None,
+                        }
+                        continue
                     current_state = np.asarray(raw_delivery_state, dtype=np.float64)[
                         index * 10 : (index + 1) * 10
                     ]
@@ -4958,25 +5667,41 @@ class ExecutionController:
                         queued.absolute_target[index * 10 : (index + 1) * 10],
                         dtype=np.float64,
                     )
+                    # Receding-horizon chunks may jump farther than one local
+                    # IK solve can safely cover.  Execute the bounded first
+                    # Cartesian step and keep the remainder for later ticks.
+                    if self.servo_backend == "ruckig":
+                        target, projected = project_delivery_target_step(
+                            current_state,
+                            target,
+                            max_translation_step_m=float(
+                                getattr(self.args, "max_translation_step_m", DEFAULT_MAX_TRANSLATION_STEP_M)
+                            ),
+                            max_rotation_step_rad=float(
+                                getattr(self.args, "max_rotation_step_rad", DEFAULT_MAX_ROTATION_STEP_RAD)
+                            ),
+                        )
+                    else:
+                        projected = False
                     checked = _check_delivery_absolute_target(
                         current_state,
                         float(qpos_slice[6]),
                         target,
                         gripper_semantics=protocol.gripper_semantics,
-                        max_translation_step_m=float(
+                        max_translation_step_m=(float("inf") if self.servo_backend == "ruckig" else float(
                             getattr(
                                 self.args,
                                 "max_translation_step_m",
                                 DEFAULT_MAX_TRANSLATION_STEP_M,
                             )
-                        ),
-                        max_rotation_step_rad=float(
+                        )),
+                        max_rotation_step_rad=(float("inf") if self.servo_backend == "ruckig" else float(
                             getattr(
                                 self.args,
                                 "max_rotation_step_rad",
                                 DEFAULT_MAX_ROTATION_STEP_RAD,
                             )
-                        ),
+                        )),
                         max_gripper_step=float(
                             getattr(self.args, "max_gripper_step", DEFAULT_MAX_GRIPPER_STEP)
                         ),
@@ -4987,28 +5712,48 @@ class ExecutionController:
                                 DEFAULT_GRIPPER_RANGE_TOLERANCE,
                             )
                         ),
-                        workspace_x=tuple(
-                            getattr(self.args, "workspace_x", DEFAULT_WORKSPACE_X_M)
+                        workspace_x=(
+                            tuple(self.args.workspace_x)
+                            if getattr(self.args, "workspace_x", None) is not None
+                            else None
                         ),
-                        workspace_y=tuple(
-                            getattr(self.args, "workspace_y", DEFAULT_WORKSPACE_Y_M)
-                        ),
-                        workspace_z=tuple(
-                            getattr(self.args, "workspace_z", DEFAULT_WORKSPACE_Z_M)
+                        workspace_y=delivery_workspace_y(self.args, side),
+                        workspace_z=(
+                            tuple(self.args.workspace_z)
+                            if getattr(self.args, "workspace_z", None) is not None
+                            else None
                         ),
                     )
                     target_xyz, target_rpy_deg, target_gripper_m, opening_fraction = checked
+                    if holding or safety_hold_only:
+                        # A stationary/underrun hold must not integrate a hidden
+                        # Cartesian reference while the actuator writer brakes.
+                        self._pose_trajectories.pop(side, None)
+                        self._pose_reference_at.pop(side, None)
+                        pose_metrics = None
+                    else:
+                        target_xyz, target_rpy_deg, pose_metrics = self._shape_delivery_pose(
+                            side, current_state, target_xyz, target_rpy_deg,
+                            allow_reanchor=True)
+                    reference_target = target.copy()
+                    if pose_metrics is not None:
+                        reference_target[:3] = target_xyz
+                        reference_target[3:9] = pose_metrics["reference_rotation6d"]
+                        pose_metrics["raw_policy_absolute_target"] = target.tolist()
                     ik_result = self._solve_delivery_ik(
                         qpos_slice[:6],
                         target_xyz,
                         target_rpy_deg,
+                        side=side,
                         warm_start_joints_rad=self._ik_warm_starts.get(side),
                     )
                     self._ik_warm_starts[side] = ik_result.solution_joints_rad.copy()
-                    target_joints = ik_result.command_joints_rad.copy()
+                    target_joints = (ik_result.solution_joints_rad if self.servo_backend == "ruckig"
+                                     else ik_result.command_joints_rad).copy()
                     prepared[side] = (target_joints, target_gripper_m)
                     command_pipeline[side] = {
                         "control_path": "delivery_continuous_ik_joint",
+                        "pose_trajectory": pose_metrics,
                         "command_input_feedback": {
                             "feedback_at": float(feedback_at),
                             "joints_rad": qpos_slice[:6].tolist(),
@@ -5018,9 +5763,10 @@ class ExecutionController:
                             "eef_rotation6d": current_state[3:9].tolist(),
                         },
                         "pre_ik_eef_target": {
-                            "absolute_target": target.tolist(),
+                            "absolute_target": reference_target.tolist(),
+                            "projected_for_local_ik": bool(projected),
                             "xyz_m": target_xyz.tolist(),
-                            "rotation6d": target[3:9].tolist(),
+                            "rotation6d": reference_target[3:9].tolist(),
                             "rpy_deg": np.asarray(target_rpy_deg, dtype=np.float64).tolist(),
                             "gripper_opening_fraction": float(opening_fraction),
                             "gripper_opening_m": float(target_gripper_m),
@@ -5028,8 +5774,9 @@ class ExecutionController:
                         "full_ik_solution_joints_rad": ik_result.solution_joints_rad.tolist(),
                         "commanded_joints_rad": target_joints.tolist(),
                         "commanded_gripper_m": float(target_gripper_m),
-                        "ik_rate_limited": ik_result.rate_limited,
+                        "ik_rate_limited": ik_result.rate_limited and self.servo_backend != "ruckig",
                         "ik_diagnostics": {
+                            "solve_elapsed_s": ik_result.solve_elapsed_s,
                             "solution_position_error_m": ik_result.solution_position_error_m,
                             "solution_rotation_error_rad": ik_result.solution_rotation_error_rad,
                             "solution_max_joint_step_rad": ik_result.solution_max_joint_step_rad,
@@ -5038,6 +5785,9 @@ class ExecutionController:
                             "optimizer_success": ik_result.optimizer_success,
                             "optimizer_status": ik_result.optimizer_status,
                             "optimizer_nfev": ik_result.optimizer_nfev,
+                            "tolerance_relaxed": ik_result.tolerance_relaxed,
+                            "accepted_position_tolerance_m": ik_result.accepted_position_tolerance_m,
+                            "accepted_rotation_tolerance_rad": ik_result.accepted_rotation_tolerance_rad,
                         },
                     }
                 elif protocol.schema == "joint":
@@ -5048,8 +5798,11 @@ class ExecutionController:
                     target_joints, target_gripper_m = build_checked_joint_target(
                         qpos_slice,
                         target,
-                        max_joint_step_rad=float(getattr(self.args, "max_joint_step_rad", 0.3)),
-                        max_gripper_step=getattr(self.args, "max_joint_gripper_step", None),
+                        joint_limits=effective_limits(self.pipers[side], JOINT_LIMITS_RAD),
+                        max_joint_step_rad=(float("inf") if self.servo_backend == "ruckig"
+                                            else float(getattr(self.args, "max_joint_step_rad", 0.3))),
+                        max_gripper_step=(float("inf") if self.planner_prefix_enabled else
+                                          getattr(self.args, "max_joint_gripper_step", None)),
                         max_gripper_step_m=getattr(self.args, "max_joint_gripper_step_m", None),
                         joint_limit_tolerance_rad=float(
                             getattr(
@@ -5092,12 +5845,30 @@ class ExecutionController:
                 sides,
                 now_monotonic=now_monotonic,
             )
+            command_started_at = time.time()
+            command_started_monotonic = time.monotonic()
+            servo_sample = None
+            if self.servo_backend == "ruckig":
+                # Servo faults are actuator failures, not skippable queue rows.
+                target_prevalidation = False
+                servo_sample = self._servo_publish_target(
+                    np.asarray(qpos_m), prepared, sides, hold=holding or safety_hold_only,
+                    context={"generation": queued.generation, "queue_index": queued.queue_index,
+                             "source_index": queued.source_index},
+                    protocol=protocol,
+                )
+                actual = np.asarray(servo_sample["qpos"])
+                for index, side in enumerate(sides):
+                    command_pipeline[side]["servo_reference_joints_rad"] = prepared[side][0].tolist()
+                    prepared[side] = (actual[index * 7:index * 7 + 6], float(actual[index * 7 + 6]))
+                    command_pipeline[side].update(servo_sample["sides"][side])
+                    command_pipeline[side]["commanded_joints_rad"] = prepared[side][0].tolist()
+                    command_pipeline[side]["servo_backend"] = "ruckig"
+                    command_pipeline[side]["servo_sample_sequence"] = servo_sample["sequence"]
             target_prevalidation = False
 
             # Blend and hold never bypass safety: both arms are fully prevalidated
             # against the same fresh feedback before either arm receives a command.
-            command_started_at = time.time()
-            command_started_monotonic = time.monotonic()
             wire_commands: dict[str, tuple[np.ndarray, int]] = {}
             for side in sides:
                 target_joints, target_gripper_m = prepared[side]
@@ -5107,57 +5878,76 @@ class ExecutionController:
                 command_pipeline[side]["piper_jointctrl_units"] = raw_joints.tolist()
                 command_pipeline[side]["piper_gripperctrl_units"] = int(raw_gripper)
                 command_pipeline[side]["piper_speed_pct"] = int(
-                    getattr(self.args, "speed_pct", 10)
+                    getattr(self.args, "speed_pct", DEFAULT_INFERENCE_SPEED_PCT)
                 )
                 command_pipeline[side]["piper_gripper_effort"] = int(
                     getattr(self.args, "gripper_effort", 1000)
                 )
 
-            # Publish bimanual commands in phases.  This avoids completing the
-            # full Mode/Joint/Gripper sequence for one arm before the other arm
-            # receives its JointCtrl target, and exposes the remaining skew.
-            for side in sides:
-                piper = self.pipers[side]
-                started_at = time.time()
-                started_monotonic = time.monotonic()
-                piper.ModeCtrl(
-                    0x01, 0x01, int(getattr(self.args, "speed_pct", 10)), 0x00
-                )
-                command_pipeline[side]["mode_ctrl_started_at"] = started_at
-                command_pipeline[side][
-                    "mode_ctrl_started_monotonic"
-                ] = started_monotonic
-                command_pipeline[side]["mode_ctrl_at"] = time.time()
-                command_pipeline[side]["mode_ctrl_monotonic"] = time.monotonic()
+            if servo_sample is None:
+                # Publish bimanual commands in phases.  This avoids completing the
+                # full Mode/Joint/Gripper sequence for one arm before the other arm
+                # receives its JointCtrl target, and exposes the remaining skew.
+                for side in sides:
+                    piper = self.pipers[side]
+                    started_at = time.time()
+                    started_monotonic = time.monotonic()
+                    piper.ModeCtrl(
+                        0x01, 0x01, int(getattr(self.args, "speed_pct", DEFAULT_INFERENCE_SPEED_PCT)), 0x00
+                    )
+                    command_pipeline[side]["mode_ctrl_started_at"] = started_at
+                    command_pipeline[side][
+                        "mode_ctrl_started_monotonic"
+                    ] = started_monotonic
+                    command_pipeline[side]["mode_ctrl_at"] = time.time()
+                    command_pipeline[side]["mode_ctrl_monotonic"] = time.monotonic()
 
-            for side in sides:
-                piper = self.pipers[side]
-                raw_joints, _ = wire_commands[side]
-                started_at = time.time()
-                started_monotonic = time.monotonic()
-                piper.JointCtrl(*map(int, raw_joints))
-                command_pipeline[side]["joint_ctrl_started_at"] = started_at
-                command_pipeline[side][
-                    "joint_ctrl_started_monotonic"
-                ] = started_monotonic
-                command_pipeline[side]["joint_ctrl_at"] = time.time()
-                command_pipeline[side]["joint_ctrl_monotonic"] = time.monotonic()
+                for side in sides:
+                    piper = self.pipers[side]
+                    raw_joints, _ = wire_commands[side]
+                    started_at = time.time()
+                    started_monotonic = time.monotonic()
+                    piper.JointCtrl(*map(int, raw_joints))
+                    command_pipeline[side]["joint_ctrl_started_at"] = started_at
+                    command_pipeline[side][
+                        "joint_ctrl_started_monotonic"
+                    ] = started_monotonic
+                    command_pipeline[side]["joint_ctrl_at"] = time.time()
+                    command_pipeline[side]["joint_ctrl_monotonic"] = time.monotonic()
 
-            for side in sides:
-                piper = self.pipers[side]
-                _, raw_gripper = wire_commands[side]
-                started_at = time.time()
-                started_monotonic = time.monotonic()
-                piper.GripperCtrl(
-                    int(raw_gripper), int(getattr(self.args, "gripper_effort", 1000)), 0x01, 0
-                )
-                command_pipeline[side]["gripper_ctrl_started_at"] = started_at
-                command_pipeline[side][
-                    "gripper_ctrl_started_monotonic"
-                ] = started_monotonic
-                command_pipeline[side]["gripper_ctrl_at"] = time.time()
-                command_pipeline[side]["gripper_ctrl_monotonic"] = time.monotonic()
-        except ExecutionBlocked as exc:
+                for side in sides:
+                    piper = self.pipers[side]
+                    _, raw_gripper = wire_commands[side]
+                    started_at = time.time()
+                    started_monotonic = time.monotonic()
+                    piper.GripperCtrl(
+                        int(raw_gripper), int(getattr(self.args, "gripper_effort", 1000)), 0x01, 0
+                    )
+                    command_pipeline[side]["gripper_ctrl_started_at"] = started_at
+                    command_pipeline[side][
+                        "gripper_ctrl_started_monotonic"
+                    ] = started_monotonic
+                    command_pipeline[side]["gripper_ctrl_at"] = time.time()
+                    command_pipeline[side]["gripper_ctrl_monotonic"] = time.monotonic()
+        except ChunkPlanDeferred as exc:
+            # Preparation has not changed the writer's plan. Keep its verified
+            # trajectory (including terminal stop), and retry the queued chunk
+            # or a fresher inference on the next control tick. Hard-pausing here
+            # freezes nonzero planner velocity and prevents all future splices.
+            (
+                self._filtered_gripper_opening,
+                self._gripper_extreme_candidate,
+                self._gripper_extreme_count,
+                self._gripper_extreme_latch,
+            ) = filter_snapshot
+            self.state = "ready"
+            self.blocked_reason = f"chunk planning deferred: {exc}"
+            now = time.monotonic()
+            if now - getattr(self, "_last_chunk_defer_log_at", -float("inf")) >= 2.0:
+                logging.warning("New chunk deferred; existing guarded writer retained: %s", exc)
+                self._last_chunk_defer_log_at = now
+            return False
+        except (ExecutionBlocked, ServoError) as exc:
             staged_enable_failure = bool(
                 self.enable_staged_generation == queued.generation
                 and self.arm_hold_targets
@@ -5168,7 +5958,22 @@ class ExecutionController:
                 self._gripper_extreme_count,
                 self._gripper_extreme_latch,
             ) = filter_snapshot
-            if target_prevalidation and self.pending_actions:
+            # A guarded writer can be paused while it brakes after a feedback
+            # or publication fault.  This is recoverable once the arm is
+            # stationary; leaving the controller in the permanent ``blocked``
+            # gate prevents the next fresh inference from restarting it.  Drop
+            # the stale queue and remain ready/holding instead.  Hardware and
+            # driver faults still take the fail-closed blocked path below.
+            if (
+                isinstance(exc, ServoError)
+                and "moving servo was safety-paused" in str(exc)
+            ):
+                self.discard_pending_actions(str(exc), kind="unsafe")
+                self.unsafe_active = True
+                self.queued_action_index = None
+                self.timeline_resync_active = False
+                return self._block("ready", f"waiting for paused servo to settle: {exc}")
+            if (target_prevalidation or isinstance(exc, ChunkPlanRejected)) and self.pending_actions:
                 # Do not chase later cumulative targets after the robot failed
                 # to execute this row.  They assume this target was reached and
                 # can create a self-sustaining unsafe-drop loop.  Drop the bad
@@ -5315,11 +6120,11 @@ class ExecutionController:
             )
             if response_received_monotonic is not None:
                 self.last_client_transport_timing["result_to_first_command_ms"] = max(
-                    0.0, (now_monotonic - response_received_monotonic) * 1000.0
+                    0.0, (command_monotonic - response_received_monotonic) * 1000.0
                 )
             if self.inference_capture_monotonic is not None:
                 self.last_client_transport_timing["observation_to_first_command_ms"] = max(
-                    0.0, (now_monotonic - self.inference_capture_monotonic) * 1000.0
+                    0.0, (command_monotonic - self.inference_capture_monotonic) * 1000.0
                 )
             self.last_transport_first_command_generation = queued.generation
         if holding:
@@ -5469,6 +6274,11 @@ def build_observation(
         "images": observation_images,
         "client_metadata": client_metadata,
     }
+    if protocol.image_transport == "jpeg_chw_v1":
+        observation["_transport"] = {
+            "image_codec": "jpeg_chw_v1",
+            "quality": int(protocol.image_jpeg_quality),
+        }
     # Prompt text is session state on the Policy side. The client sends it on
     # the first request and only when the local prompt revision changes.
     if instruction is not None:
@@ -5608,6 +6418,15 @@ def build_client_transport_timing(
         if model_inference_ms is not None
         else None
     )
+    pack_ms = finite(client_transport_timing.get("pack_ms"))
+    unpack_ms = finite(client_transport_timing.get("unpack_ms"))
+    server_unpack_ms = finite(server_timing.get("server_unpack_ms"))
+    client_codec_ms = pack_ms + unpack_ms if pack_ms is not None and unpack_ms is not None else None
+    unattributed_rpc_ms = (
+        max(0.0, non_model_rtt_ms - client_codec_ms - server_unpack_ms)
+        if non_model_rtt_ms is not None and client_codec_ms is not None and server_unpack_ms is not None
+        else None
+    )
     return {
         # Preserve the official WebSocket client's local breakdown.  These
         # fields distinguish msgpack/image packing from actual network wait;
@@ -5622,6 +6441,12 @@ def build_client_transport_timing(
         "client_transport_total_ms": finite(
             client_transport_timing.get("total_ms")
         ),
+        "request_image_shapes": client_transport_timing.get("request_image_shapes"),
+        "client_codec_ms": client_codec_ms,
+        "server_unpack_ms": server_unpack_ms,
+        # Still includes socket scheduling, server response work and transfer.
+        # Never use this residual as a measurement of pure network latency.
+        "unattributed_rpc_ms": unattributed_rpc_ms,
         "request_bytes": int(client_transport_timing["request_bytes"])
         if isinstance(client_transport_timing.get("request_bytes"), (int, float))
         and math.isfinite(float(client_transport_timing["request_bytes"]))
@@ -5673,6 +6498,9 @@ def return_pipers_to_initial(
     command_lookahead_rad: float = DEFAULT_TRAJECTORY_COMMAND_LOOKAHEAD_RAD,
     max_tracking_error_rad: float = DEFAULT_TRAJECTORY_MAX_TRACKING_ERROR_RAD,
     hold_tolerance_rad: float = DEFAULT_ARM_HOLD_TOLERANCE_RAD,
+    servo_backend: str = "legacy",
+    servo_hz: float = DEFAULT_SERVO_HZ,
+    on_sample: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Move all commanded arms back to their captured startup pose safely."""
     if arm_mode not in {"single", "bimanual"}:
@@ -5699,10 +6527,12 @@ def return_pipers_to_initial(
         raise ValueError("return timeout must be positive")
     lower = np.full(initial.shape, -np.inf, dtype=np.float32)
     upper = np.full(initial.shape, np.inf, dtype=np.float32)
-    for index in range(len(sides)):
+    for index, side in enumerate(sides):
         offset = index * 7
-        lower[offset : offset + 6] = JOINT_LIMITS_RAD[:, 0]
-        upper[offset : offset + 6] = JOINT_LIMITS_RAD[:, 1]
+        limits = effective_limits(pipers[side], JOINT_LIMITS_RAD)
+        lower[offset : offset + 6] = limits[:, 0]
+        upper[offset : offset + 6] = limits[:, 1]
+    max_joint_speed_rad_s = effective_speed(pipers, max_joint_speed_rad_s, speed_pct=speed_pct)
     home = initial.copy()
     for index in range(len(sides)):
         offset = index * 7
@@ -5712,18 +6542,36 @@ def return_pipers_to_initial(
     current = np.concatenate(
         [read_output_qpos(pipers[side], max_feedback_age_s=max_feedback_age_s) for side in sides]
     ).astype(np.float32)
-    shaper = JerkLimitedJointTrajectory(
-        current,
-        lower,
-        upper,
-        max_speed_rad_s=max_joint_speed_rad_s,
-        max_acceleration_rad_s2=max_joint_acceleration_rad_s2,
-        max_jerk_rad_s3=max_joint_jerk_rad_s3,
-        smoothing_cutoff_hz=smoothing_cutoff_hz,
-        tracking_time_constant_s=tracking_time_constant_s,
-        command_lookahead_rad=command_lookahead_rad,
-        max_tracking_error_rad=max_tracking_error_rad,
-    )
+    joint_indices = np.asarray([i for i in range(len(current)) if i % 7 != 6])
+    if servo_backend == "ruckig":
+        hz = max(float(hz), float(servo_hz))
+        shaper = RuckigJointServo(current[joint_indices], lower[joint_indices], upper[joint_indices],
+            ServoConfig(hz=hz, max_velocity=max_joint_speed_rad_s,
+                        max_acceleration=max_joint_acceleration_rad_s2, max_jerk=max_joint_jerk_rad_s3,
+                        max_tracking_error=max_tracking_error_rad))
+        # Return is a long motion at the firmware's configured speed. Bound
+        # each leg and wait for measured arrival before advancing, so a slow
+        # actuator cannot accumulate the entire home-path tracking error.
+        return_leg = min(0.1, max_tracking_error_rad * 0.25)
+        return_arrival = min(0.02, max_tracking_error_rad * 0.1)
+        def next_return_target():
+            delta = home[joint_indices] - shaper.position
+            scale = min(1.0, return_leg / max(float(np.max(np.abs(delta))), 1e-12))
+            return shaper.position + delta * scale
+        shaper.retarget(next_return_target())
+    else:
+        shaper = JerkLimitedJointTrajectory(
+            current,
+            lower,
+            upper,
+            max_speed_rad_s=max_joint_speed_rad_s,
+            max_acceleration_rad_s2=max_joint_acceleration_rad_s2,
+            max_jerk_rad_s3=max_joint_jerk_rad_s3,
+            smoothing_cutoff_hz=smoothing_cutoff_hz,
+            tracking_time_constant_s=tracking_time_constant_s,
+            command_lookahead_rad=command_lookahead_rad,
+            max_tracking_error_rad=max_tracking_error_rad,
+        )
     gripper_indices = np.asarray(
         [index * 7 + 6 for index in range(len(sides))], dtype=np.int64
     )
@@ -5731,6 +6579,7 @@ def return_pipers_to_initial(
     period = 1.0 / float(hz)
     started = time.monotonic()
     last_tick = started
+    next_tick = started
     sent = 0
     joint_error = float("inf")
     gripper_error = float("inf")
@@ -5766,9 +6615,17 @@ def return_pipers_to_initial(
         current = np.concatenate(
             [read_output_qpos(pipers[side], max_feedback_age_s=max_feedback_age_s) for side in sides]
         ).astype(np.float32)
-        joint_error = float(np.max(np.abs(current[shaper.joint_indices] - home[shaper.joint_indices])))
+        if on_sample is not None and sent % max(1, round(hz / 10)) == 0:
+            on_sample({"elapsed_s": tick - started, "feedback": current.tolist(),
+                       "home": home.tolist(), "sent_commands": sent,
+                       "servo": shaper.metrics() if servo_backend == "ruckig" else None})
+        joint_error = float(np.max(np.abs(current[joint_indices] - home[joint_indices])))
         gripper_error = float(np.max(np.abs(current[gripper_indices] - home[gripper_indices])))
-        if joint_error <= float(hold_tolerance_rad) and gripper_error <= 0.001:
+        trajectory_settled = (servo_backend != "ruckig" or (
+            np.max(np.abs(shaper.position - home[joint_indices])) < 1e-5
+            and np.max(np.abs(shaper.velocity)) < 1e-4
+            and np.max(np.abs(shaper.acceleration)) < 1e-3))
+        if trajectory_settled and joint_error <= float(hold_tolerance_rad) and gripper_error <= 0.001:
             send_exact_home()
             sent += 1
             time.sleep(min(0.15, 2.0 * period))
@@ -5781,7 +6638,7 @@ def return_pipers_to_initial(
                 ]
             ).astype(np.float32)
             joint_error = float(
-                np.max(np.abs(final[shaper.joint_indices] - home[shaper.joint_indices]))
+                np.max(np.abs(final[joint_indices] - home[joint_indices]))
             )
             gripper_error = float(
                 np.max(np.abs(final[gripper_indices] - home[gripper_indices]))
@@ -5799,7 +6656,18 @@ def return_pipers_to_initial(
             status = arm_status_dict(pipers[side])
             if status.get("arm_status") != PIPER_ARM_STATUS_NORMAL or status.get("err_code") != 0:
                 raise ExecutionBlocked(f"{side} Piper unhealthy during return: {status}")
-        shaped, _ = shaper.update(current, home, dt)
+        if servo_backend == "ruckig":
+            leg_settled = (np.max(np.abs(shaper.position - shaper.target)) < 1e-5
+                           and np.max(np.abs(shaper.velocity)) < 1e-4
+                           and np.max(np.abs(shaper.acceleration)) < 1e-3)
+            if (leg_settled
+                    and np.max(np.abs(current[joint_indices] - shaper.target)) <= return_arrival
+                    and np.max(np.abs(shaper.target - home[joint_indices])) > 1e-5):
+                shaper.retarget(next_return_target())
+            shaped = current.copy()
+            shaped[joint_indices] = shaper.update(current[joint_indices])
+        else:
+            shaped, _ = shaper.update(current, home, dt)
         gripper_target = rate_limit_grippers(
             current[gripper_indices],
             home[gripper_indices],
@@ -5823,13 +6691,204 @@ def return_pipers_to_initial(
                 0,
             )
         sent += 1
-        sleep_s = started + sent * period - time.monotonic()
+        if servo_backend == "ruckig":
+            next_tick += period
+            if next_tick < time.monotonic():
+                next_tick = time.monotonic() + period
+            sleep_s = next_tick - time.monotonic()
+        else:
+            sleep_s = started + sent * period - time.monotonic()
         if sleep_s > 0:
             time.sleep(sleep_s)
     raise TimeoutError(
         f"return-to-initial timed out after {timeout_s:.1f}s; "
         f"joint_error={joint_error:.4f}rad gripper_error={gripper_error:.4f}m"
     )
+
+
+def clip_startup_pose_to_limits(
+    pipers: dict[str, Any], pose: np.ndarray, *, arm_mode: str, arm_side: str
+) -> tuple[np.ndarray, dict[str, dict[str, list[float]]]]:
+    """Clip a saved/current startup pose to the effective Piper limits.
+
+    The saved return pose can contain a small calibrated zero offset (for
+    example J2=-0.034 rad) even though the driver advertises J2 >= 0.  This
+    helper only prepares the target; it never sends a command.  Motion is
+    performed by ``return_pipers_to_initial`` so the target is reached with
+    the same bounded Ruckig path used by replay/return.
+    """
+    sides = ("left", "right") if arm_mode == "bimanual" else (arm_side,)
+    target = np.asarray(pose, dtype=np.float32).copy()
+    expected = 7 * len(sides)
+    if target.shape != (expected,) or not np.isfinite(target).all():
+        raise ExecutionBlocked(f"startup pose must be finite {expected}D")
+    changes: dict[str, dict[str, list[float]]] = {}
+    for index, side in enumerate(sides):
+        if side not in pipers:
+            raise ExecutionBlocked(f"startup pose has no Piper for {side}")
+        offset = index * 7
+        limits = effective_limits(pipers[side], JOINT_LIMITS_RAD)
+        before = target[offset : offset + 6].copy()
+        after = np.clip(before, limits[:, 0], limits[:, 1])
+        target[offset : offset + 6] = after
+        if not np.array_equal(before, after):
+            changes[side] = {
+                "before_rad": before.astype(float).tolist(),
+                "after_rad": after.astype(float).tolist(),
+            }
+    return target, changes
+
+
+def save_return_pose(args, qpos, *, safe_to_return=False):
+    path = getattr(args, "initial_pose_file", None)
+    if not path:
+        return
+    path = Path(path)
+    data = {"qpos": np.asarray(qpos).tolist(), "arm_mode": args.arm_mode,
+            "arm_side": args.arm_side, "can": args.can, "left_can": args.left_can,
+            "right_can": args.right_can, "safe_to_return": safe_to_return}
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data), encoding="utf-8")
+    temporary.replace(path)
+
+
+def load_return_pose(path, args):
+    saved = json.loads(Path(path).read_text())
+    keys = ("arm_mode", "left_can", "right_can") if args.arm_mode == "bimanual" else ("arm_mode", "arm_side", "can")
+    for key in keys:
+        if saved.get(key) != getattr(args, key):
+            raise ExecutionBlocked(f"saved return pose does not match {key}")
+    qpos = np.asarray(saved['qpos'], dtype=np.float64)
+    if qpos.shape != ((14,) if args.arm_mode == 'bimanual' else (7,)) or not np.isfinite(qpos).all():
+        raise ExecutionBlocked("saved return pose must contain a finite matching joint vector")
+    return qpos
+
+
+def wait_for_return_stationary(pipers, args):
+    # A retry can follow a return error while firmware is still reaching
+    # its last target. Never initialize a zero-velocity plan while moving.
+    previous = np.concatenate([read_output_qpos(p, max_feedback_age_s=args.max_feedback_age_s)
+                               for p in pipers.values()])
+    stationary_since = time.monotonic()
+    deadline = stationary_since + 5.0
+    while time.monotonic() < deadline:
+        time.sleep(.05)
+        current = np.concatenate([read_output_qpos(p, max_feedback_age_s=args.max_feedback_age_s)
+                                  for p in pipers.values()])
+        if np.max(np.abs(current - previous)) > .001:
+            stationary_since = time.monotonic()
+            previous = current
+        if time.monotonic() - stationary_since >= .3:
+            break
+    else:
+        raise ExecutionBlocked("robot has not settled; manual return was not started")
+
+
+def move_pipers_to_safe_startup_pose(
+    pipers: dict[str, Any],
+    initial_qpos: np.ndarray,
+    args: argparse.Namespace,
+    *,
+    controller: "ExecutionController | None" = None,
+) -> tuple[np.ndarray, dict[str, dict[str, list[float]]], dict[str, Any]]:
+    """Approach the saved startup pose before a physical policy run.
+
+    EEF policies are especially sensitive to the initial Cartesian reference.
+    Use the same enable, Ruckig, feedback-arrival, and settling sequence as
+    replay.  The saved pose is clipped to the *queried* driver/software
+    intersection first, so a legacy calibrated J2 value below zero can never
+    become a command target.
+    """
+    target, clipped = clip_startup_pose_to_limits(
+        pipers,
+        initial_qpos,
+        arm_mode=args.arm_mode,
+        arm_side=args.arm_side,
+    )
+    recover_return_faults(pipers, driver_enable_status_dict)
+    if controller is None:
+        controller = ExecutionController(pipers, args)
+    sides = ("left", "right") if args.arm_mode == "bimanual" else (args.arm_side,)
+    for side in sides:
+        hold_qpos = read_output_qpos(
+            pipers[side], max_feedback_age_s=args.max_feedback_age_s
+        )
+        logging.info(
+            "Preparing %s Piper for EEF startup approach: enable and hold measured pose",
+            side,
+        )
+        controller._enable_robot(side, pipers[side], hold_qpos)
+    wait_for_return_stationary(pipers, args)
+    logging.info(
+        "EEF startup safe pose: moving to clipped target%s",
+        " (limits clipped)" if clipped else "",
+    )
+    result = return_pipers_to_initial(
+        pipers,
+        target,
+        arm_mode=args.arm_mode,
+        speed_pct=int(getattr(args, "return_speed_pct", None) or args.speed_pct),
+        hz=float(getattr(args, "return_hz", DEFAULT_RETURN_HZ)),
+        timeout_s=float(getattr(args, "return_timeout_s", DEFAULT_RETURN_TIMEOUT_S)),
+        max_feedback_age_s=float(args.max_feedback_age_s),
+        servo_backend="ruckig",
+        servo_hz=float(getattr(args, "servo_hz", DEFAULT_SERVO_HZ)),
+        max_joint_speed_rad_s=float(
+            getattr(args, "trajectory_max_speed_rad_s", DEFAULT_TRAJECTORY_MAX_SPEED_RAD_S)
+        ),
+        max_joint_acceleration_rad_s2=float(
+            getattr(
+                args,
+                "trajectory_max_acceleration_rad_s2",
+                DEFAULT_TRAJECTORY_MAX_ACCELERATION_RAD_S2,
+            )
+        ),
+        max_joint_jerk_rad_s3=float(
+            getattr(args, "trajectory_max_jerk_rad_s3", DEFAULT_TRAJECTORY_MAX_JERK_RAD_S3)
+        ),
+        max_tracking_error_rad=float(
+            getattr(args, "trajectory_max_tracking_error_rad", DEFAULT_TRAJECTORY_MAX_TRACKING_ERROR_RAD)
+        ),
+        hold_tolerance_rad=float(
+            getattr(args, "arm_hold_tolerance_rad", DEFAULT_ARM_HOLD_TOLERANCE_RAD)
+        ),
+    )
+    wait_for_return_stationary(pipers, args)
+    return target, clipped, result
+
+
+def run_return_only(args):
+    if not args.allow_execution or not args.initial_pose_file:
+        raise ExecutionBlocked("manual return requires execution permission and a saved session pose")
+    home = load_return_pose(args.initial_pose_file, args)
+    interfaces = ({"left": args.left_can, "right": args.right_can}
+                  if args.arm_mode == "bimanual" else {args.arm_side: args.can})
+    pipers = {}
+    try:
+        for side, interface in interfaces.items():
+            pipers[side] = connect_piper(interface)
+        wait_for_return_stationary(pipers, args)
+        recover_return_faults(pipers, driver_enable_status_dict)
+        enable_controller = ExecutionController(pipers, args)
+        for side, piper in pipers.items():
+            hold_qpos = read_output_qpos(piper, max_feedback_age_s=args.max_feedback_age_s)
+            logging.info("Preparing %s Piper for manual return: enable and hold current pose", side)
+            enable_controller._enable_robot(side, piper, hold_qpos)
+        wait_for_return_stationary(pipers, args)
+        logging.info("Returning to saved session initial pose (no policy or cameras).")
+        result = return_pipers_to_initial(
+            pipers, home, arm_mode=args.arm_mode,
+            speed_pct=args.return_speed_pct, hz=args.return_hz, timeout_s=args.return_timeout_s,
+            max_feedback_age_s=args.max_feedback_age_s, servo_backend="ruckig", servo_hz=args.servo_hz,
+            max_joint_speed_rad_s=args.trajectory_max_speed_rad_s,
+            max_joint_acceleration_rad_s2=args.trajectory_max_acceleration_rad_s2,
+            max_joint_jerk_rad_s3=args.trajectory_max_jerk_rad_s3,
+            max_tracking_error_rad=args.trajectory_max_tracking_error_rad,
+            hold_tolerance_rad=args.arm_hold_tolerance_rad)
+        logging.info("Return to initial pose completed: %s", result)
+    finally:
+        for piper in pipers.values():
+            piper.DisconnectPort()
 
 
 def run_rtc_client(args: argparse.Namespace) -> None:
@@ -5865,7 +6924,9 @@ def run_rtc_client(args: argparse.Namespace) -> None:
     else:
         logging.info("Connecting Piper feedback on %s ...", args.can)
         pipers = {args.arm_side: connect_piper(args.can)}
-        camera_ids = {"cam_high": args.cam_high_device, "cam_wrist": args.cam_wrist_device}
+        from bimanual_vla.collection.camera import select_video_device
+        wrist_device = select_video_device(f"cam_{args.arm_side}_wrist", args.cam_wrist_device)
+        camera_ids = {"cam_high": args.cam_high_device, "cam_wrist": wrist_device}
 
     monitoring = MonitoringRecorder(
         args.monitoring_dir,
@@ -5885,6 +6946,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
         cam_ids=camera_ids,
         fps=args.camera_fps,
         image_hw=IMAGE_HW,
+        resize_mode="pad",  # Updated from checkpoint metadata on connection.
         capture_hw=CAMERA_SOURCE_HW,
         parallel_reads=True,
         policy_image_hw=(224, 224) if args.preresize_policy_images else None,
@@ -5908,6 +6970,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
     return_attempted = False
     returned_to_initial = False
     once_result_accepted = False
+    startup_safe_pose_done = False
     last_reconnect_attempt = 0.0
     prompt_revision = 0
     prompt_sent_revision: int | None = None
@@ -5952,6 +7015,12 @@ def run_rtc_client(args: argparse.Namespace) -> None:
             ]
         ).astype(np.float32)
         monitoring.record("initial_pose_captured", qpos_m=initial_qpos)
+        if getattr(args, "return_target_file", None):
+            initial_qpos = load_return_pose(args.return_target_file, args)
+            monitoring.record("fixed_return_pose_loaded", qpos_m=initial_qpos, path=args.return_target_file)
+            logging.info("Using fixed saved return pose: %s", args.return_target_file)
+        save_return_pose(args, initial_qpos)
+        execution.servo_sample_callback = recorder.record_servo_tick
         recorder.start(
             {
                 "source_name": source_name,
@@ -5971,6 +7040,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                 "inference_hz": float(args.hz),
                 "rtc_execution_horizon": int(args.rtc_execution_horizon),
                 "trajectory_spike_suppression": bool(args.trajectory_spike_suppression),
+                "runtime_configuration": execution.run_configuration(),
                 "recording_video_source": "camera_stream",
                 "camera_capture_fps": float(args.camera_fps),
             }
@@ -6019,14 +7089,160 @@ def run_rtc_client(args: argparse.Namespace) -> None:
             args.min_action_chunk_steps,
         )
 
-        request_refresh_tick = False
         next_control_at = time.monotonic()
         launch_schedule = PeriodicSchedule(args.hz, next_at=next_control_at)
+
+        def handle_inference_completion(completion: InferenceCompletion) -> bool:
+            nonlocal policy, count, once_result_accepted
+            assert protocol is not None
+            refresh_reference = False
+            if completion.error is not None:
+                execution.reject_inference_completion(completion)
+                try:
+                    recorder.record_model_result(
+                        launch=completion.launch,
+                        result=None,
+                        arrived_at=completion.arrived_at,
+                        arrived_monotonic=completion.arrived_monotonic,
+                        protocol=protocol,
+                        accepted=False,
+                        rejection=execution.rejected_result,
+                        error=completion.error,
+                    )
+                except Exception:
+                    logging.exception("Failed to record failed model inference")
+                monitoring.record(
+                    "inference_error",
+                    generation=completion.launch.generation,
+                    captured_at=completion.launch.captured_at,
+                    launched_at=completion.launch.launched_at,
+                    arrived_at=completion.arrived_at,
+                    image_timestamps=completion.launch.image_timestamps,
+                    error=repr(completion.error),
+                    execution=execution.metadata(compact=monitoring.level != "full"),
+                )
+                if policy is not None:
+                    close_policy(policy)
+                policy = None
+                logging.warning(
+                    "Inference generation %d failed; old queue remains active: %s",
+                    completion.launch.generation,
+                    completion.error,
+                )
+            else:
+                accepted = execution.accept_inference_result(
+                    completion.result,
+                    completion.launch,
+                    protocol,
+                    arrived_at=completion.arrived_at,
+                    arrived_monotonic=completion.arrived_monotonic,
+                )
+                refresh_reference = accepted and execution.servo_backend == "ruckig"
+                try:
+                    recorder.record_model_result(
+                        launch=completion.launch,
+                        result=completion.result,
+                        arrived_at=completion.arrived_at,
+                        arrived_monotonic=completion.arrived_monotonic,
+                        protocol=protocol,
+                        accepted=accepted,
+                        rejection=None if accepted else execution.rejected_result,
+                    )
+                except Exception:
+                    logging.exception("Failed to record model action chunk")
+                monitoring.record(
+                    "inference_result",
+                    generation=completion.launch.generation,
+                    captured_at=completion.launch.captured_at,
+                    launched_at=completion.launch.launched_at,
+                    arrived_at=completion.arrived_at,
+                    image_timestamps=completion.launch.image_timestamps,
+                    accepted=accepted,
+                    # The raw action chunk is already persisted by
+                    # DeploymentRunRecorder.  Deep JSON conversion
+                    # of a 50x14 numpy array here used to run on the
+                    # 20 Hz control thread and could consume a
+                    # noticeable slice of the next tick.  Keep only
+                    # bounded diagnostics in the low-latency event
+                    # stream.
+                    result_summary=(
+                        {
+                            "actions_shape": list(
+                                np.asarray(
+                                    completion.result.get("actions")
+                                    if isinstance(completion.result, dict)
+                                    else []
+                                ).shape
+                            ),
+                            "transport_timing": (
+                                completion.result.get("transport_timing")
+                                if isinstance(completion.result, dict)
+                                and isinstance(
+                                    completion.result.get("transport_timing"),
+                                    dict,
+                                )
+                                else None
+                            ),
+                            "rtc": (
+                                completion.result.get("rtc")
+                                if isinstance(completion.result, dict)
+                                and isinstance(completion.result.get("rtc"), dict)
+                                else None
+                            ),
+                        }
+                        if isinstance(completion.result, dict)
+                        else None
+                    ),
+                    # Keep result telemetry bounded on the control
+                    # thread. The recorder still stores the full
+                    # model response and command trace separately.
+                    execution=execution.metadata(compact=True),
+                )
+                logging.debug(
+                    "Inference generation=%d arrival latency=%.3fs skip=%d "
+                    "blend=%d old_remaining=%d accepted=%s queue=%d rejected=%s",
+                    completion.launch.generation,
+                    execution.inference_latency_s or 0.0,
+                    execution.inference_skip_steps,
+                    execution.inference_blend_steps,
+                    execution.inference_old_remaining,
+                    accepted,
+                    execution.pending_action_count,
+                    execution.rejected_result,
+                )
+                if not execution.async_inference:
+                    # Synchronous mode never overlaps a request with
+                    # execution of the previous chunk, so this is a
+                    # clean, uncontaminated round-trip measurement.
+                    # ``hold_s`` is the wall-clock time the robot
+                    # actually sat still waiting for this result --
+                    # it should track ``latency`` closely, since the
+                    # next launch fires the instant the queue drains.
+                    logging.info(
+                        "Synchronous inference generation=%d round-trip "
+                        "latency=%.3fs hold_s=%s accepted=%s queued=%d/%d steps",
+                        completion.launch.generation,
+                        execution.inference_latency_s or 0.0,
+                        (
+                            f"{execution.last_hold_duration_s:.3f}"
+                            if execution.last_hold_duration_s is not None
+                            else "n/a"
+                        ),
+                        accepted,
+                        execution.pending_action_count,
+                        execution.sync_wait_steps,
+                    )
+                count += 1
+                if args.once and accepted:
+                    once_result_accepted = True
+            return refresh_reference
+
         manual_trigger = ManualInferenceTrigger(getattr(args, "manual_trigger_file", None))
+        reference_refresh_tick = False
         while True:
             tick_started = time.monotonic()
             execution.record_control_tick(overrun=tick_started > next_control_at + control_period)
-            if preview.enabled:
+            if preview.enabled and not reference_refresh_tick:
                 preview.update(cameras.latest_preview_images)
             command_sent = False
             completion: InferenceCompletion | None = None
@@ -6046,9 +7262,89 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                 args.arm_mode,
                                 output_mode,
                             )
+                            if protocol.image_resize_mode not in {"pad", "stretch"}:
+                                raise RuntimeError("unsupported policy image resize mode")
+                            policy_image_hw = (
+                                (protocol.image_size, protocol.image_size)
+                                if protocol.image_resize_mode == "stretch" or args.preresize_policy_images
+                                else None
+                            )
+                            if (cameras.resize_mode != protocol.image_resize_mode
+                                    or cameras._policy_image_hw != policy_image_hw):
+                                cameras.stop_background_capture()
+                                cameras.resize_mode = protocol.image_resize_mode
+                                cameras._policy_image_hw = policy_image_hw
+                                cameras.start_background_capture(record_camera_stream, fps=args.camera_fps)
                             execution.configure_protocol(protocol)
+                            # Delivery/EEF policies need the Cartesian reference
+                            # to start from a legal, settled joint pose.  Do
+                            # this after the policy schema is known but before
+                            # the first observation is sent.  Joint policies
+                            # retain the historical measured-pose startup.
+                            if (
+                                protocol.schema == "delivery"
+                                and not startup_safe_pose_done
+                                and bool(getattr(args, "allow_execution", False))
+                            ):
+                                cameras.stop_background_capture()
+                                try:
+                                    (
+                                        startup_target,
+                                        startup_clipped,
+                                        startup_result,
+                                    ) = move_pipers_to_safe_startup_pose(
+                                        pipers,
+                                        initial_qpos,
+                                        args,
+                                        controller=execution,
+                                    )
+                                except Exception:
+                                    logging.exception("EEF startup safe-pose approach failed")
+                                    raise
+                                startup_safe_pose_done = True
+                                initial_qpos = startup_target
+                                monitoring.record(
+                                    "startup_safe_pose_reached",
+                                    qpos_m=startup_target,
+                                    clipped=startup_clipped,
+                                    result=startup_result,
+                                )
+                                recorder.update_metadata(
+                                    {
+                                        "startup_safe_pose": {
+                                            "requested": True,
+                                            "clipped": startup_clipped,
+                                            "target_qpos_m": startup_target.tolist(),
+                                            "result": startup_result,
+                                        }
+                                    }
+                                )
+                                # The startup approach already established a
+                                # confirmed CAN/MOVE_J hold.  Let the normal
+                                # execution controller treat it as settled so
+                                # the first accepted EEF chunk is not discarded
+                                # by a second enable handshake.
+                                for side in (
+                                    ("left", "right")
+                                    if args.arm_mode == "bimanual"
+                                    else (args.arm_side,)
+                                ):
+                                    execution.robot_enabled.add(side)
+                                execution.arm_hold_targets.clear()
+                                execution.arm_hold_gripper_targets.clear()
+                                execution.arm_hold_started_at.clear()
+                                execution.arm_hold_stable_since.clear()
+                                execution.waiting_fresh_after_enable = False
+                                execution.fresh_inference_required_after_monotonic = None
+                                execution.enable_hold_settled_at = time.time()
+                                execution.state = "ready"
+                                execution.blocked_reason = ""
+                                cameras.start_background_capture(
+                                    record_camera_stream, fps=args.camera_fps
+                                )
                             prompt_sent_revision = None
                             recorder.update_metadata({
+                                "runtime_configuration": execution.run_configuration(),
                                 "policy_protocol": {
                                     "requested_output_mode": output_mode,
                                     "schema": protocol.schema,
@@ -6063,6 +7359,10 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                     "state_gripper_semantics": protocol.state_gripper_semantics,
                                     "contract_version": protocol.contract_version,
                                     "action_horizon": protocol.action_horizon,
+                                    "image_resize_mode": protocol.image_resize_mode,
+                                    "image_size": protocol.image_size,
+                                    "image_transport": protocol.image_transport,
+                                    "image_jpeg_quality": protocol.image_jpeg_quality,
                                 }
                             })
                             control_period = 1.0 / execution.control_hz
@@ -6135,144 +7435,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
 
                     completion = worker.poll()
                     if completion is not None:
-                        if completion.error is not None:
-                            execution.reject_inference_completion(completion)
-                            try:
-                                recorder.record_model_result(
-                                    launch=completion.launch,
-                                    result=None,
-                                    arrived_at=completion.arrived_at,
-                                    arrived_monotonic=completion.arrived_monotonic,
-                                    protocol=protocol,
-                                    accepted=False,
-                                    rejection=execution.rejected_result,
-                                    error=completion.error,
-                                )
-                            except Exception:
-                                logging.exception("Failed to record failed model inference")
-                            monitoring.record(
-                                "inference_error",
-                                generation=completion.launch.generation,
-                                captured_at=completion.launch.captured_at,
-                                launched_at=completion.launch.launched_at,
-                                arrived_at=completion.arrived_at,
-                                image_timestamps=completion.launch.image_timestamps,
-                                error=repr(completion.error),
-                                execution=execution.metadata(compact=monitoring.level != "full"),
-                            )
-                            if policy is not None:
-                                close_policy(policy)
-                            policy = None
-                            logging.warning(
-                                "Inference generation %d failed; old queue remains active: %s",
-                                completion.launch.generation,
-                                completion.error,
-                            )
-                        else:
-                            accepted = execution.accept_inference_result(
-                                completion.result,
-                                completion.launch,
-                                protocol,
-                                arrived_at=completion.arrived_at,
-                                arrived_monotonic=completion.arrived_monotonic,
-                            )
-                            try:
-                                recorder.record_model_result(
-                                    launch=completion.launch,
-                                    result=completion.result,
-                                    arrived_at=completion.arrived_at,
-                                    arrived_monotonic=completion.arrived_monotonic,
-                                    protocol=protocol,
-                                    accepted=accepted,
-                                    rejection=None if accepted else execution.rejected_result,
-                                )
-                            except Exception:
-                                logging.exception("Failed to record model action chunk")
-                            monitoring.record(
-                                "inference_result",
-                                generation=completion.launch.generation,
-                                captured_at=completion.launch.captured_at,
-                                launched_at=completion.launch.launched_at,
-                                arrived_at=completion.arrived_at,
-                                image_timestamps=completion.launch.image_timestamps,
-                                accepted=accepted,
-                                # The raw action chunk is already persisted by
-                                # DeploymentRunRecorder.  Deep JSON conversion
-                                # of a 50x14 numpy array here used to run on the
-                                # 20 Hz control thread and could consume a
-                                # noticeable slice of the next tick.  Keep only
-                                # bounded diagnostics in the low-latency event
-                                # stream.
-                                result_summary=(
-                                    {
-                                        "actions_shape": list(
-                                            np.asarray(
-                                                completion.result.get("actions")
-                                                if isinstance(completion.result, dict)
-                                                else []
-                                            ).shape
-                                        ),
-                                        "transport_timing": (
-                                            completion.result.get("transport_timing")
-                                            if isinstance(completion.result, dict)
-                                            and isinstance(
-                                                completion.result.get("transport_timing"),
-                                                dict,
-                                            )
-                                            else None
-                                        ),
-                                        "rtc": (
-                                            completion.result.get("rtc")
-                                            if isinstance(completion.result, dict)
-                                            and isinstance(completion.result.get("rtc"), dict)
-                                            else None
-                                        ),
-                                    }
-                                    if isinstance(completion.result, dict)
-                                    else None
-                                ),
-                                # Keep result telemetry bounded on the control
-                                # thread. The recorder still stores the full
-                                # model response and command trace separately.
-                                execution=execution.metadata(compact=True),
-                            )
-                            logging.debug(
-                                "Inference generation=%d arrival latency=%.3fs skip=%d "
-                                "blend=%d old_remaining=%d accepted=%s queue=%d rejected=%s",
-                                completion.launch.generation,
-                                execution.inference_latency_s or 0.0,
-                                execution.inference_skip_steps,
-                                execution.inference_blend_steps,
-                                execution.inference_old_remaining,
-                                accepted,
-                                execution.pending_action_count,
-                                execution.rejected_result,
-                            )
-                            if not execution.async_inference:
-                                # Synchronous mode never overlaps a request with
-                                # execution of the previous chunk, so this is a
-                                # clean, uncontaminated round-trip measurement.
-                                # ``hold_s`` is the wall-clock time the robot
-                                # actually sat still waiting for this result --
-                                # it should track ``latency`` closely, since the
-                                # next launch fires the instant the queue drains.
-                                logging.info(
-                                    "Synchronous inference generation=%d round-trip "
-                                    "latency=%.3fs hold_s=%s accepted=%s queued=%d/%d steps",
-                                    completion.launch.generation,
-                                    execution.inference_latency_s or 0.0,
-                                    (
-                                        f"{execution.last_hold_duration_s:.3f}"
-                                        if execution.last_hold_duration_s is not None
-                                        else "n/a"
-                                    ),
-                                    accepted,
-                                    execution.pending_action_count,
-                                    execution.sync_wait_steps,
-                                )
-                            count += 1
-                            if args.once and accepted:
-                                once_result_accepted = True
+                        handle_inference_completion(completion)
 
                     # Install the just-accepted plan BEFORE reserving the next
                     # request's RTC prefix. When inference exceeds its launch
@@ -6345,7 +7508,8 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                 )
                                 camera_selected_monotonic = time.monotonic()
                                 generation = execution.allocate_inference_generation()
-                                rtc_snapshot = execution.rtc_request_metadata(protocol)
+                                rtc_snapshot = execution.rtc_request_metadata(
+                                    protocol, observation_monotonic=observation_captured_monotonic)
                                 rtc_prefix_finished_monotonic = time.monotonic()
                                 if bool(getattr(args, "send_policy_telemetry", True)):
                                     execution_snapshot = execution.metadata(
@@ -6598,6 +7762,14 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                             ),
                             execution_state=execution.state,
                             blocked_reason=execution.blocked_reason,
+                            pose_diagnostics=(
+                                {side: {"pose_trajectory": trace["pose_trajectory"],
+                                        "ik_diagnostics": trace.get("ik_diagnostics")}
+                                 for side, trace in execution.last_actuator_command["sides"].items()
+                                 if trace.get("pose_trajectory") is not None}
+                                if command_sent and execution.last_actuator_command is not None
+                                else None
+                            ),
                         )
                     except Exception:
                         # Recording must never turn a safety-checked control tick
@@ -6671,23 +7843,36 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                 )
                 logging.exception("20 Hz control tick failed")
 
-            if not request_refresh_tick:
+            # A new plan may replace the active Ruckig reference between
+            # regular 20 Hz ticks. Keep the original model clock phase; the
+            # independent servo still owns every CAN publication at servo-hz.
+            if not reference_refresh_tick:
                 next_control_at += control_period
             now = time.monotonic()
             if now > next_control_at:
                 missed = int(math.floor((now - next_control_at) / control_period)) + 1
                 next_control_at += missed * control_period
-            wake_at = next_control_at
-            if execution.async_inference and execution.inference_trigger_mode == "periodic":
-                wake_at = launch_schedule.wakeup_deadline(
-                    next_control_at, time.monotonic(), in_flight=worker.in_flight)
-            request_refresh_tick = wake_at < next_control_at
-            sleep_s = wake_at - time.monotonic()
-            if sleep_s > 0:
-                time.sleep(sleep_s)
+            try:
+                wake_at = next_control_at
+                if execution.async_inference and execution.inference_trigger_mode == "periodic":
+                    wake_at = launch_schedule.wakeup_deadline(
+                        next_control_at, time.monotonic(), in_flight=worker.in_flight)
+                reference_refresh_tick = worker.wait_until(wake_at, handle_inference_completion)
+                # A request deadline is an extra fresh-observation tick, just
+                # like a result wakeup; preserve the regular control clock.
+                reference_refresh_tick = reference_refresh_tick or wake_at < next_control_at
+            except Exception as exc:
+                reference_refresh_tick = False
+                execution._block("blocked", f"inference completion failed: {exc}")
+                logging.exception("Inference completion failed between control ticks")
     except KeyboardInterrupt:
-        logging.info("Stopped; no further robot commands will be published.")
+        logging.info("Stopping policy references; braking the active servo before shutdown.")
     finally:
+        servo_stopped_safely = execution.close_servo()
+        if initial_qpos is not None:
+            save_return_pose(args, initial_qpos, safe_to_return=servo_stopped_safely)
+        if not servo_stopped_safely:
+            logging.error("Servo did not settle safely; automatic return is suppressed")
         worker.shutdown()
         try:
             recorder.stop(reason="client_stopped")
@@ -6700,6 +7885,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
             bool(getattr(args, "auto_return", True))
             and initial_qpos is not None
             and command_count > 0
+            and servo_stopped_safely
         ):
             return_attempted = True
             try:
@@ -6707,6 +7893,9 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                     pipers,
                     initial_qpos,
                     arm_mode=args.arm_mode,
+                    servo_backend=execution.servo_backend,
+                    on_sample=lambda sample: monitoring.record("return_to_initial_sample", **sample),
+                    servo_hz=float(getattr(args, "servo_hz", DEFAULT_SERVO_HZ)),
                     speed_pct=int(
                         getattr(args, "return_speed_pct", None) or args.speed_pct
                     ),
@@ -6770,6 +7959,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                     ),
                 )
                 returned_to_initial = bool(return_summary.get("returned"))
+                logging.info("Return to initial pose completed: %s", return_summary)
                 monitoring.record("return_to_initial_completed", **return_summary)
             except Exception as exc:
                 monitoring.record(
@@ -6791,6 +7981,8 @@ def run_rtc_client(args: argparse.Namespace) -> None:
             model_trajectory_jitter=recorder.model_jitter_snapshot,
         )
         monitoring.close(reason="stopped")
+        if return_attempted and not returned_to_initial:
+            raise ExecutionBlocked("return to initial pose failed; see return diagnostics")
 
 
 def main() -> None:
@@ -6895,6 +8087,8 @@ def main() -> None:
         default=True,
         help="use model-side Real-Time Chunking when the Policy advertises it (default: enabled)",
     )
+    parser.add_argument("--rtc-inference-delay-steps", type=int, default=8,
+                        help="fixed model-side RTC delay prefix; never estimated from latency")
     parser.add_argument("--rtc-execution-horizon", type=int, default=DEFAULT_RTC_EXECUTION_HORIZON)
     parser.add_argument("--rtc-max-guidance-weight", type=float, default=DEFAULT_RTC_MAX_GUIDANCE_WEIGHT)
     parser.add_argument(
@@ -6907,7 +8101,7 @@ def main() -> None:
         type=int,
         default=0,
         choices=(0, 2, 3, 4),
-        help="optional extra client blend after model-side RTC; default 0 to avoid adding latency",
+        help="deprecated compatibility option; ignored (RTC client blending is disabled)",
     )
     parser.add_argument(
         "--async-inference",
@@ -6966,6 +8160,16 @@ def main() -> None:
         default="smootherstep",
         help="boundary interpolation profile; smootherstep has zero slope at both ends",
     )
+    parser.add_argument("--servo-backend", choices=("off", "ruckig", "legacy"), default=None,
+                        help="joint reference planner backend (not motor servo); default Ruckig unless shaping is disabled")
+    parser.add_argument("--servo-hz", type=float, default=DEFAULT_SERVO_HZ,
+                        help="actuator publication frequency, independent of policy action Hz")
+    parser.add_argument("--servo-target-timeout-s", type=float, default=0.15)
+    parser.add_argument("--servo-waypoint-velocity", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--pose-trajectory", action=argparse.BooleanOptionalAction, default=False,
+                        help="shape delivery pose references before IK; requires Ruckig; does not alter RTC prefixes")
+    for name, default in vars(PoseTrajectoryConfig()).items():
+        parser.add_argument("--pose-" + name.replace("_", "-"), type=float, default=default)
     parser.add_argument(
         "--trajectory-shaping",
         action=argparse.BooleanOptionalAction,
@@ -7179,7 +8383,7 @@ def main() -> None:
         "--joint-limit-tolerance-rad",
         type=float,
         default=DEFAULT_JOINT_LIMIT_TOLERANCE_RAD,
-        help="clip numerical joint-target overshoot at Piper hard limits (default 0.05 rad)",
+        help="project model target overshoot within this margin onto joint limits before planning (default 0.10 rad)",
     )
     parser.add_argument(
         "--max-joint-gripper-step",
@@ -7250,18 +8454,21 @@ def main() -> None:
         help="maximum joint error before leaving the post-enable hold (default 0.05 rad)",
     )
     parser.add_argument(
-        "--workspace-x", type=float, nargs=2, default=DEFAULT_WORKSPACE_X_M, metavar=("MIN", "MAX"),
-        help=f"delivery EEF x bounds; {SAFETY_PROFILE} envelope with margin",
+        "--workspace-x", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
+        help="optional EEF x bounds; omitted means no Cartesian x envelope",
     )
     parser.add_argument(
-        "--workspace-y", type=float, nargs=2, default=DEFAULT_WORKSPACE_Y_M, metavar=("MIN", "MAX"),
-        help=f"delivery EEF y bounds; {SAFETY_PROFILE} envelope with margin",
+        "--workspace-y", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
+        help="optional EEF y bounds; omitted means no Cartesian y envelope",
     )
     parser.add_argument(
-        "--workspace-z", type=float, nargs=2, default=DEFAULT_WORKSPACE_Z_M, metavar=("MIN", "MAX"),
-        help=f"delivery EEF z bounds; {SAFETY_PROFILE} envelope with margin",
+        "--workspace-z", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
+        help="optional EEF z bounds; omitted means no Cartesian z envelope",
     )
-    parser.add_argument("--speed-pct", type=int, default=10)
+    parser.add_argument(
+        "--speed-pct", type=int, default=DEFAULT_INFERENCE_SPEED_PCT,
+        help="Piper firmware speed percentage (default 100); trajectory speed is configured separately",
+    )
     parser.add_argument("--gripper-effort", type=int, default=1000)
     parser.add_argument("--enable-timeout-s", type=float, default=3.0)
     parser.add_argument(
@@ -7281,6 +8488,9 @@ def main() -> None:
         default=True,
         help="smoothly return commanded arms to their startup pose before disconnect",
     )
+    parser.add_argument("--initial-pose-file", default=None)
+    parser.add_argument("--return-target-file", default=None)
+    parser.add_argument("--return-only", action="store_true")
     parser.add_argument("--return-hz", type=float, default=DEFAULT_RETURN_HZ)
     parser.add_argument("--return-timeout-s", type=float, default=DEFAULT_RETURN_TIMEOUT_S)
     parser.add_argument(
@@ -7290,6 +8500,27 @@ def main() -> None:
         help="return speed percentage; default reuses --speed-pct",
     )
     args = parser.parse_args()
+    args.servo_backend = args.servo_backend or ("ruckig" if args.trajectory_shaping else "off")
+    args.trajectory_shaping = args.servo_backend != "off"
+    try:
+        PoseTrajectoryConfig(**{name: getattr(args, "pose_" + name)
+                                for name in vars(PoseTrajectoryConfig())})
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.pose_trajectory and args.servo_backend != "ruckig":
+        parser.error("pose-trajectory requires servo-backend=ruckig")
+    if args.pose_trajectory:
+        if not math.isfinite(args.control_hz) or args.control_hz <= 0:
+            parser.error("pose trajectory requires a positive finite control rate")
+        if args.pose_max_update_dt_s < 1.0 / args.control_hz:
+            parser.error("pose reference timeout must cover one control period")
+    if args.servo_backend == "ruckig":
+        try:
+            ServoConfig(hz=args.servo_hz, target_timeout_s=args.servo_target_timeout_s)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.servo_hz < args.control_hz:
+            parser.error("servo-hz must be at least control-hz")
     if not math.isfinite(float(args.monitoring_rate)) or args.monitoring_rate < 0:
         parser.error("--monitoring-rate must be finite and non-negative")
     if args.sync_wait_steps < 1:
@@ -7394,7 +8625,7 @@ def main() -> None:
         parser.error("gripper-effort must be in [0,5000]")
     for name in ("workspace_x", "workspace_y", "workspace_z"):
         bounds = getattr(args, name)
-        if bounds[0] >= bounds[1]:
+        if bounds is not None and bounds[0] >= bounds[1]:
             parser.error(f"{name.replace('_', '-')} MIN must be less than MAX")
     if args.arm_mode == "bimanual":
         if args.arm_side not in {"both", "right"}:
@@ -7420,7 +8651,10 @@ def main() -> None:
     root_logger.handlers = [console_handler]
     root_logger.setLevel(logging.INFO)
     try:
-        run_rtc_client(args)
+        if args.return_only:
+            run_return_only(args)
+        else:
+            run_rtc_client(args)
     finally:
         root_logger.handlers = previous_handlers
         root_logger.setLevel(previous_level)

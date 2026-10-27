@@ -1075,3 +1075,13 @@ H100 走 4×4090 ↔ login-server 的并行 tar 流。H200 仍遵守 Slurm-only 
 - 路径关键词；
 
 进行筛选。成功状态从同目录或父目录 `_result.txt` 中尽量推断；无法推断时显示“未知”。
+
+## 统一实验产物、训练历史与视频（2026-10-23）
+
+π0.5 SFT 与 RLinf 的训练历史使用同一运行清单；训练/评测视频在评估视频页统一查询。页面支持环境来源（RoboTwin、LIBERO-Safety）、具体任务、实验、训练/评测阶段、任务成功、安全成功和事件筛选，支持分页。
+
+新实验须遵守 [实验产物约束](../docs/EXPERIMENT_ARTIFACT_CONTRACT.md)：根目录可因机器/磁盘不同而变化，`来源/任务/实验/运行` 四级保持固定，内部统一划分 metadata、logs、metrics、checkpoints、train、eval 和 artifacts。新后端通过清单声明原生格式、指标轴和恢复能力；逐回合结果须有证据，缺失时使用 unknown。
+
+API 见 [统一训练历史与 rollout 产物](API_USAGE.md#统一训练历史与-rollout-产物2026-10-23)。两类训练提交支持 `artifact_identity`；后台每五分钟更新历史索引和视频目录。训练提交登记清单，后端 writer 的输出路径仍需按约束配置。
+
+历史迁移保留旧路径兼容链接、事件标注和 checkpoint 动作约定。运行中任务延后迁移，旧输出已缺失的记录显式标为 missing；H200 指标镜像仅代表 mirror_only，不代表实际节点上的完整训练产物已迁移。当前迁移范围与回执见 [迁移记录](../docs/EXPERIMENT_ARTIFACT_MIGRATION_20261023.md)。

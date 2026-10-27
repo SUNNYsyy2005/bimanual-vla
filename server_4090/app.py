@@ -43,6 +43,7 @@ except ImportError:
     _piper_action_conventions = None
 
 from bimanual_vla.data.arm_geometry import normalize_arm_base_offset, normalize_robot_type
+from bimanual_vla.training.settings import FinetuningSettings
 
 
 def _action_constant(name: str, default: str) -> str:
@@ -119,6 +120,7 @@ try:
         normalize_contract_fingerprint,
         resolve_episode_split,
     )
+    from .rlinf_dashboard import build_launch_spec, checkpoints_for_run, evaluation_profile, metrics_for_run, native_gpu_placement, native_log_for_run, public_launch_config, public_runs, scan_runs, upgrade_native_profiles
 except ImportError:  # app.py is normally executed directly by start_server.sh
     from dataset_editor import (
         DATASET_ORIGINS,
@@ -138,6 +140,17 @@ except ImportError:  # app.py is normally executed directly by start_server.sh
         normalize_contract_fingerprint,
         resolve_episode_split,
     )
+    from rlinf_dashboard import build_launch_spec, checkpoints_for_run, evaluation_profile, metrics_for_run, native_gpu_placement, native_log_for_run, public_launch_config, public_runs, scan_runs, upgrade_native_profiles
+
+
+try:
+    from . import eval_video_catalog as video_catalog
+    from . import experiment_artifacts
+except ImportError:
+    import eval_video_catalog as video_catalog
+    import experiment_artifacts
+
+
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -603,8 +616,33 @@ def safe_float(value: Any, label: str, minimum: float, maximum: float, *, maximu
 MODEL_VARIANTS = {"pi05", "pi0"}
 
 
+def artifact_checkpoint_identity(path: Path) -> dict[str, Any] | None:
+    """Read SFT identity after physical layout migration, independent of names."""
+    path = Path(path)
+    if not path.name.isdigit():
+        return None
+    for ancestor in path.parents:
+        run = read_json(ancestor / "run.json", {}) or {}
+        if run.get("schema") != "experiment_run.v1" or run.get("backend") != "openpi":
+            continue
+        origin = run.get("origin", {})
+        config_name = origin.get("config_name")
+        if not config_name and origin.get("legacy_path"):
+            config_name = Path(origin["legacy_path"]).parent.name
+        for model_variant in sorted(MODEL_VARIANTS):
+            for arm_mode in ("single", "bimanual"):
+                if config_name == policy_config_name(arm_mode, model_variant):
+                    return {"config_name": config_name, "experiment": run["experiment"],
+                            "checkpoint_step": int(path.name), "model_variant": model_variant,
+                            "arm_mode": arm_mode}
+    return None
+
+
 def infer_model_variant(path: Path) -> str | None:
     path = Path(path)
+    registered = artifact_checkpoint_identity(path)
+    if registered:
+        return registered["model_variant"]
 
     def from_name(value: str) -> str | None:
         name = value.lower()
@@ -647,6 +685,9 @@ def training_checkpoint_identity(
     """Describe a standard ``config/experiment/step`` training checkpoint."""
     path = Path(path).expanduser().resolve()
     checkpoint_base_dir = Path(checkpoint_base_dir).expanduser().resolve()
+    registered = artifact_checkpoint_identity(path)
+    if registered:
+        return registered
     try:
         relative = path.relative_to(checkpoint_base_dir)
     except ValueError:
@@ -1224,6 +1265,10 @@ def action_contract_command_args(contract: dict[str, Any]) -> list[str]:
 
 def checkpoint_action_contract_marker(path: Path) -> Path:
     path = Path(path)
+    for ancestor in (path, *path.parents):
+        marker = ancestor / "metadata" / "action-contract.json"
+        if (ancestor / "run.json").is_file() and marker.is_file():
+            return marker
     experiment_dir = path.parent if path.name.isdigit() else path
     return (
         experiment_dir.parent
@@ -1441,7 +1486,7 @@ def load_config(path: Path) -> dict[str, Any]:
         # Policy process.
         "policy_rtc_enabled": True,
         "policy_inference_diagnostics_enabled": True,
-        "policy_rtc_max_execution_horizon": 8,
+        "policy_rtc_max_execution_horizon": 12,
         "policy_rtc_max_guidance_weight": 5.0,
         "max_upload_gib": 500,
         "max_chunk_mib": 64,
@@ -1635,6 +1680,15 @@ class TaskManager:
         *,
         state: str,
     ) -> dict[str, Any]:
+        dataset_id = metadata.get("dataset_id")
+        if dataset_id:
+            deleting = metadata.get("transfer_kind") == "dataset_delete"
+            for path in self.root.glob("*/task.json"):
+                other = read_json(path, {}) or {}
+                other_metadata = other.get("metadata", {})
+                if other.get("state") not in TERMINAL_STATES and other_metadata.get("dataset_id") == dataset_id:
+                    if deleting or other_metadata.get("transfer_kind") == "dataset_delete":
+                        raise ValueError(f"dataset {dataset_id} is in use by active task {other.get('id')}")
         if task_type not in TASK_TYPES:
             raise ValueError("unsupported task type")
         task_id = f"{task_type}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
@@ -1649,6 +1703,8 @@ class TaskManager:
             "metadata": dict(metadata),
             "log_path": str(task_dir / "task.log"),
         }
+        if task_type == "train":
+            experiment_artifacts.record_task(self.config, task)
         atomic_json(task_dir / "task.json", task)
         return task
 
@@ -4102,7 +4158,7 @@ def build_environment(
 
 def create_app(config_path: Path) -> Flask:
     config_file = Path(config_path).expanduser().resolve()
-    config = load_config(config_file)
+    config = upgrade_native_profiles(load_config(config_file))
     token = os.environ.get("BIMANUAL_VLA_SERVER_TOKEN", "")
     if len(token) < 20:
         raise RuntimeError("set BIMANUAL_VLA_SERVER_TOKEN to a random value of at least 20 characters")
@@ -4113,12 +4169,40 @@ def create_app(config_path: Path) -> Flask:
     dashboard_build_id = hashlib.sha256(dashboard_template_path.read_bytes()).hexdigest()[:12]
     app.config["MAX_CONTENT_LENGTH"] = int(config["max_chunk_mib"] * 1024**2) + 1024 * 1024
     tasks = TaskManager(config)
+    rlinf_history_path = Path(config["workspace_root"]) / "rlinf_deleted_runs.json"
+
+    def visible_rlinf_runs():
+        with tasks.lock:
+            deleted = set(read_json(rlinf_history_path, []) or [])
+            task_list = tasks.list()
+        return [run for run in scan_runs(config, task_list) if run["id"] not in deleted]
+
+    def delete_rlinf_records(run_ids):
+        if not isinstance(run_ids, list) or not run_ids or len(run_ids) > 200:
+            raise ValueError("run_ids must contain between 1 and 200 run IDs")
+        if any(not isinstance(item, str) or not item for item in run_ids):
+            raise ValueError("run_ids must contain nonempty strings")
+        runs = {run["id"]: run for run in visible_rlinf_runs()}
+        ids = list(dict.fromkeys(run_ids))
+        if any(item not in runs or runs[item].get("state") == "unavailable" for item in ids):
+            raise ValueError("unknown or unavailable RLinf run")
+        with tasks.lock:
+            if any(task.get("type") == "eval" and task.get("state") not in TERMINAL_STATES and task.get("metadata", {}).get("run_id") in ids for task in tasks.list()):
+                raise ValueError("该运行仍有正在执行的 rollout 评测，请先停止评测")
+            task_ids = list(dict.fromkeys(runs[item]["task_id"] for item in ids if runs[item].get("task_id")))
+            # Reuse process/dependency checks and delete only dashboard-owned logs.
+            if task_ids:
+                tasks.delete_many(task_ids)
+            deleted = set(read_json(rlinf_history_path, []) or [])
+            atomic_json(rlinf_history_path, sorted(deleted | set(ids)))
+        return {"deleted": True, "run_ids": ids, "task_ids": task_ids}
     dataset_root = Path(config["dataset_root"])
     dataset_root.mkdir(parents=True, exist_ok=True)
     dataset_read_roots = [Path(item) for item in config.get("dataset_read_roots", [])]
+    dataset_read_roots.extend(Path(item["dataset_root"]) for item in config.get("local_storage_locations", {}).values() if item.get("available", True) and item.get("dataset_root"))
     if dataset_root not in dataset_read_roots:
         dataset_read_roots.insert(0, dataset_root)
-    dataset_read_roots = list(dict.fromkeys(dataset_read_roots))
+    dataset_read_roots = [dataset_root, *[item for item in dict.fromkeys(dataset_read_roots) if item != dataset_root]]
 
     def assert_dataset_idle(dataset_id: str) -> None:
         active = [
@@ -4180,6 +4264,7 @@ def create_app(config_path: Path) -> Flask:
     observations = PolicyTelemetryStore(config)
     allowed_gpus = set(map(int, config["allowed_gpu_ids"]))
     checkpoint_roots = [Path(item) for item in config["checkpoint_allowed_roots"]]
+    checkpoint_roots.extend(Path(item) for item in config.get("experiment_artifact_read_roots", []))
     openpi_helper = str(APP_DIR / "openpi_single_arm.py")
     checkpoint_size_cache: dict[str, tuple[float, int]] = {}
     settings_lock = threading.RLock()
@@ -4273,9 +4358,9 @@ def create_app(config_path: Path) -> Flask:
     def dataset_path_for_id(dataset_id: str) -> Path:
         dataset_id = safe_name(dataset_id, "dataset id")
         roots = [Path(item) for item in config.get("dataset_read_roots", [])]
+        roots.extend(Path(item["dataset_root"]) for item in config.get("local_storage_locations", {}).values() if item.get("available", True) and item.get("dataset_root"))
         storage = Path(config["dataset_root"])
-        if storage not in roots:
-            roots.insert(0, storage)
+        roots = [storage, *[root for root in roots if root != storage]]
         for root in roots:
             candidate = root / dataset_id
             if candidate.is_dir() and (candidate / "meta" / "info.json").is_file():
@@ -4728,8 +4813,9 @@ def create_app(config_path: Path) -> Flask:
         datasets = []
         storage_root = Path(config["dataset_root"]).expanduser().resolve()
         roots = [Path(item).expanduser().resolve() for item in config.get("dataset_read_roots", [])]
-        if storage_root not in roots:
-            roots.insert(0, storage_root)
+        roots.extend(Path(item["dataset_root"]).expanduser().resolve() for item in config.get("local_storage_locations", {}).values() if item.get("available", True) and item.get("dataset_root"))
+        roots = list(dict.fromkeys(roots))
+        roots = [storage_root, *[root for root in roots if root != storage_root]]
         selected: dict[str, tuple[Path, bool]] = {}
         for root in roots:
             for directory in sorted(root.iterdir() if root.exists() else []):
@@ -4790,6 +4876,8 @@ def create_app(config_path: Path) -> Flask:
                         )
                     )
             default_model_variant = infer_model_variant(Path(config["base_checkpoint"])) or "pi05"
+            local_location = next((item for item in dataset_location_configs().values() if item.get("kind") in {"local", "local_archive"} and Path(item["dataset_root"]).expanduser().resolve() == directory.parent.resolve()), {})
+            local_target = local_location.get("name", "local_4090_read")
             datasets.append(
                 {
                     "id": directory.name,
@@ -4797,6 +4885,7 @@ def create_app(config_path: Path) -> Flask:
                     "root": str(directory.parent),
                     "storage": writable,
                     "read_only": not writable,
+                    "remote_only": False,
                     "episodes": info.get("total_episodes"),
                     "frames": info.get("total_frames"),
                     "fps": info.get("fps"),
@@ -4815,9 +4904,10 @@ def create_app(config_path: Path) -> Flask:
                     "mtime": directory.stat().st_mtime,
                     "locations": [
                         {
-                            "target": "local_4090",
-                            "label": "4×4090",
-                            "kind": "local",
+                            "target": local_target,
+                            "label": local_location.get("label", "4×4090 本机读取目录"),
+                            "kind": local_location.get("kind", "local"),
+                            "host": None,
                             "path": str(directory),
                             "root": str(directory.parent),
                             "read_only": not writable,
@@ -4828,7 +4918,7 @@ def create_app(config_path: Path) -> Flask:
                             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(directory.stat().st_mtime)),
                         }
                     ],
-                    "targets": ["local_4090"],
+                    "targets": [local_target],
                 }
             )
         return datasets
@@ -5110,6 +5200,7 @@ def create_app(config_path: Path) -> Flask:
                                     else None
                                 ),
                                 "gripper_semantics": action_contract.get("gripper_semantics") if action_contract else None,
+                                "finetuning": (action_contract or {}).get("finetuning") or FinetuningSettings.legacy().to_dict(),
                                 "config_name": config_name,
                                 "model_variant": model_variant,
                                 "arm_mode": arm_mode,
@@ -5290,7 +5381,7 @@ def create_app(config_path: Path) -> Flask:
                     "policy_xla_preallocate": config.get("policy_xla_preallocate", False),
                     "policy_rtc_enabled": config.get("policy_rtc_enabled", True),
                     "policy_rtc_max_execution_horizon": config.get(
-                        "policy_rtc_max_execution_horizon", 8
+                        "policy_rtc_max_execution_horizon", 12
                     ),
                     "policy_rtc_max_guidance_weight": config.get(
                         "policy_rtc_max_guidance_weight", 5.0
@@ -5367,6 +5458,16 @@ def create_app(config_path: Path) -> Flask:
         if confirmation != dataset_id:
             raise ValueError("confirm_dataset_id must exactly match the dataset id")
         return jsonify(dataset_editor.delete_dataset(dataset_id))
+
+    @app.get("/api/datasets")
+    def dataset_main_list():
+        return jsonify({"datasets": list_datasets()})
+
+    @app.get("/api/transfers")
+    def transfer_task_list():
+        # This table must not wait for GPU discovery, checkpoint inventories,
+        # or legacy destination-directory scans in the full status endpoint.
+        return jsonify({"tasks": [task for task in tasks.list() if task.get("type") == "transfer"]})
 
     @app.get("/api/datasets/<dataset_id>/episodes/<int:episode_index>/video/<video_key>")
     def dataset_episode_video(dataset_id: str, episode_index: int, video_key: str):
@@ -5645,6 +5746,7 @@ def create_app(config_path: Path) -> Flask:
         effective_mode: str,
         resume_checkpoint: str | Path | None = None,
         wandb_enabled: bool = False,
+        finetuning: FinetuningSettings | None = None,
     ) -> list[str]:
         command = [
             str(runtime_config["openpi_python"]), openpi_helper_for(runtime_config), "train",
@@ -5673,6 +5775,7 @@ def create_app(config_path: Path) -> Flask:
             command.append(f"--{effective_mode}")
         if wandb_enabled:
             command.append("--wandb-enabled")
+        command += (finetuning or FinetuningSettings()).command_args()
         return command
 
     def build_eval_command(
@@ -5854,29 +5957,34 @@ def create_app(config_path: Path) -> Flask:
     VIDEO_SUFFIXES = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".gif"}
 
     def eval_video_roots() -> list[Path]:
-        return [Path(item) for item in config.get("eval_video_roots", []) if item]
+        return list(dict.fromkeys([video_catalog.catalog_root(config), *[Path(item) for item in config.get("eval_video_roots", []) if item]]))
 
     def encode_video_id(path: Path) -> str:
-        return base64.urlsafe_b64encode(str(path.resolve()).encode()).decode().rstrip("=")
+        return base64.urlsafe_b64encode(str(path.absolute()).encode()).decode().rstrip("=")
 
     def decode_video_id(video_id: str) -> Path:
         padded = video_id + "=" * (-len(video_id) % 4)
         try:
-            path = Path(base64.urlsafe_b64decode(padded.encode()).decode()).resolve()
+            path = Path(os.path.abspath(base64.urlsafe_b64decode(padded.encode()).decode()))
         except Exception as exc:
             raise FileNotFoundError("invalid video id") from exc
-        roots = [root.resolve() for root in eval_video_roots()]
+        roots = [root.absolute() for root in eval_video_roots()]
         if not any(path == root or root in path.parents for root in roots):
             raise FileNotFoundError("video is outside configured roots")
+        allowed_targets = [*roots, *[Path(s["root"]).expanduser().resolve() for s in video_catalog.configured_sources(config) if not s.get("ssh_host")]]
+        allowed_targets.extend(Path(r).expanduser().resolve() for r in config.get("experiment_artifact_read_roots", []))
+        resolved = path.resolve()
+        if not any(resolved == r or r in resolved.parents for r in allowed_targets):
+            raise FileNotFoundError("video target is outside configured roots")
         if not path.is_file() or path.suffix.lower() not in VIDEO_SUFFIXES:
             raise FileNotFoundError("video not found")
         return path
 
     def prune_empty_eval_video_parents(path: Path) -> None:
-        roots = [root.resolve() for root in eval_video_roots()]
+        roots = [root.absolute() for root in eval_video_roots()]
         if not roots:
             return
-        current = Path(path).expanduser().resolve().parent
+        current = Path(path).expanduser().absolute().parent
         while current not in roots:
             try:
                 current.rmdir()
@@ -6094,6 +6202,11 @@ def create_app(config_path: Path) -> Flask:
             if row:
                 track = event_track_from_video_sidecar(path, row, sidecar_name, task_name=row.get("task") or row.get("task_name"))
                 max_step = safe_event_int((track or {}).get("max_step"))
+        stored = video_catalog.read_object(video_catalog.metadata_path(path))
+        if stored.get("episode_record"):
+            row = stored["episode_record"]
+            track = event_track_from_video_sidecar(path, row, stored.get("episode_sidecar"), task_name=str(stored.get("task", "")).replace("-", "_"))
+            max_step = safe_event_int((track or {}).get("max_step"))
         edit_values = payload.get("edits")
         if edit_values is None:
             step = payload.get("step", payload.get("frame"))
@@ -6135,129 +6248,10 @@ def create_app(config_path: Path) -> Flask:
         atomic_json(out_path, output)
         return {**output, "path": str(out_path), "override_count": len(edits)}
 
-    REMOTE_EVAL_VIDEO_INVENTORY_SCRIPT = r'''
-import json, os, re
-from pathlib import Path, PurePosixPath
-suffixes = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".gif"}
-roots = [Path(item).expanduser() for item in json.loads(os.environ.get("EVAL_VIDEO_ROOTS", "[]"))]
-
-def infer_metadata(root, rel, path):
-    parts = list(PurePosixPath(rel).parts)
-    name = parts[-1] if parts else rel
-    experiment = next((part for part in parts if "eval" in part.lower() or "ckpt" in part.lower() or "cp" in part.lower()), None)
-    if experiment is None and len(parts) >= 2:
-        experiment = parts[-2]
-    task_name = parts[0] if parts else "-"
-    success = None
-    score = None
-    episode_status = None
-    episode_seed = None
-
-    episode_match = re.search(r"episode(\d+)\.(?:mp4|webm|mov|mkv|avi|gif)$", name, re.IGNORECASE)
-    if episode_match is not None:
-        episode_index = int(episode_match.group(1))
-        jsonl_path = path.parent / "_episode_results.jsonl"
-        if jsonl_path.is_file():
-            rows = []
-            try:
-                for line in jsonl_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        item = json.loads(line)
-                    except Exception:
-                        continue
-                    try:
-                        item_episode_index = int(item.get("episode_index", -1))
-                    except Exception:
-                        item_episode_index = -1
-                    if item_episode_index == episode_index and item.get("counted_in_success_rate", True):
-                        rows.append(item)
-            except Exception:
-                rows = []
-            if rows:
-                item = rows[-1]
-                score_value = item.get("stage_reward")
-                if isinstance(score_value, (int, float)):
-                    score = float(score_value)
-                episode_status = str(item.get("status", "")) or None
-                episode_seed = item.get("seed")
-                if bool(item.get("success")):
-                    success = "success"
-                else:
-                    status_value = str(item.get("status", "failure")).lower()
-                    if status_value == "success":
-                        success = "success"
-                    elif status_value in {"failure", "failed", "policy_error", "expert_failed", "expert_invalid", "expert_unstable"} or "success" in item:
-                        success = "failed"
-
-    if success is None:
-        root_resolved = root.resolve()
-        for parent in [path.parent, *path.parents]:
-            try:
-                parent_resolved = parent.resolve()
-                if root_resolved not in [parent_resolved, *parent_resolved.parents]:
-                    break
-            except Exception:
-                pass
-            result_file = parent / "_result.txt"
-            if not result_file.is_file():
-                continue
-            text = result_file.read_text(encoding="utf-8", errors="replace")[-4000:]
-            lowered = text.lower()
-            if "success" in lowered and "fail" not in lowered:
-                success = "success"
-            elif "fail" in lowered or "failure" in lowered:
-                success = "failed"
-            else:
-                for token in reversed(text.replace(",", " ").split()):
-                    try:
-                        score = float(token)
-                        success = "success" if score >= 0.5 else "failed"
-                        break
-                    except ValueError:
-                        continue
-            if success:
-                break
-    if success is None:
-        lowered = rel.lower()
-        if "success" in lowered:
-            success = "success"
-        elif "fail" in lowered or "failed" in lowered:
-            success = "failed"
-        else:
-            success = "unknown"
-    return {
-        "task": task_name,
-        "experiment": experiment or "-",
-        "success": success,
-        "score": score,
-        "episode_status": episode_status,
-        "episode_seed": episode_seed,
-    }
-
+    REMOTE_EVAL_VIDEO_INVENTORY_SCRIPT = Path(video_catalog.__file__).read_text(encoding="utf-8").split('\nif __name__ == "__main__":')[0] + "\n" + r'''
 rows = []
-for root in roots:
-    if not root.exists():
-        continue
-    for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in suffixes:
-            continue
-        stat = path.stat()
-        try:
-            rel = path.relative_to(root).as_posix()
-        except ValueError:
-            rel = path.name
-        rows.append({
-            "name": path.name,
-            "relative_path": rel,
-            "path": str(path),
-            "root": str(root),
-            "size_mib": round(stat.st_size / (1024**2), 2),
-            "mtime": stat.st_mtime,
-            **infer_metadata(root, rel, path),
-        })
+for root in json.loads(os.environ.get("EVAL_VIDEO_ROOTS", "[]")):
+    rows.extend(scan_source({"root": root}))
 print(json.dumps(rows, ensure_ascii=False))
 '''
 
@@ -6273,116 +6267,28 @@ print(json.dumps(rows, ensure_ascii=False))
         return candidates
 
     def eval_video_metadata(root: Path | str, relative_path: str, *, source: str = "local_4090") -> dict[str, Any]:
-        parts = list(PurePosixPath(relative_path).parts)
-        name = parts[-1] if parts else relative_path
-        experiment = next((part for part in parts if "eval" in part.lower() or "ckpt" in part.lower() or "cp" in part.lower()), None)
-        if experiment is None and len(parts) >= 2:
-            experiment = parts[-2]
-        task_name = parts[0] if parts else "-"
-        success: str | None = None
-        score: float | None = None
-        episode_status: str | None = None
-        episode_seed: Any | None = None
-        instruction: str | None = None
-        model_name: str | None = None
-        checkpoint_id: str | None = None
-        video_layout: str | None = None
-        video_views: list[Any] | None = None
-        event_track: dict[str, Any] | None = None
-        root_path = Path(root)
-        path = root_path / relative_path
+        path = Path(root) / relative_path
+        metadata = video_catalog.classify(root, relative_path, {"storage_source": source})
+        row = metadata.pop("episode_record", {})
+        sidecar = metadata.pop("episode_sidecar", None)
+        metadata["event_track"] = event_track_from_video_sidecar(path, row, sidecar, task_name=str(metadata.get("task", "")).replace("-", "_"))
+        metadata["has_events"] = bool(metadata["event_track"])
+        metadata["source"] = source
+        return metadata
 
-        # Prefer per-episode RoboTwin jsonl metadata when available.  The old
-        # fallback below only inspected a run-level _result.txt, which is often
-        # absent until the whole eval finishes and cannot represent individual
-        # episode videos; that made running continuous eval videos show up as
-        # "unknown" even though _episode_results.jsonl already had statuses.
-        episode_match = re.search(r"episode(\d+)\.(?:mp4|webm|mov|mkv|avi|gif)$", name, re.IGNORECASE)
-        if episode_match is not None:
-            episode_index = int(episode_match.group(1))
-            try:
-                item, sidecar_name = load_episode_video_sidecar(path, episode_index)
-                if item:
-                    score_value = item.get("stage_reward")
-                    if isinstance(score_value, (int, float)):
-                        score = float(score_value)
-                    episode_status = str(item.get("status", "")) or None
-                    episode_seed = item.get("seed")
-                    instruction_value = item.get("instruction")
-                    instruction = str(instruction_value).strip() if instruction_value is not None else None
-                    model_value = item.get("model_name")
-                    model_name = str(model_value).strip() if model_value is not None else None
-                    checkpoint_value = item.get("checkpoint_id")
-                    checkpoint_id = str(checkpoint_value).strip() if checkpoint_value is not None else None
-                    layout_value = item.get("video_layout")
-                    video_layout = str(layout_value).strip() if layout_value is not None else None
-                    views_value = item.get("video_views")
-                    video_views = list(views_value) if isinstance(views_value, list) else None
-                    item_task = item.get("task_name", item.get("task"))
-                    if item_task:
-                        task_name = str(item_task)
-                    if bool(item.get("success")):
-                        success = "success"
-                    else:
-                        status_value = str(item.get("status", "failure")).lower()
-                        if status_value in {"success"}:
-                            success = "success"
-                        elif status_value in {"failure", "failed", "policy_error", "expert_failed", "expert_invalid", "expert_unstable"} or "success" in item:
-                            success = "failed"
-                    event_track = event_track_from_video_sidecar(path, item, sidecar_name, task_name=task_name)
-            except Exception:
-                pass
-
-        if success is None:
-            for parent in [path.parent, *path.parents]:
-                try:
-                    if root_path.resolve() not in [parent.resolve(), *parent.resolve().parents]:
-                        break
-                except Exception:
-                    pass
-                result_file = parent / "_result.txt"
-                if not result_file.is_file():
-                    continue
-                text = result_file.read_text(encoding="utf-8", errors="replace")[-4000:]
-                lowered = text.lower()
-                if "success" in lowered and "fail" not in lowered:
-                    success = "success"
-                elif "fail" in lowered or "failure" in lowered:
-                    success = "failed"
-                else:
-                    for token in reversed(text.replace(",", " ").split()):
-                        try:
-                            score = float(token)
-                            success = "success" if score >= 0.5 else "failed"
-                            break
-                        except ValueError:
-                            continue
-                if success:
-                    break
-        if success is None:
-            lowered = relative_path.lower()
-            if "success" in lowered:
-                success = "success"
-            elif "fail" in lowered or "failed" in lowered:
-                success = "failed"
-            else:
-                success = "unknown"
-        return {
-            "task": task_name,
-            "experiment": experiment or "-",
-            "success": success,
-            "score": score,
-            "episode_status": episode_status,
-            "episode_seed": episode_seed,
-            "instruction": instruction,
-            "model_name": model_name,
-            "checkpoint_id": checkpoint_id,
-            "video_layout": video_layout,
-            "video_views": video_views,
-            "event_track": event_track,
-            "source": source,
-            "display_name": name,
-        }
+    def catalog_remote_videos():
+        inventory = video_catalog.read_object(video_catalog.catalog_root(config) / "remote-inventory.json", max_bytes=128 * 1024 * 1024)
+        rows = []
+        for source, group in inventory.get("sources", {}).items():
+            for original in group.get("videos", []):
+                item = dict(original)
+                item.pop("episode_record", None)
+                item.pop("episode_sidecar", None)
+                item.update(source=source, remote=True, playable=False, syncable=True, deletable=False,
+                            id=base64.urlsafe_b64encode(f"{source}\0{item['root']}\0{item['relative_path']}".encode()).decode().rstrip("="),
+                            updated_at=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(item["mtime"])))
+                rows.append(item)
+        return rows, inventory.get("errors", {})
 
     def list_remote_eval_videos() -> tuple[list[dict[str, Any]], dict[str, str]]:
         videos: list[dict[str, Any]] = []
@@ -6401,7 +6307,7 @@ print(json.dumps(rows, ensure_ascii=False))
             command = (
                 "EVAL_VIDEO_ROOTS="
                 + shlex.quote(json.dumps(roots, ensure_ascii=False))
-                + " python3 - <<'REMOTE_EVAL_VIDEO_PY'\n"
+                + " " + shlex.quote(str(target.get("openpi_python") or target.get("python") or "/DATA/sync/sunny/miniconda3/bin/python")) + " - <<'REMOTE_EVAL_VIDEO_PY'\n"
                 + REMOTE_EVAL_VIDEO_INVENTORY_SCRIPT
                 + "\nREMOTE_EVAL_VIDEO_PY"
             )
@@ -6434,12 +6340,12 @@ print(json.dumps(rows, ensure_ascii=False))
                 # remote host, so metadata inferred by the remote inventory
                 # script must override local path fallbacks.  Otherwise every
                 # remote episode without a local copy is shown as "unknown".
-                for key in ("task", "experiment", "success", "score", "episode_status", "episode_seed"):
+                for key in ("score", "episode_status", "episode_seed"):
                     if key in row and row.get(key) is not None:
                         metadata[key] = row.get(key)
                 videos.append({
-                    **row,
                     **metadata,
+                    **{k: v for k, v in row.items() if k not in {"episode_record", "episode_sidecar"}},
                     "id": base64.urlsafe_b64encode(f"{name}\0{root}\0{rel}".encode()).decode().rstrip("="),
                     "source": name,
                     "host": host,
@@ -6452,71 +6358,115 @@ print(json.dumps(rows, ensure_ascii=False))
                 })
         return videos, errors
 
+    @app.post("/api/artifact-runs")
+    def allocate_artifact_run():
+        payload = request.get_json(force=True)
+        fields = experiment_artifacts.identity(payload.get("video_source"), payload.get("task"), payload.get("experiment"),
+                                               payload.get("run_id") or "run-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8])
+        backend, kind = payload.get("backend"), payload.get("kind")
+        if not isinstance(backend, str) or not SAFE_NAME.fullmatch(backend) or not isinstance(kind, str) or not SAFE_NAME.fullmatch(kind):
+            raise ValueError("backend and kind must be safe names")
+        root = Path(config.get("experiment_artifact_root") or Path(config["workspace_root"]) / "experiment_artifacts")
+        directory = experiment_artifacts.run_directory(root, fields)
+        try:
+            directory.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            raise ValueError("artifact run already exists; use a new run_id") from None
+        row = experiment_artifacts.manifest(fields, backend=backend, kind=kind, state="created")
+        for name in row["artifacts"].values():
+            (directory / name).mkdir(exist_ok=True)
+        video_catalog.atomic_write(directory / "run.json", row)
+        return jsonify(**row, path=str(directory), manifest_path=str(directory / "run.json")), 201
+
+    @app.get("/api/artifact-runs")
+    def artifact_runs():
+        path = Path(config["workspace_root"]) / "artifact-run-inventory.json"
+        data = video_catalog.read_object(path, max_bytes=128 * 1024 * 1024)
+        rows = list(data.get("runs", []))
+        root = Path(config.get("experiment_artifact_root") or Path(config["workspace_root"]) / "experiment_artifacts")
+        for path in root.glob("*/*/*/*/run.json"):
+            row = video_catalog.read_object(path)
+            if row.get("schema") == experiment_artifacts.SCHEMA:
+                rows.append({**row, "path": str(path.parent)})
+        for task in tasks.list():
+            if task.get("type") != "train":
+                continue
+            meta = task.get("metadata", {})
+            if meta.get("artifact_manifest"):
+                row = video_catalog.read_object(Path(meta["artifact_manifest"]))
+                if row:
+                    rows.append({**row, "state": task["state"], "task_id": task["id"], "path": meta.get("artifact_run_dir")})
+        unique = {row.get("path") or row.get("run_id"): row for row in rows}
+        rows = list(unique.values())
+        for field in ("source", "task", "backend", "kind", "state", "experiment"):
+            value = request.args.get(field, "")
+            if value and value != "all":
+                rows = [r for r in rows if r.get(field) == value]
+        return jsonify(schema=experiment_artifacts.SCHEMA, runs=rows, total=len(rows), updated_at=data.get("updated_at"))
+
     @app.get("/api/eval-videos")
     def list_eval_videos():
         limit = safe_int(request.args.get("limit", 200), "limit", 1, 1000)
+        offset = safe_int(request.args.get("offset", 0), "offset", 0, 10000000)
         include_remote = str(request.args.get("include_remote", "")).lower() in {"1", "true", "yes"}
-        task_filter = str(request.args.get("task", "")).strip().lower()
-        experiment_filter = str(request.args.get("experiment", "")).strip().lower()
-        success_filter = str(request.args.get("success", "")).strip().lower()
-        query_filter = str(request.args.get("q", "")).strip().lower()
-        videos = []
+        destination = video_catalog.catalog_root(config).absolute()
+        registry = video_catalog.read_object(destination / "registry.json", max_bytes=128 * 1024 * 1024)
+        videos, seen = [], set()
         for root in eval_video_roots():
             if not root.exists():
                 continue
-            for path in root.rglob("*"):
-                if not path.is_file() or path.suffix.lower() not in VIDEO_SUFFIXES:
+            for path in video_catalog.walk_videos(root):
+                identity = str(path.absolute())
+                if identity in registry or identity in seen:
                     continue
+                seen.add(identity)
                 stat = path.stat()
-                try:
-                    rel = path.relative_to(root).as_posix()
-                except ValueError:
-                    rel = path.name
+                rel = path.relative_to(root).as_posix()
                 videos.append({
-                    "id": encode_video_id(path),
-                    **eval_video_metadata(root, rel),
-                    "name": path.name,
-                    "relative_path": rel,
-                    "root": str(root),
-                    "size_mib": round(stat.st_size / (1024**2), 2),
-                    "mtime": stat.st_mtime,
-                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
-                    "url": f"/api/eval-videos/{encode_video_id(path)}",
-                    "remote": False,
-                    "playable": True,
-                    "syncable": False,
-                    "deletable": True,
+                    **eval_video_metadata(root, rel), "id": encode_video_id(path), "name": path.name,
+                    "relative_path": rel, "root": str(root), "size_mib": round(stat.st_size / 1024**2, 2),
+                    "mtime": stat.st_mtime, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+                    "url": f"/api/eval-videos/{encode_video_id(path)}", "remote": False, "playable": True,
+                    "syncable": False, "deletable": True,
                 })
-        remote_errors = {}
+        remote_videos, remote_errors = catalog_remote_videos()
+        # Hide cached originals once their canonical local copy is available.
+        synced = {(v.get("provenance", {}).get("storage_source"), v.get("provenance", {}).get("root"), v.get("provenance", {}).get("relative_path")) for v in videos}
+        videos.extend(v for v in remote_videos if (v["source"], v["root"], v["relative_path"]) not in synced)
         if include_remote:
-            remote_videos, remote_errors = list_remote_eval_videos()
-            videos.extend(remote_videos)
-        def video_matches(item: dict[str, Any]) -> bool:
-            if task_filter and task_filter not in str(item.get("task", "")).lower():
+            extra, errors = list_remote_eval_videos()
+            remote_errors.update(errors)
+            videos.extend(extra)
+        # Facets cover the inventory, independent of active filters.
+        facets = {key: sorted({str(v.get(field) or "unknown") for v in videos}) for key, field in
+                  (("video_sources", "video_source"), ("tasks", "task"), ("experiments", "experiment"), ("phases", "phase"), ("storage_sources", "source"))}
+        def video_matches(item):
+            events = request.args.get("events", "all")
+            if events in {"with", "without"} and bool(item.get("has_events")) != (events == "with"):
                 return False
-            if experiment_filter and experiment_filter not in str(item.get("experiment", "")).lower():
-                return False
-            if success_filter and success_filter not in {"all", str(item.get("success", "unknown")).lower()}:
-                return False
-            if query_filter:
-                haystack = " ".join(str(item.get(key, "")) for key in ("relative_path", "name", "task", "experiment", "source")).lower()
-                if query_filter not in haystack:
+            for key in ("video_source", "phase", "source", "success", "safe_success"):
+                value = str(request.args.get(key, "")).strip().lower()
+                if value and value != "all" and value != str(item.get(key, "unknown")).lower():
                     return False
-            return True
-        videos = [item for item in videos if video_matches(item)]
-        videos.sort(key=lambda item: item["mtime"], reverse=True)
-        facets = {
-            "tasks": sorted({str(item.get("task") or "-") for item in videos}),
-            "experiments": sorted({str(item.get("experiment") or "-") for item in videos}),
-            "success": {key: sum(1 for item in videos if item.get("success") == key) for key in ("success", "failed", "unknown")},
-        }
-        return jsonify({
-            "videos": videos[:limit],
-            "total": len(videos),
-            "facets": facets,
-            "roots": [str(root) for root in eval_video_roots()],
-            "remote_errors": remote_errors,
-        })
+            for key in ("task", "experiment", "run_id", "checkpoint_id"):
+                value = str(request.args.get(key, "")).strip().lower().replace("_", "-")
+                haystack = " ".join(str(item.get(k, "")) for k in (key, "experiment_label") if k == key or key == "experiment").lower().replace("_", "-")
+                if value and value not in haystack:
+                    return False
+            query = str(request.args.get("q", "")).strip().lower()
+            return not query or query in " ".join(str(item.get(k, "")) for k in ("relative_path", "catalog_relative_path", "name", "task", "experiment", "experiment_label", "run_id", "checkpoint_id", "source", "video_source", "instruction")).lower()
+        videos = [v for v in videos if video_matches(v)]
+        videos.sort(key=lambda v: (-v["mtime"], v["id"]))
+        facets["success"] = {k: sum(v.get("success") == k for v in videos) for k in ("success", "failed", "unknown")}
+        return jsonify(videos=videos[offset:offset + limit], total=len(videos), offset=offset, limit=limit,
+                       facets=facets, roots=[str(r) for r in eval_video_roots()], remote_errors=remote_errors,
+                       catalog_status=video_catalog.read_object(destination / "status.json"))
+
+    @app.post("/api/eval-videos/catalog/refresh")
+    def refresh_eval_video_catalog():
+        return jsonify(tasks.start("transfer", [config["openpi_python"], str(APP_DIR / "eval_video_catalog_runner.py"),
+                       "--config", str(config_file), "--apply"], env=build_environment(config, None),
+                       metadata={"transfer_kind": "eval_video_catalog", "gpu_required": False})), 201
 
     @app.get("/api/eval-videos/<video_id>")
     def get_eval_video(video_id: str):
@@ -6544,7 +6494,7 @@ print(json.dumps(rows, ensure_ascii=False))
 
         selected: list[dict[str, Any]] = []
         seen: set[str] = set()
-        roots = [root.resolve() for root in eval_video_roots()]
+        roots = [root.absolute() for root in eval_video_roots()]
         for raw_video_id in raw_video_ids:
             if not isinstance(raw_video_id, str) or not raw_video_id.strip():
                 raise ValueError("video_ids must contain non-empty strings")
@@ -6575,6 +6525,8 @@ print(json.dumps(rows, ensure_ascii=False))
         for item in selected:
             path = item["path"]
             path.unlink()
+            video_catalog.metadata_path(path).unlink(missing_ok=True)
+            event_override_path_for_video(path).unlink(missing_ok=True)
             prune_empty_eval_video_parents(path)
             deleted.append(
                 {
@@ -6601,54 +6553,46 @@ print(json.dumps(rows, ensure_ascii=False))
         source = str(payload.get("source", ""))
         root = str(payload.get("root", ""))
         relative_path = str(payload.get("relative_path", ""))
-        overwrite = bool(payload.get("overwrite", False))
         parallelism = safe_int(payload.get("parallelism", config.get("transfer_parallelism", 4)), "parallelism", 1, 16)
-        targets = config.get("cluster_targets", {})
-        if source not in targets:
-            raise ValueError(f"unknown video source target: {source}")
-        target = targets[source]
-        if target.get("access_mode") == "slurm_only":
-            raise ValueError(
-                "remote video source is Slurm-only; copy/export the video via a Slurm staging job or NAS before Dashboard playback"
-            )
-        roots = remote_eval_video_roots(target)
         rel = PurePosixPath(relative_path)
-        if root not in roots:
-            raise ValueError("remote video root is not configured")
-        if rel.is_absolute() or ".." in rel.parts or Path(rel.name).suffix.lower() not in VIDEO_SUFFIXES:
+        if rel.is_absolute() or ".." in rel.parts or not rel.name or Path(rel.name).suffix.lower() not in VIDEO_SUFFIXES:
             raise ValueError("invalid remote video relative_path")
-        local_roots = eval_video_roots()
-        if not local_roots:
-            raise ValueError("no local eval_video_roots configured")
-        command = [
-            config["openpi_python"],
-            str(APP_DIR / "video_transfer_runner.py"),
-            "--source-name", source,
-            "--source-host", str(target.get("submit_host")),
-            "--source-root", root,
-            "--relative-path", relative_path,
-            "--target-root", str(local_roots[0]),
-            "--parallelism", str(parallelism),
-        ]
-        if overwrite:
+        catalog_sources = {s["storage_source"]: s for s in video_catalog.configured_sources(config) if s.get("ssh_host")}
+        target = config.get("cluster_targets", {}).get(source)
+        metadata = None
+        if source in catalog_sources:
+            item = catalog_sources[source]
+            if root != item["root"] or item.get("access_mode") == "slurm_only":
+                raise ValueError("remote video root is not configured for SSH inventory")
+            host = item["ssh_host"]
+            inventory = video_catalog.read_object(video_catalog.catalog_root(config) / "remote-inventory.json", max_bytes=128 * 1024 * 1024)
+            metadata = next((r for r in inventory.get("sources", {}).get(source, {}).get("videos", [])
+                             if r["root"] == root and r["relative_path"] == relative_path), None)
+            if metadata is None:
+                raise ValueError("video is absent from the configured inventory; refresh the catalog")
+        elif target and target.get("access_mode") != "slurm_only" and root in remote_eval_video_roots(target):
+            host = target.get("submit_host")
+            remote, _ = list_remote_eval_videos()
+            metadata = next((r for r in remote if r["source"] == source and r["root"] == root and r["relative_path"] == relative_path), None)
+        else:
+            raise ValueError("unknown or Slurm-only video source/root")
+        if not metadata or not host:
+            raise ValueError("remote video was not found")
+        metadata = {**metadata, "provenance": {"storage_source": source, "root": root, "relative_path": relative_path}}
+        metadata["catalog_relative_path"] = video_catalog.catalog_relative_path(metadata, rel.name)
+        destination = video_catalog.catalog_root(config)
+        target_path = destination / metadata["catalog_relative_path"]
+        command = [config["openpi_python"], str(APP_DIR / "video_transfer_runner.py"),
+                   "--source-name", source, "--source-host", str(host), "--source-root", root,
+                   "--relative-path", relative_path, "--target-root", str(destination),
+                   "--catalog-relative-path", metadata["catalog_relative_path"], "--metadata-json", json.dumps(metadata, ensure_ascii=False),
+                   "--parallelism", str(parallelism)]
+        if payload.get("overwrite", False):
             command.append("--overwrite")
-        task = tasks.start(
-            "transfer",
-            command,
-            env=build_environment(config, None),
-            metadata={
-                "transfer_kind": "eval_video",
-                "source": source,
-                "target": "local_4090",
-                "source_path": str(PurePosixPath(root) / rel),
-                "target_path": str(local_roots[0] / source / Path(*rel.parts)),
-                "overwrite": overwrite,
-                "parallelism": parallelism,
-                "slurm_involved": slurm_involved,
-                "nas_dataset_staging_root": config.get("nas_dataset_staging_root"),
-            },
-        )
-        return jsonify(task), 201
+        return jsonify(tasks.start("transfer", command, env=build_environment(config, None), metadata={
+            "transfer_kind": "eval_video", "source": source, "target": "local_4090",
+            "source_path": str(PurePosixPath(root) / rel), "target_path": str(target_path),
+            "parallelism": parallelism, "slurm_involved": False})), 201
 
     def dataset_location_configs() -> dict[str, dict[str, Any]]:
         locations = {
@@ -6683,6 +6627,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 "kind": "slurm_only" if target.get("access_mode") == "slurm_only" else "ssh",
                 "access_mode": target.get("access_mode", "ssh"),
                 "inventory_note": target.get("inventory_note"),
+                "inventory_python": target.get("inventory_python") or target.get("openpi_python"),
                 "inventory_cache_path": target.get("inventory_cache_path"),
                 "inventory_cache_host": target.get("inventory_cache_host", target.get("submit_host")),
                 "inventory_source_path": target.get("inventory_source_path"),
@@ -6694,6 +6639,11 @@ print(json.dumps(rows, ensure_ascii=False))
                 "node": target.get("node"),
                 "gpu_type": target.get("gpu_type"),
                 "dataset_root": target.get("dataset_root"),
+                "openpi_python": target.get("openpi_python"),
+                "workdir": target.get("workdir"),
+                "log_dir": target.get("log_dir"),
+                "remote_job_dir": target.get("remote_job_dir"),
+                "cache_root": target.get("cache_root"),
                 "available": True,
             }
         return locations
@@ -6906,10 +6856,9 @@ print(json.dumps(rows, ensure_ascii=False))
                 return [], f"invalid JSON inventory cache from {source_label}: {exc}"
             if isinstance(payload, dict):
                 rows = payload.get("datasets", [])
-                if not rows and payload.get("roots"):
-                    note = location.get("inventory_note") or "slurm-only inventory cache contains no datasets"
-                    return [], f"{note}; roots={payload.get('roots')}"
-                return rows if isinstance(rows, list) else [], None
+                if not isinstance(rows, list):
+                    return [], f"invalid dataset list in inventory cache from {source_label}"
+                return rows, None
             if isinstance(payload, list):
                 return payload, None
             return [], f"unsupported inventory cache format from {source_label}"
@@ -6917,7 +6866,10 @@ print(json.dumps(rows, ensure_ascii=False))
         if not host:
             return [], "missing ssh host"
         env = f"DATASET_ROOT={shlex.quote(str(location['dataset_root']))}"
-        command = f"{env} python3 - <<'REMOTE_DATASET_PY'\n{REMOTE_DATASET_INVENTORY_SCRIPT}\nREMOTE_DATASET_PY"
+        inventory_python = location.get("inventory_python") or location.get("openpi_python")
+        if not inventory_python:
+            return [], "missing configured inventory Python interpreter"
+        command = f"{env} {shlex.quote(str(inventory_python))} - <<'REMOTE_DATASET_PY'\n{REMOTE_DATASET_INVENTORY_SCRIPT}\nREMOTE_DATASET_PY"
         try:
             result = subprocess.run(
                 [*SSH_COMMAND, str(host), command],
@@ -6967,7 +6919,7 @@ print(json.dumps(rows, ensure_ascii=False))
             item["targets"] = sorted({loc.get("target") for loc in item["locations"] if loc.get("target")})
             datasets.append(item)
         datasets.sort(key=lambda item: item["id"])
-        return {"datasets": datasets, "locations": locations, "errors": errors}
+        return {"datasets": datasets, "local_datasets": list_datasets(), "locations": locations, "errors": errors}
 
     @app.get("/api/dataset-locations")
     def dataset_locations():
@@ -6976,41 +6928,55 @@ print(json.dumps(rows, ensure_ascii=False))
             origin = normalize_dataset_origin(origin)
         return jsonify(grouped_dataset_locations(origin_filter=origin))
 
+    @app.post("/api/datasets/<dataset_id>/delete-copy")
+    def delete_dataset_copy(dataset_id: str):
+        dataset_id = safe_name(dataset_id, "dataset id")
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict) or payload.get("confirm_dataset_id") != dataset_id:
+            raise ValueError("confirm_dataset_id must exactly match the dataset id")
+        target_name = str(payload.get("target", ""))
+        location = dataset_location_configs().get(target_name)
+        if not location or not location.get("available", True):
+            raise ValueError("unknown or unavailable dataset location")
+        expected_episodes = payload.get("expected_episodes")
+        if expected_episodes is not None:
+            expected_episodes = safe_int(expected_episodes, "expected_episodes", 1, 1000000)
+        with tasks.lock:
+            assert_dataset_idle(dataset_id)
+            if target_name == "local_4090":
+                # Explicitly delete the storage copy even if another read root
+                # with the same ID happens to appear earlier in the config.
+                target_path = Path(config["dataset_root"]) / dataset_id
+                if target_path.is_symlink() or target_path.resolve().parent != Path(config["dataset_root"]).resolve():
+                    raise ValueError("dataset path escapes configured storage root")
+                if not (target_path / "meta/info.json").is_file():
+                    raise FileNotFoundError("local dataset copy is not installed")
+                if expected_episodes is not None and read_json(target_path / "meta/info.json", {}).get("total_episodes") != expected_episodes:
+                    raise ValueError("dataset episode count changed; deletion refused")
+                return jsonify({**dataset_editor.delete_dataset(dataset_id), "target": target_name})
+            if location.get("kind") not in {"local", "local_archive"}:
+                if not location.get("openpi_python") or not location.get("partition") or not location.get("node"):
+                    raise ValueError("remote dataset deletion requires a configured Slurm target and Conda Python")
+            command = [config["openpi_python"], str(APP_DIR / "dataset_delete_runner.py"),
+                       "--dataset-id", dataset_id, "--location-json", json_arg(location)]
+            if expected_episodes is not None:
+                command.extend(["--expected-episodes", str(expected_episodes)])
+            task = tasks.start("transfer", command, env=build_environment(config, None), metadata={
+                "dataset_id": dataset_id, "transfer_kind": "dataset_delete", "target": target_name,
+                "target_path": str(Path(location["dataset_root"]) / dataset_id) if location.get("kind") in {"local", "local_archive"} else str(PurePosixPath(location["dataset_root"]) / dataset_id),
+                "execution_target": target_name, "runtime": "local_4090", "source": target_name,
+            })
+        return jsonify({"task": task, "dataset_id": dataset_id, "target": target_name}), 202
+
     @app.get("/api/cluster-resources")
     def cluster_resources():
-        """Return a read-only H100/H200 Slurm resource snapshot.
-
-        This never starts a service or opens a port on H100/H200.  It runs the
-        existing query helper locally on 4x4090, which itself uses SSH to the
-        Slurm login node when needed.
-        """
-        script = Path(config.get("cluster_resources_script", ""))
-        if not script.is_file():
-            raise FileNotFoundError(f"cluster resources script not found: {script}")
-        show_all = str(request.args.get("all_jobs", "")).lower() in {"1", "true", "yes"}
-        native = str(request.args.get("native", "")).lower() in {"1", "true", "yes"}
-        command = [str(script), "--compact"]
-        if show_all:
-            command.append("--all-jobs")
-        if native:
-            command.append("--native")
+        from server_4090.extension_nodes import resource_snapshot
         started = time.time()
-        result = subprocess.run(
-            command,
-            cwd=str(REPO_DIR),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=60,
-        )
-        return jsonify({
-            "command": command,
-            "returncode": result.returncode,
-            "ok": result.returncode == 0,
-            "elapsed_s": round(time.time() - started, 3),
-            "output": result.stdout[-64_000:],
-            "note": "H100/H200 are queried via SSH/Slurm only; no remote Dashboard port is opened.",
-        })
+        result = resource_snapshot(config.get("cluster_targets", {}),
+            all_jobs=str(request.args.get("all_jobs", "")).lower() in {"1", "true", "yes"},
+            native=str(request.args.get("native", "")).lower() in {"1", "true", "yes"})
+        result["elapsed_s"] = round(time.time() - started, 3)
+        return jsonify(result)
 
     @app.post("/api/datasets/<dataset_id>/sync")
     def sync_dataset(dataset_id: str):
@@ -7064,6 +7030,56 @@ print(json.dumps(rows, ensure_ascii=False))
         )
         return jsonify(task), 201
 
+    from server_4090.remote_checkpoints import RemoteCheckpointInventory
+    remote_checkpoints = RemoteCheckpointInventory(config.get("cluster_targets", {}))
+
+    extension_nodes_lock = threading.Lock()
+
+    @app.get("/api/settings/extension-nodes")
+    def get_extension_nodes():
+        return jsonify({"nodes": config.get("cluster_targets", {})})
+
+    def check_node_unused(name):
+        for task in tasks.list():
+            if task.get("state") not in PROCESS_STATES | WAITING_STATES:
+                continue
+            metadata = task.get("metadata", {})
+            if name in [metadata.get(key) for key in ("execution_target", "cluster_target", "slurm_target", "source", "target")]:
+                raise ValueError(f"node {name} is used by active task {task['id']}; edit after it finishes")
+
+    @app.route("/api/settings/extension-nodes/<name>", methods=["PUT", "DELETE"])
+    def save_extension_node(name):
+        nonlocal remote_checkpoints
+        from server_4090.extension_nodes import validate_node
+        with extension_nodes_lock:
+            targets = dict(config.get("cluster_targets", {}))
+            check_node_unused(name)
+            if request.method == "DELETE":
+                if name not in targets:
+                    raise ValueError("unknown extension node")
+                del targets[name]
+            else:
+                payload = request.get_json(force=True)
+                if not isinstance(payload, dict):
+                    raise ValueError("node settings must be an object")
+                targets[name] = validate_node(name, {**targets.get(name, {}), **payload})
+            persist_settings({"cluster_targets": targets})
+            config["cluster_targets"] = targets
+            previous = remote_checkpoints
+            remote_checkpoints = RemoteCheckpointInventory(targets)
+            previous.pool.shutdown(wait=False)
+        return jsonify({"ok": True, "nodes": targets, "restart_required": False})
+
+    @app.get("/api/checkpoints/remote")
+    def list_remote_checkpoints():
+        locations = remote_checkpoints.snapshot(force=request.args.get("refresh") == "1", source=request.args.get("source"))
+        # Keep real/simulation Dashboard provenance filtering consistent.
+        for location in locations:
+            location["checkpoints"] = [row for row in location["checkpoints"]
+                if any(origin in visible_dataset_origin_set() for origin in checkpoint_dataset_origins(row["dataset_ids"]).values())
+                or (not row["dataset_ids"] and "unknown" in visible_dataset_origin_set())]
+        return jsonify({"locations": locations})
+
     @app.post("/api/checkpoints/sync")
     def sync_checkpoint():
         payload = request.get_json(force=True)
@@ -7092,6 +7108,40 @@ print(json.dumps(rows, ensure_ascii=False))
             raise ValueError(f"unknown checkpoint target location: {target_name}")
         if source_name == target_name:
             raise ValueError("source and target must differ")
+        if payload.get("step") is not None:
+            if target_name != "local_4090" or source_name not in config.get("cluster_targets", {}):
+                raise ValueError("single-step sync supports cluster to local_4090")
+            step = safe_int(payload["step"], "checkpoint step", 0, 10**9)
+            row = remote_checkpoints.selected(source_name, config_name, exp_name, step)
+            contract = row.get("action_contract")
+            if not contract:
+                raise ValueError("checkpoint has no action contract; cannot prepare policy deployment")
+            source, target = dict(locations[source_name]), dict(locations[target_name])
+            marker_path = str(PurePosixPath(target["dataset_root"]) / ".policy_action_conventions" / (exp_name + ".json"))
+            source["dataset_root"] = str(PurePosixPath(row["root"]) / config_name / exp_name)
+            target["dataset_root"] = str(PurePosixPath(target["dataset_root"]) / exp_name)
+            if source.get("kind") == "slurm_only":
+                staging = source.get("nas_dataset_staging_root") or config["nas_checkpoint_staging_root"]
+                source["nas_dataset_staging_root"] = str(PurePosixPath(staging) / source_name / config_name / exp_name)
+            for existing in tasks.list():
+                meta = existing.get("metadata", {})
+                if (existing.get("type") == "transfer" and existing.get("state") in PROCESS_STATES
+                        and meta.get("transfer_kind") == "checkpoint"
+                        and (meta.get("source"), meta.get("config_name"), meta.get("exp_name"), meta.get("checkpoint_step"))
+                        == (source_name, config_name, exp_name, step)):
+                    return jsonify(existing), 200
+            transfer_request = dict(source=source, target=target, step=step, contract=contract,
+                                    marker_path=marker_path, parallelism=parallelism,
+                                    nas_staging_root=config.get("nas_checkpoint_staging_root"))
+            task = tasks.start("transfer", [config["openpi_python"], str(APP_DIR / "checkpoint_sync_runner.py"),
+                               "--request-json", json_arg(transfer_request)], env=build_environment(config, None),
+                               metadata={"transfer_kind": "checkpoint", "config_name": config_name,
+                                         "exp_name": exp_name, "checkpoint_step": step,
+                                         "source": source_name, "target": target_name,
+                                         "source_path": str(PurePosixPath(source["dataset_root"]) / str(step)),
+                                         "target_path": str(PurePosixPath(target["dataset_root"]) / str(step)),
+                                         "parallelism": parallelism})
+            return jsonify(task), 201
         slurm_involved = (
             locations[source_name].get("kind") == "slurm_only"
             or locations[target_name].get("kind") == "slurm_only"
@@ -7527,6 +7577,32 @@ print(json.dumps(rows, ensure_ascii=False))
                 "so the failed run remains available for audit"
             )
 
+        settings_source = checkpoint_action_contract(resume_checkpoint) if resume_checkpoint is not None else marker
+        requested_finetuning = {key: payload.get(key) for key in FinetuningSettings.__dataclass_fields__}
+        weights = requested_finetuning["rtc_training_delay_weights"]
+        if isinstance(weights, str):
+            requested_finetuning["rtc_training_delay_weights"] = json.loads(weights) if weights.strip() else None
+        for key in ("llm_lora", "rtc_training", "train_vision", "train_llm"):
+            value = requested_finetuning[key]
+            if value is not None and not isinstance(value, bool):
+                if str(value).strip().lower() not in {"true", "false", "1", "0"}:
+                    raise ValueError(f"{key} must be a boolean")
+                requested_finetuning[key] = str(value).strip().lower() in {"true", "1"}
+        if requested_finetuning["rtc_training_max_delay"] is not None:
+            requested_finetuning["rtc_training_max_delay"] = safe_int(
+                requested_finetuning["rtc_training_max_delay"], "rtc_training_max_delay", 1, 49)
+        is_resume = resume_kind != "none"
+        finetuning = FinetuningSettings.resolve(requested_finetuning,
+            (settings_source or {}).get("finetuning"), legacy=is_resume, resume=is_resume)
+        finetuning.validate_model(model_variant)
+        if not is_resume:
+            initialization_marker = checkpoint_action_contract(base_checkpoint)
+            if initialization_marker:
+                initial_settings = FinetuningSettings.resolve({}, initialization_marker.get("finetuning"), legacy=True)
+                if (finetuning.action_expert_tuning != initial_settings.action_expert_tuning
+                        or finetuning.llm_lora != initial_settings.llm_lora):
+                    raise ValueError("initialization checkpoint uses a different LoRA architecture; choose a base model or convert adapters")
+
         execution_target = str(payload.get("execution_target", "local_4090") or "local_4090")
         cluster_target_config = runtime_config_for_target(execution_target)
         is_cluster_target = cluster_target_config is not None
@@ -7635,6 +7711,7 @@ print(json.dumps(rows, ensure_ascii=False))
             effective_mode=("resume" if resume_kind == "in_place_full_state" else effective_mode),
             resume_checkpoint=(resume_checkpoint if resume_kind == "external_full_state" else None),
             wandb_enabled=bool(payload.get("wandb_enabled", False)),
+            finetuning=finetuning,
         )
         cluster_dataset_sync_command: list[str] | None = None
         remote_checkpoint_dir: str | None = None
@@ -7718,6 +7795,7 @@ print(json.dumps(rows, ensure_ascii=False))
                     else None
                 ),
                 wandb_enabled=bool(payload.get("wandb_enabled", False)),
+                finetuning=finetuning,
             )
             slurm_command = slurm_runner_command(
                 target_name=execution_target,
@@ -7757,8 +7835,10 @@ print(json.dumps(rows, ensure_ascii=False))
                 model_contract["model_action_convention"] if schema == "delivery" else None
             ),
             "model_variant": model_variant,
+            "finetuning": finetuning.to_dict(),
             "base_checkpoint": str(base_checkpoint),
             "exp_name": exp_name,
+            "artifact_identity": payload.get("artifact_identity") or {"video_source": "robotwin" if "handover_mic" in dataset_id or "put_bottles" in dataset_id else "unknown", "task": "handover-mic" if "handover_mic" in dataset_id else "put-bottles-dustbin" if "put_bottles_dustbin" in dataset_id else "unknown", "experiment": video_catalog.slug(exp_name)},
             "gpu_ids": gpu_ids,
             "execution_target": execution_target,
             "runtime": "slurm" if is_cluster_target else "local_4090",
@@ -7801,9 +7881,10 @@ print(json.dumps(rows, ensure_ascii=False))
             "test_episode_indexes": list(split.test_episodes),
             "norm_config": saved_norm_config if isinstance(saved_norm_config, dict) else None,
             "norm_batch_size": (
-                saved_norm_config.get("effective_batch_size")
-                if isinstance(saved_norm_config, dict)
-                else None
+                remote_norm_batch_size if is_cluster_target else (
+                    saved_norm_config.get("effective_batch_size")
+                    if isinstance(saved_norm_config, dict) else None
+                )
             ),
             "eval_after_step": eval_after_step,
             "auto_eval": {
@@ -8071,7 +8152,7 @@ print(json.dumps(rows, ensure_ascii=False))
             config.get("policy_inference_diagnostics_enabled", True)
         )
         rtc_execution_horizon = safe_int(
-            config.get("policy_rtc_max_execution_horizon", 8),
+            config.get("policy_rtc_max_execution_horizon", 12),
             "policy_rtc_max_execution_horizon",
             1,
             50,
@@ -8380,6 +8461,8 @@ print(json.dumps(rows, ensure_ascii=False))
         if cached and now - cached[0] < 4.0:
             return cached[1]
         metadata = task.get("metadata", {}) if isinstance(task.get("metadata"), dict) else {}
+        if metadata.get("transfer_kind") == "dataset_delete":
+            return {"stage": "delete_dataset", "progress": 1.0 if task.get("state") == "completed" else None}
         total_bytes = 0
         total_files = 0
         total_shards = 0
@@ -8396,7 +8479,7 @@ print(json.dumps(rows, ensure_ascii=False))
         completed_bytes = 0
         completed_files = 0
         scan_error = None
-        if target_path:
+        if target_path and task.get("state") not in TERMINAL_STATES and target_cfg.get("kind") != "slurm_only":
             command = f"test -d {shlex.quote(target_path)} && cd {shlex.quote(target_path)} && find . -type f -printf '%s\\t%P\\0' | sort -z"
             host = target_cfg.get("host") or target_cfg.get("submit_host")
             try:
@@ -8496,6 +8579,12 @@ print(json.dumps(rows, ensure_ascii=False))
                 key: metadata.get(key)
                 for key in (
                     "dataset_id",
+                    "finetuning",
+                    "cluster_gpus",
+                    "auto_eval",
+                    "norm_batch_size",
+                    "num_workers",
+                    "xla_memory_fraction",
                     "exp_name",
                     "model_variant",
                     "arm_mode",
@@ -8670,6 +8759,242 @@ print(json.dumps(rows, ensure_ascii=False))
             }
         )
         return jsonify(result)
+
+    @app.get("/api/rlinf/config")
+    def rlinf_dashboard_config():
+        return jsonify(public_launch_config(config))
+
+    @app.get("/api/rlinf/runs")
+    def rlinf_dashboard_runs():
+        # Run roots may live on the 4x4090 host, H100's shared filesystem, or
+        # a NAS-backed H200 export.  The source map is server-owned; clients
+        # can select a run but can never submit an arbitrary filesystem path.
+        return jsonify({"runs": public_runs(visible_rlinf_runs())})
+
+    @app.get("/api/rlinf/runs/<run_id>/metrics")
+    def rlinf_dashboard_run_metrics(run_id: str):
+        return jsonify(metrics_for_run(visible_rlinf_runs(), run_id))
+
+    @app.get("/api/rlinf/runs/<run_id>/log")
+    def rlinf_run_log(run_id: str):
+        run = next((item for item in visible_rlinf_runs() if item["id"] == run_id), None)
+        if not run or run.get("state") == "unavailable":
+            raise ValueError("unknown or unavailable RLInf run")
+        if run.get("task_id"):
+            result = {"log": tasks.log_tail(run["task_id"], 131072, include_remote_slurm=True)}
+        else:
+            result = native_log_for_run(run)
+        return jsonify({"run": public_runs([run])[0], **result})
+
+    @app.get("/api/rlinf/runs/<run_id>/checkpoints")
+    def rlinf_run_checkpoints(run_id: str):
+        run = next((item for item in visible_rlinf_runs() if item["id"] == run_id), None)
+        if not run or run.get("state") == "unavailable":
+            raise ValueError("unknown or unavailable RLInf run")
+        try:
+            target_id, _, profile_id, _ = evaluation_profile(config, run)
+        except ValueError as exc:
+            return jsonify({"checkpoints": [], "error": str(exc)})
+        return jsonify({"checkpoints": checkpoints_for_run(run), "target": target_id, "profile": profile_id})
+
+    @app.get("/api/rlinf/evaluations")
+    def rlinf_evaluation_tasks():
+        return jsonify({"tasks": [task for task in tasks.list() if task.get("type") == "eval" and task.get("metadata", {}).get("framework") == "RLinf"]})
+
+    @app.post("/api/rlinf/evaluate")
+    def evaluate_rlinf_checkpoint():
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        run = next((item for item in visible_rlinf_runs() if item["id"] == payload.get("run_id")), None)
+        if not run or run.get("state") == "unavailable":
+            raise ValueError("unknown or unavailable RLInf run")
+        target_id, target, profile_id, profile = evaluation_profile(config, run)
+        checkpoint = next((item for item in checkpoints_for_run(run) if item["id"] == payload.get("checkpoint_id")), None)
+        if not checkpoint:
+            raise ValueError("请选择实际存在且权重完整的 RLInf checkpoint")
+        episodes = safe_int(payload.get("episodes", 5), "episodes", 1, 1000)
+        horizon = safe_int(payload.get("max_steps", 512), "max_steps", 1, 2000)
+        seed = safe_int(payload.get("seed", 43), "seed", 0, 2147483647)
+        record_video = payload.get("record_video", False)
+        if not isinstance(record_video, bool):
+            raise ValueError("record_video must be a boolean")
+        roots = eval_video_roots()
+        if not roots:
+            raise ValueError("no evaluation artifact/video root configured")
+        eval_name = f"step_{checkpoint['step']}_{uuid.uuid4().hex[:12]}"
+        local_output = Path(config["eval_video_roots"][0]) / "rlinf" / target_id / eval_name
+        kind = target.get("kind", "local")
+        output = str(local_output) if kind == "local" else str(PurePosixPath(profile["run_root"]) / "dashboard_evaluations" / eval_name)
+        context = video_catalog.classify(Path(run["path"]).parent, Path(run["path"]).name + "/context.mp4", {
+            "video_source": "libero-safety", "phase": "eval", "experiment": run.get("source_id") or run.get("source") or target_id,
+            "experiment_label": run.get("name"), "run_id": Path(run["path"]).name,
+            "checkpoint_id": f"step-{checkpoint['step']}"})
+        context = {k: context[k] for k in ("video_source", "task", "experiment", "experiment_label", "run_id", "phase", "checkpoint_id")}
+        settings = profile["evaluation"]
+        project = str(target["project_root"])
+        entrypoint = settings.get("entrypoint", project + "/third_party/wovr/evaluations/eval_embodied_agent.py")
+        runner = str(APP_DIR / "rlinf_eval_runner.py")
+        inner = [str(target.get("python", "python3")), runner, "--entrypoint", str(entrypoint),
+                 "--config-path", str(settings.get("config_path", project + "/configs/rlinf")),
+                 "--config-name", str(settings.get("config_name", "libero_safety_grpo_pi05_smoke")),
+                 "--checkpoint", checkpoint["path"], "--step", str(checkpoint["step"]),
+                 "--output", output, "--episodes", str(episodes), "--max-steps", str(horizon),
+                 "--seed", str(seed), "--record-video", str(record_video).lower(), "--video-context-json", json.dumps(context, ensure_ascii=False),
+                 *[str(item) for item in settings.get("overrides", [])]]
+        profile_env = {str(key): str(value) for key, value in profile.get("environment", {}).items()}
+        if kind == "local":
+            gpu_ids = parse_gpus(payload, one_only=True, minimum_free_mib=int(target.get("minimum_free_gpu_mib", 18000)), allow_busy=bool(target.get("allow_busy_gpus", False)))
+            env = build_environment(config, gpu_ids)
+            env.update(profile_env)
+            env.pop("CUDA_VISIBLE_DEVICES", None)
+            inner.extend(native_gpu_placement(gpu_ids, evaluation=True))
+            command = ["bash", "-lc", "cd " + shlex.quote(project) + " && exec " + shlex.join(inner)]
+        elif kind == "slurm":
+            # Ship this exact helper in the generated batch command so H200
+            # node-local checkouts do not need another deployment or NAS mount
+            # just to obtain the small dashboard evaluation wrapper.
+            inner = [str(target.get("python", "python3")), "-c", (APP_DIR / "rlinf_eval_runner.py").read_text(encoding="utf-8"), *inner[2:]]
+            exports = " ".join(f"export {key}={shlex.quote(value)};" for key, value in profile_env.items() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key))
+            cluster = {**target, "gpu_count": 1, "workdir": project, "openpi_python": config["openpi_python"]}
+            slurm = slurm_runner_command(target_name=target_id, target_config=cluster,
+                commands=[["bash", "-lc", exports + " exec " + shlex.join(inner)]], labels=["rlinf_eval"], job_name="rlinf_eval_" + eval_name)
+            command = [config["openpi_python"], str(APP_DIR / "rlinf_eval_collect.py"), "--command-json", json_arg(slurm),
+                       "--host", str(target["submit_host"]), "--remote-output", output, "--local-output", str(local_output)]
+            env = build_environment(config, None)
+            gpu_ids = []
+        else:
+            raise ValueError("unknown RLInf evaluation target kind")
+        return jsonify(tasks.start("eval", command, env=env, metadata={
+            "framework": "RLinf", "eval_kind": "rollout", "execution_target": target_id,
+            "runtime": "local_4090" if kind == "local" else "slurm", "cluster_target": target_id if kind == "slurm" else None,
+            "launch_profile": profile_id, "run_id": run["id"], "run_name": run["name"],
+            "parent_train_task_id": run.get("task_id"), "checkpoint": checkpoint["path"], "checkpoint_step": checkpoint["step"],
+            "episodes": episodes, "max_steps": horizon, "seed": seed, "record_video": record_video,
+            "gpu_ids": gpu_ids, "result_path": str(local_output / "result.json"), "video_dir": str(local_output),
+        })), 201
+
+    @app.delete("/api/rlinf/runs/<run_id>")
+    def delete_rlinf_run(run_id: str):
+        return jsonify(delete_rlinf_records([run_id]))
+
+    @app.post("/api/rlinf/runs/batch-delete")
+    def delete_rlinf_runs_batch():
+        payload = request.get_json(force=True)
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        return jsonify(delete_rlinf_records(payload.get("run_ids")))
+
+    @app.post("/api/rlinf/launch")
+    def launch_rlinf_training():
+        payload = request.get_json(force=True)
+        spec = build_launch_spec(config, payload)
+        target = spec["target"]
+        profile = spec["profile"]
+        output_dir = spec["output_dir"]
+        kind = str(target.get("kind", "local"))
+        if kind == "local":
+            # Refuse to overwrite any run.  The parent is created here while
+            # the method-specific directory remains absent for the trainer's
+            # own exist_ok=False guard.
+            output_path = Path(output_dir).expanduser()
+            if output_path.exists():
+                raise FileExistsError(f"RLinf output already exists: {output_dir}")
+            gpu_ids = parse_gpus(
+                {"gpu_ids": payload.get("gpu_ids", target.get("default_gpu_ids", []))},
+                minimum_free_mib=int(target.get("minimum_free_gpu_mib", 0)),
+                allow_busy=bool(target.get("allow_busy_gpus", False)),
+            )
+            env = build_environment(config, gpu_ids)
+            env.update(spec["environment"])
+            env["SAFE_RL_WM_DASHBOARD_RUN_DIR"] = output_dir
+            if profile.get("backend") == "rlinf":
+                if int(spec["values"]["total_envs"]) % len(gpu_ids):
+                    raise ValueError("采样环境总数（每组个数 × 组数）必须能被 GPU 数量整除")
+                env.pop("CUDA_VISIBLE_DEVICES", None)
+                placement = native_gpu_placement(gpu_ids)
+                # Hydra overrides belong inside the existing bash profile command.
+                if spec["command"][:2] == ["bash", "-lc"]:
+                    spec["command"][2] += " " + shlex.join(placement)
+                else:
+                    spec["command"].extend(placement)
+            shell = "cd " + shlex.quote(spec["project_root"]) + " && exec " + shlex.join(spec["command"])
+            command = ["bash", "-lc", shell]
+            runtime = "local_4090"
+            metadata_gpu_ids = gpu_ids
+            target_config = None
+        elif kind == "slurm":
+            required = ("submit_host", "partition", "project_root", "run_root")
+            missing = [key for key in required if not target.get(key)]
+            if missing:
+                raise ValueError(f"Slurm RLinf target is missing {missing}")
+            gpu_count = safe_int(payload.get("gpu_count", target.get("gpu_count", 1)), "gpu_count", 1, 8)
+            shell_env = {
+                **{str(k): str(v) for k, v in target.get("environment", {}).items()},
+                **spec["environment"],
+                "SAFE_RL_WM_DASHBOARD_RUN_DIR": output_dir,
+            }
+            exports = " ".join(
+                f"export {key}={shlex.quote(value)};"
+                for key, value in sorted(shell_env.items())
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+            )
+            remote_shell = (
+                "mkdir -p " + shlex.quote(str(PurePosixPath(output_dir).parent)) + " && "
+                "(set -o noclobber; : > " + shlex.quote(
+                    str(PurePosixPath(output_dir).parent / f".dashboard-reserved-{spec['algorithm']}")
+                ) + ") && test ! -e " + shlex.quote(output_dir) + " && cd "
+                + shlex.quote(spec["project_root"]) + " && "
+                + exports + " exec " + shlex.join(spec["command"])
+            )
+            cluster = dict(target)
+            cluster.update({
+                "workdir": str(target["project_root"]),
+                "gpu_count": gpu_count,
+                "openpi_python": config["openpi_python"],
+                "dataset_root": target.get("dataset_root", target.get("cache_root", "/tmp")),
+                "cache_root": target.get("cache_root", "/tmp"),
+            })
+            labels = ["rlinf"]
+            command = slurm_runner_command(
+                target_name=str(payload.get("target")),
+                target_config=cluster,
+                commands=[["bash", "-lc", remote_shell]],
+                labels=labels,
+                job_name=f"rlinf_{spec['algorithm']}_{spec['run_name']}",
+            )
+            env = build_environment(config, None)
+            runtime = "slurm"
+            metadata_gpu_ids = []
+            target_config = cluster
+        else:
+            raise ValueError("RLinf target kind must be local or slurm")
+
+        metadata = {
+            "framework": "RLinf",
+            "artifact_identity": payload.get("artifact_identity") or {"video_source": "libero-safety", "task": "unknown", "experiment": video_catalog.slug(spec["run_name"])},
+            "algorithm": spec["algorithm"],
+            "launch_profile": spec["profile_id"],
+            "run_name": spec["run_name"],
+            "rlinf_output_dir": output_dir,
+            "rlinf_run_root": spec["run_root"],
+            "execution_target": payload.get("target"),
+            "runtime": runtime,
+            "gpu_ids": metadata_gpu_ids,
+            "cluster_target": payload.get("target") if kind == "slurm" else None,
+            "cluster_gpu_count": target_config.get("gpu_count") if target_config else None,
+            "test_episodes": 0,
+            "auto_eval": {"enabled": False},
+        }
+        if kind == "local":
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            reservation = output_path.parent / f".dashboard-reserved-{spec['algorithm']}"
+            try:
+                with reservation.open("x", encoding="utf-8") as handle:
+                    handle.write(f"{now_iso()}\n")
+            except FileExistsError as exc:
+                raise FileExistsError(f"RLinf run already reserved: {output_dir}") from exc
+        return jsonify(tasks.start("train", command, env=env, metadata=metadata)), 201
 
 
     return app

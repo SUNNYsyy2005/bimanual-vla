@@ -2,28 +2,35 @@
 
 # bimanual-vla
 
-**End-to-end Piper robot data collection, OpenPI training, and real-time policy deployment**
+**Piper robot data collection, multi-node data management, SFT / RL training, and real-time deployment**
 
-[![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](docs/INSTALLATION.md) [![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04-E95420?logo=ubuntu&logoColor=white)](docs/INSTALLATION.md) [![LeRobot](https://img.shields.io/badge/LeRobot-v2.1-FFD21E)](https://github.com/huggingface/lerobot) [![OpenPI](https://img.shields.io/badge/OpenPI-pi0%20%7C%20pi0.5-6C5CE7)](https://github.com/Physical-Intelligence/openpi) [![Control](https://img.shields.io/badge/Robot_Control-20_Hz-2E8B57)](#real-robot-deployment)
+[![Python](https://img.shields.io/badge/Python-3.10%20%2F%203.11-3776AB?logo=python&logoColor=white)](docs/INSTALLATION.md) [![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04-E95420?logo=ubuntu&logoColor=white)](docs/INSTALLATION.md) [![LeRobot](https://img.shields.io/badge/LeRobot-v2.1-FFD21E)](https://github.com/huggingface/lerobot) [![OpenPI](https://img.shields.io/badge/OpenPI-pi0%20%7C%20pi0.5-6C5CE7)](https://github.com/Physical-Intelligence/openpi) [![RTC](https://img.shields.io/badge/Deployment-RTC_%2B_Ruckig-2E8B57)](#real-robot-deployment)
 
-[**Code**](https://github.com/SUNNYsyy2005/bimanual-vla) &nbsp;&middot;&nbsp; [**Documentation**](docs/README.md) &nbsp;&middot;&nbsp; [**Demo**](#demo) &nbsp;&middot;&nbsp; [**Installation**](docs/INSTALLATION.md)
+[**Code**](https://github.com/SUNNYsyy2005/bimanual-vla) &nbsp;&middot;&nbsp; [**Documentation**](docs/README.md) &nbsp;&middot;&nbsp; [**Demo**](#demo) &nbsp;&middot;&nbsp; [**Models & Datasets**](#released-models-and-datasets) &nbsp;&middot;&nbsp; [**Installation**](docs/INSTALLATION.md)
 
 </div>
 
 <p align="center">
-  <img src="assets/hero.jpg" width="100%" alt="Bimanual Piper robot platform">
+  <img src="assets/hero.jpg" width="640" alt="Complete Piper bimanual real-robot setup with Pika devices awaiting integration">
+  <br>
+  <em>Real-robot system. Pika devices shown are awaiting integration（Pika 设备待接入）.</em>
 </p>
 
 ## Overview
 
 `bimanual-vla` connects the complete real-robot learning loop in one repository:
 collect synchronized Piper demonstrations, validate and export LeRobot datasets,
-fine-tune OpenPI `pi0` / `pi0.5` policies, and deploy action chunks through a
-latency-aware and safety-gated execution stack.
+manage datasets and checkpoints across workstations and GPU clusters, fine-tune
+OpenPI `pi0` / `pi0.5` policies, and deploy action chunks through a latency-aware
+execution stack with local safety checks.
+
+Training workflows cover **supervised fine-tuning (SFT)** with OpenPI and
+**reinforcement learning (RL)** through the simulation Dashboard's RLinf
+integration, with shared experiment, checkpoint, and evaluation-video management.
 
 ```text
 Piper + RGB Cameras  ->  Robot Demonstrations  ->  LeRobot Dataset
-        ->  OpenPI LoRA Fine-tuning  ->  Policy Server
+        ->  OpenPI Fine-tuning  ->  Policy Server
         ->  Real-Time Chunking  ->  Safety Layer  ->  Piper Execution
 ```
 
@@ -36,14 +43,30 @@ behavior depends on the active Policy contract and hardware configuration.
 - **End-to-end real-robot pipeline** from demonstrations to closed-loop policy execution.
 - **Multi-camera Piper collection** with GUI operation, teleoperation, replay, and episode management.
 - **LeRobot-compatible data** with versioned contracts, validation, conversion, and upload tools.
-- **OpenPI training stack** for `pi0` / `pi0.5` LoRA fine-tuning and optional multi-GPU FSDP.
-- **Real-time, safety-aware deployment** with model-side RTC, configurable inference scheduling, 20 Hz robot control, and fail-closed execution.
+- **Multi-node Dashboard** for dataset locations and transfers, checkpoint synchronization, training jobs, metrics, and evaluation videos.
+- **SFT and RL workflows**: OpenPI supervised fine-tuning with configurable full/LoRA tuning and π0.5 RTC training; RLinf integration for simulation RL training and evaluation.
+- **Real-time, safety-aware deployment** with model-side RTC, asynchronous inference, an independent Ruckig command loop, and local execution checks.
 
 ## System Overview
 
-<p align="center">
-  <img src="assets/architecture_overview.png" width="100%" alt="bimanual-vla system architecture">
-</p>
+```mermaid
+flowchart LR
+    Robot["Piper + RGB cameras"] --> Collect["Demonstration collection"]
+    Collect --> Data["LeRobot datasets"]
+    Data --> Train["OpenPI SFT"]
+    Train --> Weights["Checkpoints + action contracts"]
+    Sim["Simulation rollouts + rewards"] --> RL["RLinf RL training"]
+    RL --> RLWeights["RL checkpoints + evaluation videos"]
+    Weights --> Policy["Policy server + model-side RTC"]
+    Robot -->|Images and state| Policy
+    Policy --> Queue["Timed action queue"]
+    Queue --> Execute["Local safety checks + Ruckig"]
+    Execute --> Robot
+    Dashboard["Dashboard: data, jobs, metrics, transfers"] -.-> Data
+    Dashboard -.-> Train
+    Dashboard -.-> Weights
+    Dashboard -.-> RL
+```
 
 The public workflow is organized into three stages. Detailed data contracts,
 validation rules, transport fields, and server operations live in
@@ -52,7 +75,7 @@ validation rules, transport fields, and server operations live in
 | Stage | Input | Core components | Output |
 |---|---|---|---|
 | Data collection | Piper feedback, RGB views, language instruction | GUI or teleoperation, synchronized recording, episode validation | Raw robot episodes and LeRobot v2.1 datasets |
-| VLA training | Images, robot state, actions, task text | OpenPI `pi0` / `pi0.5`, LoRA, optional FSDP | Versioned Policy checkpoints |
+| VLA training | Demonstrations for SFT; simulation rollouts/rewards for RL | OpenPI SFT, RLinf RL profiles, local/Slurm job management | Checkpoints, metrics, and evaluation artifacts |
 | Real-time deployment | Live observation and Policy checkpoint | Asynchronous WebSocket inference, model-side RTC, action queues, safety gates | Validated Piper commands at the configured control rate |
 
 ## Hardware Setup
@@ -67,7 +90,8 @@ validation rules, transport fields, and server operations live in
 | Control | Piper SDK over SocketCAN at `1 Mbit/s` |
 | Overhead camera | Intel RealSense D435i, third-person RGB view |
 | Wrist cameras | Intel RealSense D405, one RGB view per active wrist |
-| Collection / control rate | `20 Hz` |
+| Collection rate | Configurable; GUI defaults to `30 FPS`, teleoperation CLI to `20 FPS` |
+| Policy reference / command publication | Default `20 Hz` reference updates and `100 Hz` Ruckig command publication; configurable |
 | Camera source rate | Typically `30 FPS` |
 
 Depth is available on the camera hardware but is not part of the current
@@ -79,7 +103,7 @@ because `/dev/videoN` indices can change after USB reconnection.
 | Role | Typical platform | Responsibility |
 |---|---|---|
 | Robot workstation | Ubuntu 22.04, x86_64 | CAN control, camera capture, GUI, RTC client |
-| Policy and Dashboard server | NVIDIA RTX 4090 workstation | Dataset management, Policy inference, telemetry |
+| Policy and Dashboard server | NVIDIA RTX 4090 workstation | Multi-node data management, Policy inference, telemetry, simulation evaluation |
 | Training cluster | NVIDIA H100 / H200 with Slurm | Multi-GPU fine-tuning and evaluation |
 
 ROS, ROS2, gRPC, and EtherCAT are not required by the current stack.
@@ -87,7 +111,7 @@ ROS, ROS2, gRPC, and EtherCAT are not required by the current stack.
 ## Data Collection
 
 <p align="center">
-  <img src="assets/collection_gui.jpg" width="100%" alt="Piper data collection GUI">
+  <img src="assets/collection_gui.png" width="100%" alt="Current Piper collection GUI with overhead and wrist camera views">
 </p>
 
 The collection application provides device discovery, live multi-camera
@@ -99,6 +123,19 @@ conversion/upload. It supports:
 - overhead plus left/right wrist RGB streams;
 - `joint` and `delivery` data schemas;
 - success/failure labeling and guarded episode publication.
+
+<details>
+<summary>Episode preview and hardware replay</summary>
+
+<p align="center">
+  <img src="assets/episode_replay.png" width="100%" alt="Episode replay controls with synchronized camera playback">
+</p>
+
+Recorded episodes support synchronized camera playback and supervised hardware
+replay with joint or EEF commands. See the
+[episode replay guide](docs/collection/EPISODE_HARDWARE_REPLAY.md).
+
+</details>
 
 Start the GUI from the robot workstation:
 
@@ -166,9 +203,36 @@ bin/bimanual-vla data-check lerobot_datasets/piper_v1
 The authoritative field definitions are documented in the
 [Piper data contract](docs/collection/PIPER_DATA_CONTRACT.md).
 
+<details>
+<summary>Client-side trajectory and end-effector analysis</summary>
+
+<p align="center">
+  <img src="assets/data_analysis.png" width="100%" alt="Joint trajectory analysis with predicted, measured, and executed signals">
+  <img src="assets/eef_analysis.png" width="100%" alt="Left and right end-effector trajectories in the client analysis view">
+</p>
+
+The data-processing tab compares available measured, predicted, and sent
+trajectories, marks chunk transitions, and visualizes both arms' EEF paths.
+
+</details>
+
 ## VLA Training
 
-The training backend integrates OpenPI `pi0` and `pi0.5` with LoRA fine-tuning.
+The platform supports two training modes:
+
+| Mode | Backend and inputs | Supported workflow |
+|---|---|---|
+| **SFT — supervised fine-tuning** | OpenPI `pi0` / `pi0.5` and LeRobot demonstrations | Normalization, train/test splits, configurable fine-tuning, FSDP, checkpointing, and held-out evaluation |
+| **RL — reinforcement learning** | RLinf and configured simulation environments/reward functions | Launch configured algorithm profiles, monitor rollout/training metrics, manage checkpoints, and evaluate/review rollout videos |
+
+RL runs through the **simulation Dashboard** and requires a configured RLinf
+environment, launch profile, and execution target. Algorithm availability is
+defined by those profiles. Both modes expose task logs and experiment artifacts;
+the pick-and-place weights linked below are **SFT checkpoints**.
+
+For SFT, the backend integrates OpenPI `pi0` and `pi0.5` with independently
+configurable action-expert, language-model, and vision-encoder tuning. The
+π0.5 path also supports training-time RTC prefix conditioning.
 The Dashboard manages dataset selection, persistent train/test splits,
 normalization statistics, training jobs, checkpoints, and held-out evaluation.
 FSDP can distribute supported runs across multiple GPUs; H100/H200 jobs are
@@ -202,6 +266,10 @@ for the pinned upstream revision and server configuration.
 
 ## Real-Robot Deployment
 
+<p align="center">
+  <img src="assets/inference_gui.png" width="100%" alt="Current client inference GUI with RTC, reference planner, and device controls">
+</p>
+
 ```text
 Robot Workstation                         Policy Server
 -----------------                        -----------------
@@ -209,7 +277,7 @@ RGB cameras + Piper state  --WebSocket-> OpenPI pi0 / pi0.5
 RTC session and timing      --WebSocket-> Model-side RTC
 Action queue + safety       <-WebSocket-- Timestamped action chunk
         |
-        +--> 20 Hz validated Piper commands
+        +--> Reference updates --> Ruckig --> Validated Piper commands
 ```
 
 Start the Dashboard/Policy stack on a configured inference server, then run the
@@ -235,19 +303,23 @@ bin/bimanual-vla rtc-client \
 ```
 
 > [!CAUTION]
-> Real motion requires both the local `--allow-execution` flag and a non-expired
-> Dashboard `EXECUTE` authorization for the same Policy. A stale camera, CAN or
-> Policy stream, a contract mismatch, or any failed safety check blocks commands.
+> Real motion requires the local `--allow-execution` flag and valid robot,
+> observation, and Policy state. Stale inputs, a contract mismatch, or a failed
+> safety check block execution or trigger the configured hold/braking behavior.
 
 The execution layer validates action age and shape, workspace bounds, joint and
-gripper changes, IK feasibility, Piper state, and authorization on every control
-cycle. RTC is applied inside model denoising; it is not client-side interpolation.
+gripper changes, schema-specific IK feasibility, and Piper state before command
+publication. RTC is applied inside model denoising.
 See the [RTC deployment guide](docs/deployment/RTC_CLIENT_GUIDE.md).
 
 ### Inference timing and execution controls
 
-Policy inference is asynchronous and separate from the robot's 20 Hz control
-loop. The client supports two scheduling modes:
+Policy inference, model action timing, reference updates, and actuator command
+publication have separate clocks. Reference updates default to `--control-hz 20`;
+the Ruckig backend publishes at `--servo-hz 100` by default. Model action timing
+comes from Policy metadata (30 Hz for the released pick-and-place checkpoints)
+unless explicitly overridden with `--action-hz`. The client supports two
+inference scheduling modes:
 
 - `--inference-trigger-mode periodic` (default): attempt a new inference at
   `--hz` (default 4 Hz), with at most one request in flight. Actual throughput
@@ -264,12 +336,12 @@ as equivalent to model-side RTC.
 The execution path includes configurable joint trajectory shaping and safety
 interlocks:
 
-- `--trajectory-shaping` is enabled by default, with independently
-  configurable low-pass, tracking, speed, acceleration, jerk and lookahead
-  stages. Use `--no-trajectory-shaping` for controlled comparisons.
-- `--trajectory-spike-suppression` is **disabled by default**; it targets
-  isolated acceleration spikes in short execution horizons and can be tested
-  separately from trajectory shaping.
+- `--trajectory-shaping` selects the **Ruckig** reference planner by default,
+  with velocity, acceleration, jerk, tracking-error, and joint-position limits.
+  Use `--servo-backend legacy` for the older low-pass/tracking pipeline or
+  `--no-trajectory-shaping` for controlled comparisons.
+- `--pose-trajectory` optionally shapes EEF pose references before IK and is
+  disabled by default. It requires the Ruckig backend.
 - `--blend-profile smootherstep` controls the optional action-boundary blend.
 - `--gripper-open-lookahead-steps` can anticipate opening while keeping
   gripper filtering and safety checks active.
@@ -292,22 +364,78 @@ diagnostic definitions, and safety prerequisites.
 ## Demo
 
 <p align="center">
-  <img src="assets/demo.gif" width="720" alt="Bimanual Piper real-robot demonstration">
+  <a href="https://huggingface.co/SUNNYsyy2005/pi05_pick_place_clean_joint_20261025_20k/resolve/main/media/pick-place-real-robot-20261027.mp4">
+    <img src="assets/demo.gif" width="640" alt="Successful real-robot Piper pick-and-place demonstration, October 27, 2026">
+  </a>
 </p>
 
-Real-robot manipulation demonstration. Playback is accelerated for README viewing; it does not represent the live robot control rate.
+Successful real-robot pick-and-place demonstration recorded on **October 27, 2026**:
+*“Pick up the small blue plastic container and place it inside the large blue
+plastic container.”* The preview plays at **4× speed**;
+[watch or download the original-speed video](https://huggingface.co/SUNNYsyy2005/pi05_pick_place_clean_joint_20261025_20k/resolve/main/media/pick-place-real-robot-20261027.mp4).
+
+## Released Models and Datasets
+
+The **20,000-step π0.5 checkpoints** and their matching real-robot datasets are
+available on Hugging Face in both joint-space and end-effector-space formats:
+
+| Representation | Dataset | Model weights |
+|---|---|---|
+| Joint space — 14D state / raw action | [pick_place_clean_joint_20261025](https://huggingface.co/datasets/SUNNYsyy2005/pick_place_clean_joint_20261025) | [π0.5 joint · 20k](https://huggingface.co/SUNNYsyy2005/pi05_pick_place_clean_joint_20261025_20k) |
+| End-effector space (`delivery`) — 20D state / raw action | [pick_place_clean_delivery_20261025](https://huggingface.co/datasets/SUNNYsyy2005/pick_place_clean_delivery_20261025) | [π0.5 EEF · 20k](https://huggingface.co/SUNNYsyy2005/pi05_pick_place_clean_delivery_20261025_20k) |
+
+Each dataset contains **90 episodes / 69,905 frames at 30 FPS**, with overhead
+and left/right wrist RGB views in LeRobot v2.1 format. These are two
+representations of the same demonstrations. The actual grouped split is
+**81 training / 9 held-out episodes**; use `meta/train_test_split.json` for the
+episode indices, as explained in the dataset cards.
+
+Both policies use full vision-encoder and action-expert fine-tuning, language-model
+LoRA, and RTC training with delays up to 12 steps. The native OpenPI / Orbax
+releases include parameters, normalization statistics, and action contracts.
+They contain **inference weights**, without optimizer state for exact training
+resumption. See the model cards for download commands and runtime requirements.
 
 ## Dashboard
 
 <p align="center">
-  <img src="assets/dashboard.png" width="100%" alt="Training and deployment Dashboard">
+  <img src="assets/dashboard.png" width="100%" alt="Current Dashboard with synchronized three-camera episode preview and editing">
 </p>
 
-The Dashboard supports dataset/episode management, normalization, LoRA/FSDP
-training workflows, Policy lifecycle controls, live telemetry, and trajectory
-analysis. Diagnostics distinguish Policy output from executed commands, and
-include chunk-boundary and timing views when the underlying recordings contain
-the required signals.
+The Dashboard is the project's **data and experiment management platform**.
+Collection workstations upload demonstrations through the GUI, CLI, or REST API;
+the web interface tracks their locations and moves the required datasets and
+checkpoints between local storage, inference workstations, and configured
+H100/H200 Slurm targets.
+
+| Capability | Workflow |
+|---|---|
+| Multi-node data catalog | Group dataset copies by ID, inspect per-node locations and counts, filter real/simulation sources, and synchronize datasets to a training target |
+| Dataset preparation | Resumable uploads, episode and camera previews, metadata editing, merge/trim tools, time-alignment inspection, and persistent train/test splits |
+| SFT and RL training | Manage OpenPI SFT and configured RLinf simulation RL runs, submit jobs, inspect GPU resources, and follow task logs, loss/reward curves, and evaluation metrics |
+| Checkpoint management | Browse local and remote checkpoints, retain action contracts and normalization assets, and synchronize trained weights to the inference server |
+| Deployment and review | Manage Policy processes, inspect live telemetry and trajectories, and browse/synchronize simulation evaluation videos |
+| Storage and node settings | Configure data/checkpoint roots and extension nodes for the available workstation and cluster infrastructure |
+
+Real-robot and simulation Dashboards use separate service configurations and
+source filters while sharing the underlying management code. H100 and H200
+workloads run through Slurm; datasets and environments must be staged on each
+node's own storage. The platform exposes the same operations through an
+authenticated [REST API](server_4090/API_USAGE.md) for scripted workflows.
+
+<details>
+<summary>Multi-node dataset catalog and synchronization</summary>
+
+<p align="center">
+  <img src="assets/dashboard_datasets.png" width="100%" alt="Dashboard dataset catalog showing storage locations, synchronization targets, and action contracts">
+</p>
+
+</details>
+
+Diagnostics distinguish Policy predictions from commands actually executed by
+the robot, with chunk boundaries and timing when recorded. See
+[Dashboard operations](server_4090/README.md) and the
+[simulation workflow guide](server_4090/SIMULATION_DASHBOARD.md).
 
 ## Installation
 
@@ -337,8 +465,9 @@ in the [complete installation guide](docs/INSTALLATION.md).
 |-- bin/bimanual-vla          # Unified command entry point
 |-- bimanual_vla/
 |   |-- collection/           # GUI, cameras, teleoperation, robot sessions
-|   |-- data/                 # Contracts, validation, export, upload, replay
-|   `-- deployment/           # RTC client, Policy adapter, safety execution
+|   |-- data/                 # Contracts, validation, export, upload, analysis
+|   |-- deployment/           # RTC client, Ruckig, Policy adapters, safety
+|   `-- training/             # OpenPI model, fine-tuning settings, RTC sampling
 |-- server_4090/              # Dashboard backend, frontend, Policy services
 |-- docs/                     # Installation, collection, and deployment guides
 |-- scripts/                  # Model, maintenance, analysis, and smoke tools
@@ -362,6 +491,7 @@ source code and are excluded from Git.
 | Real-robot inference | [RTC client guide](docs/deployment/RTC_CLIENT_GUIDE.md) |
 | Dashboard backend | [Dashboard operations](server_4090/README.md) |
 | Dashboard API | [API reference](server_4090/API_USAGE.md) |
+| Simulation data, training, and videos | [Simulation Dashboard](server_4090/SIMULATION_DASHBOARD.md) |
 
 ## Testing
 

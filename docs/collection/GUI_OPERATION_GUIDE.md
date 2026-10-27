@@ -122,13 +122,15 @@ Arm data 的显示由 `Collection format` 决定：
 
 ### 4.1 回放检查
 
-在 `Saved Episodes` 中选择文件，然后点击 `Replay episode`。回放器会自动识别旧版双相机数据和新版双臂三相机数据。至少检查：
+在 `Saved Episodes` 中选择文件，点击 `Replay episode` 打开配置，再点击 `Video preview` 检查记录图像；双击文件也只做视频预览。视频预览支持旧版双相机和新版双臂三相机数据。至少检查：
 
 - 第三视角与腕部视角是否正确。
 - 图像是否连续，是否存在长时间冻结。
 - 机械臂运动与状态变化是否同步。
 - 夹爪状态是否随实际开合变化。
 - instruction 和成功/失败标签是否正确。
+
+最新 v3 采集数据还支持 **Start hardware replay**：先自动低速平滑移动到首帧，确认到位后再开始回放。可选择关节角或末端位姿，并分别配置平滑。主臂控制必须先隔离；详见 [Episode 真机回放](EPISODE_HARDWARE_REPLAY.md)。
 
 ### 4.2 删除本地 episode
 

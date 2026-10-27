@@ -5,6 +5,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch, call
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -235,6 +236,28 @@ class PiperDataContractTest(unittest.TestCase):
 
 
 class RobotStateReaderTest(unittest.TestCase):
+    def test_collection_connect_is_passive(self):
+        from bimanual_vla.collection.output import connect
+        piper = Mock()
+        with patch("bimanual_vla.collection.output.require_can_interface_up"), patch(
+            "bimanual_vla.collection.output.C_PiperInterface_V2", return_value=piper
+        ):
+            self.assertIs(connect("can0"), piper)
+        self.assertEqual(piper.method_calls, [
+            call.CreateCanBus(can_name="can0", bustype="socketcan", expected_bitrate=1_000_000, judge_flag=False),
+            call.ConnectPort(can_init=True, piper_init=False),
+        ])
+
+    def test_failed_collection_connection_closes_port(self):
+        from bimanual_vla.collection.output import connect
+        piper = Mock()
+        piper.ConnectPort.side_effect = RuntimeError("connection failed")
+        with patch("bimanual_vla.collection.output.require_can_interface_up"), patch(
+            "bimanual_vla.collection.output.C_PiperInterface_V2", return_value=piper
+        ), self.assertRaisesRegex(RuntimeError, "connection failed"):
+            connect("can0")
+        piper.DisconnectPort.assert_called_once()
+
     def test_stale_feedback_is_rejected(self):
         class Message:
             def __init__(self, timestamp):
