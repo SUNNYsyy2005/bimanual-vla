@@ -2207,6 +2207,56 @@ async function syncDatasetTo(datasetId, selectId, source) {
   }
 }
 
+function datasetSchemaLabel(d) {
+  const arm = d.arm_mode === 'bimanual' ? '双臂' : d.arm_mode === 'single' ? (d.arm_side === 'left' ? '左臂' : '右臂') : '';
+  const schema = d.schema === 'delivery' ? 'EEF' : d.schema === 'joint' ? 'Joint' : (d.schema || '未知格式');
+  return `${arm} ${schema}`.trim();
+}
+
+function datasetSchemaCell(d) {
+  const state = d.state_dim ?? d.state_shape?.at(-1);
+  const action = d.raw_action_dim ?? d.action_shape?.at(-1);
+  const dimensions = state != null && state === action ? `状态 / 动作 ${state}D` : `状态 ${state ?? '?'}D · 动作 ${action ?? '?'}D`;
+  const warnings = [];
+  if (d.contract_version != null && Number(d.contract_version) !== 3) warnings.push(`旧版 v${d.contract_version}`);
+  if (d.dataset_layout && d.dataset_layout !== 'canonical') warnings.push(d.dataset_layout === 'legacy' ? '旧字段布局' : '未知字段布局');
+  if (!d.training_supported) warnings.push('仅管理 / 预览');
+  const errors = [...new Set([d.contract_error, d.training_error].filter(Boolean))];
+  const cameras = (d.media || []).map(m => esc(cameraDisplayName(m.key, d.arm_side))).join(' · ');
+  return `<strong>${esc(datasetSchemaLabel(d))}</strong><br>${esc(dimensions)}${warnings.length ? `<br><span class="warn">${warnings.map(esc).join(' · ')}</span>` : ''}${errors.map(error => `<br><span class="bad">${esc(error)}</span>`).join('')}<br><span class="muted">${cameras || '无相机媒体'}</span>`;
+}
+
+function datasetActionLabel(d, model = false) {
+  const convention = model ? d.model_action_convention : d.raw_action_convention;
+  if (convention === 'absolute_eef_target') return '末端绝对位姿';
+  if (convention === 'absolute' || convention === 'absolute_joint' || convention === 'absolute_joint_position' || convention === 'absolute_joint_target') return '关节绝对位置';
+  if (convention === 'chunk_origin') return d.schema === 'joint' ? '相对观测帧的关节增量' : '相对观测帧的位姿增量';
+  if (convention === 'step') return '逐步位姿增量';
+  return (model ? d.model_action_semantics : d.raw_action_semantics) || '未标注';
+}
+
+function datasetGripperLabel(value) {
+  if (value === 'absolute_opening_fraction_0_closed_1_open') return '开度 0–1（0 关 / 1 开）';
+  if (value === 'absolute_closed_fraction_0_open_1_closed') return '闭合度 0–1（0 开 / 1 关）';
+  if (['absolute_opening_m', 'absolute_opening_metres', 'opening_m'].includes(value)) return '开度（米）';
+  return value || '未标注';
+}
+
+function datasetActionCell(d) {
+  const rawGripper = datasetGripperLabel(d.raw_gripper_semantics);
+  const wireGripper = datasetGripperLabel(d.wire_gripper_semantics);
+  const rotationNote = d.schema === 'delivery' && !d.legacy_delivery_v2 && d.raw_action_dim !== d.model_action_dim
+    ? '<br>训练时每臂旋转由 6D 转为 3D 旋转向量。' : '';
+  return `${esc(datasetActionLabel(d))}<br><span class="muted">夹爪：${esc(rawGripper)}</span>
+    <details><summary>训练约定</summary>
+      <div class="muted">模型动作：${esc(d.model_action_dim ?? '?')}D · ${esc(datasetActionLabel(d, true))}${rotationNote}
+      ${rawGripper !== wireGripper ? `<br>模型夹爪：${esc(wireGripper)}` : ''}
+      <br>数据动作偏移：${esc(d.action_offset ?? '?')} · 模型首步：+${esc(d.model_action_start_offset ?? '?')}
+      <br>字段：${esc(d.state_key || '?')} → ${esc(d.action_key || '?')}
+      <br>数据约定 v${esc(d.contract_version ?? '?')} · ${esc(d.dataset_layout || 'unknown')}</div>
+    </details>`;
+}
+
 function fillDatasets(items) {
   items = dashboardDatasets(items);
   const filter = document.getElementById('datasetOriginFilter').value || 'all';
@@ -2231,8 +2281,8 @@ function fillDatasets(items) {
           <td>${datasetOriginBadge(d.dataset_origin)} <code>${esc(d.id)}</code><br><span class="muted">${esc(d.robot_type)} · source=${esc(d.dataset_origin_source || '-')}</span>${d.remote_only ? '<br><span class="warn">远端清单项，本地未安装</span>' : ''}</td>
           <td>${renderDatasetLocations(d)}</td>
           <td>${esc(d.episodes)} episodes<br>${esc(d.frames)} frames @ ${esc(d.fps)}fps<br>${d.train_episodes == null ? '<span class="muted">尚未生成 train/test 划分</span>' : `<span class="pill">${esc(d.train_episodes)} train</span> <span class="pill">${esc(d.test_episodes)} test</span>`}<br>${(d.norm_model_variants || []).length ? `<span class="ok">norm ready: ${esc((d.norm_model_variants || []).map(modelVariantLabel).join(', '))}</span>` : '<span class="warn">norm 需计算或划分已变化</span>'}</td>
-          <td><span class="pill">${esc(d.schema_label || d.schema)}</span> <span class="pill">${esc(d.arm_mode || '-')}</span> <span class="pill">${esc(d.dataset_layout || '-')}</span> <span class="pill">contract v${esc(d.contract_version || '?')}</span> ${d.training_supported ? '<span class="ok">训练兼容</span>' : '<span class="warn">仅管理 / 预览</span>'}<br><code>${esc(d.state_key || 'state?')}</code> ${esc(JSON.stringify(d.state_shape))} → <code>${esc(d.action_key || 'action?')}</code> ${esc(JSON.stringify(d.action_shape))}<br>state=${esc(d.state_dim || '?')}D · raw action=${esc(d.raw_action_dim || '?')}D · model/wire=${esc(d.model_action_dim || '?')}D · arm=${esc(d.arm_side || '-')}<br>${d.contract_error ? `<span class="bad">${esc(d.contract_error)}</span><br>` : ''}${d.training_error ? `<span class="warn">${esc(d.training_error)}</span><br>` : ''}${(d.media || []).map(m => `<span class="pill">${esc(m.type)} · ${esc(cameraDisplayName(m.key, d.arm_side))}</span>`).join(' ') || '<span class="muted">无相机媒体</span>'}</td>
-          <td><strong>raw</strong> ${esc(d.raw_action_semantics || '-')}<br><span class="muted">convention=${esc(d.raw_action_convention || '-')}</span><br><strong>model</strong> ${esc(d.model_action_semantics || '-')}<br><span class="muted">convention=${esc(d.model_action_convention || '-')}</span><br><strong>gripper</strong> raw=${esc(d.raw_gripper_semantics || '-')} → wire=${esc(d.wire_gripper_semantics || '-')}<br><span class="muted">raw offset=${d.action_offset == null ? '-' : esc(d.action_offset)} · model start=+${esc(d.model_action_start_offset ?? 1)} step</span></td>
+          <td>${datasetSchemaCell(d)}</td>
+          <td>${datasetActionCell(d)}</td>
           <td>${(d.remote_only || d.read_only) ? `<span class="muted">${d.remote_only ? '远端数据集：先同步到 4×4090 后可编辑。' : '外部读取目录数据集：只读；如需编辑请先同步到存储目录。'}</span>` : `<select class="dataset-origin-select" onchange="setDatasetOrigin('${esc(d.id)}', this.value)">${datasetOriginOptions(d.dataset_origin)}</select><br><button class="inline secondary" onclick="openDatasetEditor('${esc(d.id)}')">编辑 episodes</button><button class="inline secondary" onclick="renameDataset('${esc(d.id)}')">重命名</button><button class="inline danger" onclick="deleteDataset('${esc(d.id)}')">删除数据集</button>`}${!d.remote_only ? `<button class="inline secondary" onclick="openDatasetTiming('${esc(d.id)}')">时间对齐</button>` : ''}</td>
         </tr>`);
     }
@@ -2244,7 +2294,7 @@ function fillDatasets(items) {
   const trainable = items.filter(d => d.training_supported);
   document.querySelectorAll('.dataset-select').forEach(select => {
     const old = select.value;
-    select.innerHTML = trainable.map(d => `<option value="${esc(d.id)}">[${esc(datasetOriginLabel(d.dataset_origin))}] ${esc(d.id)} · ${esc(d.arm_mode || '-')} · ${esc(d.schema_label || d.schema)}</option>`).join('') || '<option value="" disabled>没有兼容训练的数据集</option>';
+    select.innerHTML = trainable.map(d => `<option value="${esc(d.id)}">[${esc(datasetOriginLabel(d.dataset_origin))}] ${esc(d.id)} · ${esc(datasetSchemaLabel(d))}</option>`).join('') || '<option value="" disabled>没有兼容训练的数据集</option>';
     if (trainable.some(d => d.id === old)) select.value = old;
     syncArmSideForDatasetSelect(select);
   });
