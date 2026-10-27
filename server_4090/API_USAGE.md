@@ -800,6 +800,14 @@ H100/H200 Slurm 示例：
 字段说明：
 
 - `execution_target`：`local_4090` / `h100` / `h200-ali-01` / `h200-ali-02`；
+- `action_expert_tuning`：`full`（新实验默认）或 `lora`，独立选择 action expert 全量微调或 LoRA；
+- `llm_lora`：布尔值，新实验默认 `false`（冻结 LLM），设为 `true` 时仅训练 LLM 的 LoRA；视觉编码器默认冻结；
+- `train_vision`：布尔值，默认 `false`；设为 `true` 全量训练视觉编码器；
+- `train_llm`：布尔值，默认 `false`；设为 `true` 全量训练 LLM，与 `llm_lora=true` 互斥。三部分全量训练使用 `train_vision=true`、`train_llm=true`、`llm_lora=false`、`action_expert_tuning="full"`，可同时开启 `rtc_training`；
+- `rtc_training`：布尔值，默认 `false`；设为 `true` 启用 Pi05 干净动作前缀训练 RTC，仅支持 JAX/Orbax 路径；
+- `rtc_training_max_delay`：1–49 个 action 步，默认 8。训练随机采样 0 到该上限的干净前缀，前缀不计入 loss；20 Hz 下 8 步为 400 ms；
+- `rtc_training_delay_weights`：可选数组，长度必须为 `rtc_training_max_delay + 1`，依次对应 0 到上限的采样权重；必须非负、有限且总和大于零。省略时均匀采样，零权重的步数不会被采样。例如上限 10 时可传 `[39,0,0,0,0,574,873,275,101,32,22]`；
+- `image_resize_mode`：`stretch` 直接缩放、保留全画面且不补黑边；`pad` 保留旧版等比例补边。API 兼容默认值为 `pad`，新实验 GUI 默认选 `stretch`。该设置随 checkpoint 保存。新采集/导出在生成时完成 224×224 图像准备；stretch 模型输入仅校验尺寸，不在训练时补边、裁剪或缩放。推理客户端在采集时直接生成 224×224；已有视频内的黑边需要预先处理。`stretch` 训练只保留颜色增强，不做几何裁剪或旋转；
 - `gpu_ids`：本地 4×4090 用，如 `"0,1"`；
 - `cluster_gpus` / `gpu_count`：Slurm 目标用，表示申请卡数；
 - `mode`：`auto` / `new` / `resume` / `overwrite`；
@@ -819,6 +827,31 @@ H100/H200 Slurm 示例：
 - Policy 推理只能在 4×4090 启动；H100/H200 训练出的 checkpoint 需要通过 `POST /api/checkpoints/sync` 同步回 4×4090 的本地 checkpoint root 后才能在实机 Policy 中选择。
 
 返回 `train` task。若自动 norm，返回的 train task 可能处于 `waiting_norm`。
+
+例如，在上述训练请求中加入以下字段可启用 action expert 全量微调、冻结
+LLM，并训练 RTC：
+
+```json
+{
+  "action_expert_tuning": "full",
+  "llm_lora": false,
+  "rtc_training": true,
+  "rtc_training_max_delay": 8
+}
+```
+
+对应训练 CLI 参数为 `--action-expert-tuning full --no-llm-lora
+--rtc-training --rtc-training-max-delay 8`。参数写入 checkpoint 的 action-contract
+marker，完整状态恢复和 serving 自动继承，不能更改这些设置。无该元数据的
+旧 checkpoint 按旧配置（expert LoRA、LLM LoRA、无训练 RTC）加载。
+从已微调 checkpoint 初始化新实验也必须保持 LoRA 网络结构；切换结构应选择
+基础模型或先显式转换 adapter，不能静默丢弃权重。现有配置/目录名称中的
+`_lora` 为兼容历史路径保留，实际训练方式以 `finetuning` 元数据为准。
+
+Serving 的 `--rtc-mode auto` 自动为训练 RTC checkpoint 选择 `trained`，为旧
+checkpoint 选择 `guided`（推理时 prefix guidance）。可显式选择两种模式；
+`trained` 拒绝未经 RTC 训练的 checkpoint、超过训练上限的延迟和不足以覆盖
+延迟的旧动作前缀。伺服后端与训练 RTC 开关相互独立。
 
 ### 7.3 启动 heldout loss 评测
 
@@ -1054,11 +1087,16 @@ GET /api/cluster-resources?native=true
   "ok":true,
   "returncode":0,
   "elapsed_s":3.2,
-  "command":["scripts/query_h100_h200_resources.sh","--compact"],
   "output":"...",
   "note":"H100/H200 are queried via SSH/Slurm only; no remote Dashboard port is opened."
 }
 ```
+
+按配置的 `cluster_targets` 提交主机分组查询。默认输出节点 GPU 已分配/总数、
+未分配数量、CPU/内存分配，以及配置分区中所有用户的运行作业、GPU 物理索引、
+当前 SSH 用户的完整队列（包括尚未分配节点的排队任务）。`all_jobs=true` 额外显示
+所有用户的完整队列。作业名称和索引不截断；任何查询段失败会令 `ok=false` 并保留
+已取得的结果和错误说明。GPU 数量与索引来自 Slurm，不代表实时利用率、显存或 OS 进程。
 
 ---
 
@@ -1282,3 +1320,66 @@ curl -H "Authorization: Bearer $TOKEN" \
 | GET | `/api/eval-videos` | 列评估视频，支持筛选 |
 | GET | `/api/eval-videos/<video_id>` | 获取视频流 |
 | POST | `/api/eval-videos/sync` | 同步远端视频到 4×4090 |
+
+### 拓展节点配置
+
+在 Dashboard「设置 → 拓展节点」中编辑已有 H100/H200，或新增 Slurm 节点。SSH 别名及认证需事先在 Dashboard 服务器配置；页面不保存密码或私钥。
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `/api/settings/extension-nodes` | 返回 `nodes`，以节点 ID 为键 |
+| PUT | `/api/settings/extension-nodes/<id>` | 新增节点或合并更新现有配置 |
+| DELETE | `/api/settings/extension-nodes/<id>` | 仅移除节点配置，不删除远端文件 |
+
+保存会持久化到 `cluster_targets` 并立即更新运行时配置，无需重启。训练、数据同步、Checkpoint 列表和资源查询使用该配置。有活跃任务引用的节点禁止修改或删除，需待任务结束。
+
+接入方式支持 `login_shared_slurm`（提交主机可读取共享存储）和 `slurm_only`（通过 Slurm 访问节点独立存储）；暂不支持新增普通 SSH 独立工作站作为训练节点。
+
+必填字段：`submit_host`、`partition`、`node`、`access_mode`、`openpi_python`、`workdir`、`dashboard_repo`、`dataset_root`、`assets_base_dir`、`checkpoint_base_dir`、`base_checkpoint`、`cache_root`、`log_dir`、`remote_job_dir`。路径均为远端绝对路径，保存时不以 4090 本地目录是否存在作为依据，也不自动安装环境或搬迁数据。
+
+可选配置包括 GPU 类型/数量、CPU、内存（最多 512G）、时限、Conda、源码路径、目录扫描 Python，以及历史读取目录 `checkpoint_read_roots` / `dataset_read_roots`、NAS 中转目录。列表字段接受数组或每行一个路径。`GET /api/cluster-resources` 按配置的提交主机和节点查询，不再固定为三个原始节点。
+
+### 远端 Checkpoint 列表与单步同步
+
+`GET /api/checkpoints/remote` 返回 `locations`，每个位置包含 `source`、`label`、`state`（loading/ready/error）、`updated_at`、`error` 和 `checkpoints`。追加 `?refresh=1` 强制刷新；普通请求缓存10分钟，查询异步执行，不阻塞本地状态。
+H100 在共享提交节点读取目录；H200 通过 CPU-only Slurm 作业读取节点独立磁盘，将小型目录清单通过 Slurm job comment 返回，不依赖 NAS。配置中的 `checkpoint_read_roots` 可补充历史目录；缺失目录或访问失败显式报错。
+
+`POST /api/checkpoints/sync` 传入 `step` 时只同步选定的完整 checkpoint：
+
+```json
+{"source":"h100","target":"local_4090","config_name":"pi05_piper_bimanual_lora","exp_name":"fix_nopad_rtc_empirical_d10_20261019","step":20000,"parallelism":4,"skip_existing":true}
+```
+
+先读取远端列表，确认该 step 已完成。同步包含该步的参数、训练状态、assets，以及实验的动作契约/finetuning marker。不同契约拒绝覆盖；重复请求返回已有活跃任务，失败后可以续传。H200 checkpoint 数据传输仍使用既有 NAS staging（与不依赖NAS的列表查询不同）。完成后本地 checkpoint 列表/Policy 选择器自动可见。
+
+### 统一训练历史与 rollout 产物（2026-10-23）
+
+完整约束见 [EXPERIMENT_ARTIFACT_CONTRACT.md](../docs/EXPERIMENT_ARTIFACT_CONTRACT.md)。适用于 π0.5/OpenPI SFT、RLinf 和后续后端。物理根目录随节点/磁盘变化，根目录内使用固定层级：
+
+```text
+<root>/<环境来源>/<任务>/<实验>/<运行>/
+  run.json
+  metadata/ logs/ metrics/ checkpoints/
+  train/<checkpoint>/<success|failed|unknown>/<episode>/
+  eval/<checkpoint>/<success|failed|unknown>/<episode>/
+```
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `/api/artifact-runs` | 通用训练历史，返回 `experiment_run.v1`，支持 source/task/backend/kind/state/experiment 筛选 |
+| POST | `/api/artifact-runs` | 分配本地运行目录和清单；不会提交训练或创建远端目录 |
+| POST | `/api/eval-videos/catalog/refresh` | 提交视频目录整理与索引刷新任务，响应为含 `id` 的任务对象 |
+
+分配请求示例：
+
+```json
+{"video_source":"libero-safety","task":"tsa-moka","experiment":"ppo-safety-v2","run_id":"train-20261023-180000-a1b2c3d4","backend":"rlinf","kind":"rl"}
+```
+
+SFT 与 RLinf 的训练提交接口均可附加 `artifact_identity`，内容为 `video_source`、`task`、`experiment`、`run_id`。旧客户端可以省略，无法确认的来源/任务保留 unknown。提交钩子登记通用运行清单及原生输出引用；第三方 writer 的物理输出路径仍须按约束配置，并在结束后规范化。不能将清单登记等同于全部产物已经重定向。
+
+`GET /api/eval-videos` 追加筛选：`video_source`（环境）、`task`、`experiment`、`phase`（train/eval/unknown）、`success`（success/failed/unknown）、`safe_success`；事件使用 `events=with|without|all`，保留原有 `source`（存储来源）、`q` 等。响应包含 `facets`、`total`、`offset`、`limit`；使用 offset 分页，limit 最大 1000。RLinf 远端视频清单由后台定时刷新，远端条目需同步后播放。
+
+视频条目含 `evaluation_video.v1` 分类字段、`catalog_relative_path` 和 provenance。任务成功与安全成功分开；训练曲线中的总体成功率不能当作某个视频成功的证据。RoboTwin 旧事件记录和人工修订继续保留。
+
+`POST /api/eval-videos/sync` 接受列表返回的 `source`、`root`、`relative_path`，支持已配置的 RLinf 视频源，写入规范目录并保存元数据 sidecar。同步后媒体接口支持 HTTP Range。视频聚合目录主要使用链接，删除索引链接保留原始 rollout。

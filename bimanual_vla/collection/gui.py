@@ -36,6 +36,11 @@ from tkinter import messagebox, ttk
 import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
+from bimanual_vla.deployment.pose_trajectory import PoseTrajectoryConfig
+from bimanual_vla.deployment.execution_defaults import (
+    DEFAULT_ACTION_HZ, DEFAULT_SERVO_HZ, DEFAULT_INFERENCE_SPEED_PCT, DEFAULT_TRAJECTORY_MAX_SPEED_RAD_S,
+    DEFAULT_TRAJECTORY_MAX_ACCELERATION_RAD_S2, DEFAULT_TRAJECTORY_MAX_JERK_RAD_S3,
+)
 
 try:
     from PIL import Image, ImageTk
@@ -78,6 +83,7 @@ EPISODE_FILE_RE = re.compile(r"ep_\d+\.npz")
 CAN_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+")
 CAN_BITRATE = 1_000_000
 GUI_PREFERENCES_PATH = pathlib.Path("~/.config/bimanual-vla/collect_gui_preferences.json").expanduser()
+RETURN_POSE_PATH = pathlib.Path("~/.config/bimanual-vla/return_pose.json").expanduser()
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _can_helper_config = pathlib.Path(
     os.environ.get(
@@ -117,6 +123,44 @@ def save_gui_preferences(
     )
     os.chmod(temporary, 0o600)
     temporary.replace(target)
+
+
+def return_pose_matches_inference_config(
+    path: str | pathlib.Path,
+    *,
+    arm_mode: str,
+    arm_side: str,
+    can: str,
+    left_can: str,
+    right_can: str,
+) -> bool:
+    """Return whether a saved pose is safe to pass to the current client.
+
+    Return poses are shared by GUI sessions, so an old bimanual pose must not
+    be handed to a single-arm client (or vice versa).  Keep this check here so
+    startup can skip stale files instead of letting the child process fail
+    after cameras and CAN have already been opened.
+    """
+    try:
+        saved = json.loads(pathlib.Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(saved, dict) or saved.get("arm_mode") != arm_mode:
+        return False
+    if arm_mode == BIMANUAL:
+        if saved.get("left_can") != left_can or saved.get("right_can") != right_can:
+            return False
+        expected_size = 14
+    else:
+        if saved.get("arm_side") != arm_side or saved.get("can") != can:
+            return False
+        expected_size = 7
+    qpos = saved.get("qpos")
+    try:
+        values = np.asarray(qpos, dtype=np.float64)
+    except (TypeError, ValueError):
+        return False
+    return values.shape == (expected_size,) and bool(np.isfinite(values).all())
 
 
 def validate_can_name(can_name: str) -> str:
@@ -519,13 +563,14 @@ def build_inference_bridge_command(
     allow_execution: bool,
     send_policy_telemetry: bool = True,
     preresize_policy_images: bool = False,
-    control_hz: float = 20.0,
+    control_hz: float = DEFAULT_ACTION_HZ,
     camera_fps: int = 30,  # This rig negotiates a 20 FPS request down to 15.
     inference_trigger_mode: str = "periodic",
     inference_trigger_step: int = 10,
     camera_preview: bool = False,
     rtc_enabled: bool = True,
-    rtc_execution_horizon: int = 8,
+    rtc_inference_delay_steps: int = 8,
+    rtc_execution_horizon: int = 12,
     rtc_max_guidance_weight: float = 5.0,
     rtc_prefix_attention_schedule: str = "linear",
     rtc_client_blend_steps: int = 0,
@@ -535,6 +580,10 @@ def build_inference_bridge_command(
     trajectory_smoothing_hz: float = 3.0,
     gripper_lowpass_alpha: float = 0.5,
     trajectory_shaping_enabled: bool = True,
+    servo_backend: str = "ruckig",
+    servo_hz: float = DEFAULT_SERVO_HZ,
+    pose_trajectory_enabled: bool = False,
+    pose_trajectory_settings: dict[str, float] | None = None,
     joint_lowpass_enabled: bool | None = None,
     joint_tracking_enabled: bool = True,
     joint_speed_limit_enabled: bool = True,
@@ -542,9 +591,9 @@ def build_inference_bridge_command(
     joint_spike_suppression_enabled: bool = False,
     joint_jerk_limit_enabled: bool = True,
     joint_lookahead_enabled: bool = True,
-    joint_max_speed_rad_s: float = 0.30,
-    joint_max_acceleration_rad_s2: float = 0.80,
-    joint_max_jerk_rad_s3: float = 4.0,
+    joint_max_speed_rad_s: float = DEFAULT_TRAJECTORY_MAX_SPEED_RAD_S,
+    joint_max_acceleration_rad_s2: float = DEFAULT_TRAJECTORY_MAX_ACCELERATION_RAD_S2,
+    joint_max_jerk_rad_s3: float = DEFAULT_TRAJECTORY_MAX_JERK_RAD_S3,
     joint_tracking_time_constant_s: float = 0.25,
     joint_lookahead_rad: float = 0.02,
     blend_enabled: bool = True,
@@ -571,6 +620,17 @@ def build_inference_bridge_command(
         raise ValueError("inference rate must be positive and finite")
     if not math.isfinite(float(control_hz)) or float(control_hz) <= 0:
         raise ValueError("control rate must be positive and finite")
+    if servo_backend not in {"off", "ruckig", "legacy"}:
+        raise ValueError("servo backend must be off, ruckig, or legacy")
+    pose_config = PoseTrajectoryConfig(**(pose_trajectory_settings or {}))
+    if pose_trajectory_enabled and (not trajectory_shaping_enabled or servo_backend != "ruckig"):
+        raise ValueError("end-effector reference shaping requires the Ruckig planner")
+    if pose_trajectory_enabled and pose_config.max_update_dt_s < 1.0 / control_hz:
+        raise ValueError("end-effector reference timeout must cover one control period")
+    if not math.isfinite(float(servo_hz)) or servo_hz <= 0:
+        raise ValueError("servo rate must be positive and finite")
+    if trajectory_shaping_enabled and servo_backend == "ruckig" and servo_hz < control_hz:
+        raise ValueError("servo rate must be at least the reference rate")
     if inference_trigger_mode not in {"periodic", "chunk_step"}:
         raise ValueError("inference trigger mode must be periodic or chunk_step")
     if int(inference_trigger_step) < 1:
@@ -585,6 +645,8 @@ def build_inference_bridge_command(
     # launched, so RTC is force-disabled here regardless of the checkbox --
     # this is the safety net behind the GUI's own grey-out/auto-uncheck.
     rtc_enabled = bool(rtc_enabled) and bool(async_inference)
+    if rtc_enabled and not 0 <= int(rtc_inference_delay_steps) <= int(rtc_execution_horizon):
+        raise ValueError("RTC requires 0 <= inference delay steps <= execution horizon")
     if not 1 <= int(rtc_execution_horizon) <= 50:
         raise ValueError("RTC execution horizon must be in [1, 50]")
     if float(rtc_max_guidance_weight) <= 0:
@@ -639,6 +701,19 @@ def build_inference_bridge_command(
     instruction = instruction.strip()
     if not instruction:
         raise ValueError("instruction must not be empty")
+
+    # In single-arm mode the legacy ``cam_wrist_device`` field defaults to
+    # ``auto``. Auto-discovery cannot distinguish the two identical D405
+    # cameras, so inherit the side-specific selector saved by the GUI. An
+    # explicit single-arm selector still takes precedence.
+    selected_single_wrist = cam_wrist_device.strip()
+    if arm_mode == SINGLE_ARM and selected_single_wrist.lower() == "auto":
+        selected_single_wrist = (
+            cam_right_wrist_device.strip()
+            if arm_side == "right"
+            else cam_left_wrist_device.strip()
+        )
+
     command = [
         python_executable,
         "-m",
@@ -670,7 +745,7 @@ def build_inference_bridge_command(
         "--cam-high-device",
         cam_high_device.strip(),
         "--cam-wrist-device",
-        cam_wrist_device.strip(),
+        selected_single_wrist,
         "--cam-left-wrist-device",
         cam_left_wrist_device.strip(),
         "--cam-right-wrist-device",
@@ -691,13 +766,11 @@ def build_inference_bridge_command(
         else "--no-preresize-policy-images"
     )
     command.append("--rtc-enabled" if rtc_enabled else "--no-rtc-enabled")
-    rtc_blend_steps = (
-        int(rtc_client_blend_steps)
-        if rtc_enabled and (rtc_client_blend_enabled is None or rtc_client_blend_enabled)
-        else 0
-    )
+    rtc_blend_steps = 0  # RTC blending removed; ignore legacy saved settings.
     command.extend(
         (
+            "--rtc-inference-delay-steps",
+            str(int(rtc_inference_delay_steps)),
             "--rtc-execution-horizon",
             str(int(rtc_execution_horizon)),
             "--rtc-max-guidance-weight",
@@ -708,7 +781,7 @@ def build_inference_bridge_command(
             str(rtc_blend_steps),
         )
     )
-    # 异步推理和等待步数
+    # Asynchronous inference and wait steps.
     if not async_inference:
         command.extend(("--no-async-inference", "--sync-wait-steps", str(int(sync_wait_steps))))
         if not auto_next_inference:
@@ -720,6 +793,7 @@ def build_inference_bridge_command(
                 )
             )
     joint_lowpass = lowpass_filter_enabled if joint_lowpass_enabled is None else joint_lowpass_enabled
+    backend = servo_backend if trajectory_shaping_enabled else "off"
     gripper_lowpass = lowpass_filter_enabled if gripper_lowpass_enabled is None else gripper_lowpass_enabled
     switches = {
         "trajectory-shaping": trajectory_shaping_enabled,
@@ -727,12 +801,12 @@ def build_inference_bridge_command(
         "trajectory-tracking": joint_tracking_enabled,
         "trajectory-speed-limit": joint_speed_limit_enabled,
         "trajectory-acceleration-limit": joint_acceleration_limit_enabled,
-        "trajectory-spike-suppression": joint_spike_suppression_enabled,
+        "trajectory-spike-suppression": joint_spike_suppression_enabled and backend == "legacy",
         "trajectory-jerk-limit": joint_jerk_limit_enabled,
         "trajectory-lookahead": joint_lookahead_enabled,
         "gripper-lowpass": gripper_lowpass,
         "gripper-endpoint-filter": gripper_endpoint_filter_enabled,
-        "ik-rate-limit": ik_rate_limit_enabled,
+        "ik-rate-limit": ik_rate_limit_enabled and backend != "ruckig",
     }
     command.extend(
         flag if enabled else "--no-" + flag[2:]
@@ -740,6 +814,11 @@ def build_inference_bridge_command(
         for flag in ("--" + name,)
     )
     command.extend((
+        "--speed-pct", str(DEFAULT_INFERENCE_SPEED_PCT),
+        "--servo-backend", backend,
+        "--servo-hz", str(float(servo_hz)),
+        "--no-servo-waypoint-velocity",
+        "--pose-trajectory" if pose_trajectory_enabled else "--no-pose-trajectory",
         "--trajectory-smoothing-cutoff-hz", str(float(trajectory_smoothing_hz)),
         "--trajectory-tracking-time-constant-s", str(float(joint_tracking_time_constant_s)),
         "--trajectory-max-speed-rad-s", str(float(joint_max_speed_rad_s)),
@@ -754,6 +833,8 @@ def build_inference_bridge_command(
         "--blend-steps", str(int(blend_steps) if blend_enabled and not rtc_enabled else 0),
         "--blend-profile", blend_profile,
     ))
+    for name, value in vars(pose_config).items():
+        command.extend(("--pose-" + name.replace("_", "-"), str(float(value))))
     return command
 
 
@@ -976,7 +1057,7 @@ class CollectorGUI:
         self.camera_fps_var = tk.StringVar(value=str(DEFAULT_CAMERA_FPS))
         self.out_var = tk.StringVar(value="episodes_piper_v21")
         self.task_var = tk.StringVar(value="pick_cube")
-        self.instruction_var = tk.StringVar(value="pick up the cube")
+        self.instruction_var = tk.StringVar(value=str(self.gui_preferences.get("task_instruction") or ""))
         self.task_summary_var = tk.StringVar(value=self.task_var.get())
         self.instruction_summary_var = tk.StringVar(value=self.instruction_var.get())
         self.dataset_source_var = tk.StringVar(
@@ -1013,7 +1094,7 @@ class CollectorGUI:
             value=str(self.gui_preferences.get("inference_hz") or "4")
         )
         self.inference_control_hz_var = tk.StringVar(
-            value=str(self.gui_preferences.get("inference_control_hz") or "20")
+            value=str(self.gui_preferences.get("inference_control_hz") or DEFAULT_ACTION_HZ)
         )
         self.inference_trigger_mode_var = tk.StringVar(
             value=str(self.gui_preferences.get("inference_trigger_mode") or "periodic")
@@ -1035,17 +1116,17 @@ class CollectorGUI:
         self.inference_rtc_enabled_var = tk.BooleanVar(
             value=bool(self.gui_preferences.get("inference_rtc_enabled", True))
         )
+        self.inference_rtc_delay_var = tk.StringVar(
+            value=str(self.gui_preferences.get("inference_rtc_delay_steps", 8))
+        )
         self.inference_rtc_horizon_var = tk.StringVar(
-            value=str(self.gui_preferences.get("inference_rtc_horizon") or "8")
+            value=str(self.gui_preferences.get("inference_rtc_horizon") or "12")
         )
         self.inference_rtc_weight_var = tk.StringVar(
             value=str(self.gui_preferences.get("inference_rtc_weight") or "5.0")
         )
         self.inference_rtc_schedule_var = tk.StringVar(
             value=str(self.gui_preferences.get("inference_rtc_schedule") or "linear")
-        )
-        self.inference_rtc_blend_steps_var = tk.StringVar(
-            value=str(self.gui_preferences.get("inference_rtc_blend_steps") or "0")
         )
         self.inference_async_enabled_var = tk.BooleanVar(
             value=bool(self.gui_preferences.get("inference_async_enabled", True))
@@ -1057,6 +1138,22 @@ class CollectorGUI:
             value=bool(self.gui_preferences.get("inference_auto_next", True))
         )
         self.inference_manual_trigger_path: pathlib.Path | None = None
+        self.inference_return_button = None
+        self.inference_return_pose_path = (
+            RETURN_POSE_PATH
+            if return_pose_matches_inference_config(
+                RETURN_POSE_PATH,
+                arm_mode=self.arm_mode,
+                arm_side=self.arm_side,
+                can=self.can_var.get(),
+                left_can=self.left_can_var.get(),
+                right_can=self.right_can_var.get(),
+            )
+            else None
+        )
+        self.inference_session_command = None
+        self.inference_return_only = False
+        self.inference_return_after_stop = False
         self.inference_next_button: ttk.Button | None = None
         self.inference_lowpass_filter_enabled_var = tk.BooleanVar(
             value=bool(self.gui_preferences.get("inference_lowpass_filter_enabled", True))
@@ -1072,6 +1169,18 @@ class CollectorGUI:
         self.inference_trajectory_shaping_var = tk.BooleanVar(
             value=bool(preferences.get("inference_trajectory_shaping_enabled", True))
         )
+        self.inference_servo_backend_var = tk.StringVar(
+            value=str(preferences.get("inference_servo_backend") or "ruckig")
+        )
+        self.inference_servo_hz_var = tk.StringVar(
+            value=str(preferences.get("inference_servo_hz") or DEFAULT_SERVO_HZ)
+        )
+        self.inference_pose_trajectory_var = tk.BooleanVar(
+            value=bool(preferences.get("inference_pose_trajectory_enabled", False)))
+        self.inference_pose_settings = {
+            name: tk.StringVar(value=str(preferences.get("inference_pose_" + name, default)))
+            for name, default in vars(PoseTrajectoryConfig()).items()
+        }
         self.inference_joint_lowpass_var = tk.BooleanVar(
             value=bool(preferences.get("inference_joint_lowpass_enabled", legacy_lowpass))
         )
@@ -1097,13 +1206,13 @@ class CollectorGUI:
             value=str(preferences.get("inference_joint_tracking_time_constant_s") or "0.25")
         )
         self.inference_joint_max_speed_var = tk.StringVar(
-            value=str(preferences.get("inference_joint_max_speed_rad_s") or "0.30")
+            value=str(preferences.get("inference_joint_max_speed_rad_s") or DEFAULT_TRAJECTORY_MAX_SPEED_RAD_S)
         )
         self.inference_joint_max_acceleration_var = tk.StringVar(
-            value=str(preferences.get("inference_joint_max_acceleration_rad_s2") or "0.80")
+            value=str(preferences.get("inference_joint_max_acceleration_rad_s2") or DEFAULT_TRAJECTORY_MAX_ACCELERATION_RAD_S2)
         )
         self.inference_joint_max_jerk_var = tk.StringVar(
-            value=str(preferences.get("inference_joint_max_jerk_rad_s3") or "4.0")
+            value=str(preferences.get("inference_joint_max_jerk_rad_s3") or DEFAULT_TRAJECTORY_MAX_JERK_RAD_S3)
         )
         self.inference_joint_lookahead_rad_var = tk.StringVar(
             value=str(
@@ -1121,12 +1230,6 @@ class CollectorGUI:
         self.inference_blend_profile_var = tk.StringVar(
             value=str(preferences.get("inference_blend_profile") or "smootherstep")
         )
-        saved_rtc_blend = str(preferences.get("inference_rtc_blend_steps") or "0")
-        self._rtc_blend_preference = bool(preferences.get("inference_rtc_blend_enabled", saved_rtc_blend != "0"))
-        self.inference_rtc_blend_enabled_var = tk.BooleanVar(
-            value=self._rtc_blend_preference if self.inference_rtc_enabled_var.get() else False
-        )
-        self.inference_rtc_blend_steps_var.set(saved_rtc_blend if saved_rtc_blend != "0" else "3")
         self.inference_gripper_lowpass_var = tk.BooleanVar(
             value=bool(preferences.get("inference_gripper_lowpass_enabled", legacy_lowpass))
         )
@@ -1576,7 +1679,7 @@ class CollectorGUI:
         scrollbar = ttk.Scrollbar(files, orient="vertical", command=self.listbox.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.listbox.configure(yscrollcommand=scrollbar.set)
-        self.listbox.bind("<Double-1>", lambda _event: self.replay_selected())
+        self.listbox.bind("<Double-1>", lambda _event: self.preview_selected())
         ttk.Label(
             files,
             textvariable=self.dataset_stats_var,
@@ -1899,13 +2002,39 @@ class CollectorGUI:
         tabs.grid(row=0, column=0, sticky="nsew")
         chunk_tab = ttk.Frame(tabs, padding=10)
         joint_tab = ttk.Frame(tabs, padding=10)
+        pose_tab = ttk.Frame(tabs, padding=10)
         gripper_tab = ttk.Frame(tabs, padding=10)
         tabs.add(chunk_tab, text="Chunk transition")
-        tabs.add(joint_tab, text="Joint motion")
+        tabs.add(joint_tab, text="Joint reference planner")
+        tabs.add(pose_tab, text="End-effector reference")
         tabs.add(gripper_tab, text="Gripper")
 
-        for tab in (chunk_tab, joint_tab, gripper_tab):
+        for tab in (chunk_tab, joint_tab, pose_tab, gripper_tab):
             tab.columnconfigure(1, weight=1)
+
+        pose_switch = ttk.Checkbutton(pose_tab, text="Smooth end-effector targets before IK",
+                                      variable=self.inference_pose_trajectory_var)
+        pose_switch.grid(row=0, column=0, columnspan=3, sticky="w")
+        for row, (name, label, unit) in enumerate((
+            ("max_linear_speed_m_s", "Translation speed", "m/s"),
+            ("max_linear_acceleration_m_s2", "Translation acceleration", "m/s²"),
+            ("max_angular_speed_rad_s", "Rotation speed", "rad/s"),
+            ("max_angular_acceleration_rad_s2", "Rotation acceleration", "rad/s²"),
+            ("response_time_s", "Response time", "s"),
+            ("max_position_tracking_error_m", "Position tracking limit", "m"),
+            ("max_rotation_tracking_error_rad", "Rotation tracking limit", "rad"),
+            ("max_update_dt_s", "Reference timeout", "s"),
+        ), start=1):
+            ttk.Label(pose_tab, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Label(pose_tab, text=unit).grid(row=row, column=1, sticky="e", padx=7)
+            entry = ttk.Entry(pose_tab, textvariable=self.inference_pose_settings[name], width=9)
+            entry.grid(row=row, column=2, sticky="e")
+            enable_when(entry, (self.inference_pose_trajectory_var, True))
+        ttk.Label(pose_tab, text="Applies only to end-effector policies; requires Ruckig.\n"
+                  "Smooths translation and shortest-path rotation before IK.\n"
+                  "Adds response delay; joint limits remain on the Joint tab.\n"
+                  "The policy's RTC prefix is unchanged.", foreground="#68707d",
+                  justify="left").grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         rtc_checkbox = ttk.Checkbutton(
             chunk_tab, text="Model-side RTC", variable=self.inference_rtc_enabled_var
@@ -1958,16 +2087,10 @@ class CollectorGUI:
         blend_steps_box.grid(row=4, column=2, sticky="e")
         enable_when(blend_steps_box, (self.inference_rtc_enabled_var, False),
                     (self.inference_blend_enabled_var, True), enabled_state="readonly")
-        rtc_blend_check = ttk.Checkbutton(chunk_tab, text="Extra blend with RTC", variable=self.inference_rtc_blend_enabled_var)
-        rtc_blend_check.grid(
-            row=5, column=0, columnspan=2, sticky="w", pady=3
-        )
-        enable_when(rtc_blend_check, (self.inference_rtc_enabled_var, True))
-        rtc_blend_steps_box = ttk.Combobox(chunk_tab, textvariable=self.inference_rtc_blend_steps_var,
-                                           values=("2", "3", "4"), state="readonly", width=9)
-        rtc_blend_steps_box.grid(row=5, column=2, sticky="e")
-        enable_when(rtc_blend_steps_box, (self.inference_rtc_enabled_var, True),
-                    (self.inference_rtc_blend_enabled_var, True), enabled_state="readonly")
+        ttk.Label(chunk_tab, text="Inference delay steps").grid(row=5, column=0, sticky="w", pady=3)
+        rtc_delay_entry = ttk.Entry(chunk_tab, textvariable=self.inference_rtc_delay_var, width=9)
+        rtc_delay_entry.grid(row=5, column=2, sticky="e")
+        enable_when(rtc_delay_entry, (self.inference_rtc_enabled_var, True))
         active_rtc_mode = self.inference_rtc_enabled_var.get()
         def sync_blend_mode(*_args: object) -> None:
             nonlocal active_rtc_mode
@@ -1975,13 +2098,10 @@ class CollectorGUI:
             if next_rtc_mode == active_rtc_mode:
                 return
             if active_rtc_mode:
-                self._rtc_blend_preference = self.inference_rtc_blend_enabled_var.get()
-                self.inference_rtc_blend_enabled_var.set(False)
                 self.inference_blend_enabled_var.set(self._nonrtc_blend_preference)
             else:
                 self._nonrtc_blend_preference = self.inference_blend_enabled_var.get()
                 self.inference_blend_enabled_var.set(False)
-                self.inference_rtc_blend_enabled_var.set(self._rtc_blend_preference)
             active_rtc_mode = next_rtc_mode
 
         self.inference_rtc_enabled_var.trace_add("write", sync_blend_mode)
@@ -1990,13 +2110,10 @@ class CollectorGUI:
                                          values=("smootherstep", "linear"), state="readonly", width=13)
         blend_profile_box.grid(row=6, column=2, sticky="e")
         def refresh_blend_profile(*_args: object) -> None:
-            active = (not self.inference_rtc_enabled_var.get() and self.inference_blend_enabled_var.get()) or (
-                self.inference_rtc_enabled_var.get() and self.inference_rtc_blend_enabled_var.get()
-            )
+            active = not self.inference_rtc_enabled_var.get() and self.inference_blend_enabled_var.get()
             blend_profile_box.configure(state="readonly" if active else "disabled")
 
-        for variable in (self.inference_blend_enabled_var, self.inference_rtc_enabled_var,
-                         self.inference_rtc_blend_enabled_var):
+        for variable in (self.inference_blend_enabled_var, self.inference_rtc_enabled_var):
             variable.trace_add("write", refresh_blend_profile)
         refresh_blend_profile()
         ttk.Label(chunk_tab, text="Sync wait steps").grid(row=7, column=0, sticky="w", pady=3)
@@ -2020,10 +2137,38 @@ class CollectorGUI:
         for variable in (self.inference_async_enabled_var, self.inference_auto_next_var):
             variable.trace_add("write", lambda *_args: self._update_mode_controls())
 
-        ttk.Checkbutton(joint_tab, text="Joint trajectory shaper",
+        ttk.Checkbutton(joint_tab, text="Enable reference planner",
                         variable=self.inference_trajectory_shaping_var).grid(
             row=0, column=0, columnspan=3, sticky="w", pady=(0, 6)
         )
+        ttk.Label(joint_tab, text="Planner backend").grid(row=1, column=0, sticky="w")
+        backend_box = ttk.Combobox(joint_tab, textvariable=self.inference_servo_backend_var,
+                                   values=("ruckig", "legacy"), state="readonly", width=12)
+        backend_box.grid(row=1, column=2, sticky="e")
+        ruckig_panel = ttk.Frame(joint_tab)
+        ruckig_panel.grid(row=2, column=0, columnspan=3, sticky="ew")
+        ruckig_panel.columnconfigure(1, weight=1)
+        for row, (label, variable, unit) in enumerate((
+            ("Reference output frequency", self.inference_servo_hz_var, "Hz"),
+            ("Maximum speed", self.inference_joint_max_speed_var, "rad/s"),
+            ("Maximum acceleration", self.inference_joint_max_acceleration_var, "rad/s²"),
+            ("Maximum jerk", self.inference_joint_max_jerk_var, "rad/s³"),
+        )):
+            ttk.Label(ruckig_panel, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Label(ruckig_panel, text=unit).grid(row=row, column=1, sticky="e", padx=7)
+            entry = ttk.Entry(ruckig_panel, textvariable=variable, width=9)
+            entry.grid(row=row, column=2, sticky="e")
+            enable_when(entry, (self.inference_trajectory_shaping_var, True))
+        ttk.Label(ruckig_panel, text=f"Piper firmware speed: {DEFAULT_INFERENCE_SPEED_PCT}%.\n"
+                  "Policy targets → continuous position references.\n"
+                  "Planner limits speed, acceleration and jerk;\n"
+                  "Piper tracks commands. Feedback deviation is monitored.\n"
+                  "Trained joint RTC uses the planned trajectory as its prefix.",
+                  foreground="#68707d", justify="left").grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        legacy_panel = ttk.Frame(joint_tab)
+        legacy_panel.grid(row=2, column=0, columnspan=3, sticky="ew")
+        legacy_panel.columnconfigure(1, weight=1)
         joint_controls = (
             ("Reference low-pass", self.inference_joint_lowpass_var, self.inference_trajectory_smoothing_var, "Cutoff Hz"),
             ("Second-order tracking", self.inference_joint_tracking_var, self.inference_joint_tracking_time_var, "Time s"),
@@ -2035,16 +2180,26 @@ class CollectorGUI:
             ("Delivery IK step limit", self.inference_ik_rate_limit_var, self.inference_ik_max_step_var, "rad/step"),
         )
         for row, (label, enabled_var, value_var, unit) in enumerate(joint_controls, start=1):
-            check = ttk.Checkbutton(joint_tab, text=label, variable=enabled_var)
+            check = ttk.Checkbutton(legacy_panel, text=label, variable=enabled_var)
             check.grid(row=row, column=0, sticky="w", pady=3)
-            ttk.Label(joint_tab, text=unit, foreground="#68707d").grid(row=row, column=1, sticky="e", padx=(6, 7))
-            entry = ttk.Entry(joint_tab, textvariable=value_var, width=9)
+            ttk.Label(legacy_panel, text=unit, foreground="#68707d").grid(row=row, column=1, sticky="e", padx=(6, 7))
+            entry = ttk.Entry(legacy_panel, textvariable=value_var, width=9)
             entry.grid(row=row, column=2, sticky="e")
             if enabled_var is self.inference_ik_rate_limit_var:
                 enable_when(entry, (enabled_var, True))
             else:
                 enable_when(check, (self.inference_trajectory_shaping_var, True))
                 enable_when(entry, (self.inference_trajectory_shaping_var, True), (enabled_var, True))
+
+        def refresh_servo_panel(*_args: object) -> None:
+            ruckig = self.inference_servo_backend_var.get() == "ruckig"
+            (legacy_panel if ruckig else ruckig_panel).grid_remove()
+            (ruckig_panel if ruckig else legacy_panel).grid()
+            backend_box.configure(state="readonly" if self.inference_trajectory_shaping_var.get() else "disabled")
+
+        self.inference_servo_backend_var.trace_add("write", refresh_servo_panel)
+        self.inference_trajectory_shaping_var.trace_add("write", refresh_servo_panel)
+        refresh_servo_panel()
 
         gripper_controls = (
             ("Opening low-pass", self.inference_gripper_lowpass_var, self.inference_gripper_lowpass_alpha_var, "α"),
@@ -2085,6 +2240,10 @@ class CollectorGUI:
             style="Violet.TButton",
         )
         self.inference_stop_button.pack(side="left")
+        self.inference_return_button = ttk.Button(
+            buttons, text="回到原始位置", command=self.return_inference_to_initial,
+            state="disabled")
+        self.inference_return_button.pack(side="left", padx=(8, 0))
         self.inference_next_button = ttk.Button(
             buttons,
             text="Next inference",
@@ -2213,9 +2372,24 @@ class CollectorGUI:
         canvas.coords(self.preview_text_items[slot], width // 2, height // 2)
         canvas.itemconfigure(self.preview_text_items[slot], text=message, state="normal")
 
+    def _sync_single_arm_device_selectors(self) -> None:
+        context = (self.arm_mode, self.arm_side)
+        previous = getattr(self, "_device_selector_context", None)
+        if previous is not None and context != previous and self.arm_mode == SINGLE_ARM:
+            # A resolved single-arm selector belongs to the previous side.
+            # Switching sides must also switch the CAN adapter and wrist view.
+            if self.arm_side == "left":
+                self.can_var.set(self.left_can_var.get())
+                self.wrist_var.set(self.left_wrist_var.get())
+            else:
+                self.can_var.set(self.right_can_var.get())
+                self.wrist_var.set(self.right_wrist_var.get())
+        self._device_selector_context = context
+
     def _configure_mode_ui(self):
         if not hasattr(self, "preview_labels"):
             return
+        self._sync_single_arm_device_selectors()
         bimanual = self.arm_mode == BIMANUAL
         if self.inference_mode_display_vars:
             self.inference_mode_display_vars[0].set("Bimanual" if bimanual else "Single arm")
@@ -2269,7 +2443,14 @@ class CollectorGUI:
         process = self.inference_process
         return process is not None and process.poll() is None
 
+    def _replay_running(self) -> bool:
+        dialog = getattr(self, "replay_dialog", None)
+        return dialog is not None and dialog.running
+
     def set_app_mode(self, mode: str) -> None:
+        if self._replay_running():
+            messagebox.showwarning("Mode locked", "Stop hardware replay before switching modes.")
+            return
         if mode not in {"collection", "inference", "data_process"} or mode == self.app_mode:
             return
         if self.recording:
@@ -2328,7 +2509,13 @@ class CollectorGUI:
         if self.inference_start_button is not None:
             self.inference_start_button.configure(state="disabled" if running else "normal")
         if self.inference_stop_button is not None:
-            self.inference_stop_button.configure(state="normal" if running else "disabled")
+            self.inference_stop_button.configure(state="normal" if running and not self.inference_stop_requested else "disabled")
+        if getattr(self, "inference_return_button", None) is not None:
+            pose_path = self.inference_return_pose_path
+            available = (pose_path is not None and pose_path.is_file()
+                         and not self.inference_stop_requested and not self.inference_return_only
+                         and not self.recording and self.piper is None)
+            self.inference_return_button.configure(state="normal" if available else "disabled")
         if self.inference_next_button is not None:
             manual_mode = (
                 not self.inference_async_enabled_var.get()
@@ -2355,7 +2542,7 @@ class CollectorGUI:
             )
 
     def _set_connection_config_enabled(self, enabled: bool) -> None:
-        enabled = bool(enabled) and not self._inference_running()
+        enabled = bool(enabled) and not self._inference_running() and not self._replay_running()
         selector_state = "readonly" if enabled else "disabled"
         for selector in self.mode_selectors:
             selector.configure(state=selector_state)
@@ -2435,6 +2622,7 @@ class CollectorGUI:
             "can_selector": self.can_var.get().strip(),
             "left_can_selector": self.left_can_var.get().strip(),
             "right_can_selector": self.right_can_var.get().strip(),
+            "task_instruction": self.instruction_var.get().strip(),
             "upload_server": self.dataset_server_var.get().strip(),
             "remember_can_password": bool(self.remember_can_password_var.get()),
             "remember_upload_token": bool(self.remember_upload_token_var.get()),
@@ -2452,10 +2640,10 @@ class CollectorGUI:
                 self.inference_preresize_policy_images_var.get()
             ),
             "inference_rtc_enabled": bool(self.inference_rtc_enabled_var.get()),
+            "inference_rtc_delay_steps": self.inference_rtc_delay_var.get().strip(),
             "inference_rtc_horizon": self.inference_rtc_horizon_var.get().strip(),
             "inference_rtc_weight": self.inference_rtc_weight_var.get().strip(),
             "inference_rtc_schedule": self.inference_rtc_schedule_var.get().strip(),
-            "inference_rtc_blend_steps": self.inference_rtc_blend_steps_var.get().strip(),
             "inference_async_enabled": bool(self.inference_async_enabled_var.get()),
             "inference_sync_wait_steps": self.inference_sync_wait_steps_var.get().strip(),
             "inference_auto_next": bool(self.inference_auto_next_var.get()),
@@ -2463,6 +2651,11 @@ class CollectorGUI:
             "inference_trajectory_smoothing_hz": self.inference_trajectory_smoothing_var.get().strip(),
             "inference_gripper_lowpass_alpha": self.inference_gripper_lowpass_alpha_var.get().strip(),
             "inference_trajectory_shaping_enabled": self.inference_trajectory_shaping_var.get(),
+            "inference_servo_backend": self.inference_servo_backend_var.get(),
+            "inference_servo_hz": self.inference_servo_hz_var.get().strip(),
+            "inference_pose_trajectory_enabled": self.inference_pose_trajectory_var.get(),
+            **{"inference_pose_" + name: value.get().strip()
+               for name, value in self.inference_pose_settings.items()},
             "inference_joint_lowpass_enabled": self.inference_joint_lowpass_var.get(),
             "inference_joint_tracking_enabled": self.inference_joint_tracking_var.get(),
             "inference_joint_speed_limit_enabled": self.inference_joint_speed_limit_var.get(),
@@ -2481,10 +2674,6 @@ class CollectorGUI:
             ),
             "inference_blend_steps": self.inference_blend_steps_var.get().strip(),
             "inference_blend_profile": self.inference_blend_profile_var.get().strip(),
-            "inference_rtc_blend_enabled": (
-                self.inference_rtc_blend_enabled_var.get() if self.inference_rtc_enabled_var.get()
-                else self._rtc_blend_preference
-            ),
             "inference_gripper_lowpass_enabled": self.inference_gripper_lowpass_var.get(),
             "inference_gripper_endpoint_filter_enabled": self.inference_gripper_endpoint_var.get(),
             "inference_gripper_hysteresis": self.inference_gripper_hysteresis_var.get().strip(),
@@ -2560,6 +2749,7 @@ class CollectorGUI:
             self.task_var.set(task_name)
             self.instruction_var.set(pending_instruction.get().strip())
             self._update_task_summary()
+            self._save_gui_preferences()
             if self._inference_running():
                 restart = ask_english_yes_no(
                     dialog,
@@ -2596,6 +2786,9 @@ class CollectorGUI:
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
     def open_device_settings(self) -> None:
+        if self._replay_running():
+            messagebox.showwarning("Replay active", "Stop hardware replay before changing devices.")
+            return
         if self.device_settings_window is not None and self.device_settings_window.winfo_exists():
             self.device_settings_window.lift()
             self.device_settings_window.focus_force()
@@ -2936,6 +3129,9 @@ class CollectorGUI:
         return result["password"]
 
     def activate_can(self) -> None:
+        if self._replay_running():
+            messagebox.showwarning("Cannot activate CAN", "Stop hardware replay first.")
+            return
         if self._inference_running():
             messagebox.showwarning("Cannot activate CAN", "Stop inference before reconfiguring CAN interfaces.")
             return
@@ -3013,11 +3209,14 @@ class CollectorGUI:
             return parse(variable.get()) if enabled else default
 
         shaping = self.inference_trajectory_shaping_var.get()
+        ruckig = shaping and self.inference_servo_backend_var.get() == "ruckig"
+        legacy = shaping and self.inference_servo_backend_var.get() == "legacy"
         endpoint_filter = self.inference_gripper_endpoint_var.get()
         try:
             port = int(self.inference_port_var.get())
             hz = float(self.inference_hz_var.get())
             control_hz = float(self.inference_control_hz_var.get())
+            servo_hz = numeric_setting(self.inference_servo_hz_var, ruckig, 100.0, float)
             trigger_mode = (
                 self.inference_trigger_mode_var.get().strip()
                 if self.inference_async_enabled_var.get() else "periodic"
@@ -3030,34 +3229,35 @@ class CollectorGUI:
             rtc_horizon = numeric_setting(
                 self.inference_rtc_horizon_var,
                 self.inference_rtc_enabled_var.get()
-                or self.inference_joint_spike_suppression_var.get(),
-                8, int,
+                or (legacy and self.inference_joint_spike_suppression_var.get()),
+                12, int,
             )
             rtc_weight = numeric_setting(self.inference_rtc_weight_var, self.inference_rtc_enabled_var.get(), 5.0, float)
-            rtc_blend_steps = numeric_setting(self.inference_rtc_blend_steps_var,
-                self.inference_rtc_enabled_var.get() and self.inference_rtc_blend_enabled_var.get(), 3, int)
+            rtc_blend_steps = 0
+            rtc_delay = numeric_setting(self.inference_rtc_delay_var, self.inference_rtc_enabled_var.get(), 8, int)
             sync_wait_steps = numeric_setting(self.inference_sync_wait_steps_var, not self.inference_async_enabled_var.get(), 8, int)
             trajectory_smoothing_hz = numeric_setting(self.inference_trajectory_smoothing_var,
-                shaping and self.inference_joint_lowpass_var.get(), 3.0, float)
+                legacy and self.inference_joint_lowpass_var.get(), 3.0, float)
             gripper_lowpass_alpha = numeric_setting(self.inference_gripper_lowpass_alpha_var,
                 self.inference_gripper_lowpass_var.get(), 0.5, float)
             joint_max_speed = numeric_setting(self.inference_joint_max_speed_var,
-                shaping and self.inference_joint_speed_limit_var.get(), 0.30, float)
+                ruckig or (legacy and self.inference_joint_speed_limit_var.get()), 0.60, float)
             joint_max_acceleration = numeric_setting(self.inference_joint_max_acceleration_var,
-                shaping and self.inference_joint_acceleration_limit_var.get(), 0.80, float)
+                ruckig or (legacy and self.inference_joint_acceleration_limit_var.get()), 3.0, float)
             joint_max_jerk = numeric_setting(self.inference_joint_max_jerk_var,
-                shaping and self.inference_joint_jerk_limit_var.get(), 4.0, float)
+                ruckig or (legacy and self.inference_joint_jerk_limit_var.get()), 20.0, float)
             joint_tracking_time = numeric_setting(self.inference_joint_tracking_time_var,
-                shaping and self.inference_joint_tracking_var.get(), 0.25, float)
+                legacy and self.inference_joint_tracking_var.get(), 0.25, float)
             joint_lookahead_rad = numeric_setting(self.inference_joint_lookahead_rad_var,
-                shaping and self.inference_joint_lookahead_var.get(), 0.02, float)
+                legacy and self.inference_joint_lookahead_var.get(), 0.02, float)
             blend_steps = numeric_setting(self.inference_blend_steps_var,
                 not self.inference_rtc_enabled_var.get() and self.inference_blend_enabled_var.get(), 3, int)
             gripper_hysteresis = numeric_setting(self.inference_gripper_hysteresis_var, endpoint_filter, 0.05, float)
             gripper_confirm_steps = numeric_setting(self.inference_gripper_confirm_steps_var, endpoint_filter, 2, int)
             gripper_lookahead_steps = numeric_setting(self.inference_gripper_lookahead_steps_var,
                 self.inference_gripper_lookahead_var.get(), 30, int)
-            ik_max_step = numeric_setting(self.inference_ik_max_step_var, self.inference_ik_rate_limit_var.get(), 0.02, float)
+            ik_max_step = numeric_setting(self.inference_ik_max_step_var,
+                self.inference_ik_rate_limit_var.get() and not ruckig, 0.02, float)
         except ValueError as exc:
             raise ValueError("Policy port, inference rate, and enabled numeric values must be valid") from exc
         manual_next_mode = (
@@ -3097,6 +3297,7 @@ class CollectorGUI:
             preresize_policy_images=bool(self.inference_preresize_policy_images_var.get()),
             camera_preview=bool(self.inference_camera_preview_var.get()),
             rtc_enabled=bool(self.inference_rtc_enabled_var.get()),
+            rtc_inference_delay_steps=rtc_delay,
             rtc_execution_horizon=rtc_horizon,
             rtc_max_guidance_weight=rtc_weight,
             rtc_prefix_attention_schedule=(
@@ -3110,6 +3311,10 @@ class CollectorGUI:
             trajectory_smoothing_hz=trajectory_smoothing_hz,
             gripper_lowpass_alpha=gripper_lowpass_alpha,
             trajectory_shaping_enabled=self.inference_trajectory_shaping_var.get(),
+            servo_backend=self.inference_servo_backend_var.get(),
+            servo_hz=servo_hz,
+            pose_trajectory_enabled=self.inference_pose_trajectory_var.get(),
+            pose_trajectory_settings={name: float(value.get()) for name, value in self.inference_pose_settings.items()},
             joint_lowpass_enabled=self.inference_joint_lowpass_var.get(),
             joint_tracking_enabled=self.inference_joint_tracking_var.get(),
             joint_speed_limit_enabled=self.inference_joint_speed_limit_var.get(),
@@ -3127,10 +3332,9 @@ class CollectorGUI:
             blend_profile=(
                 self.inference_blend_profile_var.get().strip().lower()
                 if (not self.inference_rtc_enabled_var.get() and self.inference_blend_enabled_var.get())
-                or (self.inference_rtc_enabled_var.get() and self.inference_rtc_blend_enabled_var.get())
                 else "smootherstep"
             ),
-            rtc_client_blend_enabled=self.inference_rtc_enabled_var.get() and self.inference_rtc_blend_enabled_var.get(),
+            rtc_client_blend_enabled=False,
             gripper_lowpass_enabled=self.inference_gripper_lowpass_var.get(),
             gripper_endpoint_filter_enabled=self.inference_gripper_endpoint_var.get(),
             gripper_hysteresis=gripper_hysteresis,
@@ -3146,12 +3350,24 @@ class CollectorGUI:
                 else None
             ),
         )
+        if return_pose_matches_inference_config(
+            RETURN_POSE_PATH,
+            arm_mode=self.arm_mode,
+            arm_side=self.arm_side,
+            can=self.can_var.get(),
+            left_can=self.left_can_var.get(),
+            right_can=self.right_can_var.get(),
+        ):
+            command += ["--return-target-file", str(RETURN_POSE_PATH)]
         endpoint = f"{self.inference_host_var.get().strip()}:{port}"
         if self.inference_async_enabled_var.get() and trigger_mode == "chunk_step":
             return command, f"{endpoint} @ chunk step {trigger_step}, control {control_hz:g} Hz"
         return command, f"{endpoint} @ {hz:g} Hz"
 
     def start_inference(self) -> None:
+        if self._replay_running():
+            messagebox.showwarning("Cannot start inference", "Stop hardware replay first.")
+            return
         if self._inference_running():
             return
         if self.recording or self.piper is not None:
@@ -3169,6 +3385,16 @@ class CollectorGUI:
             messagebox.showerror("Invalid inference settings", str(exc))
             return
         self._save_gui_preferences()
+        fd, pose_path = tempfile.mkstemp(prefix="bimanual-return-", suffix=".json")
+        os.close(fd)
+        pathlib.Path(pose_path).unlink()
+        self.inference_return_pose_path = pathlib.Path(pose_path)
+        command += ["--initial-pose-file", pose_path]
+        self.inference_session_command = list(command)
+        self.inference_return_only = False
+        self._launch_inference_process(command, endpoint)
+
+    def _launch_inference_process(self, command, endpoint):
         self._append_inference_log("$ " + " ".join(command))
         self.inference_stop_requested = False
         try:
@@ -3213,7 +3439,43 @@ class CollectorGUI:
         self._set_connection_config_enabled(False)
         self._update_mode_controls()
 
+    def return_inference_to_initial(self) -> None:
+        if self._replay_running():
+            messagebox.showwarning("Cannot return", "Stop hardware replay first.")
+            return
+        if self.inference_stop_requested or self.inference_return_only:
+            return
+        if self.recording or self.piper is not None or self._can_activation_running():
+            messagebox.showwarning("Cannot return", "Disconnect collection devices and wait for CAN activation first.")
+            return
+        if self._inference_running():
+            self.inference_restart_requested = False
+            # A preview-only bridge sends no commands and therefore skips
+            # automatic return. Launch the explicit return after it releases CAN.
+            self.inference_return_after_stop = "--allow-execution" not in (self.inference_session_command or [])
+            self.stop_inference()
+            self.inference_status_var.set("正在停止推理并回到原始位置…")
+            return
+        if not self.inference_return_pose_path:
+            return
+        if not self.inference_session_command:
+            try:
+                command, _ = self._validate_inference_settings()
+            except (ValueError, OSError) as exc:
+                messagebox.showerror("Cannot return", str(exc))
+                return
+            self.inference_session_command = command + ["--initial-pose-file", str(self.inference_return_pose_path)]
+        command = list(self.inference_session_command)
+        # Clicking Return explicitly authorizes this return-only operation;
+        # it does not change execution permission for future inference runs.
+        if "--allow-execution" not in command:
+            command.append("--allow-execution")
+        self.inference_return_only = True
+        self._launch_inference_process(command + ["--return-only"], "回到原始位置")
+
     def stop_inference(self) -> None:
+        if self.inference_stop_requested:
+            return
         process = self.inference_process
         if process is None or process.poll() is not None:
             self._finish_inference(process.returncode if process is not None else 0, True)
@@ -3238,6 +3500,10 @@ class CollectorGUI:
 
     def _finish_inference(self, return_code: int | None, requested: bool) -> None:
         restart_requested = self.inference_restart_requested
+        return_after_stop = getattr(self, "inference_return_after_stop", False)
+        self.inference_return_after_stop = False
+        was_return_only = self.inference_return_only
+        self.inference_return_only = False
         self.inference_process = None
         self.inference_process_thread = None
         self.inference_stop_requested = False
@@ -3253,9 +3519,13 @@ class CollectorGUI:
             self.inference_status_var.set("Inference idle")
         else:
             self.inference_status_var.set(f"Inference exited with code {return_code}")
+        if was_return_only:
+            self.inference_status_var.set("已回到原始位置" if return_code == 0 else "回位失败，请查看日志")
         self._set_connection_config_enabled(True)
         self._update_mode_controls()
-        if restart_requested:
+        if return_after_stop:
+            self.root.after(250, self.return_inference_to_initial)
+        elif restart_requested:
             self.root.after(250, self.start_inference)
 
     def _finish_can_activation(
@@ -3287,6 +3557,9 @@ class CollectorGUI:
         messagebox.showerror("CAN activation failed", message)
 
     def toggle_connection(self):
+        if self._replay_running():
+            messagebox.showwarning("Replay active", "Stop hardware replay before changing devices.")
+            return
         if self._can_activation_running():
             messagebox.showwarning("CAN activation", "Wait for CAN activation to finish")
             return
@@ -3343,6 +3616,9 @@ class CollectorGUI:
                     self.high_var.set(selected_device)
                 elif self.arm_mode == SINGLE_ARM:
                     self.wrist_var.set(selected_device)
+                    side_wrist = (self.left_wrist_var if self.arm_side == "left"
+                                  else self.right_wrist_var)
+                    side_wrist.set(selected_device)
                 elif key == "cam_left_wrist":
                     self.left_wrist_var.set(selected_device)
                 elif key == "cam_right_wrist":
@@ -3459,6 +3735,9 @@ class CollectorGUI:
         self.root.after_idle(clear_if_main_still_focused)
 
     def start_episode(self):
+        if self._replay_running():
+            messagebox.showwarning("Cannot collect", "Stop hardware replay before starting an episode.")
+            return
         if self.session is None or self.recording:
             return
         with self.data_lock:
@@ -3665,6 +3944,8 @@ class CollectorGUI:
                 if self.cameras is not None:
                     source_aspects = getattr(self.cameras, "source_aspects", {})
                     source_aspect = source_aspects.get(key, source_aspect)
+                    if getattr(self.cameras, "resize_mode", "pad") == "stretch":
+                        source_aspect = 1.0
                 target_w = max(320, label.winfo_width())
                 target_h = max(180, label.winfo_height())
                 rgb = letterbox_preview_frame(
@@ -3693,6 +3974,8 @@ class CollectorGUI:
             if self.cameras is not None:
                 source_aspects = getattr(self.cameras, "source_aspects", {})
                 source_aspect = source_aspects.get(key, source_aspect)
+                if getattr(self.cameras, "resize_mode", "pad") == "stretch":
+                    source_aspect = 1.0
             label = self.preview_labels.get(slot)
             target_w = max(320, 640 if label is None else label.winfo_width())
             target_h = max(180, 360 if label is None else label.winfo_height())
@@ -3953,13 +4236,13 @@ class CollectorGUI:
         if action == "upload":
             install_mode = self.dataset_install_mode_var.get()
             mode_hint = {
-                "merge": "merge 会保留服务器已有数据并追加本次 episode，服务器总数可能增加",
-                "overwrite": "overwrite 会替换服务器上同名数据集",
-                "install": "install 只允许安装尚不存在的同名数据集",
+                "merge": "merge keeps existing server data and appends this episode; the server count may increase",
+                "overwrite": "overwrite replaces the dataset with the same name on the server",
+                "install": "install only allows a dataset name that does not already exist",
             }.get(install_mode, install_mode)
             self._append_dataset_log(
                 f"Source NPZ episodes: {source_episode_count}; upload mode: {install_mode}\n"
-                f"{mode_hint}。上传 archive parts 是传输分片，不是 episode 数。"
+                f"{mode_hint}. Archive parts are transfer fragments, not episode counts."
             )
         else:
             self._append_dataset_log(f"Source NPZ episodes: {source_episode_count}")
@@ -4054,12 +4337,87 @@ class CollectorGUI:
             f"{summary['failure']} failure{invalid}"
         )
 
+    def _replay_inference_defaults(self):
+        """Snapshot effective execution settings without starting inference."""
+        from bimanual_vla.collection.replay import ReplayConfig
+        defaults = ReplayConfig()
+        backend = self.inference_servo_backend_var.get() if self.inference_trajectory_shaping_var.get() else 'off'
+        if backend not in ('ruckig', 'off'):
+            raise ValueError('Replay supports inference settings with Ruckig or shaping disabled; legacy backend is unsupported')
+        ruckig = backend == 'ruckig'
+        control_hz = float(self.inference_control_hz_var.get())
+        values = {}
+        for name, variable in (
+            ('max_joint_speed', self.inference_joint_max_speed_var),
+            ('max_joint_acceleration', self.inference_joint_max_acceleration_var),
+            ('max_joint_jerk', self.inference_joint_max_jerk_var),
+        ):
+            values[name] = float(variable.get()) if ruckig else getattr(defaults, name)
+        pose_enabled = ruckig and self.inference_pose_trajectory_var.get()
+        pose = (PoseTrajectoryConfig(**{k: float(v.get()) for k, v in self.inference_pose_settings.items()})
+                if pose_enabled else PoseTrajectoryConfig())
+        ik_enabled_var = getattr(self, 'inference_ik_rate_limit_var', None)
+        ik_step_var = getattr(self, 'inference_ik_max_step_var', None)
+        # Keep the inference switch even when Ruckig currently ignores it;
+        # replay may turn joint smoothing off in its own dialog.
+        ik_rate_limit = bool(ik_enabled_var.get()) if ik_enabled_var is not None else True
+        ik_step = (float(ik_step_var.get()) if ik_step_var is not None and ik_rate_limit
+                   else defaults.ik_max_joint_step_rad)
+        return replace(defaults, control_hz=control_hz,
+            speed_pct=DEFAULT_INFERENCE_SPEED_PCT,
+            hz=float(self.inference_servo_hz_var.get()) if ruckig else control_hz,
+            joint_smoothing=ruckig, eef_smoothing=pose_enabled, pose=pose,
+            ik_rate_limit=ik_rate_limit, ik_max_joint_step_rad=ik_step, **values)
+
     def replay_selected(self):
+        from bimanual_vla.collection.replay_gui import ReplayDialog
+        selection = self.listbox.selection()
+        if not selection:
+            messagebox.showinfo("Replay", "Select an episode first")
+            return
+        existing = getattr(self, "replay_dialog", None)
+        if existing is not None and existing.window.winfo_exists():
+            existing.window.lift()
+            return
+        path = self.episode_paths[selection[0]]
+
+        def selectors(episode):
+            result = {"left": self.left_can_var.get().strip(), "right": self.right_can_var.get().strip()}
+            if self.arm_mode_var.get() == SINGLE_ARM and episode.sides == (self.arm_side_var.get(),):
+                result[episode.sides[0]] = self.can_var.get().strip()
+            return result
+
+        def blocking_reason():
+            if self.recording:
+                return "Stop and save the current episode before hardware replay."
+            if self._inference_running() or self._can_activation_running():
+                return "Stop inference/return and wait for CAN activation before hardware replay."
+            return ""
+
+        try:
+            defaults = self._replay_inference_defaults()
+        except ValueError as exc:
+            messagebox.showerror('Replay settings', str(exc))
+            return
+        try:
+            smoothed_hz = float(self.inference_servo_hz_var.get())
+            if not math.isfinite(smoothed_hz) or smoothed_hz <= 0:
+                smoothed_hz = DEFAULT_SERVO_HZ
+        except ValueError:
+            smoothed_hz = DEFAULT_SERVO_HZ
+        self.replay_dialog = ReplayDialog(self.root, path, defaults=defaults, smoothed_hz=smoothed_hz,
+            preview=lambda: self._preview_episode(path), selectors=selectors, blocking_reason=blocking_reason,
+            activity_changed=lambda active: self._set_connection_config_enabled(not active and self.piper is None))
+
+    def preview_selected(self):
         selection = self.listbox.selection()
         if not selection:
             messagebox.showinfo("Replay", "Select an episode first")
             return
         path = self.episode_paths[selection[0]]
+        self._preview_episode(path)
+
+    def _preview_episode(self, path):
         subprocess.Popen(
             [sys.executable, "-m", EPISODE_VIEWER_MODULE, str(path)],
             cwd=str(PROJECT_ROOT),
@@ -4093,6 +4451,9 @@ class CollectorGUI:
             pass
 
     def disconnect(self):
+        if self._replay_running():
+            messagebox.showwarning("Cannot disconnect", "Stop hardware replay first.")
+            return
         if self._can_activation_running():
             messagebox.showwarning("Cannot disconnect", "Wait for CAN activation to finish")
             return
@@ -4109,6 +4470,10 @@ class CollectorGUI:
         self.status_var.set("Disconnected")
 
     def close(self):
+        if self._replay_running():
+            self.replay_dialog.stop()
+            messagebox.showinfo("Stopping replay", "Wait for hardware replay to stop before exiting.")
+            return
         self._save_gui_preferences()
         if self._can_activation_running():
             messagebox.showwarning(

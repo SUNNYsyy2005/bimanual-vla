@@ -191,6 +191,42 @@ class ChunkPlannerTest(unittest.TestCase):
                 self.assertTrue(loop.prefix_is_valid(fresh['plan_id']))
                 self.assertFalse(loop.prefix_is_valid(prefix['plan_id']))
 
+    def test_rejected_chunk_can_fall_back_to_single_target_without_old_plan(self):
+        q, lower, upper, times, targets = self.inputs(7)
+        feedback = q.copy()
+        samples = []
+        def publish(command):
+            feedback[:] = command
+            return {}
+        loop = ServoLoop(q, lower, upper, ServoConfig(), lambda: feedback.copy(), publish, samples.append)
+        self.addCleanup(loop.close)
+        loop.install_chunk(targets, time.monotonic()+times, np.arange(len(times)), generation=1)
+        prefix = loop.rtc_prefix(time.monotonic(), 5, 20)
+        self.assertIsNotNone(prefix)
+        # This is a single-target fallback, not a successful timed-plan splice.
+        # Its first publication must carry the replacement context, revoke all
+        # old prefix promises, and continue bounded q/v/a from the writer state.
+        target = feedback.copy()
+        target[0] += .02
+        result = loop.submit(target, context={"generation": 2}, discard_chunk=True)
+        self.assertIsNone(loop._plan)
+        self.assertFalse(loop.prefix_is_valid(prefix['plan_id']))
+        self.assertFalse(loop._hold)
+        self.assertEqual(result["context"]["generation"], 2)
+        self.assertIsNone(result["plan_id"])
+        self.assertLessEqual(np.max(np.abs(result["velocity"])), loop.config.max_velocity+1e-7)
+        self.assertLessEqual(np.max(np.abs(result["acceleration"])), loop.config.max_acceleration+1e-7)
+
+    def test_single_target_fallback_cannot_unpause_moving_safety_paused_writer(self):
+        from bimanual_vla.deployment.servo import ServoError
+        loop, _, _, _ = self.prefix_fixture()
+        loop._sample_count = 1
+        loop._paused = True
+        loop.planner.velocity[:] = .1
+        with self.assertRaisesRegex(ServoError, "moving servo was safety-paused"):
+            loop.submit(loop._target, discard_chunk=True)
+        self.assertTrue(loop._paused)
+
     def test_prefix_still_rejected_when_writer_unavailable(self):
         loop, _, _, prefix = self.prefix_fixture()
         for field, value in (('_paused', True), ('_hold', True), ('_fault', 'driver fault'),

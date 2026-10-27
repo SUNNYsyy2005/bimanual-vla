@@ -21,6 +21,20 @@ rsync -av --relative --exclude='__pycache__/' --exclude='*.py[cod]' \
   "$LOCAL_ROOT/./server_4090/dataset_transfer_runner.py" \
   "$LOCAL_ROOT/./server_4090/slurm_dataset_sync_runner.py" \
   "$LOCAL_ROOT/./server_4090/video_transfer_runner.py" \
+  "$LOCAL_ROOT/./server_4090/remote_checkpoints.py" \
+  "$LOCAL_ROOT/./server_4090/checkpoint_sync_runner.py" \
+  "$LOCAL_ROOT/./server_4090/extension_nodes.py" \
+  "$LOCAL_ROOT/./server_4090/slurm_resources.py" \
+  "$LOCAL_ROOT/./server_4090/eval_video_catalog.py" \
+  "$LOCAL_ROOT/./server_4090/eval_video_catalog_runner.py" \
+  "$LOCAL_ROOT/./server_4090/experiment_artifacts.py" \
+  "$LOCAL_ROOT/./server_4090/artifact_history_runner.py" \
+  "$LOCAL_ROOT/./server_4090/prepare_artifact_migration.py" \
+  "$LOCAL_ROOT/./server_4090/rlinf_dashboard.py" \
+  "$LOCAL_ROOT/./server_4090/rlinf_eval_runner.py" \
+  "$LOCAL_ROOT/./server_4090/rlinf_eval_collect.py" \
+  "$LOCAL_ROOT/./server_4090/bimanual-vla-artifact-index.service" \
+  "$LOCAL_ROOT/./server_4090/bimanual-vla-artifact-index.timer" \
   "$LOCAL_ROOT/./server_4090/validate_lerobot.py" \
   "$LOCAL_ROOT/./server_4090/config.example.json" \
   "$LOCAL_ROOT/./server_4090/config.simulation.example.json" \
@@ -34,6 +48,8 @@ rsync -av --relative --exclude='__pycache__/' --exclude='*.py[cod]' \
   "$LOCAL_ROOT/./server_4090/README.md" \
   "$LOCAL_ROOT/./server_4090/API_USAGE.md" \
   "$LOCAL_ROOT/./server_4090/SIMULATION_DASHBOARD.md" \
+  "$LOCAL_ROOT/./docs/EXPERIMENT_ARTIFACT_CONTRACT.md" \
+  "$LOCAL_ROOT/./docs/EXPERIMENT_ARTIFACT_MIGRATION_20261023.md" \
   "$LOCAL_ROOT/./bimanual_vla" \
   "$LOCAL_ROOT/./bin/bimanual-vla" \
   "$LOCAL_ROOT/./scripts/models/download_openpi_checkpoint.py" \

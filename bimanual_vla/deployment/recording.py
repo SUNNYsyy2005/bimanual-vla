@@ -127,6 +127,8 @@ class DeploymentRunRecorder:
         self._trajectory_file: Any | None = None
         self._model_file: Any | None = None
         self._video_index_file: Any | None = None
+        self._servo_file: Any | None = None
+        self._servo_hz: float | None = None
         self._jitter_file: Any | None = None
         self._jitter_monitor: TrajectoryJitterMonitor | None = None
         self._jitter_snapshot: dict[str, Any] | None = None
@@ -143,6 +145,11 @@ class DeploymentRunRecorder:
     @property
     def is_active(self) -> bool:
         return bool(self.enabled and self.run_dir is not None and not self._closed)
+
+    def record_servo_tick(self, sample: Mapping[str, Any]) -> None:
+        """Queue actual high-rate actuator samples independently of camera ticks."""
+        if self.is_active:
+            self._enqueue(("servo", _json_safe(sample)))
 
     def start(self, metadata: Mapping[str, Any] | None = None) -> Path | None:
         """Start a new run and return its directory, or ``None`` when disabled."""
@@ -196,8 +203,12 @@ class DeploymentRunRecorder:
         self._jitter_file = (run_dir / "trajectory_jitter.jsonl").open(
             "w", encoding="utf-8", buffering=64 * 1024
         )
+        servo_config = (self._metadata.get("runtime_configuration") or {}).get("servo") or {}
+        self._servo_hz = float(servo_config["hz"]) if servo_config.get("backend") == "ruckig" else None
+        self._servo_file = (run_dir / "servo_commands.jsonl").open("w", encoding="utf-8")
+        self._metadata["servo_command_stream"] = "servo_commands.jsonl"
         self._jitter_monitor = TrajectoryJitterMonitor(
-            float(self._metadata.get("control_hz", 20.0))
+            self._servo_hz or float(self._metadata.get("control_hz", 20.0))
         )
         self._jitter_snapshot = self._jitter_monitor.summary()
         self._model_jitter_monitor = None
@@ -261,6 +272,7 @@ class DeploymentRunRecorder:
         command_hold: bool = False,
         execution_state: str | None = None,
         blocked_reason: str | None = None,
+        pose_diagnostics: Mapping[str, Any] | None = None,
     ) -> None:
         """Record measured state and command outcome for one control tick."""
         if not self.is_active:
@@ -309,6 +321,10 @@ class DeploymentRunRecorder:
             "execution_state": "" if execution_state is None else str(execution_state),
             "blocked_reason": "" if blocked_reason is None else str(blocked_reason)[:500],
         }
+        if pose_diagnostics:
+            # JSONL retains nested pose/IK diagnostics independently of the
+            # optional monitoring stream. Numeric trajectory NPZ stays stable.
+            row["pose_diagnostics"] = _json_safe(pose_diagnostics)
         self._trajectory_rows.append(row)
         if len(self._trajectory_rows) >= self._trajectory_chunk_size:
             # Compression must stay off the 20 Hz robot control thread.
@@ -395,6 +411,13 @@ class DeploymentRunRecorder:
             "raw_delivery_state": _as_finite_array(getattr(launch, "raw_delivery_state")),
             "qpos": _as_finite_array(getattr(launch, "qpos_m")),
         }
+        snapshot = getattr(launch, "observation_snapshot", None)
+        rtc_request = dict(getattr(snapshot, "rtc_metadata", {}) or {})
+        planned_prefix = rtc_request.pop("planned_prefix", None)
+        if planned_prefix is not None:
+            arrays["planned_prefix_actions"] = np.asarray(planned_prefix["actions"], dtype=np.float64)
+            arrays["planned_prefix_offsets_s"] = np.asarray(planned_prefix["sample_offsets_s"], dtype=np.float64)
+            rtc_request["plan_id"] = planned_prefix["plan_id"]
         payload = {
             "sequence": sequence,
             "generation": generation,
@@ -410,6 +433,7 @@ class DeploymentRunRecorder:
             "accepted": None if accepted is None else bool(accepted),
             "rejection": _json_safe(rejection),
             "error": None if error is None else str(error),
+            "rtc_request": _json_safe(rtc_request),
             "protocol": _json_safe({
                 "schema": getattr(protocol, "schema", None),
                 "arm_mode": getattr(protocol, "arm_mode", None),
@@ -424,7 +448,7 @@ class DeploymentRunRecorder:
             }),
         }
         if result is not None:
-            for key in ("model_phase_timing", "execution_control", "transport_timing", "_client_transport_timing"):
+            for key in ("model_phase_timing", "execution_control", "transport_timing", "_client_transport_timing", "rtc"):
                 if key in result:
                     payload[key] = _json_safe(result[key])
         self._enqueue(("model", payload, arrays))
@@ -480,13 +504,14 @@ class DeploymentRunRecorder:
             }
         )
         self._write_metadata()
-        for stream in (self._trajectory_file, self._model_file, self._video_index_file, self._jitter_file):
+        for stream in (self._trajectory_file, self._model_file, self._video_index_file, self._jitter_file, self._servo_file):
             if stream is not None:
                 stream.close()
         self._trajectory_file = None
         self._model_file = None
         self._video_index_file = None
         self._jitter_file = None
+        self._servo_file = None
         self._queue = None
         self._worker = None
         self._video_queue = None
@@ -647,8 +672,11 @@ class DeploymentRunRecorder:
                 if event is _STOP:
                     return
                 kind = event[0]
-                if kind == "control":
-                    self._observe_jitter(event[1])
+                if kind == "servo":
+                    self._write_servo_sample(event[1])
+                elif kind == "control":
+                    if self._servo_hz is None:
+                        self._observe_jitter(event[1])
                     self._write_control_json(event[1])
                 elif kind == "trajectory_chunk":
                     self._write_trajectory_chunk(event[1])
@@ -684,6 +712,21 @@ class DeploymentRunRecorder:
             for key, value in row.items()
         }
         self._trajectory_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _write_servo_sample(self, sample: Mapping[str, Any]) -> None:
+        if self._servo_file is not None:
+            self._servo_file.write(json.dumps(sample, ensure_ascii=False) + "\n")
+        context = sample.get("context") or {}
+        # Queue indexes here count actuator samples, not 20 Hz policy rows.
+        # This preserves consecutive differences within each generation.
+        self._observe_jitter({
+            "command_joints_rad": np.array([value for index, value in enumerate(sample["qpos"])
+                                            if index % 7 != 6]),
+            "command_monotonic_timestamp": sample["monotonic_timestamp"],
+            "command_sent": True, "command_generation": context.get("generation", -1),
+            "command_queue_index": sample["sequence"],
+            "command_hold": sample["braking"], "timestamp": sample["timestamp"],
+        })
 
     def _observe_jitter(self, row: Mapping[str, Any]) -> None:
         monitor = self._jitter_monitor

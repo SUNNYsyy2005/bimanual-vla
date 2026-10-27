@@ -42,9 +42,15 @@ class ChunkPlanRejected(ServoError):
 @dataclass(frozen=True)
 class ServoConfig:
     hz: float = 100.0
-    max_velocity: float = 0.60
-    max_acceleration: float = 3.0
-    max_jerk: float = 20.0
+    # The previous 0.60/3.0/20 defaults were tuned for the slower ``fix``
+    # collection.  The current bimanual dataset has a 1.19 rad/s velocity
+    # P95 and an 8.73 rad/s² acceleration P95, so those defaults made the
+    # planner permanently lag the recorded/policy trajectory.  These remain
+    # software ceilings; the queried Piper driver limit and feedback guards
+    # still cap what can be published.
+    max_velocity: float = 1.20
+    max_acceleration: float = 8.0
+    max_jerk: float = 60.0
     max_tracking_error: float = 0.35
     target_timeout_s: float = 0.15
     max_gripper_velocity: float = 0.08
@@ -176,12 +182,31 @@ class RuckigJointPlanner:
             raise ServoError("invalid servo terminal velocity")
         # Avoid a nonzero terminal speed towards a nearby mechanical stop.
         distance = np.minimum(target - self.lower, self.upper - target)
+        # Keep the endpoint approach envelope conservative even when the
+        # normal trajectory limits are raised for the new dataset.  A target
+        # close to a hard stop must never arrive with a speed that leaves no
+        # numerical/driver margin; the older 3 rad/s² and 20 rad/s³ envelope
+        # is used only for this terminal-speed calculation.
+        stop_acceleration = min(self.config.max_acceleration, 3.0)
+        stop_jerk = min(self.config.max_jerk, 20.0)
         braking_speed = np.minimum(
-            np.sqrt(np.maximum(0.0, 2 * self.config.max_acceleration * distance)),
-            np.cbrt(np.maximum(0.0, self.config.max_jerk * distance**2)),
+            np.sqrt(np.maximum(0.0, 2 * stop_acceleration * distance)),
+            np.cbrt(np.maximum(0.0, stop_jerk * distance**2)),
         )
         limit = np.minimum(self.config.max_velocity, braking_speed)
+        # If the current state is already on a mechanical boundary, require a
+        # stopped endpoint for a short nearby move.  This prevents Ruckig from
+        # choosing a nonzero terminal speed that can first overshoot the stop
+        # during its synchronized initial segment.
+        at_boundary = ((self.position <= self.lower + JOINT_POSITION_NUMERICAL_TOLERANCE_RAD)
+                       | (self.position >= self.upper - JOINT_POSITION_NUMERICAL_TOLERANCE_RAD))
+        limit = np.where(at_boundary & (distance < 0.05), 0.0, limit)
         terminal_velocity = np.clip(terminal_velocity, -limit, limit)
+        # A previous short-bridge fallback may have lowered the Ruckig input
+        # limits. Restore the configured limits for every fresh target.
+        self.input.max_velocity = [self.config.max_velocity] * len(target)
+        self.input.max_acceleration = [self.config.max_acceleration] * len(target)
+        self.input.max_jerk = [self.config.max_jerk] * len(target)
         self.input.control_interface = self._ruckig.ControlInterface.Position
         self.input.target_position = target.tolist()
         self.input.target_velocity = terminal_velocity.tolist()
@@ -191,11 +216,34 @@ class RuckigJointPlanner:
         # Check analytic extrema before publishing any part of the new plan.
         try:
             self._checked_trajectory = self._check_planned_bounds()
-        except ServoError:
-            if not np.any(terminal_velocity):
-                raise
-            self.input.target_velocity = [0.0] * len(target)
-            self._checked_trajectory = self._check_planned_bounds()
+        except ServoError as first_error:
+            if np.any(terminal_velocity):
+                self.input.target_velocity = [0.0] * len(target)
+                try:
+                    self._checked_trajectory = self._check_planned_bounds()
+                except ServoError:
+                    pass
+                else:
+                    self.target = target.copy()
+                    self.braking = False
+                    return
+            # A high acceleration limit can make a very short retarget
+            # interval numerically infeasible for Ruckig while the previous
+            # state is still braking. Retry that local bridge with the former
+            # conservative limits; the normal limits are restored at the next
+            # retarget. This avoids dropping an otherwise valid chunk solely
+            # because of a discrete-time splice.
+            original_limits = (
+                self.input.max_velocity[:], self.input.max_acceleration[:], self.input.max_jerk[:]
+            )
+            self.input.max_velocity = [min(self.config.max_velocity, 0.60)] * len(target)
+            self.input.max_acceleration = [min(self.config.max_acceleration, 3.0)] * len(target)
+            self.input.max_jerk = [min(self.config.max_jerk, 20.0)] * len(target)
+            try:
+                self._checked_trajectory = self._check_planned_bounds()
+            except ServoError:
+                self.input.max_velocity, self.input.max_acceleration, self.input.max_jerk = original_limits
+                raise first_error
         self.target = target.copy()
         self.braking = False
 
@@ -359,7 +407,7 @@ class ServoLoop:
     def install_chunk(self, targets, target_times, source_indices, *, generation: int) -> None:
         """Compile first, then join on the actual clock without a duration forecast."""
         from .chunk_planner import ChunkPlan, compile_chunk, splice_ready_chunk
-        from bimanual_vla.data.contract import GRIPPER_MAX_M
+        from .gripper_limits import GRIPPER_MAX_M
         with self._condition:
             snapshot = self._chunk_start(time.monotonic())
             if self._plan is not None and self._plan.generation == generation:
@@ -523,7 +571,8 @@ class ServoLoop:
         self._prefix_reservations.clear()
 
     def submit(self, target: np.ndarray, *, hold: bool = False,
-               context: dict[str, Any] | None = None) -> dict[str, Any]:
+               context: dict[str, Any] | None = None,
+               discard_chunk: bool = False) -> dict[str, Any]:
         target = np.asarray(target, dtype=np.float64)
         if target.shape != self._target.shape or not np.isfinite(target).all():
             raise ServoError("invalid submitted servo reference")
@@ -533,7 +582,10 @@ class ServoLoop:
             if self._paused and self._sample_count and not self._stationary():
                 raise ServoError("moving servo was safety-paused; restart after the robot is stationary")
             now = time.monotonic()
-            if hold:
+            if hold or discard_chunk:
+                # Retain current q/v/a, revoke old RTC promises and install the
+                # replacement reference atomically with respect to publication.
+                # An old timed plan must not swallow a fallback submission.
                 self._invalidate_plan()
             velocity = np.zeros(len(self.joint_indices))
             if (self.config.follow_waypoint_velocity and not hold

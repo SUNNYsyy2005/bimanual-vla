@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import Counter
 import math
 from pathlib import Path
+import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import messagebox, ttk
@@ -27,6 +29,31 @@ from bimanual_vla.data.analysis import (
     trajectory_motion_series,
 )
 from bimanual_vla.data.eef_view import draw_end_effector_trajectory
+
+
+def _deployment_joint_values(measured: np.ndarray) -> np.ndarray:
+    """Drop per-arm gripper columns to match ``command_joints_rad``."""
+    values = np.asarray(measured, dtype=np.float64)
+    if values.ndim != 2:
+        return np.empty((0, 0), dtype=np.float64)
+    if values.shape[1] == 7:
+        return values[:, :6]
+    if values.shape[1] == 14:
+        return np.concatenate((values[:, :6], values[:, 7:13]), axis=1)
+    return values
+
+
+def _deployment_joint_index(index: int, width: int) -> int | None:
+    """Map state-column indices (which include grippers) to motor columns."""
+    if width == 7:
+        return index if 0 <= index < 6 else None
+    if width == 14:
+        if 0 <= index < 6:
+            return index
+        if 7 <= index < 13:
+            return index - 1
+        return None
+    return index if index >= 0 else None
 
 
 MOTION_VIEWS = {
@@ -52,11 +79,50 @@ def available_plot_groups(data: AnalysisData | None) -> dict[str, tuple[str, ...
     """Only offer charts backed by the selected source's recording format."""
     if data is not None and data.kind == "episode":
         return {
-            "Trajectory": ("Position", "Tracking error"),
+            "Trajectory": ("Position", *MOTION_VIEWS, "Tracking error"),
             "Timing": ("Control interval",),
             "End effector": PLOT_GROUPS["End effector"],
         }
     return PLOT_GROUPS
+
+
+def _episode_motion_series(
+    times: np.ndarray,
+    values: np.ndarray,
+    *,
+    order: int,
+    joint_indices: tuple[int, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Differentiate episode joint signals against their recorded timestamps."""
+    if order not in (1, 2) or len(times) != len(values) or len(times) < order + 1:
+        return np.empty(0, dtype=np.float64), np.empty((0, len(joint_indices)), dtype=np.float64)
+
+    dt = np.diff(times)
+    valid_dt = np.isfinite(dt) & (dt > 0)
+    selected = values[:, joint_indices]
+    valid_values = np.isfinite(selected[:-1]) & np.isfinite(selected[1:])
+    velocity = np.full((len(dt), len(joint_indices)), np.nan, dtype=np.float64)
+    valid = valid_values & valid_dt[:, np.newaxis]
+    np.divide(np.diff(selected, axis=0), dt[:, np.newaxis], out=velocity, where=valid)
+    velocity_times = (times[:-1] + times[1:]) / 2.0
+    if order == 1:
+        return velocity_times, velocity
+
+    acceleration_dt = np.diff(velocity_times)
+    valid_acceleration_dt = np.isfinite(acceleration_dt) & (acceleration_dt > 0)
+    acceleration = np.full((len(acceleration_dt), len(joint_indices)), np.nan, dtype=np.float64)
+    valid = (
+        np.isfinite(velocity[:-1])
+        & np.isfinite(velocity[1:])
+        & valid_acceleration_dt[:, np.newaxis]
+    )
+    np.divide(
+        np.diff(velocity, axis=0),
+        acceleration_dt[:, np.newaxis],
+        out=acceleration,
+        where=valid,
+    )
+    return (velocity_times[:-1] + velocity_times[1:]) / 2.0, acceleration
 
 
 def _timing_value_ms(record: dict[str, object], key: str) -> float:
@@ -69,6 +135,33 @@ def _timing_value_ms(record: dict[str, object], key: str) -> float:
     except (TypeError, ValueError, OverflowError):
         return float("nan")
     return value if np.isfinite(value) else float("nan")
+
+
+def _ask_english_yes_no(parent: tk.Misc, title: str, message: str) -> bool:
+    """Show a confirmation dialog with English button labels."""
+    result = {"confirmed": False}
+    dialog = tk.Toplevel(parent)
+    dialog.title(title)
+    dialog.transient(parent)
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    body = ttk.Frame(dialog, padding=16)
+    body.pack(fill="both", expand=True)
+    ttk.Label(body, text=message, justify="left", wraplength=520).pack(anchor="w", fill="x")
+    buttons = ttk.Frame(body)
+    buttons.pack(fill="x", pady=(16, 0))
+    buttons.columnconfigure(0, weight=1)
+
+    def finish(confirmed: bool) -> None:
+        result["confirmed"] = confirmed
+        dialog.grab_release()
+        dialog.destroy()
+
+    ttk.Button(buttons, text="Cancel", command=lambda: finish(False)).grid(row=0, column=1, padx=(0, 8))
+    ttk.Button(buttons, text="Move to trash", command=lambda: finish(True)).grid(row=0, column=2)
+    dialog.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+    parent.wait_window(dialog)
+    return bool(result["confirmed"])
 
 
 class DataProcessPanel(ttk.Frame):
@@ -87,6 +180,8 @@ class DataProcessPanel(ttk.Frame):
         self.displayed_sources: list[Path] = []
         self.data: AnalysisData | None = None
         self.pose_cache: dict[Path, dict[str, np.ndarray]] = {}
+        self._scan_request_id = 0
+        self._load_request_id = 0
         self.start_var = tk.StringVar(value="0.00")
         self.end_var = tk.StringVar(value="0.00")
         self.source_filter_var = tk.StringVar(value="Run")
@@ -122,6 +217,10 @@ class DataProcessPanel(ttk.Frame):
         self.chart_markers: list[tuple[str, np.ndarray, str]] = []
         self.chart_series_x: list[np.ndarray] = []
         self.chart_series_dash_patterns: list[tuple[int, ...] | None] = []
+        self.chart_series_visible: dict[str, bool] = {}
+        self.chart_legend_regions: list[tuple[float, float, float, float, str]] = []
+        self.chart_legend_vars: dict[str, tk.BooleanVar] = {}
+        self.chart_legend_widgets: dict[str, tk.Checkbutton] = {}
         self.eef_yaw = 0.0
         self.eef_pitch = 0.45
         self.eef_zoom = 1.0
@@ -130,6 +229,18 @@ class DataProcessPanel(ttk.Frame):
         self.refresh_sources()
 
     def _build_ui(self) -> None:
+        analysis_style = ttk.Style(self)
+        analysis_style.configure(
+            "Analysis.Treeview",
+            rowheight=38,
+            font=(self.font_name, 10),
+            padding=(4, 3),
+        )
+        analysis_style.configure(
+            "Analysis.Treeview.Heading",
+            font=(self.font_name, 10, "bold"),
+            padding=(6, 9),
+        )
         self.columnconfigure(0, weight=0, minsize=300)
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
@@ -153,7 +264,10 @@ class DataProcessPanel(ttk.Frame):
         source_box.grid(row=1, column=0, sticky="nsew")
         source_box.rowconfigure(0, weight=1)
         source_box.columnconfigure(0, weight=1)
-        self.source_tree = ttk.Treeview(source_box, columns=("kind", "source"), show="headings", height=18)
+        self.source_tree = ttk.Treeview(
+            source_box, columns=("kind", "source"), show="headings", height=18,
+            style="Analysis.Treeview",
+        )
         self.source_tree.heading("kind", text="Type")
         self.source_tree.heading("source", text="Source")
         self.source_tree.column("kind", width=90, minwidth=70, stretch=False)
@@ -166,13 +280,32 @@ class DataProcessPanel(ttk.Frame):
         ttk.Label(left, textvariable=self.status_var, foreground="#68707d", wraplength=300).grid(
             row=2, column=0, sticky="w", pady=(8, 0)
         )
+        ttk.Button(left, text="Move selected data to trash", command=self._delete_selected_source).grid(
+            row=3, column=0, sticky="ew", pady=(8, 0)
+        )
 
         right = ttk.Frame(self)
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(4, weight=1)
-        summary = ttk.LabelFrame(right, text="Summary", padding=10)
+        right.rowconfigure(0, weight=1)
+
+        notebook = ttk.Notebook(right)
+        notebook.grid(row=0, column=0, sticky="nsew")
+
+        overview = ttk.Frame(notebook, padding=(0, 0, 0, 4))
+        overview.columnconfigure(0, weight=1)
+        overview.rowconfigure(1, weight=1)
+        notebook.add(overview, text="Overview")
+
+        charts = ttk.Frame(notebook, padding=(0, 0, 0, 4))
+        charts.columnconfigure(0, weight=1)
+        charts.rowconfigure(2, weight=1)
+        notebook.add(charts, text="Charts")
+
+        summary = ttk.LabelFrame(overview, text="Summary", padding=10)
         summary.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        summary.rowconfigure(0, minsize=58)
+        summary.rowconfigure(1, minsize=58)
         for column in range(4):
             summary.columnconfigure(column, weight=1)
         cards = (
@@ -188,10 +321,21 @@ class DataProcessPanel(ttk.Frame):
             tk.Label(card, text=title, bg="#f7f8fa", fg="#68707d", font=("Liberation Serif", 9), anchor="w").pack(fill="x", padx=8, pady=(6, 1))
             tk.Label(card, textvariable=self.metric_vars[key], bg="#f7f8fa", fg="#202124", font=("Liberation Serif", 10, "bold"), anchor="w").pack(fill="x", padx=8, pady=(0, 6))
 
-        accounting = ttk.LabelFrame(right, text="Actions and chunk metrics", padding=8)
-        accounting.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        overview_body = ttk.Frame(overview)
+        overview_body.grid(row=1, column=0, sticky="nsew")
+        overview_body.columnconfigure(0, weight=3, uniform="overview-column")
+        overview_body.columnconfigure(1, weight=2, uniform="overview-column")
+        overview_body.rowconfigure(0, weight=1)
+
+        accounting = ttk.LabelFrame(overview_body, text="Actions and chunk metrics", padding=8)
+        accounting.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         for column in range(4):
             accounting.columnconfigure(column, weight=1)
+        accounting.columnconfigure(4, weight=0)
+        accounting.rowconfigure(0, minsize=58)
+        accounting.rowconfigure(1, minsize=58)
+        accounting.rowconfigure(2, minsize=32)
+        accounting.rowconfigure(3, weight=1)
         accounting_cards = (
             ("action_rows", "Rows returned by model"),
             ("executed_actions", "Control actions sent"),
@@ -202,7 +346,7 @@ class DataProcessPanel(ttk.Frame):
         for index, (key, title) in enumerate(accounting_cards):
             row, column = divmod(index, 4)
             card = tk.Frame(accounting, bg="#f7f8fa", highlightthickness=1, highlightbackground="#e4e7ec")
-            card.grid(row=row, column=column, sticky="ew", padx=4, pady=3)
+            card.grid(row=row, column=column, sticky="nsew", padx=4, pady=5, ipady=4)
             tk.Label(card, text=title, bg="#f7f8fa", fg="#68707d", font=("Liberation Serif", 9), anchor="w").pack(fill="x", padx=8, pady=(5, 1))
             tk.Label(card, textvariable=self.metric_vars[key], bg="#f7f8fa", fg="#202124", font=("Liberation Serif", 10, "bold"), anchor="w").pack(fill="x", padx=8, pady=(0, 5))
         ttk.Label(
@@ -211,7 +355,8 @@ class DataProcessPanel(ttk.Frame):
             foreground="#68707d",
         ).grid(row=2, column=0, columnspan=4, sticky="w", padx=4, pady=(5, 2))
         self.jitter_tree = ttk.Treeview(
-            accounting, columns=("metric", "model", "sent"), show="headings", height=3
+            accounting, columns=("metric", "model", "sent"), show="headings", height=8,
+            style="Analysis.Treeview",
         )
         for key, title, width in (
             ("metric", "Metric", 240),
@@ -220,10 +365,13 @@ class DataProcessPanel(ttk.Frame):
         ):
             self.jitter_tree.heading(key, text=title)
             self.jitter_tree.column(key, width=width, minwidth=110, stretch=True)
-        self.jitter_tree.grid(row=3, column=0, columnspan=4, sticky="ew", padx=4, pady=(0, 4))
+        self.jitter_tree.grid(row=3, column=0, columnspan=4, sticky="nsew", padx=(4, 0), pady=(0, 4))
+        jitter_scroll = ttk.Scrollbar(accounting, orient="vertical", command=self.jitter_tree.yview)
+        jitter_scroll.grid(row=3, column=4, sticky="ns", padx=(4, 4), pady=(0, 4))
+        self.jitter_tree.configure(yscrollcommand=jitter_scroll.set)
 
-        controls = ttk.LabelFrame(right, text="Analysis range", padding=8)
-        controls.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        controls = ttk.LabelFrame(charts, text="Analysis range", padding=8)
+        controls.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         controls.columnconfigure(1, weight=1)
         controls.columnconfigure(4, weight=1)
         ttk.Label(controls, text="Start").grid(row=0, column=0, sticky="w", padx=(0, 8))
@@ -237,8 +385,8 @@ class DataProcessPanel(ttk.Frame):
         ttk.Button(controls, text="Full range", command=self._full_range).grid(row=0, column=6)
         ttk.Label(controls, textvariable=self.selection_var, foreground="#68707d").grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
 
-        chart_controls = ttk.Frame(right)
-        chart_controls.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        chart_controls = ttk.Frame(charts)
+        chart_controls.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         ttk.Label(chart_controls, text="Group").pack(side="left")
         self.group_selector = ttk.Combobox(
             chart_controls, textvariable=self.group_var, state="readonly",
@@ -259,34 +407,66 @@ class DataProcessPanel(ttk.Frame):
         self.signal_selector.bind("<<ComboboxSelected>>", lambda _event: self._refresh_chart())
         self.reset_3d_button = ttk.Button(chart_controls, text="Reset 3D view", command=self._reset_3d_view)
 
-        self.chart = tk.Canvas(right, background="#ffffff", highlightthickness=1, highlightbackground="#d9dde5")
-        self.chart.grid(row=4, column=0, sticky="nsew")
+        self.chart = tk.Canvas(charts, background="#ffffff", highlightthickness=1, highlightbackground="#d9dde5")
+        self.chart.grid(row=2, column=0, sticky="nsew")
         self.chart.bind("<Configure>", lambda _event: self._draw_chart())
         self.chart.bind("<ButtonPress-1>", self._eef_drag_start)
         self.chart.bind("<B1-Motion>", self._eef_drag_move)
         self.chart.bind("<ButtonRelease-1>", self._eef_drag_end)
+        self.chart.bind("<ButtonRelease-1>", self._chart_legend_click, add="+")
         self.chart.bind("<MouseWheel>", self._eef_mouse_wheel)
         self.chart.bind("<Button-4>", self._eef_mouse_wheel)
         self.chart.bind("<Button-5>", self._eef_mouse_wheel)
+        self.legend_frame = ttk.Frame(charts)
+        self.legend_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        for column in range(3):
+            self.legend_frame.columnconfigure(column, weight=1)
 
-        events = ttk.LabelFrame(right, text="Events in selected range", padding=6)
-        events.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        events = ttk.LabelFrame(overview_body, text="Events in selected range", padding=6)
+        events.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         events.columnconfigure(0, weight=1)
-        self.events_tree = ttk.Treeview(events, columns=("event", "count"), show="headings", height=4)
+        events.rowconfigure(0, weight=1)
+        self.events_tree = ttk.Treeview(
+            events, columns=("event", "count"), show="headings", height=10,
+            style="Analysis.Treeview",
+        )
         self.events_tree.heading("event", text="Event")
         self.events_tree.heading("count", text="Count")
         self.events_tree.column("event", width=520, anchor="w")
         self.events_tree.column("count", width=80, anchor="center", stretch=False)
-        self.events_tree.grid(row=0, column=0, sticky="ew")
+        self.events_tree.grid(row=0, column=0, sticky="nsew")
+        events_scroll = ttk.Scrollbar(events, orient="vertical", command=self.events_tree.yview)
+        events_scroll.grid(row=0, column=1, sticky="ns")
+        self.events_tree.configure(yscrollcommand=events_scroll.set)
 
     def refresh_sources(self) -> None:
         current = self._selected_path()
-        try:
-            self.sources = scan_analysis_sources(self.roots_provider())
-        except Exception as exc:  # keep refresh non-fatal
-            self.sources = []
-            self.status_var.set(f"Unable to scan data: {exc}")
-        self._render_source_tree(current)
+        self._scan_request_id += 1
+        request_id = self._scan_request_id
+        self.status_var.set("Scanning data sources…")
+        roots = tuple(self.roots_provider())
+
+        def scan() -> None:
+            try:
+                sources = scan_analysis_sources(roots)
+                error = None
+            except Exception as exc:  # keep refresh non-fatal
+                sources, error = [], exc
+
+            def finish() -> None:
+                if request_id != self._scan_request_id:
+                    return
+                self.sources = sources
+                if error is not None:
+                    self.status_var.set(f"Unable to scan data: {error}")
+                self._render_source_tree(current)
+
+            try:
+                self.after(0, finish)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=scan, name="data-source-scan", daemon=True).start()
 
     def _render_source_tree(self, current: Path | None = None) -> None:
         if current is None:
@@ -311,6 +491,9 @@ class DataProcessPanel(ttk.Frame):
         if selected_iid is not None:
             self.source_tree.selection_set(selected_iid)
             self.source_tree.focus(selected_iid)
+            selected_path = self.displayed_sources[int(selected_iid)]
+            if self.data is None or self.data.path != selected_path.resolve():
+                self._load_source(selected_path)
         elif self.displayed_sources:
             self.source_tree.selection_set("0")
             self.source_tree.focus("0")
@@ -335,13 +518,37 @@ class DataProcessPanel(ttk.Frame):
             self._load_source(path)
 
     def _load_source(self, path: Path) -> None:
-        try:
-            data = load_analysis_data(path)
-        except Exception as exc:
-            self.data = None
-            self.status_var.set(f"Cannot load {path.name}: {exc}")
-            self._clear_view()
-            return
+        self._load_request_id += 1
+        request_id = self._load_request_id
+        self.data = None
+        self.status_var.set(f"Loading {path.name}…")
+        self._clear_view()
+
+        def load() -> None:
+            try:
+                data = load_analysis_data(path)
+                error = None
+            except Exception as exc:
+                data, error = None, exc
+
+            def finish() -> None:
+                if request_id != self._load_request_id or path not in self.displayed_sources:
+                    return
+                if error is not None:
+                    self.data = None
+                    self.status_var.set(f"Cannot load {path.name}: {error}")
+                    self._clear_view()
+                    return
+                self._apply_loaded_source(data)
+
+            try:
+                self.after(0, finish)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=load, name="analysis-data-load", daemon=True).start()
+
+    def _apply_loaded_source(self, data: AnalysisData) -> None:
         self.data = data
         self.pose_cache.pop(data.path, None)
         self.start_scale.configure(to=max(0.01, data.duration_s))
@@ -354,6 +561,42 @@ class DataProcessPanel(ttk.Frame):
         self.status_var.set(f"Loaded {data.label} · {data.sample_count} samples")
         self.apply_range()
 
+    def _delete_selected_source(self) -> None:
+        path = self._selected_path()
+        if path is None or path not in self.displayed_sources:
+            messagebox.showinfo("Move data to trash", "Select a data source first.", parent=self)
+            return
+        if not _ask_english_yes_no(
+            self,
+            "Move data to trash",
+            f"Move this data source to a recoverable .trash folder?\n\n{path}",
+        ):
+            return
+        try:
+            path = path.resolve(strict=True)
+            if path not in {source.resolve() for source in self.sources}:
+                raise ValueError("Selected path is no longer a recognized data source")
+            trash_root = path.parent / ".trash"
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            trash_dir = trash_root / stamp
+            suffix = 1
+            while trash_dir.exists():
+                trash_dir = trash_root / f"{stamp}-{suffix}"
+                suffix += 1
+            trash_dir.mkdir(parents=True)
+            destination = trash_dir / path.name
+            path.rename(destination)
+        except Exception as exc:
+            messagebox.showerror("Move failed", str(exc), parent=self)
+            return
+        self._load_request_id += 1
+        self._scan_request_id += 1
+        self.data = None
+        self.pose_cache.pop(path, None)
+        self._clear_view()
+        self.status_var.set(f"Moved to {destination}")
+        self.refresh_sources()
+
     def _clear_view(self) -> None:
         for variable in self.metric_vars.values():
             variable.set("—")
@@ -362,6 +605,9 @@ class DataProcessPanel(ttk.Frame):
         self.chart_x = np.array([], dtype=np.float64)
         self.chart_markers = []
         self.chart_series_x = []
+        self.chart_series_visible = {}
+        self.chart_legend_regions = []
+        self._render_chart_legend()
         if self.chart is not None:
             self.chart.delete("all")
         for item in self.events_tree.get_children():
@@ -491,6 +737,8 @@ class DataProcessPanel(ttk.Frame):
             self.chart_x = np.array([], dtype=np.float64)
             self.chart_markers = []
             self.chart_series_x = []
+            self.chart_series_visible = {}
+            self._render_chart_legend()
             self._draw_chart()
             return
         start, end = self._selected_indices()
@@ -501,10 +749,75 @@ class DataProcessPanel(ttk.Frame):
             self.chart_x = np.array([], dtype=np.float64)
             self.chart_markers = []
             self.chart_series_x = []
+            self.chart_series_visible = {}
+            self._render_chart_legend()
             self._draw_chart()
             return
         self.chart_series, self.chart_x, self.chart_y_label = self._make_series(start, end)
+        previous = getattr(self, "chart_series_visible", {})
+        self.chart_series_visible = {
+            label: previous.get(label, True)
+            for label, _values, _color in self.chart_series
+        }
+        self._render_chart_legend()
         self._draw_chart()
+
+    def _chart_legend_click(self, event: tk.Event) -> None:
+        """Toggle one plotted series when its legend entry is clicked."""
+        if self.plot_var.get() == "3D trajectory":
+            return
+        x, y = float(event.x), float(event.y)
+        for left, top, right, bottom, label in getattr(self, "chart_legend_regions", []):
+            if left <= x <= right and top <= y <= bottom:
+                visible = getattr(self, "chart_series_visible", {})
+                visible[label] = not visible.get(label, True)
+                self.chart_series_visible = visible
+                self._draw_chart()
+                return
+
+    def _legend_toggle(self, label: str) -> None:
+        """Apply a legend checkbox change and redraw the chart."""
+        variable = self.chart_legend_vars.get(label)
+        if variable is not None:
+            is_visible = bool(variable.get())
+            self.chart_series_visible[label] = is_visible
+            widget = self.chart_legend_widgets.get(label)
+            if widget is not None:
+                color = next((color for name, _values, color in self.chart_series if name == label), "#202124")
+                widget.configure(fg=color if is_visible else "#9aa0a6")
+        self._draw_chart()
+
+    def _render_chart_legend(self) -> None:
+        """Render a spacious, multi-column legend below the plotting area."""
+        if not hasattr(self, "legend_frame"):
+            return
+        for child in self.legend_frame.winfo_children():
+            child.destroy()
+        self.chart_legend_vars = {}
+        self.chart_legend_widgets = {}
+        series = getattr(self, "chart_series", [])
+        if not series:
+            return
+        for index, (label, _values, color) in enumerate(series):
+            variable = tk.BooleanVar(value=self.chart_series_visible.get(label, True))
+            self.chart_legend_vars[label] = variable
+            check = tk.Checkbutton(
+                self.legend_frame,
+                text=label,
+                variable=variable,
+                command=lambda name=label: self._legend_toggle(name),
+                anchor="w",
+                justify="left",
+                padx=4,
+                pady=2,
+                fg=color if variable.get() else "#9aa0a6",
+                activeforeground=color,
+                selectcolor="#ffffff",
+                relief="flat",
+                highlightthickness=0,
+            )
+            check.grid(row=index // 3, column=index % 3, sticky="ew", padx=(0, 12), pady=1)
+            self.chart_legend_widgets[label] = check
 
     def _plot_changed(self) -> None:
         self._update_signal_options()
@@ -567,7 +880,13 @@ class DataProcessPanel(ttk.Frame):
             return
         plot = self.plot_var.get()
         if plot in MOTION_VIEWS:
-            options = ("Joint L2 norm", *motion_joint_names(self.data))
+            if self.data.kind == "episode":
+                options = (
+                    "Joint L2 norm",
+                    *(name for name in self.data.names if "gripper" not in name.lower()),
+                )
+            else:
+                options = ("Joint L2 norm", *motion_joint_names(self.data))
         elif plot in {"Position", "Tracking error"}:
             options = self.data.names or ("No joints",)
         elif plot == "3D trajectory":
@@ -603,6 +922,44 @@ class DataProcessPanel(ttk.Frame):
             ]
         if plot in MOTION_VIEWS:
             order, unit = MOTION_VIEWS[plot]
+            if data.kind == "episode":
+                joint_indices = tuple(
+                    index for index, name in enumerate(data.names[: data.measured.shape[1]])
+                    if "gripper" not in name.lower()
+                )
+                if not joint_indices:
+                    joint_indices = tuple(range(data.measured.shape[1]))
+                if signal == "Joint L2 norm":
+                    selected_index = None
+                else:
+                    try:
+                        selected_index = data.names.index(signal)
+                    except ValueError:
+                        selected_index = joint_indices[0]
+                selected_times = times
+                series = []
+                for label, values, color in (
+                    ("Measured", data.measured[start : end + 1], "#68707d"),
+                    ("Recorded target", data.desired[start : end + 1], "#e76f51"),
+                ):
+                    x, derivatives = _episode_motion_series(
+                        selected_times,
+                        values,
+                        order=order,
+                        joint_indices=joint_indices,
+                    )
+                    if selected_index is None:
+                        curve = np.linalg.norm(derivatives, axis=1)
+                    else:
+                        local_index = joint_indices.index(selected_index) if selected_index in joint_indices else None
+                        if local_index is None:
+                            curve = np.full(len(x), np.nan, dtype=np.float64)
+                        else:
+                            curve = derivatives[:, local_index]
+                    series.append((label, curve, color))
+                    self.chart_series_x.append(x)
+                    self.chart_series_dash_patterns.append(None)
+                return series, np.concatenate(self.chart_series_x), unit
             joints = motion_joint_names(data)
             joint_index = joints.index(signal) if signal in joints else None
             model_x, current_values, older_values, _ = policy_trajectory_series(
@@ -652,13 +1009,33 @@ class DataProcessPanel(ttk.Frame):
         if plot == "Tracking error":
             self.chart_series_x = [times]
             self.chart_series_dash_patterns = [None]
+            if data.kind == "deployment" and data.command_joints_rad.ndim == 2:
+                # ``command_action`` is the queued model target and can be
+                # many steps ahead of feedback.  Use the quantized joint
+                # reference actually published to Piper for tracking error.
+                measured_joints = _deployment_joint_values(measured)
+                sent = data.command_joints_rad[start : end + 1]
+                command_index = _deployment_joint_index(index, measured.shape[1])
+                if command_index is not None and command_index < sent.shape[1] and command_index < measured_joints.shape[1]:
+                    command_names = motion_joint_names(data)
+                    return [(
+                        f"{command_names[command_index]} command - measured",
+                        sent[:, command_index] - measured_joints[:, command_index],
+                        "#7c4dff",
+                    )], times, "command - measured"
             return [(f"{data.names[index]} target - measured", desired[:, index] - measured[:, index], "#7c4dff")], times, "target - measured"
         series = [
             ("Measured", measured[:, index], "#68707d"),
             ("Recorded target", desired[:, index], "#e76f51"),
         ]
-        self.chart_series_x = [times, times]
-        self.chart_series_dash_patterns = [None, None]
+        if data.kind == "deployment" and data.command_joints_rad.ndim == 2:
+            measured_joints = _deployment_joint_values(measured)
+            sent = data.command_joints_rad[start : end + 1]
+            command_index = _deployment_joint_index(index, measured.shape[1])
+            if command_index is not None and command_index < sent.shape[1] and command_index < measured_joints.shape[1]:
+                series.append(("Command sent", sent[:, command_index], "#9c27b0"))
+        self.chart_series_x = [times for _ in series]
+        self.chart_series_dash_patterns = [None for _ in series]
         model_joints = motion_joint_names(data)
         model_joint_index = model_joints.index(signal) if signal in model_joints else None
         if model_joint_index is None and signal_index is not None:
@@ -699,6 +1076,7 @@ class DataProcessPanel(ttk.Frame):
         if canvas is None:
             return
         canvas.delete("all")
+        self.chart_legend_regions = []
         width = max(320, canvas.winfo_width())
         height = max(220, canvas.winfo_height())
         if self.plot_var.get() == "3D trajectory" and self.data is not None:
@@ -722,7 +1100,16 @@ class DataProcessPanel(ttk.Frame):
         if not self.chart_series or not len(self.chart_x):
             canvas.create_text(width // 2, height // 2, text="Select a source to display a chart", fill="#68707d", font=(self.font_name, 11))
             return
-        all_values = np.concatenate([np.asarray(values, dtype=float).reshape(-1) for _, values, _ in self.chart_series])
+        visible = getattr(self, "chart_series_visible", {})
+        visible_series = [
+            (label, values, color)
+            for label, values, color in self.chart_series
+            if visible.get(label, True)
+        ]
+        all_values = np.concatenate([
+            np.asarray(values, dtype=float).reshape(-1)
+            for _, values, _ in (visible_series or self.chart_series)
+        ])
         all_values = all_values[np.isfinite(all_values)]
         if not len(all_values):
             canvas.create_text(width // 2, height // 2, text="No valid values in this range", fill="#68707d", font=(self.font_name, 11))
@@ -752,6 +1139,10 @@ class DataProcessPanel(ttk.Frame):
         canvas.create_text(left, height - 14, text=f"{xmin:.2f}s", fill="#68707d", anchor="w", font=(self.font_name, 8))
         canvas.create_text(width - right, height - 14, text=f"{xmax:.2f}s", fill="#68707d", anchor="e", font=(self.font_name, 8))
         canvas.create_text(10, top, text=self.chart_y_label, fill="#68707d", anchor="nw", font=(self.font_name, 8))
+        if not visible_series:
+            canvas.create_text(width / 2, (top + height - bottom) / 2,
+                               text="All curves are hidden", fill="#68707d",
+                               font=(self.font_name, 11))
         dash_patterns = getattr(self, "chart_series_dash_patterns", [])
         if self.chart_markers:
             for _marker_label, marker_times, color in self.chart_markers:
@@ -763,8 +1154,10 @@ class DataProcessPanel(ttk.Frame):
                 marker_x = left + 8 + index * min(180, max(120, (width - left - right) // 2))
                 canvas.create_line(marker_x, 26, marker_x + 14, 26, fill=color, dash=(4, 3))
                 canvas.create_text(marker_x + 18, 26, text=marker_label, fill="#68707d", anchor="w", font=(self.font_name, 8))
-        legend_x = left + 8
         for series_index, (label, values, color) in enumerate(self.chart_series):
+            is_visible = visible.get(label, True)
+            if not is_visible:
+                continue
             points = []
             values = np.asarray(values, dtype=float)
             series_x = (
@@ -787,9 +1180,6 @@ class DataProcessPanel(ttk.Frame):
                     canvas.create_oval(x_pixel - 2, y_pixel - 2, x_pixel + 2, y_pixel + 2, fill=color, outline=color)
                 if len(points) > 3:
                     canvas.create_line(*points, fill=color, width=1.5, smooth=False)
-                canvas.create_line(legend_x, 10, legend_x + 14, 10, fill=color, width=2)
-                canvas.create_text(legend_x + 18, 10, text=label, fill="#68707d", anchor="w", font=(self.font_name, 8))
-                legend_x += min(145, max(70, len(label) * 7 + 30))
                 continue
             for x_value, y_value in zip(series_x[:limit], values[:limit]):
                 if not np.isfinite(y_value):
@@ -804,7 +1194,3 @@ class DataProcessPanel(ttk.Frame):
             if len(points) > 3:
                 canvas.create_line(*points, fill=color, width=1.5, smooth=False,
                                    dash=dash_pattern or "")
-            canvas.create_line(legend_x, 10, legend_x + 14, 10, fill=color, width=2,
-                               dash=dash_pattern or "")
-            canvas.create_text(legend_x + 18, 10, text=label, fill="#68707d", anchor="w", font=(self.font_name, 8))
-            legend_x += min(145, max(70, len(label) * 7 + 30))

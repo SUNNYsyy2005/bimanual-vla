@@ -1,0 +1,9 @@
+{
+  "profile": "piper_s_v1_8_2_driver_feedback",
+  "firmware": "S-V1.8-2",
+  "observed_at": "2026-10-23T12:16:46+08:00",
+  "source": "Driver angle-limit feedback logged by deployment client; same limits for left and right arms",
+  "units": "degrees",
+  "joint_limits": [[-150,150],[0,180],[-170,0],[-100,100],[-70,70],[-180,180]],
+  "numerical_tolerance_rad": 0.0000001
+}

@@ -58,7 +58,7 @@ function dashboard(remoteFailure = false) {
   for (const name of [
     'fillDatasets', 'fillTrainingExperiments', 'fillBaseModels',
     'fillExecutionTargets', 'fillCheckpoints', 'fillTasks', 'fillTrainingTasks',
-    'fillTransferTasks', 'refreshSelectedLogs', 'fillObservation',
+    'fillTransferTasks', 'refreshSelectedLogs', 'fillObservation', 'loadRemoteCheckpoints',
     'loadDatasetEpisodes', 'loadEvalVideos', 'loadTrainingMetrics',
   ]) context[name] = () => {};
   vm.createContext(context);

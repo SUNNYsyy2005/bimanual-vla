@@ -283,7 +283,7 @@ class DataProcessAnalysisTest(unittest.TestCase):
             self.assertEqual(metrics["model_command_count"], 0)
             self.assertGreater(metrics["action_step_norm"]["p95"], 0.0)
             self.assertEqual(available_plot_groups(data), {
-                "Trajectory": ("Position", "Tracking error"),
+            "Trajectory": ("Position", "Velocity", "Acceleration", "Tracking error"),
                 "Timing": ("Control interval",),
                 "End effector": ("3D trajectory",),
             })

@@ -4,11 +4,22 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import os
 import shlex
 import subprocess
 import time
 from pathlib import Path, PurePosixPath
+
+try:
+    from .dataset_transfer_runner import clean_transport_env
+except ImportError:
+    from dataset_transfer_runner import clean_transport_env
+
+try:
+    from . import eval_video_catalog as catalog
+except ImportError:
+    import eval_video_catalog as catalog
 
 VIDEO_SUFFIXES = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".gif"}
 SSH_OPTS = [
@@ -27,7 +38,7 @@ def q(value: str) -> str:
 
 
 def ssh_capture(host: str, inner: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([*SSH_OPTS, host, inner], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return subprocess.run([*SSH_OPTS, host, inner], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=clean_transport_env())
 
 
 def remote_size(host: str, path: str) -> int:
@@ -46,7 +57,7 @@ def copy_chunk(host: str, remote_path: str, offset: int, length: int, part_path:
         f"skip={offset} count={length} status=none"
     )
     with part_path.open("wb") as output:
-        result = subprocess.run([*SSH_OPTS, host, inner], stdout=output, stderr=subprocess.PIPE)
+        result = subprocess.run([*SSH_OPTS, host, inner], stdout=output, stderr=subprocess.PIPE, env=clean_transport_env())
     if result.returncode != 0:
         stderr = result.stderr.decode(errors="replace")[-4000:]
         raise RuntimeError(f"chunk {index + 1}/{count} failed: {stderr}")
@@ -65,6 +76,8 @@ def main() -> int:
     parser.add_argument("--target-root", required=True)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--parallelism", type=int, default=4)
+    parser.add_argument("--catalog-relative-path")
+    parser.add_argument("--metadata-json")
     args = parser.parse_args()
 
     rel = PurePosixPath(args.relative_path)
@@ -74,8 +87,14 @@ def main() -> int:
         raise SystemExit("unsupported video suffix")
 
     source_path = str(PurePosixPath(args.source_root) / rel)
-    target_root = Path(args.target_root).expanduser().resolve() / args.source_name
-    target_path = target_root / Path(*rel.parts)
+    target_root = Path(args.target_root).expanduser().resolve()
+    if args.catalog_relative_path:
+        canonical = PurePosixPath(args.catalog_relative_path)
+        if canonical.is_absolute() or ".." in canonical.parts or len(canonical.parts) != 8:
+            raise SystemExit("invalid catalog relative path")
+        target_path = target_root / Path(*canonical.parts)
+    else:
+        target_path = target_root / args.source_name / Path(*rel.parts)
     if target_path.exists() and not args.overwrite:
         raise SystemExit(f"target exists; use overwrite: {target_path}")
 
@@ -126,6 +145,10 @@ def main() -> int:
         if tmp_path.stat().st_size != size:
             raise RuntimeError(f"assembled video size mismatch: got {tmp_path.stat().st_size}, expected {size}")
         os.replace(tmp_path, target_path)
+        if args.metadata_json:
+            metadata = json.loads(args.metadata_json)
+            metadata["schema"] = catalog.SCHEMA
+            catalog.atomic_write(catalog.metadata_path(target_path), metadata)
     finally:
         for part in part_paths:
             try:

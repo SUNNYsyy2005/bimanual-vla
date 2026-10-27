@@ -4,6 +4,8 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
+import tkinter as tk
 from types import SimpleNamespace
 
 import numpy as np
@@ -24,9 +26,36 @@ from bimanual_vla.collection.gui import (
     parse_can_link_status,
     save_gui_preferences,
     summarize_dataset_directory,
+    return_pose_matches_inference_config,
 )
 from bimanual_vla.collection.session import SessionState
 from bimanual_vla.data.contract import BIMANUAL, DELIVERY_SCHEMA, JOINT_SCHEMA, SINGLE_ARM
+
+
+class SingleArmDeviceSelectionTest(unittest.TestCase):
+    def test_switching_side_updates_both_arm_and_camera_without_reusing_old_device(self):
+        root = tk.Tcl()
+        gui = CollectorGUI.__new__(CollectorGUI)
+        for name, value in {
+            "arm_mode_var": BIMANUAL, "arm_side_var": "left",
+            "can_var": "previous-arm", "wrist_var": "previous-camera",
+            "left_can_var": "serial:left", "right_can_var": "serial:right",
+            "left_wrist_var": "left-camera", "right_wrist_var": "right-camera",
+        }.items():
+            setattr(gui, name, tk.StringVar(master=root, value=value))
+        gui._sync_single_arm_device_selectors()
+        gui.arm_mode_var.set(SINGLE_ARM)
+        gui._sync_single_arm_device_selectors()
+        self.assertEqual((gui.can_var.get(), gui.wrist_var.get()), ("serial:left", "left-camera"))
+        gui.arm_side_var.set("right")
+        gui._sync_single_arm_device_selectors()
+        self.assertEqual((gui.can_var.get(), gui.wrist_var.get()), ("serial:right", "right-camera"))
+        gui.wrist_var.set("manual-camera")
+        gui._sync_single_arm_device_selectors()
+        self.assertEqual(gui.wrist_var.get(), "manual-camera")
+        gui.arm_side_var.set("left")
+        gui._sync_single_arm_device_selectors()
+        self.assertEqual(gui.wrist_var.get(), "left-camera")
 
 
 class GuiPreferencesTest(unittest.TestCase):
@@ -214,6 +243,43 @@ class CanActivationTest(unittest.TestCase):
 
 
 class InferenceCommandTest(unittest.TestCase):
+    def test_servo_backend_and_clock_reach_client(self):
+        command = self._command(servo_backend="ruckig", servo_hz=125)
+        self.assertEqual(command[command.index("--servo-backend") + 1], "ruckig")
+        self.assertEqual(command[command.index("--servo-hz") + 1], "125.0")
+        self.assertIn("--no-ik-rate-limit", command)
+        disabled = self._command(trajectory_shaping_enabled=False)
+        self.assertEqual(disabled[disabled.index("--servo-backend") + 1], "off")
+        legacy = self._command(servo_backend="legacy")
+        self.assertEqual(legacy[legacy.index("--servo-backend") + 1], "legacy")
+        with self.assertRaises(ValueError):
+            self._command(servo_backend="ruckig", servo_hz=10, control_hz=20)
+
+    def test_single_arm_skips_old_bimanual_pose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "return_pose.json"
+            path.write_text(__import__("json").dumps({
+                "arm_mode": BIMANUAL, "arm_side": "both",
+                "left_can": "can0", "right_can": "can1", "qpos": [0.0] * 14,
+            }), encoding="utf-8")
+            from bimanual_vla.collection.gui import return_pose_matches_inference_config
+            self.assertFalse(return_pose_matches_inference_config(
+                path, arm_mode=SINGLE_ARM, arm_side="right", can="can1",
+                left_can="can0", right_can="can1"))
+
+    def test_matching_single_arm_pose_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "return_pose.json"
+            path.write_text(__import__("json").dumps({
+                "arm_mode": SINGLE_ARM, "arm_side": "right", "can": "can1",
+                "qpos": [0.0] * 7,
+            }), encoding="utf-8")
+            from bimanual_vla.collection.gui import return_pose_matches_inference_config
+            self.assertTrue(return_pose_matches_inference_config(
+                path, arm_mode=SINGLE_ARM, arm_side="right", can="can1",
+                left_can="can0", right_can="can1"))
+
+
     def _command(self, **overrides):
         values = dict(
             python_executable="/env/bin/python",
@@ -244,6 +310,7 @@ class InferenceCommandTest(unittest.TestCase):
         )
         self.assertIn("--allow-execution", command)
         self.assertIn("--rtc-enabled", command)
+        self.assertEqual(command[command.index("--speed-pct") + 1], "100")
         self.assertEqual(command[command.index("--camera-fps") + 1], "30")
         self.assertEqual(command[command.index("--left-can") + 1], "can0")
         self.assertEqual(command[command.index("--right-can") + 1], "can1")
@@ -274,7 +341,7 @@ class InferenceCommandTest(unittest.TestCase):
             rtc_client_blend_enabled=True, rtc_client_blend_steps=4,
         )
         self.assertEqual(rtc_command[rtc_command.index("--blend-steps") + 1], "0")
-        self.assertEqual(rtc_command[rtc_command.index("--rtc-client-blend-steps") + 1], "4")
+        self.assertEqual(rtc_command[rtc_command.index("--rtc-client-blend-steps") + 1], "0")
 
         non_rtc_command = self._command(
             rtc_enabled=False, blend_enabled=True,
@@ -282,6 +349,12 @@ class InferenceCommandTest(unittest.TestCase):
         )
         self.assertEqual(non_rtc_command[non_rtc_command.index("--blend-steps") + 1], "3")
         self.assertEqual(non_rtc_command[non_rtc_command.index("--rtc-client-blend-steps") + 1], "0")
+
+    def test_explicit_rtc_delay_reaches_client(self):
+        command = self._command(rtc_inference_delay_steps=7, rtc_execution_horizon=10)
+        self.assertEqual(command[command.index("--rtc-inference-delay-steps") + 1], "7")
+        with self.assertRaises(ValueError):
+            self._command(rtc_enabled=True, rtc_inference_delay_steps=11, rtc_execution_horizon=10)
 
     def test_trigger_mode_step_and_rates_reach_client_command(self):
         command = self._command(
@@ -550,7 +623,10 @@ class VideoDeviceDisplayTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             camera = Path(directory) / "video-test"
             camera.touch()
-            self.assertEqual(select_video_device("cam_high", camera), str(camera))
+            # A workstation's saved camera identities must not affect this
+            # explicit-selector unit test.
+            with patch("bimanual_vla.collection.camera.Path.home", return_value=Path(directory)):
+                self.assertEqual(select_video_device("cam_high", camera), str(camera))
 
 
 if __name__ == "__main__":

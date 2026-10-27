@@ -206,6 +206,7 @@ except ImportError:  # Keep the OpenPI helper usable while collection code is st
     _piper_action_conventions = None
 
 from bimanual_vla.deployment.rtc_policy import RTCConfig, build_rtc_policy
+from bimanual_vla.training.settings import FinetuningSettings
 
 
 def _convention_value(name: str, default: str) -> str:
@@ -403,6 +404,10 @@ def _checkpoint_has_saved_steps(path: Path) -> bool:
 
 
 def _checkpoint_marker_for_step(checkpoint: Path) -> Path:
+    for ancestor in (checkpoint, *checkpoint.parents):
+        marker = ancestor / "metadata" / "action-contract.json"
+        if (ancestor / "run.json").is_file() and marker.is_file():
+            return marker
     experiment_dir = checkpoint.parent
     return (
         experiment_dir.parent
@@ -678,6 +683,7 @@ def _write_action_convention_marker(config: training_config.TrainConfig) -> Path
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "finetuning": metadata.get("finetuning"),
         "version": ACTION_CONVENTION_MARKER_VERSION,
         "dataset_id": metadata.get("dataset_id"),
         "schema": metadata.get("schema"),
@@ -1571,6 +1577,12 @@ class PiperDataConfig(training_config.DataConfigFactory):
                 f"{self.contract.model_action_convention!r}"
             )
         model_transforms = training_config.ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        if getattr(model_config, "image_resize_mode", "pad") == "stretch":
+            from bimanual_vla.data.image_resize import PreparedImages
+            model_transforms = dataclasses.replace(model_transforms, inputs=[
+                PreparedImages(step.height, step.width) if isinstance(step, transforms.ResizeImages) else step
+                for step in model_transforms.inputs
+            ])
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack,
@@ -1610,13 +1622,43 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
     # Piper 7-D/14-D datasets are padded to 32-D and the training loss is
     # diluted by zero padding, so low scalar loss can still hide poor joint/
     # gripper fitting.
-    model = pi0_config.Pi0Config(
-        pi05=model_variant == "pi05",
-        paligemma_variant="gemma_2b_lora",
-        action_expert_variant="gemma_300m_lora",
-        loss_action_dim=int(contract.model_action_dim),
-    )
+    requested = {key: getattr(args, key, None) for key in FinetuningSettings.__dataclass_fields__}
+    resume = bool(getattr(args, "resume", False) or getattr(args, "resume_checkpoint", None))
+    marker = None
+    if args.command == "serve":
+        marker = _read_action_contract_marker(_checkpoint_marker_for_step(Path(args.checkpoint).expanduser().resolve()))
+    elif resume:
+        source = getattr(args, "resume_checkpoint", None)
+        marker_path = (_checkpoint_marker_for_step(Path(source).expanduser().resolve()) if source else
+                       _action_convention_marker(Path(args.checkpoint_base_dir).expanduser().resolve(),
+                                                 model_variant, contract.arm_mode, args.exp_name))
+        marker = _read_action_contract_marker(marker_path)
+    settings = FinetuningSettings.resolve(requested, (marker or {}).get("finetuning"),
+                                         legacy=args.command == "serve" or resume,
+                                         resume=resume or args.command == "serve")
+    settings.validate_model(model_variant)
     base_checkpoint = Path(args.base_checkpoint).expanduser().resolve()
+    if args.command == "train" and not resume:
+        base_marker = _read_action_contract_marker(_checkpoint_marker_for_step(base_checkpoint))
+        if base_marker:
+            source_settings = FinetuningSettings.resolve({}, base_marker.get("finetuning"), legacy=True)
+            if (settings.action_expert_tuning != source_settings.action_expert_tuning
+                    or settings.llm_lora != source_settings.llm_lora):
+                raise ValueError("initialization checkpoint has a different LoRA architecture; choose a base model "
+                                 "or explicitly merge/convert adapters before changing finetuning partitions")
+    from bimanual_vla.training.openpi_model import PiperPi0Config
+    model = PiperPi0Config(
+        pi05=model_variant == "pi05",
+        paligemma_variant="gemma_2b_lora" if settings.llm_lora else "gemma_2b",
+        action_expert_variant="gemma_300m_lora" if settings.action_expert_tuning == "lora" else "gemma_300m",
+        image_resize_mode=settings.image_resize_mode,
+        loss_action_dim=int(contract.model_action_dim),
+        llm_lora_enabled=settings.llm_lora,
+        train_vision=settings.train_vision,
+        train_llm=settings.train_llm,
+        rtc_training_max_delay=settings.rtc_training_max_delay if settings.rtc_training else 0,
+        rtc_training_delay_weights=settings.rtc_training_delay_weights if settings.rtc_training else None,
+    )
     params_path = base_checkpoint / "params"
     if args.command == "train" and not params_path.exists():
         raise FileNotFoundError(
@@ -1655,6 +1697,8 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
         overwrite=bool(getattr(args, "overwrite", False) or getattr(args, "resume_checkpoint", None)),
         wandb_enabled=getattr(args, "wandb_enabled", False),
         policy_metadata={
+            "finetuning": settings.to_dict(),
+            "image_resize_mode": settings.image_resize_mode,
             "robot_type": "piper_bimanual" if contract.arm_mode == "bimanual" else "piper_single_arm",
             "model_variant": model_variant,
             "base_checkpoint": str(base_checkpoint),
@@ -1702,7 +1746,7 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
             "transport": "openpi_websocket_v1",
             "rtc_supported": bool(getattr(args, "rtc_enabled", False)),
             "rtc_capabilities": {
-                "max_execution_horizon": int(getattr(args, "rtc_execution_horizon", 8)),
+                "max_execution_horizon": int(model.action_horizon),
                 "max_guidance_weight": float(
                     getattr(args, "rtc_max_guidance_weight", 5.0)
                 ),
@@ -3272,7 +3316,14 @@ class PolicyTelemetry:
         self._enqueue_json(self.root / "latest.json", payload)
 
 
-class TelemetryWebsocketPolicyServer(websocket_policy_server.WebsocketPolicyServer):
+class MeasuredWebsocketPolicyServer(websocket_policy_server.WebsocketPolicyServer):
+    async def _handler(self, websocket: Any) -> None:
+        from bimanual_vla.deployment.transport import serve_policy_requests
+
+        await serve_policy_requests(self._policy, self._metadata, websocket)
+
+
+class TelemetryWebsocketPolicyServer(MeasuredWebsocketPolicyServer):
     """Keep the official wire protocol while mirroring client lifecycle events."""
 
     def __init__(self, *args: Any, telemetry: PolicyTelemetry, **kwargs: Any):
@@ -3442,7 +3493,11 @@ def warmup_policy(policy: Any, metadata: dict[str, Any], prompt: str | None) -> 
                 "inference_generation": 2,
                 "previous_chunk_generation": 1,
                 "previous_chunk_offset_steps": 0,
-                "inference_delay_steps": min(6, max(0, len(actions) - 1)),
+                "inference_delay_steps": min(
+                    6, max(0, len(actions) - 1),
+                    int(metadata.get("rtc_execution_horizon", 12)),
+                    int(metadata.get("rtc_training_max_delay") or 8),
+                ),
             },
         }
         guided_started = time.monotonic()
@@ -3469,12 +3524,24 @@ def run_serve(args: argparse.Namespace) -> None:
         default_prompt=args.default_prompt,
     )
     policy_metadata = dict(config.policy_metadata)
+    # OpenPI's JAX NNX module_jit treats keyword arguments as traced values.
+    # Passing ``num_steps`` through ``_sample_kwargs`` therefore turns the
+    # Python validation in the Pi05 sampler into a TracerBoolConversionError.
+    # Keep the CLI option for compatibility and diagnostics, while using the
+    # sampler's compiled default (the same path as the upstream Policy).
+    policy_metadata["denoising_steps"] = int(args.denoising_steps)
     policy_metadata["inference_diagnostics_enabled"] = bool(args.inference_diagnostics)
     if args.inference_diagnostics:
         policy_metadata["policy_instance_id"] = f"{os.getpid()}-{time.time_ns()}"
         policy_metadata["policy_instance_started_at"] = time.time()
     if args.rtc_enabled:
         rtc_backend = "pytorch" if bool(getattr(policy, "_is_pytorch_model", False)) else "jax"
+        training_settings = FinetuningSettings(**policy_metadata["finetuning"])
+        rtc_mode = getattr(args, "rtc_mode", "auto")
+        if rtc_mode == "auto":
+            rtc_mode = "trained" if training_settings.rtc_training else "guided"
+        if rtc_mode == "trained" and not training_settings.rtc_training:
+            raise ValueError("trained RTC requires a checkpoint trained with --rtc-training")
         contract = getattr(getattr(config, "data", None), "contract", None)
         if contract is None:
             raise RuntimeError("RTC requires the resolved Piper dataset contract")
@@ -3489,6 +3556,8 @@ def run_serve(args: argparse.Namespace) -> None:
             reanchor_action_mask = tuple(mask_values)
         rtc_config = RTCConfig(
             enabled=True,
+            mode=rtc_mode,
+            training_max_delay=training_settings.rtc_training_max_delay if training_settings.rtc_training else 0,
             execution_horizon=args.rtc_execution_horizon,
             max_guidance_weight=args.rtc_max_guidance_weight,
             prefix_attention_schedule=args.rtc_prefix_attention_schedule,
@@ -3503,11 +3572,16 @@ def run_serve(args: argparse.Namespace) -> None:
             {
                 "rtc_supported": True,
                 "rtc_capabilities": {
-                    "max_execution_horizon": rtc_config.execution_horizon,
+                    "max_execution_horizon": int(policy_metadata["action_horizon"]),
                     "max_guidance_weight": rtc_config.max_guidance_weight,
                     "prefix_attention_schedules": ["zeros", "ones", "linear", "exp"],
+                    "client_planner_prefix": rtc_mode == "trained" and contract.schema == "joint",
                 },
-                "rtc_algorithm": "real_time_chunking_prefix_guidance",
+                "rtc_mode": rtc_mode,
+                "rtc_execution_horizon": int(args.rtc_execution_horizon),
+                "rtc_training_max_delay": rtc_config.training_max_delay,
+                "rtc_algorithm": ("real_time_chunking_clean_prefix" if rtc_mode == "trained" else
+                                  "real_time_chunking_prefix_guidance"),
                 "rtc_backend": rtc_backend,
                 "rtc_physical_action_dim": rtc_config.physical_action_dim,
                 "rtc_chunk_origin_reanchoring": bool(reanchor_action_mask),
@@ -3522,10 +3596,10 @@ def run_serve(args: argparse.Namespace) -> None:
             "max_guidance_weight": 0.0,
             "prefix_attention_schedules": [],
         }
-    # On a stable gigabit robot LAN, raw CHW avoids JPEG encode/decode CPU
-    # latency.  JPEG remains available as an explicit option for constrained or
-    # congested links where reducing bytes matters more than local CPU time.
-    image_transport = str(getattr(args, "image_transport", "raw")).strip().lower()
+    # Three raw 224x224 RGB frames are roughly 450 KB per request.  JPEG is
+    # the safer default for the observed 4090 client link; raw remains
+    # available explicitly for a benchmark on a genuinely uncongested LAN.
+    image_transport = str(getattr(args, "image_transport", "jpeg_chw_v1")).strip().lower()
     if image_transport not in {"raw", "jpeg_chw_v1"}:
         raise ValueError(f"unsupported image transport: {image_transport!r}")
     policy_metadata["image_transport"] = image_transport
@@ -3549,7 +3623,7 @@ def run_serve(args: argparse.Namespace) -> None:
             telemetry=telemetry,
         )
     else:
-        server = websocket_policy_server.WebsocketPolicyServer(
+        server = MeasuredWebsocketPolicyServer(
             policy=policy,
             host="0.0.0.0",
             port=args.port,
@@ -3563,6 +3637,17 @@ def run_serve(args: argparse.Namespace) -> None:
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--image-resize-mode", choices=("pad", "stretch"), default=None)
+    parser.add_argument("--action-expert-tuning", choices=("full", "lora"), default=None)
+    parser.add_argument("--llm-lora", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--train-vision", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--train-llm", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--rtc-training", action=argparse.BooleanOptionalAction, default=None,
+                        help="train with random clean action prefixes (Pi05)")
+    parser.add_argument("--rtc-training-delay-weights", type=json.loads, default=None,
+                        help="JSON weights for delay 0..max; omitted means uniform")
+    parser.add_argument("--rtc-training-max-delay", type=int, default=None,
+                        help="maximum clean-prefix length in 20 Hz action steps; new-run default 8")
     parser.add_argument("--dataset-id", required=True)
     parser.add_argument("--arm-mode", choices=("auto", "single", "bimanual"), default="auto")
     parser.add_argument("--arm-side", choices=("left", "right", "both"), default="right")
@@ -3667,8 +3752,8 @@ def parse_args() -> argparse.Namespace:
     serve.add_argument(
         "--image-transport",
         choices=("jpeg_chw_v1", "raw"),
-        default="raw",
-        help="observation image transport (raw is lower-latency on a stable LAN)",
+        default="jpeg_chw_v1",
+        help="observation image transport (use raw only on an uncongested LAN)",
     )
     serve.add_argument(
         "--image-jpeg-quality",
@@ -3682,8 +3767,13 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="enable model-side Real-Time Chunking prefix guidance (JAX and PyTorch checkpoints)",
     )
-    serve.add_argument("--rtc-execution-horizon", type=int, default=8)
+    serve.add_argument("--rtc-execution-horizon", type=int, default=12)
+    serve.add_argument(
+        "--denoising-steps", type=int, default=5,
+        help="reported flow-matching denoising steps (JAX sampler default is 5)",
+    )
     serve.add_argument("--rtc-max-guidance-weight", type=float, default=5.0)
+    serve.add_argument("--rtc-mode", choices=("auto", "guided", "trained"), default="auto")
     serve.add_argument(
         "--rtc-prefix-attention-schedule",
         choices=("zeros", "ones", "linear", "exp"),
@@ -3717,6 +3807,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--test-ratio must be in [0, 1)")
     if hasattr(args, "rtc_execution_horizon") and args.rtc_execution_horizon <= 0:
         parser.error("--rtc-execution-horizon must be positive")
+    if hasattr(args, "denoising_steps") and args.denoising_steps <= 0:
+        parser.error("--denoising-steps must be positive")
     if hasattr(args, "rtc_max_guidance_weight") and args.rtc_max_guidance_weight <= 0:
         parser.error("--rtc-max-guidance-weight must be positive")
     if hasattr(args, "image_jpeg_quality") and not 1 <= args.image_jpeg_quality <= 100:

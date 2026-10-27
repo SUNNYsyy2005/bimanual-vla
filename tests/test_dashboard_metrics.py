@@ -863,7 +863,8 @@ class AsyncPolicyDashboardContractTest(unittest.TestCase):
         for marker in ("action_horizon", "action_hz", "action_time_step_s", "action_start_offset_steps", "action_offset", "model_action_start_offset", "--hz 4", "4 Hz", "actual_hz <= 1 / latency_s", "550 ms", "旧 chunk", "动态", "2~4 步", "0.05", "0.18", "0.30"):
             self.assertIn(marker, readme)
         combined = template + "\n" + readme
-        for stale in ("0.015", "0.15", "0.25", "--hz 5", "5 Hz", "选择第4行", "选择第 4 行", "只排队4步", "只排队 4 步", "每次排队", "典型约 4 步", "skip≈4"):
+        self.assertNotRegex(combined, r"(?<![\d.])5 Hz\b")
+        for stale in ("0.015", "0.15", "0.25", "--hz 5", "选择第4行", "选择第 4 行", "只排队4步", "只排队 4 步", "每次排队", "典型约 4 步", "skip≈4"):
             self.assertNotIn(stale, combined)
 
 

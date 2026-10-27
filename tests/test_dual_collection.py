@@ -254,3 +254,16 @@ def test_actual_session_dual_capture_uses_camera_paced_30hz_and_sdk_stamps(tmp_p
         assert data["feedback_timestamp_left_joint"][0] == pytest.approx(100+1/30-.002)
         assert data["joint_state"].shape == (6,7)
     session.disconnect()
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_single_collection_inherits_side_specific_wrist_selector(side):
+    from bimanual_vla.collection.session import CollectionConfig
+    from bimanual_vla.collection.output import _camera_devices
+    config = CollectionConfig(arm_side=side, cam_left_wrist_device="left-camera",
+                              cam_right_wrist_device="right-camera")
+    assert config.camera_devices == {"cam_high": "auto", f"cam_{side}_wrist": f"{side}-camera"}
+    assert _camera_devices(config, EpisodeContract(arm_side=side)) == config.camera_devices
+    override = CollectionConfig(arm_side=side, cam_wrist_device="explicit-camera",
+                                cam_left_wrist_device="left-camera", cam_right_wrist_device="right-camera")
+    assert override.camera_devices[f"cam_{side}_wrist"] == "explicit-camera"

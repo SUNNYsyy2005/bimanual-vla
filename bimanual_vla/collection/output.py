@@ -407,6 +407,7 @@ def reset_robot_arms(
 
 
 def connect(can_name: str) -> Any:
+    """Subscribe to feedback without changing the arm's control mode."""
     if C_PiperInterface_V2 is None:
         raise RuntimeError("piper_sdk is not installed; run this collector in the Piper hardware environment")
     can_name = resolve_can_selector(can_name)
@@ -418,44 +419,13 @@ def connect(can_name: str) -> Any:
         expected_bitrate=1_000_000,
         judge_flag=False,
     )
-    piper.ConnectPort(can_init=True, piper_init=True)
-    time.sleep(0.5)
-
-    # Robustly initialize arm to CAN joint control mode
-    # This ensures the arm is ready for inference/collection without enable timeout
-    max_retries = 10
-    for attempt in range(max_retries):
-        try:
-            # Read current status
-            status_msg = piper.GetArmStatus()
-            if not hasattr(status_msg, 'arm_status'):
-                time.sleep(0.1)
-                continue
-
-            feedback = status_msg.arm_status
-            current_ctrl_mode = int(feedback.ctrl_mode)
-
-            # If already in CAN mode, done
-            if current_ctrl_mode == 0x01:
-                break
-
-            # Send mode control command
-            piper.ModeCtrl(
-                0x01,  # PIPER_CTRL_MODE_CAN
-                0x01,  # PIPER_MOVE_MODE_J (joint mode)
-                10,    # speed_pct
-                0x00,
-            )
-            time.sleep(0.15)
-
-        except Exception as e:
-            # Log but continue retrying
-            if attempt == max_retries - 1:
-                # Last attempt, print warning but don't fail
-                import logging
-                logging.warning(f"Could not set CAN mode for {can_name}: {e}")
-            time.sleep(0.1)
-
+    try:
+        # Feedback is broadcast by the powered arm. Initialization and ModeCtrl
+        # writes are unnecessary for recording and can interrupt teleoperation.
+        piper.ConnectPort(can_init=True, piper_init=False)
+    except BaseException:
+        piper.DisconnectPort()
+        raise
     return piper
 
 
@@ -525,7 +495,11 @@ def _camera_devices(args, contract: EpisodeContract) -> dict[str, str]:
             "cam_right_wrist": args.cam_right_wrist_device,
         }
     wrist_key = contract.camera_keys[1]
-    return {"cam_high": args.cam_high_device, wrist_key: args.cam_wrist_device}
+    wrist_device = args.cam_wrist_device.strip()
+    if wrist_device.lower() == "auto":
+        wrist_device = (args.cam_left_wrist_device if contract.arm_side == "left"
+                        else args.cam_right_wrist_device)
+    return {"cam_high": args.cam_high_device, wrist_key: wrist_device}
 
 
 def run(args) -> None:
@@ -556,7 +530,8 @@ def run(args) -> None:
     cameras = CameraCapture(
         cam_ids=_camera_devices(args, contract),
         fps=args.camera_fps,
-        image_hw=IMAGE_HW,
+        image_hw=(224, 224),
+        resize_mode="stretch",
         capture_hw=CAMERA_SOURCE_HW,
         parallel_reads=True,
     )

@@ -1,0 +1,11 @@
+[Unit]
+Description=Discover new simulation rollout artifacts every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=bimanual-vla-artifact-index.service
+
+[Install]
+WantedBy=timers.target

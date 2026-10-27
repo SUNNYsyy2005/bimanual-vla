@@ -209,6 +209,10 @@ class DeploymentRunRecorderTest(unittest.TestCase):
                 raw_delivery_state=np.arange(10, dtype=np.float32),
                 qpos_m=np.arange(7, dtype=np.float32),
                 image_timestamps={"cam_high": 100.02},
+                observation_snapshot=SimpleNamespace(rtc_metadata={
+                    "prefix_source": "client_planner", "inference_delay_steps": 2,
+                    "planned_prefix": {"plan_id": "2:3", "sample_offsets_s": [.05, .1],
+                                       "actions": np.full((2, 7), .125)}}),
             )
             protocol = SimpleNamespace(
                 schema="joint",
@@ -249,10 +253,13 @@ class DeploymentRunRecorderTest(unittest.TestCase):
             ]
             self.assertEqual(len(command_records), 1)
             self.assertFalse(command_records[0]["accepted"])
+            self.assertEqual(command_records[0]["rtc_request"]["plan_id"], "2:3")
             command_file = run_dir / command_records[0]["action_file"]
             self.assertTrue(command_file.exists())
             with np.load(command_file) as command_data:
                 self.assertEqual(command_data["raw_actions"].shape, (2, 7))
+                np.testing.assert_array_equal(command_data["planned_prefix_actions"], np.full((2, 7), .125))
+                np.testing.assert_array_equal(command_data["planned_prefix_offsets_s"], [.05, .1])
 
             video_index = (run_dir / "videos" / "timestamps.jsonl").read_text().splitlines()
             self.assertEqual(len(video_index), 1)

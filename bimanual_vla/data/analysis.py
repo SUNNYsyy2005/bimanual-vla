@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -60,6 +61,18 @@ def _finite_vector(value: Any, width: int) -> np.ndarray:
     if array.ndim != 2 or array.shape[1] != width:
         return np.full((len(array), width), np.nan, dtype=np.float64)
     return array
+
+
+def _deployment_joint_values(measured: np.ndarray) -> np.ndarray:
+    """Drop per-arm gripper columns to match recorded motor commands."""
+    values = np.asarray(measured, dtype=np.float64)
+    if values.ndim != 2:
+        return np.empty((0, 0), dtype=np.float64)
+    if values.shape[1] == 7:
+        return values[:, :6]
+    if values.shape[1] == 14:
+        return np.concatenate((values[:, :6], values[:, 7:13]), axis=1)
+    return values
 
 
 def _names(value: Any, width: int) -> tuple[str, ...]:
@@ -378,6 +391,8 @@ def scan_analysis_sources(roots: Iterable[str | Path]) -> list[Path]:
     found: set[Path] = set()
     for raw_root in roots:
         root = Path(raw_root).expanduser()
+        if ".trash" in root.parts:
+            continue
         if root.is_file() and root.suffix.lower() == ".npz":
             found.add(root.resolve())
             continue
@@ -386,12 +401,14 @@ def scan_analysis_sources(roots: Iterable[str | Path]) -> list[Path]:
         if (root / "trajectory.npz").is_file():
             found.add(root.resolve())
             continue
-        for trajectory in root.rglob("trajectory.npz"):
-            if trajectory.parent.is_dir():
-                found.add(trajectory.parent.resolve())
-        for episode in root.rglob("ep_*.npz"):
-            if episode.is_file() and "model_commands" not in episode.parts:
-                found.add(episode.resolve())
+        for directory, dirnames, filenames in os.walk(root):
+            dirnames[:] = [name for name in dirnames if name not in {".trash", "model_commands"}]
+            current = Path(directory)
+            if "trajectory.npz" in filenames:
+                found.add(current.resolve())
+            for filename in filenames:
+                if filename.startswith("ep_") and filename.endswith(".npz"):
+                    found.add((current / filename).resolve())
     return sorted(found, key=lambda value: str(value))
 
 
@@ -606,6 +623,9 @@ def _analysis_spike_horizon_steps(
         record.get("execution_control"),
         record.get("_client_transport_timing"),
         record.get("transport_timing"),
+        (data.metadata.get("runtime_configuration") or {}).get("rtc")
+        if isinstance(data.metadata.get("runtime_configuration"), dict)
+        else None,
         data.metadata,
     )
     for source in candidates:
@@ -663,12 +683,22 @@ def _smoothed_model_chunk_joints(
     skip = min(_analysis_skipped_prefix(record), len(values))
     if len(values) - skip < 5:
         return values.copy()
+    runtime = data.metadata.get("runtime_configuration")
+    suppression = runtime.get("trajectory_spike_suppression") if isinstance(runtime, dict) else None
+    if not isinstance(suppression, dict):
+        suppression = {}
+    elif suppression.get("enabled") is False:
+        return values.copy()
     output = values.copy()
     output[skip:] = suppress_local_joint_spikes(
         output[skip:].astype(np.float32),
         action_hz=float(action_hz),
         horizon_steps=_analysis_spike_horizon_steps(data, record),
         joint_indices=range(output.shape[1]),
+        accel_floor_rad_s2=float(suppression.get("accel_floor_rad_s2", 1.2)),
+        outlier_sigma=float(suppression.get("outlier_sigma", 1.5)),
+        max_correction_rad=float(suppression.get("max_correction_rad", 0.03)),
+        passes=int(suppression.get("passes", 2)),
     ).astype(np.float64)
     return output
 
@@ -703,32 +733,53 @@ def policy_trajectory_series(
             return np.full(len(values), np.nan)
         return values[:, joint_index]
 
-    records: list[tuple[float, int, float, np.ndarray]] = []
+    records: list[tuple[float, float, int, float, np.ndarray]] = []
     for record in data.command_records:
         if record.get("accepted") is not True:
             continue
         try:
             arrived = float(record.get("arrived_at") or record.get("captured_at"))
+            captured = float(record.get("captured_at") or arrived)
             generation = int(record.get("generation"))
             protocol = record.get("protocol") or {}
             hz = float(protocol.get("action_hz") or data.metadata.get("control_hz") or 0.0)
         except (TypeError, ValueError, OverflowError):
             continue
-        if not np.isfinite(arrived) or not np.isfinite(hz) or hz <= 0:
+        if not np.isfinite(arrived) or not np.isfinite(captured) or not np.isfinite(hz) or hz <= 0:
             continue
         joints = _model_chunk_joints(data, record)
         if joints is not None:
             if smoothed:
                 joints = _smoothed_model_chunk_joints(data, record, joints, hz)
-            records.append((arrived, generation, hz, joints))
+            # A model row is a forecast from the captured observation.  The
+            # first row is the next action sample. Response arrival is a
+            # separate event; it must not shift the forecast's time axis.
+            policy_protocol = data.metadata.get("policy_protocol") or {}
+            try:
+                start_offset = int(
+                    protocol.get(
+                        "model_action_start_offset",
+                        protocol.get(
+                            "action_start_offset_steps",
+                            policy_protocol.get("model_action_start_offset",
+                                policy_protocol.get("action_start_offset_steps",
+                                    data.metadata.get("model_action_start_offset", 1))),
+                        ),
+                    )
+                )
+            except (TypeError, ValueError, OverflowError):
+                start_offset = 1
+            start_offset = max(0, start_offset)
+            forecast_start = captured + start_offset / hz
+            records.append((arrived, forecast_start, generation, hz, joints))
     records.sort(key=lambda item: item[0])
 
     previous_generation: int | None = None
-    for chunk_index, (arrived, generation, hz, joints) in enumerate(records):
+    for chunk_index, (arrived, forecast_start, generation, hz, joints) in enumerate(records):
         if previous_generation is not None and generation != previous_generation and start_at <= arrived <= end_at:
             switches.append(arrived - origin)
         previous_generation = generation
-        if arrived > end_at or arrived + (len(joints) - 1) / hz < start_at:
+        if forecast_start > end_at or forecast_start + (len(joints) - 1) / hz < start_at:
             continue
         values = joints
         if order == 1:
@@ -739,7 +790,7 @@ def policy_trajectory_series(
             values = np.full(joints.shape, np.nan, dtype=np.float64)
             if len(joints) > 2:
                 values[2:] = np.diff(joints, n=2, axis=0) * hz * hz
-        chunk_time = arrived + np.arange(len(joints)) / hz
+        chunk_time = forecast_start + np.arange(len(joints)) / hz
         selected = (chunk_time >= start_at) & (chunk_time <= end_at)
         if not np.any(selected):
             continue
@@ -859,6 +910,26 @@ def compute_metrics(data: AnalysisData, start_index: int = 0, end_index: int | N
     qpos_delta = np.linalg.norm(np.diff(measured, axis=0), axis=1) if len(measured) > 1 else []
     error = desired[valid_desired] - measured[valid_desired]
     error_norm = np.linalg.norm(error, axis=1) if len(error) else []
+    # Deployment ``command_action`` is the queued future model target.  For
+    # actuator tracking, compare the quantized motor command published on this
+    # tick with the feedback from the same tick instead of reporting forecast
+    # lead as a motor error.
+    command_error_norm = error_norm
+    if (data.kind == "deployment" and data.command_joints_rad.ndim == 2
+            and len(data.command_joints_rad) == len(measured)
+            and data.command_joints_rad.shape[1] > 0):
+        measured_joints = _deployment_joint_values(measured)
+        sent = data.command_joints_rad[sl]
+        valid_command = (
+            data.command_sent[sl]
+            & ~data.command_hold[sl]
+            & np.isfinite(sent).all(axis=1)
+            & np.isfinite(measured_joints).all(axis=1)
+        )
+        if np.any(valid_command):
+            command_error_norm = np.linalg.norm(
+                sent[valid_command] - measured_joints[valid_command], axis=1
+            )
     blocked = Counter(reason for reason in data.blocked_reasons[sl] if reason)
     states = Counter(state for state in data.execution_states[sl] if state)
     commands = [
@@ -917,6 +988,7 @@ def compute_metrics(data: AnalysisData, start_index: int = 0, end_index: int | N
         "action_step_norm": _stat(action_delta),
         "qpos_step_norm": _stat(qpos_delta),
         "action_error_norm": _stat(error_norm),
+        "command_tracking_error_norm": _stat(command_error_norm),
     }
 
 

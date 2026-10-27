@@ -692,7 +692,7 @@ def _as_contract_image(image: np.ndarray, name: str) -> np.ndarray:
     if frame.shape in {(3, *IMAGE_HW), (3, 224, 224)}:
         frame = frame.transpose(1, 2, 0)
     if frame.shape not in {(*IMAGE_HW, 3), (224, 224, 3)}:
-        raise ValueError(f"{name} must have RGB shape (224,224,3) or {(*IMAGE_HW, 3)}, got {frame.shape}")
+        raise ValueError(f"{name} must have RGB shape (224,224,3) or legacy {(*IMAGE_HW, 3)}, got {frame.shape}")
     if frame.dtype != np.uint8:
         raise ValueError(f"{name} must have dtype uint8, got {frame.dtype}")
     return frame.copy()

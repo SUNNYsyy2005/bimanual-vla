@@ -19,6 +19,7 @@ import re
 import subprocess
 import time
 import logging
+import json
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from typing import Callable
@@ -238,6 +239,8 @@ def _existing_configured_device(
         numeric_device = device_root / f"video{int(configured_device)}"
         return int(configured_device) if numeric_device.exists() else None
     configured_text = str(configured_device).strip()
+    if configured_text.startswith('serial:'):
+        return _serial_rgb_device(configured_text[7:], device_root=device_root)
     if configured_text.lower() == "auto":
         return None
     candidate = Path(configured_text).expanduser()
@@ -252,12 +255,58 @@ def _concrete_video_device(device: object, *, device_root: Path) -> Path:
     return candidate.resolve(strict=False)
 
 
+def _physical_video_device(device: Path) -> Path:
+    """Group all V4L2 interfaces under their actual USB device, not serial label."""
+    concrete = device.resolve(strict=False)
+    if concrete.parent == Path('/dev'):
+        node = Path('/sys/class/video4linux') / concrete.name / 'device'
+        if node.exists():
+            for parent in node.resolve().parents:
+                if (parent / 'idVendor').is_file() and (parent / 'idProduct').is_file():
+                    return parent
+    return concrete
+
+
+def _realsense_serial_devices() -> dict[str, Path]:
+    """SDK serials differ from USB descriptor serials on D405 units."""
+    try:
+        import pyrealsense2 as rs
+    except ImportError:
+        return {}
+    result = {}
+    for device in rs.context().query_devices():
+        port = Path(device.get_info(rs.camera_info.physical_port))
+        for parent in (port, *port.parents):
+            if (parent / 'idVendor').is_file() and (parent / 'idProduct').is_file():
+                result[device.get_info(rs.camera_info.serial_number)] = parent
+                break
+    return result
+
+
+def _serial_rgb_device(serial: str, *, device_root: Path = Path('/dev')) -> str:
+    """Resolve a hardware serial to its best RGB node; never fall back to another camera."""
+    matches = []
+    sdk_device = _realsense_serial_devices().get(serial) if device_root == Path('/dev') else None
+    for candidate in _enumerate_video_candidates(device_root=device_root):
+        physical = _physical_video_device(candidate.device)
+        serial_file = physical / 'serial'
+        if physical == sdk_device or (serial_file.is_file() and serial_file.read_text().strip() == serial):
+            # D405 exposes UYVY on an auxiliary stream as well. Its primary
+            # colour stream advertises YUYV (35), ahead of auxiliary UYVY (10).
+            if candidate.format_score >= 35:
+                matches.append(candidate)
+    if not matches:
+        raise RuntimeError(f'No RGB camera found for serial:{serial}; refusing camera substitution')
+    matches.sort(key=lambda c: (-c.format_score, c.index))
+    return _stable_video_selector(matches[0].device)
+
+
 def select_video_devices(
     configured_devices: dict[str, object],
     *,
     device_root: Path = Path("/dev"),
 ) -> dict[str, object]:
-    """Resolve all camera roles together without assigning one node twice.
+    """Resolve camera roles without assigning one physical USB camera twice.
 
     Valid explicit selectors take priority. Missing, stale, or ``auto`` values
     are filled from colour-capable nodes matching the expected camera model.
@@ -267,7 +316,13 @@ def select_video_devices(
     used_devices: dict[Path, str] = {}
     pending: list[str] = []
 
+    bindings_path = Path.home() / '.config/bimanual-vla/camera_serials.json'
+    bindings = json.loads(bindings_path.read_text()) if device_root == Path('/dev') and bindings_path.is_file() else {}
+
     for camera_key, configured_device in configured_devices.items():
+        if camera_key in bindings:
+            # A saved identity supersedes old GUI video paths after replugging.
+            configured_device = 'serial:' + str(bindings[camera_key])
         explicit = _existing_configured_device(
             configured_device,
             device_root=device_root,
@@ -276,21 +331,42 @@ def select_video_devices(
             pending.append(camera_key)
             continue
         concrete = _concrete_video_device(explicit, device_root=device_root)
-        previous_role = used_devices.get(concrete)
+        physical = _physical_video_device(concrete)
+        previous_role = used_devices.get(physical)
         if previous_role is not None:
             raise RuntimeError(
-                f"Camera roles {previous_role} and {camera_key} both select {concrete}. "
+                f"Camera roles {previous_role} and {camera_key} select the same physical camera {physical} ({concrete}). "
                 "Choose distinct devices or set both selectors to 'auto'."
             )
         selected[camera_key] = explicit
-        used_devices[concrete] = camera_key
+        used_devices[physical] = camera_key
 
     candidates = _enumerate_video_candidates(device_root=device_root) if pending else []
-    for camera_key in pending:
+    allocation_roles = list(pending)
+    wrist_roles = ("cam_left_wrist", "cam_right_wrist")
+    # Allocate a canonical pair even when only one wrist is requested. Otherwise
+    # single-right picks the first D405 while bimanual-right picks the second.
+    # A rig with only one wrist camera still uses its sole available camera.
+    if any(role in pending for role in wrist_roles):
+        wrist_candidates = _matching_video_candidates("cam_left_wrist", candidates)
+        if len({_physical_video_device(c.device) for c in wrist_candidates}) >= 2:
+            allocation_roles.extend(role for role in wrist_roles if role not in configured_devices)
+
+    def allocation_order(role: str) -> tuple[int, str]:
+        # Reserve a known physical placement before assigning an unhinted role.
+        hints = CAMERA_ROLE_PATH_HINTS.get(role, ())
+        preferred = any(
+            hint in _stable_video_selector(candidate.device)
+            for candidate in _matching_video_candidates(role, candidates)
+            for hint in hints
+        )
+        return (0 if preferred else 1, role)
+
+    for camera_key in sorted(allocation_roles, key=allocation_order):
         available = [
             candidate
             for candidate in _matching_video_candidates(camera_key, candidates)
-            if candidate.device.resolve(strict=False) not in used_devices
+            if _physical_video_device(candidate.device) not in used_devices
         ]
         if not available:
             expected = " / ".join(CAMERA_MODEL_HINTS.get(camera_key, (camera_key,)))
@@ -301,9 +377,9 @@ def select_video_devices(
             )
         candidate = available[0]
         selected[camera_key] = _stable_video_selector(candidate.device)
-        used_devices[candidate.device.resolve(strict=False)] = camera_key
+        used_devices[_physical_video_device(candidate.device)] = camera_key
 
-    return selected
+    return {key: selected[key] for key in configured_devices}
 
 
 def select_video_device(camera_key: str, configured_device: object) -> object:
@@ -347,7 +423,7 @@ class CameraCapture:
         capture_hw: tuple[int, int] | None = None,
         parallel_reads: bool = False,
         policy_image_hw: tuple[int, int] | None = None,
-        resize_mode: str = "pad",
+        resize_mode: str = "stretch",
     ):
         self._ids = cam_ids or dict(DEFAULT_CAM_IDS)
         self._configured_ids = dict(self._ids)
@@ -373,6 +449,7 @@ class CameraCapture:
         self._background_thread: threading.Thread | None = None
         self._latest_condition = threading.Condition()
         self._latest_images: dict[str, np.ndarray] = {}
+        self._native_policy_images: dict[str, np.ndarray] = {}
         # Native-aspect RGB frames for the optional operator preview.  Model
         # observations remain square/padded in ``_latest_images``.
         self._latest_preview_images: dict[str, np.ndarray] = {}
@@ -490,7 +567,16 @@ class CameraCapture:
                     self._latest_preview_images[key] = rgb.copy()
             if self.resize_mode == "stretch":
                 from bimanual_vla.data.image_resize import resize_stretch
-                images[key] = resize_stretch(rgb, target_h, target_w).transpose(2, 0, 1)
+                # Policy input comes directly from native RGB, avoiding the
+                # recording-size intermediate (typically 256 -> 224).
+                policy_hw = self._policy_image_hw or (224, 224)
+                self._native_policy_images[key] = resize_stretch(
+                    rgb, *policy_hw
+                ).transpose(2, 0, 1)
+                images[key] = (
+                    self._native_policy_images[key] if (target_h, target_w) == policy_hw
+                    else resize_stretch(rgb, target_h, target_w).transpose(2, 0, 1)
+                )
                 continue
             scale = min(target_w / src_w, target_h / src_h)
             new_w = max(1, round(src_w * scale))
@@ -508,6 +594,8 @@ class CameraCapture:
         self, images: dict[str, np.ndarray]
     ) -> dict[str, np.ndarray] | None:
         """Precompute exactly the server's PIL resize on the camera thread."""
+        if self.resize_mode == "stretch" and self._native_policy_images:
+            return {key: self._native_policy_images[key] for key in images}
         if self._policy_image_hw is None:
             return None
         if self.resize_mode == "stretch":
@@ -637,7 +725,7 @@ class CameraCapture:
                 try:
                     with self._read_lock:
                         images, timestamps = self._read_direct()
-                    policy_images = self._prepare_policy_images(images)
+                        policy_images = self._prepare_policy_images(images)
                     completed = time.monotonic()
                     monotonic_timestamps = dict(self._last_direct_monotonic_timestamps)
                     if set(monotonic_timestamps) != set(images):

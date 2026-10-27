@@ -205,7 +205,8 @@ def run(args):
     wrist_key = f"cam_{args.arm_side}_wrist"
     cameras = None
     if args.record:
-        cameras = CameraCapture(cam_ids={"cam_high": args.cam_high_id, wrist_key: args.cam_wrist_id}, fps=args.fps)
+        cameras = CameraCapture(cam_ids={"cam_high": args.cam_high_id, wrist_key: args.cam_wrist_id},
+                                fps=args.fps, capture_hw=(240, 424))
         cameras.open()
         for key, info in cameras.verify().items():
             print(f"  {key}: {'OK' if info['ok'] else 'FAIL'}  {info['latency_ms']} ms")

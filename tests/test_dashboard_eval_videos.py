@@ -9,9 +9,77 @@ from pathlib import Path
 from unittest import mock
 
 from server_4090.app import create_app
+from server_4090 import eval_video_catalog as catalog
+from server_4090.eval_video_catalog_runner import organize_row
 
 
 class DashboardEvalVideoManagementTest(unittest.TestCase):
+    def test_canonical_catalog_keeps_event_edits_and_deletes_only_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, token, videos = self._make_app(root)
+            run = videos / "handover_mic" / "exp"
+            run.mkdir(parents=True)
+            original = run / "episode0.mp4"
+            original.write_bytes(b"video")
+            (run / "_episode_results.jsonl").write_text(json.dumps({"episode_index": 0, "success": True, "event_timeline": [{"step": 4, "current_event": 2, "max_event_reached": 2}]}) + "\n")
+            destination = root / "workspace/eval_video_catalog"
+            registry = {}
+            row = catalog.scan_source({"root": str(videos), "stable_seconds": 0})[0]
+            organize_row(row, destination, registry)
+            catalog.atomic_write(destination / "registry.json", registry)
+            client = app.test_client()
+            headers = {"Authorization": f"Bearer {token}"}
+            response = client.get('/api/eval-videos?video_source=robotwin&task=handover_mic&events=with', headers=headers)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json["total"], 1)
+            item = response.json["videos"][0]
+            self.assertEqual(item["event_track"]["max_event_reached"], 2)
+            stream = client.get(item["url"], headers=headers)
+            self.assertEqual(stream.data, b"video")
+            stream.close()
+            saved = client.post(f"/api/eval-videos/{item['id']}/event-overrides", headers=headers,
+                                json={"step": 4, "current_event": 3, "max_event_reached": 3})
+            self.assertEqual(saved.status_code, 200)
+            after = client.get('/api/eval-videos', headers=headers).json["videos"][0]
+            self.assertEqual(after["event_track"]["max_event_reached"], 3)
+            deleted = client.post('/api/eval-videos/batch-delete', headers=headers, json={"video_ids": [item["id"]]})
+            self.assertEqual(deleted.status_code, 200)
+            self.assertTrue(original.is_file())
+            self.assertEqual(client.get('/api/eval-videos', headers=headers).json["total"], 0)
+
+    def test_remote_rollouts_use_cached_metadata_and_server_pagination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, token, _ = self._make_app(root)
+            destination = root / "workspace/eval_video_catalog"
+            rows = [{"video_source": "libero-safety", "task": "tsa-moka", "experiment": "exp1", "run_id": "run1", "phase": "train", "success": "success", "safe_success": "failed", "has_events": False,
+                     "root": "/DATA/runs", "relative_path": f"episode{i}.mp4", "mtime": i + 1} for i in range(1005)]
+            catalog.atomic_write(destination / "remote-inventory.json", {"sources": {"rlinf-h100": {"videos": rows}}})
+            client = app.test_client()
+            headers = {"Authorization": f"Bearer {token}"}
+            response = client.get('/api/eval-videos?video_source=libero-safety&task=tsa_moka&phase=train&safe_success=failed&offset=1000&limit=25', headers=headers)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json["total"], 1005)
+            self.assertEqual(len(response.json["videos"]), 5)
+            self.assertTrue(all(v["remote"] for v in response.json["videos"]))
+            self.assertEqual(response.json["facets"]["video_sources"], ["libero-safety"])
+
+    def test_generic_run_registration_accepts_new_backend_and_rejects_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, token, _ = self._make_app(root)
+            client = app.test_client()
+            headers = {"Authorization": f"Bearer {token}"}
+            payload = {"video_source": "robotwin", "task": "handover-mic", "experiment": "sft", "run_id": "run1", "backend": "future-trainer", "kind": "distillation"}
+            response = client.post('/api/artifact-runs', headers=headers, json=payload)
+            self.assertEqual(response.status_code, 201)
+            self.assertTrue((Path(response.json["path"]) / "run.json").is_file())
+            history = client.get('/api/artifact-runs?backend=future-trainer', headers=headers)
+            self.assertEqual(history.json["total"], 1)
+            bad = client.post('/api/artifact-runs', headers=headers, json={**payload, "task": "../../outside"})
+            self.assertEqual(bad.status_code, 400)
+
     def _make_app(self, root: Path):
         dataset_root = root / "datasets"
         workspace_root = root / "workspace"

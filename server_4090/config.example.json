@@ -25,7 +25,7 @@
   "policy_xla_preallocate": false,
   "policy_rtc_enabled": true,
   "policy_inference_diagnostics_enabled": true,
-  "policy_rtc_max_execution_horizon": 8,
+  "policy_rtc_max_execution_horizon": 12,
   "policy_rtc_max_guidance_weight": 5.0,
   "task_monitor_interval_s": 2.0,
   "robot_observation_max_age_s": 3.0,

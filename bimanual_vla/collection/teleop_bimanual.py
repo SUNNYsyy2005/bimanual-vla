@@ -389,6 +389,7 @@ def run(args):
         cameras = CameraCapture(
             cam_ids={"cam_high": args.cam_high_id, "cam_left_wrist": args.cam_left_wrist_id, "cam_right_wrist": args.cam_right_wrist_id},
             fps=args.fps,
+            capture_hw=(240, 424),
         )
         cameras.open()
         for key, info in cameras.verify().items():

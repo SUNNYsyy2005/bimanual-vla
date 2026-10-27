@@ -11,6 +11,10 @@ callers can choose their own serialization and rendering strategy.
 
 from __future__ import annotations
 
+from bimanual_vla.data.joint_limits import driver_limit_diagnostics, limit_summary, limit_frame
+
+from .motion_diagnostics import diagnose_motion, motion_payload
+
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -67,6 +71,7 @@ class EpisodeAnalysis:
     jitter: np.ndarray
     abrupt_change: np.ndarray
     anomaly_score: np.ndarray
+    acceleration_norm: np.ndarray
     jerk_norm: np.ndarray
     joint_names: tuple[str, ...]
     eef: dict[str, dict[str, np.ndarray]]
@@ -76,6 +81,8 @@ class EpisodeAnalysis:
     arm_base_rotations: dict[str, np.ndarray] | None
     robot_type: str | None
     arm_axis_signs: dict[str, list[int]]
+    joint_limits: dict[str, Any]
+    motion_diagnostics: dict[str, Any]
 
     @property
     def frame_count(self) -> int:
@@ -240,7 +247,7 @@ def detect_motion_anomalies(
         )
         velocity_reversal[2:] = strong & ((previous * current) < 0.0)
 
-    motion_dims = min(6, width)
+    motion_dims = width
     acceleration_norm = np.linalg.norm(np.nan_to_num(accelerations[:, :motion_dims]), axis=1) if motion_dims else np.zeros(count)
     jerk_norm = np.linalg.norm(np.nan_to_num(jerk[:, :motion_dims]), axis=1) if motion_dims else np.zeros(count)
     acceleration_limit = _robust_limit(acceleration_norm, acceleration_threshold)
@@ -758,6 +765,7 @@ def analyze_episode(
     velocity_threshold: float = 0.035,
     action_delta_threshold: float = 0.012,
     min_idle_run: int = 2,
+    action_is_absolute: bool = True,
 ) -> EpisodeAnalysis:
     """Build the shared analysis representation for one episode."""
 
@@ -767,7 +775,7 @@ def analyze_episode(
     measured, desired = measured[:count], desired[:count]
     time_axis = _safe_time_axis(timestamps, count, fps)
     velocities = compute_joint_velocities(measured, time_axis, fps=fps)
-    anomalies = detect_motion_anomalies(measured, time_axis, fps=fps)
+    anomalies = diagnose_motion(measured, time_axis, fps=fps, names=infer_joint_names(state_names, measured.shape[1], arm_side=arm_side, robot_type=robot_type), arm_side=arm_side)
     idle, speed_norm, _command_delta = detect_idle_frames(
         measured,
         action=desired,
@@ -800,7 +808,10 @@ def analyze_episode(
         dataset_origin=dataset_origin,
     )
     inferred_fps = float(fps or (1.0 / np.median(np.diff(time_axis)) if count > 1 else 20.0))
+    joint_limits = driver_limit_diagnostics(measured, desired, infer_joint_names(state_names, measured.shape[1], arm_side=arm_side, robot_type=robot_type), robot_type=robot_type, action_is_absolute=action_is_absolute)
     return EpisodeAnalysis(
+        joint_limits=joint_limits,
+        motion_diagnostics=anomalies["diagnostics"],
         timestamps=time_axis,
         state=measured,
         action=desired,
@@ -813,6 +824,7 @@ def analyze_episode(
         abrupt_change=anomalies["abrupt_change"],
         anomaly_score=anomalies["anomaly_score"],
         jerk_norm=anomalies["jerk_norm"],
+        acceleration_norm=anomalies["acceleration_norm"],
         joint_names=infer_joint_names(
             state_names,
             measured.shape[1],
@@ -854,6 +866,7 @@ def frame_payload(analysis: EpisodeAnalysis, frame_index: int) -> dict[str, Any]
     for joint_index, name in enumerate(analysis.joint_names):
         joints.append(
             {
+                **limit_frame(analysis.joint_limits, index, joint_index),
                 "index": joint_index,
                 "name": name,
                 "angle": _json_number(analysis.state[index, joint_index]),
@@ -873,14 +886,16 @@ def frame_payload(analysis: EpisodeAnalysis, frame_index: int) -> dict[str, Any]
             side_payload[key] = [_json_number(value) for value in row]
         eef[side] = side_payload
     return {
+        "motion_diagnostics": motion_payload(analysis.motion_diagnostics, index=index),
         "frame_index": index,
         "timestamp": _json_number(analysis.timestamps[index]),
         "relative_time_s": _json_number(analysis.timestamps[index] - analysis.timestamps[0]),
         "idle": bool(analysis.idle[index]),
         "speed_norm": _json_number(analysis.speed_norm[index]),
-        "acceleration_norm": _json_number(np.linalg.norm(np.nan_to_num(analysis.accelerations[index, : min(6, analysis.state.shape[1])]))),
+        "acceleration_norm": _json_number(analysis.acceleration_norm[index]),
         "jerk_norm": _json_number(analysis.jerk_norm[index]),
-        "anomaly": bool(analysis.abrupt_change[index] or np.any(analysis.velocity_reversal[index]) or np.any(analysis.jitter[index])),
+        "joint_limit_violation": bool(analysis.joint_limits["mask"][index]),
+        "anomaly": bool(analysis.joint_limits["mask"][index] or analysis.abrupt_change[index] or np.any(analysis.velocity_reversal[index]) or np.any(analysis.jitter[index])),
         "abrupt_change": bool(analysis.abrupt_change[index]),
         "velocity_reversal": bool(np.any(analysis.velocity_reversal[index])),
         "jitter": bool(np.any(analysis.jitter[index])),
@@ -888,6 +903,8 @@ def frame_payload(analysis: EpisodeAnalysis, frame_index: int) -> dict[str, Any]
         "anomaly_types": [
             label
             for label, present in (
+                ("joint_state_limit", bool(np.any(analysis.joint_limits["state_excess_rad"][index] > 0))),
+                ("joint_target_limit", bool(np.any(analysis.joint_limits["target_excess_rad"][index] > 0))),
                 ("jitter", bool(np.any(analysis.jitter[index]))),
                 ("velocity_reversal", bool(np.any(analysis.velocity_reversal[index]))),
                 ("abrupt_change", bool(analysis.abrupt_change[index])),
@@ -942,6 +959,9 @@ def analysis_payload(analysis: EpisodeAnalysis, *, max_points: int = 1200) -> di
         for side, item in analysis.eef.items()
     }
     return {
+        "motion_diagnostics": motion_payload(analysis.motion_diagnostics),
+        "motion_warning_frames": int(np.count_nonzero(analysis.abrupt_change | np.any(analysis.velocity_reversal, axis=1) | np.any(analysis.jitter, axis=1))),
+        **limit_summary(analysis.joint_limits),
         "frame_count": count,
         "fps": analysis.fps,
         "duration_s": float(analysis.timestamps[-1] - analysis.timestamps[0]) if count > 1 else 0.0,
@@ -959,7 +979,7 @@ def analysis_payload(analysis: EpisodeAnalysis, *, max_points: int = 1200) -> di
         "arm_origins": arm_base_origins(analysis.arm_base_offset),
         "idle_frames": int(np.count_nonzero(analysis.idle)),
         "idle_fraction": float(np.mean(analysis.idle)),
-        "anomaly_frames": int(np.count_nonzero(analysis.abrupt_change | np.any(analysis.velocity_reversal, axis=1) | np.any(analysis.jitter, axis=1))),
+        "anomaly_frames": int(np.count_nonzero(analysis.joint_limits["mask"] | analysis.abrupt_change | np.any(analysis.velocity_reversal, axis=1) | np.any(analysis.jitter, axis=1))),
         "jitter_frames": int(np.count_nonzero(np.any(analysis.jitter, axis=1))),
         "velocity_reversal_frames": int(np.count_nonzero(np.any(analysis.velocity_reversal, axis=1))),
         "abrupt_change_frames": int(np.count_nonzero(analysis.abrupt_change)),
@@ -971,11 +991,12 @@ def analysis_payload(analysis: EpisodeAnalysis, *, max_points: int = 1200) -> di
             "relative_time_s": _json_array(analysis.timestamps[indexes] - analysis.timestamps[0]),
             "speed_norm": _json_array(analysis.speed_norm[indexes]),
             "acceleration_norm": _json_array(
-                np.linalg.norm(np.nan_to_num(analysis.accelerations[indexes, : min(6, analysis.state.shape[1])]), axis=1)
+                analysis.acceleration_norm[indexes]
             ),
             "jerk_norm": _json_array(analysis.jerk_norm[indexes]),
             "idle": analysis.idle[indexes].astype(bool).tolist(),
-            "anomaly": (analysis.abrupt_change[indexes] | np.any(analysis.velocity_reversal[indexes], axis=1) | np.any(analysis.jitter[indexes], axis=1)).tolist(),
+            "joint_limit_violation": analysis.joint_limits["mask"][indexes].tolist(),
+            "anomaly": (analysis.joint_limits["mask"][indexes] | analysis.abrupt_change[indexes] | np.any(analysis.velocity_reversal[indexes], axis=1) | np.any(analysis.jitter[indexes], axis=1)).tolist(),
             "jitter": np.any(analysis.jitter[indexes], axis=1).tolist(),
             "velocity_reversal": np.any(analysis.velocity_reversal[indexes], axis=1).tolist(),
             "abrupt_change": analysis.abrupt_change[indexes].tolist(),
