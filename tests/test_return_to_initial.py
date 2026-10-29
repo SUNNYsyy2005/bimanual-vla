@@ -12,6 +12,51 @@ from bimanual_vla.collection.gui import CollectorGUI
 
 
 class ReturnToInitialTest(unittest.TestCase):
+    def test_native_startup_clearance_uses_driver_limits_without_changing_gripper(self):
+        limits = np.deg2rad([[-150, 150], [0, 180], [-170, 0], [-100, 100], [-70, 70], [-180, 180]])
+        robot = SimpleNamespace(_vla_joint_limits=limits.copy())
+        pose = np.array([0., -.034, -.005, 0., 0., 0., .003])
+        target, _ = client.clip_startup_pose_to_limits(
+            {'right': robot}, pose, arm_mode='single', arm_side='right',
+            joint_margin_rad=client.NATIVE_STARTUP_MARGIN_RAD)
+        np.testing.assert_allclose(np.rad2deg(target[1:3]), [1., -1.], atol=1e-6)
+        np.testing.assert_allclose(target[[0, 3, 4, 5, 6]], pose[[0, 3, 4, 5, 6]])
+        np.testing.assert_array_equal(robot._vla_joint_limits, limits)
+        # Queried limits, rather than a hard-coded zero, define the interior.
+        robot._vla_joint_limits[1, 0] = np.deg2rad(2.)
+        target, _ = client.clip_startup_pose_to_limits(
+            {'right': robot}, pose, arm_mode='single', arm_side='right',
+            joint_margin_rad=client.NATIVE_STARTUP_MARGIN_RAD)
+        self.assertAlmostEqual(np.rad2deg(target[1]), 3., places=5)
+
+    def test_native_startup_requires_actual_interior_arrival(self):
+        from tests.test_robot_observation_bridge import execution_args
+        limits = np.deg2rad([[-150, 150], [0, 180], [-170, 0], [-100, 100], [-70, 70], [-180, 180]])
+        robot = SimpleNamespace(_vla_joint_limits=limits)
+        pose = np.array([0., -.034, -.005, 0., 0., 0., .003])
+        args = execution_args(arm_mode='single', arm_side='right', eef_control_mode='piper_eef')
+        for follows in (True, False):
+            with self.subTest(follows=follows):
+                current = pose.copy(); current[1] = 0.
+                def move(pipers, target, **kwargs):
+                    self.assertLessEqual(kwargs['hold_tolerance_rad'], np.deg2rad(.1))
+                    if follows:
+                        current[:] = target
+                    return {'returned': True}
+                with patch.object(client, 'recover_return_faults'), \
+                     patch.object(client, 'wait_for_return_stationary'), \
+                     patch.object(client, 'read_output_qpos', side_effect=lambda *a, **k: current.copy()), \
+                     patch.object(client, 'return_pipers_to_initial', side_effect=move):
+                    if follows:
+                        target, _, result = client.move_pipers_to_safe_startup_pose(
+                            {'right': robot}, pose, args, controller=Mock())
+                        self.assertIn('native_startup_joint_margins_deg', result)
+                        np.testing.assert_allclose(current, target)
+                    else:
+                        with self.assertRaisesRegex(client.ExecutionBlocked, 'MOVE_P prohibited'):
+                            client.move_pipers_to_safe_startup_pose(
+                                {'right': robot}, pose, args, controller=Mock())
+
     def test_startup_pose_is_clipped_to_effective_driver_limits(self):
         robot = SimpleNamespace()
         robot._vla_joint_limits = np.deg2rad(

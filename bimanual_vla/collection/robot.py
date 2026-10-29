@@ -18,20 +18,14 @@ from piper_sdk import C_PiperInterface_V2
 
 from bimanual_vla.data.action_conventions import NEW_GRIPPER_SEMANTICS
 from bimanual_vla.data.contract import LEGACY_GRIPPER_OPENING_METRES_SEMANTICS
+from bimanual_vla.deployment.hardware_safety import NOMINAL_JOINT_LIMITS_RAD, effective_limits, query_limits
 
 # --- unit conversion constants ---
 _RAD_TO_MDEG = 1000.0 * 180.0 / math.pi   # rad  →  0.001 °
 _M_TO_MM01   = 1_000_000.0                  # m    →  0.001 mm
 
-# Joint limits from piper_sdk C_PiperParamManager (radians)
-JOINT_LIMITS_RAD = np.array([
-    (-2.6179,  2.6179),
-    ( 0.0000,  3.1400),
-    (-2.9670,  0.0000),
-    (-1.7450,  1.7450),
-    (-1.2200,  1.2200),
-    (-2.0944,  2.0944),
-], dtype=np.float64)
+# Offline default; connected arms use their queried driver limits.
+JOINT_LIMITS_RAD = NOMINAL_JOINT_LIMITS_RAD.copy()
 
 GRIPPER_RANGE_M = (0.0, 0.07)   # fully closed → fully open
 DEFAULT_MAX_JOINT_STEP_RAD = 0.3
@@ -45,6 +39,7 @@ def decode_joint_policy_target(
     gripper_semantics: str,
     max_joint_step_rad: float = DEFAULT_MAX_JOINT_STEP_RAD,
     max_gripper_step_fraction: float = DEFAULT_MAX_GRIPPER_STEP_FRACTION,
+    joint_limits: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float]:
     """Decode/check one 7D policy target before converting to Piper metres."""
     current = np.asarray(current_qpos, dtype=np.float64)
@@ -53,7 +48,8 @@ def decode_joint_policy_target(
         raise ValueError(f"current_qpos and wire_action must be 7D, got {current.shape}/{target.shape}")
     if not np.isfinite(current).all() or not np.isfinite(target).all():
         raise ValueError("joint policy target contains NaN or Inf")
-    for index, (value, bounds) in enumerate(zip(target[:6], JOINT_LIMITS_RAD), start=1):
+    limits = JOINT_LIMITS_RAD if joint_limits is None else joint_limits
+    for index, (value, bounds) in enumerate(zip(target[:6], limits), start=1):
         if not bounds[0] <= value <= bounds[1]:
             raise ValueError(f"joint{index} target {value:.5f}rad outside {tuple(bounds)}")
     deltas = np.abs(target[:6] - current[:6])
@@ -110,6 +106,11 @@ class SingleArm:
     def connect(self):
         self._arm.ConnectPort(can_init=True, piper_init=True)
         time.sleep(0.5)
+        try:
+            query_limits(self._arm)
+        except Exception:
+            self._arm.DisconnectPort()
+            raise
         deadline = time.time() + 5.0
         while not self._arm.EnablePiper():
             if time.time() > deadline:
@@ -143,6 +144,11 @@ class SingleArm:
 
     def send(self, joints_rad: np.ndarray, gripper_m: float):
         """Send joint angles (6×rad) and gripper position (m)."""
+        joints_rad = np.asarray(joints_rad, dtype=np.float64)
+        limits = effective_limits(self._arm, JOINT_LIMITS_RAD)
+        if (joints_rad.shape != (6,) or not np.isfinite(joints_rad).all()
+                or np.any(joints_rad < limits[:, 0]) or np.any(joints_rad > limits[:, 1])):
+            raise ValueError("joint target is outside driver limits")
         j_mdeg = [round(float(v) * _RAD_TO_MDEG) for v in joints_rad]
         self._arm.JointCtrl(*j_mdeg)
         gripper_mm01 = round(abs(gripper_m) * _M_TO_MM01)
@@ -226,6 +232,7 @@ class PiperBimanualEnv:
             gripper_semantics=gripper_semantics,
             max_joint_step_rad=max_joint_step_rad,
             max_gripper_step_fraction=max_gripper_step_fraction,
+            joint_limits=effective_limits(self.left.raw, JOINT_LIMITS_RAD),
         )
         right_target = decode_joint_policy_target(
             current[7:],
@@ -233,6 +240,7 @@ class PiperBimanualEnv:
             gripper_semantics=gripper_semantics,
             max_joint_step_rad=max_joint_step_rad,
             max_gripper_step_fraction=max_gripper_step_fraction,
+            joint_limits=effective_limits(self.right.raw, JOINT_LIMITS_RAD),
         )
         self.left.send(*left_target)
         self.right.send(*right_target)

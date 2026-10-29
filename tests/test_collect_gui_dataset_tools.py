@@ -22,6 +22,7 @@ from bimanual_vla.collection.gui import (
     format_arm_state_rows,
     letterbox_preview_frame,
     load_gui_preferences,
+    load_eef_pose_profiles,
     move_episodes_to_trash,
     parse_can_link_status,
     save_gui_preferences,
@@ -33,6 +34,35 @@ from bimanual_vla.data.contract import BIMANUAL, DELIVERY_SCHEMA, JOINT_SCHEMA, 
 
 
 class SingleArmDeviceSelectionTest(unittest.TestCase):
+    def test_eef_modes_keep_separate_smoothing_profiles_and_lock_while_running(self):
+        root = tk.Tcl()
+        gui = CollectorGUI.__new__(CollectorGUI)
+        gui.inference_process = None
+        gui._eef_pose_profiles = load_eef_pose_profiles({
+            'inference_pose_trajectory_enabled': True, 'inference_pose_response_time_s': '.08'})
+        gui._eef_mode_active = 'local_ik_joint'
+        gui.inference_eef_control_mode_var = tk.StringVar(root, 'local_ik_joint')
+        gui.inference_pose_trajectory_var = tk.BooleanVar(root)
+        gui.inference_pose_settings = {name: tk.StringVar(root) for name in gui._eef_pose_profiles['local_ik_joint']['settings']}
+        gui._load_eef_pose_profile('local_ik_joint')
+        gui.inference_eef_control_mode_var.trace_add('write', gui._on_eef_control_mode_changed)
+        gui.inference_eef_control_mode_var.set('piper_eef')
+        self.assertFalse(gui.inference_pose_trajectory_var.get())
+        self.assertEqual(float(gui.inference_pose_settings['response_time_s'].get()), .06)
+        gui.inference_pose_settings['response_time_s'].set('.04')
+        gui.inference_pose_trajectory_var.set(True)
+        gui.inference_eef_control_mode_var.set('local_ik_joint')
+        self.assertTrue(gui.inference_pose_trajectory_var.get())
+        self.assertEqual(gui.inference_pose_settings['response_time_s'].get(), '.08')
+        gui._store_eef_pose_profile()
+        restored = load_eef_pose_profiles({'inference_eef_pose_profiles': gui._eef_pose_profiles})
+        self.assertEqual(restored['piper_eef']['settings']['response_time_s'], '.04')
+        gui.inference_process = SimpleNamespace(poll=lambda: None)
+        with patch('bimanual_vla.collection.gui.messagebox.showwarning') as warning:
+            gui.inference_eef_control_mode_var.set('piper_eef')
+        warning.assert_called_once()
+        self.assertEqual(gui.inference_eef_control_mode_var.get(), 'local_ik_joint')
+
     def test_switching_side_updates_both_arm_and_camera_without_reusing_old_device(self):
         root = tk.Tcl()
         gui = CollectorGUI.__new__(CollectorGUI)
@@ -317,6 +347,31 @@ class InferenceCommandTest(unittest.TestCase):
 
     def test_execution_flag_can_be_disabled(self):
         self.assertNotIn("--allow-execution", self._command(allow_execution=False))
+
+    def test_native_eef_mode_command_and_independent_smoothing(self):
+        for mode in ('local_ik_joint', 'piper_eef'):
+            command = self._command(eef_control_mode=mode)
+            self.assertEqual(command[command.index('--eef-control-mode')+1], mode)
+        command = self._command(eef_control_mode='piper_eef', servo_backend='off',
+            trajectory_shaping_enabled=False, pose_trajectory_enabled=True, rtc_enabled=False)
+        self.assertIn('--pose-trajectory', command)
+        with self.assertRaises(ValueError):
+            self._command(eef_control_mode='unknown')
+
+    def test_eef_arrival_parameters_and_validation(self):
+        for values in ({}, dict(eef_goal_position_tolerance_m=.003,
+                               eef_goal_rotation_tolerance_rad=.04, eef_goal_timeout_s=1.5)):
+            command = self._command(**values)
+            for name, default in (('eef_goal_position_tolerance_m', .005),
+                                  ('eef_goal_rotation_tolerance_rad', .05), ('eef_goal_timeout_s', 2.)):
+                flag = '--' + name.replace('_', '-')
+                self.assertEqual(float(command[command.index(flag)+1]), values.get(name, default))
+        command = self._command()
+        self.assertEqual(command[command.index('--gripper-open-lookahead-steps')+1], '0')
+        for value in (0., -1., float('nan'), float('inf')):
+            for name in ('eef_goal_position_tolerance_m', 'eef_goal_rotation_tolerance_rad', 'eef_goal_timeout_s'):
+                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                    self._command(**{name: value})
 
     def test_policy_request_diagnostics_switch_reaches_client(self):
         self.assertIn("--send-policy-telemetry", self._command())

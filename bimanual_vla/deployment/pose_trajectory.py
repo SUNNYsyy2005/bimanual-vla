@@ -4,7 +4,9 @@ Translation is in metres and rotations are matrices in the robot base frame.
 Angular velocity is a spatial (base-frame) vector. The shortest SO(3) error is
 used, never Euler-angle interpolation. This is an online reference shaper at
 the policy/control rate, not a timed chunk planner or a motor feedback loop.
-The downstream joint Ruckig writer remains responsible for joint jerk limits.
+The downstream joint Ruckig writer remains responsible for physical joint
+velocity/acceleration/jerk bounds. Pose velocities are interval reference
+increments divided by dt; acceleration limits bound their successive changes.
 """
 from dataclasses import asdict, dataclass
 import math
@@ -15,8 +17,9 @@ from scipy.spatial.transform import Rotation
 
 @dataclass(frozen=True)
 class PoseTrajectoryConfig:
-    # 20 Hz fix demonstrations: keep lag small without the tau=0.05 noise gain.
-    # FK geometry tuning only; hardware and task success require validation.
+    # Historical 20 Hz bounds retained during the stopping-law correction.
+    # Dataset-specific faster settings remain offline candidates, not validated
+    # hardware limits. Shaping remains opt-in.
     max_linear_speed_m_s: float = 0.20
     max_linear_acceleration_m_s2: float = 1.20
     max_angular_speed_rad_s: float = 0.75
@@ -47,9 +50,43 @@ def _rotation(value):
     return result
 
 
-def _bounded(value, limit):
-    norm = float(np.linalg.norm(value))
-    return value * min(1.0, limit / max(norm, 1e-15))
+def _reference_velocity(error, previous, *, dt, speed_limit, acceleration_limit, response_time):
+    """Bound a geodesic reference step by response, slew and stopping distance.
+
+    A feasible aligned step stays on the segment to the target. Reserve enough
+    remaining distance to stop: s*dt + s**2/(2*a) <= distance. The intersection
+    with ||s*direction-previous|| <= a*dt preserves the vector slew limit.
+
+    A suddenly changed target can make that intersection empty (e.g. a goal
+    inside the stopping distance). Brake the existing velocity instead of
+    teleporting the reference or pretending instantaneous stopping is possible.
+    Supports (..., 3) arrays for offline production-code replay.
+    """
+    distance = np.linalg.norm(error, axis=-1)
+    old_speed = np.linalg.norm(previous, axis=-1)
+    direction = error / np.maximum(distance[..., None], 1e-15)
+    parallel = np.sum(previous * direction, axis=-1)
+    perpendicular_sq = np.maximum(0., old_speed**2 - parallel**2)
+    budget = acceleration_limit * dt
+    radius = np.sqrt(np.maximum(0., budget**2 - perpendicular_sq))
+    lower = np.maximum(0., parallel - radius)
+    # Stable positive root of s*dt + s**2/(2*a) = distance.
+    stopping_speed = 2 * acceleration_limit * distance / (
+        np.sqrt(budget**2 + 2 * acceleration_limit * distance) + budget)
+    upper = np.minimum(np.minimum(parallel + radius, speed_limit), stopping_speed)
+    # Exact first-order response has 0 <= gain <= 1 at every valid update dt.
+    desired_speed = -math.expm1(-dt / response_time) * distance / dt
+    feasible = ((distance > 1e-12) & (perpendicular_sq <= budget**2)
+                & (upper >= lower))
+    speed = np.minimum(np.maximum(desired_speed, lower), np.maximum(upper, 0.))
+    braking_velocity = previous * np.maximum(0., 1 - budget / np.maximum(old_speed, 1e-15))[..., None]
+    velocity = np.where(feasible[..., None], direction * speed[..., None], braking_velocity)
+    return velocity, {
+        "speed_limited": desired_speed > speed_limit,
+        "acceleration_limited": np.linalg.norm(direction * desired_speed[..., None] - previous, axis=-1) > budget,
+        "stopping_distance_limited": desired_speed > stopping_speed,
+        "braking_for_target_change": ~feasible & (old_speed > 1e-12),
+    }
 
 
 class PoseTrajectory:
@@ -85,18 +122,18 @@ class PoseTrajectory:
             raise ValueError("pose trajectory feedback tracking error exceeded limit")
         error = target - self.xyz
         angular_error = Rotation.from_matrix(target_rotation @ self.rotation.T).as_rotvec()
-        # An acceleration-limited velocity tracker. At short distances the
-        # proportional velocity converges continuously to zero. Braking may
-        # overshoot a reversing target; workspace checks remain mandatory.
-        desired_v = _bounded(error / cfg.response_time_s, cfg.max_linear_speed_m_s)
-        desired_w = _bounded(angular_error / cfg.response_time_s, cfg.max_angular_speed_rad_s)
-        velocity = self.linear_velocity + _bounded(
-            desired_v - self.linear_velocity, cfg.max_linear_acceleration_m_s2 * dt)
-        angular_velocity = self.angular_velocity + _bounded(
-            desired_w - self.angular_velocity, cfg.max_angular_acceleration_rad_s2 * dt)
-        next_xyz = self.xyz + 0.5 * (self.linear_velocity + velocity) * dt
-        next_rotation = Rotation.from_rotvec(
-            0.5 * (self.angular_velocity + angular_velocity) * dt).as_matrix() @ self.rotation
+        velocity, linear_flags = _reference_velocity(
+            error, self.linear_velocity, dt=dt, speed_limit=cfg.max_linear_speed_m_s,
+            acceleration_limit=cfg.max_linear_acceleration_m_s2, response_time=cfg.response_time_s)
+        angular_velocity, angular_flags = _reference_velocity(
+            angular_error, self.angular_velocity, dt=dt, speed_limit=cfg.max_angular_speed_rad_s,
+            acceleration_limit=cfg.max_angular_acceleration_rad_s2, response_time=cfg.response_time_s)
+        velocity = _vector(velocity, (3,), "candidate linear velocity")
+        angular_velocity = _vector(angular_velocity, (3,), "candidate angular velocity")
+        next_xyz = self.xyz + velocity * dt
+        next_rotation = Rotation.from_rotvec(angular_velocity * dt).as_matrix() @ self.rotation
+        next_xyz = _vector(next_xyz, (3,), "candidate position")
+        next_rotation = _rotation(next_rotation)
         next_position_tracking = float(np.linalg.norm(next_xyz - measured))
         next_rotation_tracking = float(np.linalg.norm(Rotation.from_matrix(
             next_rotation @ measured_rotation.T).as_rotvec()))
@@ -104,6 +141,7 @@ class PoseTrajectory:
                 or next_rotation_tracking > cfg.max_rotation_tracking_error_rad):
             raise ValueError("pose trajectory candidate feedback tracking error exceeded limit")
         self.last_metrics = {
+            "algorithm": "stopping_distance_reference_v2",
             "dt_s": float(dt),
             "raw_xyz_m": target.tolist(),
             "reference_xyz_m": next_xyz.tolist(),
@@ -118,10 +156,8 @@ class PoseTrajectory:
             "angular_velocity_rad_s": angular_velocity.tolist(),
             "linear_acceleration_m_s2": ((velocity - self.linear_velocity) / dt).tolist(),
             "angular_acceleration_rad_s2": ((angular_velocity - self.angular_velocity) / dt).tolist(),
-            "linear_speed_limited": bool(np.linalg.norm(error / cfg.response_time_s) > cfg.max_linear_speed_m_s),
-            "angular_speed_limited": bool(np.linalg.norm(angular_error / cfg.response_time_s) > cfg.max_angular_speed_rad_s),
-            "linear_acceleration_limited": bool(np.linalg.norm(desired_v - self.linear_velocity) > cfg.max_linear_acceleration_m_s2 * dt),
-            "angular_acceleration_limited": bool(np.linalg.norm(desired_w - self.angular_velocity) > cfg.max_angular_acceleration_rad_s2 * dt),
+            **{"linear_" + key: bool(value) for key, value in linear_flags.items()},
+            **{"angular_" + key: bool(value) for key, value in angular_flags.items()},
         }
         self.xyz, self.rotation = next_xyz, next_rotation
         self.linear_velocity, self.angular_velocity = velocity, angular_velocity

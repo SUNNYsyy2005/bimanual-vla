@@ -10,6 +10,51 @@ import numpy as np
 # the commanded speed or write the driver's persistent configuration.
 ASSUMED_JOINT_SPEED_UNIT = .01
 
+# Exact fallback for offline calculations; live execution queries each driver.
+NOMINAL_JOINT_LIMITS_RAD = np.deg2rad([
+    [-150., 150.], [0., 180.], [-170., 0.], [-100., 100.], [-70., 70.], [-180., 180.],
+])
+
+
+def install_can_send_guard(piper, *, error_type=RuntimeError):
+    """Latch SDK transmit failures instead of treating logged errors as success.
+
+    This confirms host-side submission only, never motor execution. A failed
+    connection is not retried automatically, including during cleanup.
+    """
+    bus = piper.GetCanBus()
+    if getattr(piper, '_vla_guarded_can_bus', None) is bus:
+        return
+    original_send = bus.SendCanMessage
+    success = bus.CAN_STATUS.SEND_MESSAGE_SUCCESS
+    name = piper.GetCanName()
+    piper._vla_can_send_fault = None
+
+    def checked_send(arbitration_id, *args, **kwargs):
+        if piper._vla_can_send_fault is not None:
+            raise error_type(piper._vla_can_send_fault)
+        try:
+            result = original_send(arbitration_id, *args, **kwargs)
+        except Exception as exc:
+            piper._vla_can_send_fault = (
+                f'{name} CAN transmit failed at 0x{arbitration_id:03x}: {exc}; connection latched')
+            raise error_type(piper._vla_can_send_fault) from exc
+        if result != success:
+            piper._vla_can_send_fault = (
+                f'{name} CAN transmit failed at 0x{arbitration_id:03x}: {result}; connection latched')
+            raise error_type(piper._vla_can_send_fault)
+        return result
+
+    bus.SendCanMessage = checked_send
+    piper._vla_guarded_can_bus = bus
+
+
+def require_can_send_healthy(pipers, *, error_type=RuntimeError):
+    for side, piper in pipers.items():
+        fault = getattr(piper, '_vla_can_send_fault', None)
+        if isinstance(fault, str) and fault:
+            raise error_type(f'{side}: {fault}')
+
 
 def joint_speed_unit(firmware):
     """0x473/0x474 changed units at firmware V1.5-8 (inclusive).
@@ -93,13 +138,15 @@ def query_limits(piper, timeout=2.0):
 
 def effective_limits(piper, software):
     hardware = getattr(piper, '_vla_joint_limits', None)
-    if not isinstance(hardware, np.ndarray):
+    if hardware is None:
         return software.copy()
-    result = np.column_stack((np.maximum(software[:, 0], hardware[:, 0]),
-                              np.minimum(software[:, 1], hardware[:, 1])))
-    if np.any(result[:, 0] >= result[:, 1]):
-        raise RuntimeError('driver/software joint limits have no intersection')
-    return result
+    # A validated driver is authoritative, including wider ranges than old
+    # SDK defaults. Never round radians or intersect with stale constants.
+    if (not isinstance(hardware, np.ndarray) or hardware.shape != (6, 2)
+            or not np.isfinite(hardware).all()
+            or np.any(hardware[:, 0] >= hardware[:, 1])):
+        raise RuntimeError('invalid cached driver joint limits')
+    return hardware.copy()
 
 
 def effective_speed(pipers, requested, *, speed_pct=None):

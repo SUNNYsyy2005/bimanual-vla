@@ -110,6 +110,24 @@ def load_gui_preferences(path: str | pathlib.Path = GUI_PREFERENCES_PATH) -> dic
     return value if isinstance(value, dict) else {}
 
 
+def load_eef_pose_profiles(preferences):
+    """Migrate old smoothing settings only to the existing local IK mode."""
+    saved = preferences.get("inference_eef_pose_profiles", {})
+    profiles = {}
+    for mode in ("local_ik_joint", "piper_eef"):
+        item = saved.get(mode, {}) if isinstance(saved, dict) else {}
+        if not isinstance(item, dict):
+            item = {}
+        settings = item.get("settings", {})
+        if not isinstance(settings, dict):
+            settings = {}
+        profiles[mode] = dict(enabled=bool(item.get("enabled", preferences.get(
+            "inference_pose_trajectory_enabled", False) if mode == "local_ik_joint" else False)),
+            settings={name: str(settings.get(name, preferences.get("inference_pose_" + name, default)
+                if mode == "local_ik_joint" else default)) for name, default in vars(PoseTrajectoryConfig()).items()})
+    return profiles
+
+
 def save_gui_preferences(
     values: dict[str, object],
     path: str | pathlib.Path = GUI_PREFERENCES_PATH,
@@ -582,6 +600,7 @@ def build_inference_bridge_command(
     gripper_lowpass_alpha: float = 0.5,
     trajectory_shaping_enabled: bool = True,
     servo_backend: str = "ruckig",
+    eef_control_mode: str = "local_ik_joint",
     servo_hz: float = DEFAULT_SERVO_HZ,
     pose_trajectory_enabled: bool = False,
     pose_trajectory_settings: dict[str, float] | None = None,
@@ -605,8 +624,11 @@ def build_inference_bridge_command(
     gripper_endpoint_filter_enabled: bool = True,
     gripper_hysteresis: float = 0.05,
     gripper_confirm_steps: int = 2,
-    gripper_open_lookahead_enabled: bool = True,
-    gripper_open_lookahead_steps: int = 30,
+    gripper_open_lookahead_enabled: bool = False,
+    gripper_open_lookahead_steps: int = 0,
+    eef_goal_position_tolerance_m: float = .005,
+    eef_goal_rotation_tolerance_rad: float = .05,
+    eef_goal_timeout_s: float = 2.,
     ik_rate_limit_enabled: bool = True,
     ik_max_joint_step_rad: float = 0.02,
     auto_next_inference: bool = True,
@@ -623,8 +645,10 @@ def build_inference_bridge_command(
         raise ValueError("control rate must be positive and finite")
     if servo_backend not in {"off", "ruckig", "legacy"}:
         raise ValueError("servo backend must be off, ruckig, or legacy")
+    if eef_control_mode not in {"local_ik_joint", "piper_eef"}:
+        raise ValueError("unknown EEF control mode")
     pose_config = PoseTrajectoryConfig(**(pose_trajectory_settings or {}))
-    if pose_trajectory_enabled and (not trajectory_shaping_enabled or servo_backend != "ruckig"):
+    if pose_trajectory_enabled and eef_control_mode == "local_ik_joint" and (not trajectory_shaping_enabled or servo_backend != "ruckig"):
         raise ValueError("end-effector reference shaping requires the Ruckig planner")
     if pose_trajectory_enabled and pose_config.max_update_dt_s < 1.0 / control_hz:
         raise ValueError("end-effector reference timeout must cover one control period")
@@ -680,6 +704,9 @@ def build_inference_bridge_command(
         raise ValueError("gripper hysteresis must be in (0, 0.5)")
     if int(gripper_confirm_steps) < 1 or int(gripper_open_lookahead_steps) < 0:
         raise ValueError("gripper confirmation must be positive; lookahead must be non-negative")
+    if any(not math.isfinite(value) or value <= 0 for value in (
+            eef_goal_position_tolerance_m, eef_goal_rotation_tolerance_rad, eef_goal_timeout_s)):
+        raise ValueError("EEF arrival tolerances and timeout must be finite and positive")
     if not 1 <= int(camera_fps) <= 60:
         raise ValueError("inference camera FPS must be in [1, 60]")
     if float(ik_max_joint_step_rad) > 0.30:
@@ -817,6 +844,7 @@ def build_inference_bridge_command(
     command.extend((
         "--speed-pct", str(DEFAULT_INFERENCE_SPEED_PCT),
         "--servo-backend", backend,
+        "--eef-control-mode", eef_control_mode,
         "--servo-hz", str(float(servo_hz)),
         "--no-servo-waypoint-velocity",
         "--pose-trajectory" if pose_trajectory_enabled else "--no-pose-trajectory",
@@ -829,6 +857,9 @@ def build_inference_bridge_command(
         "--gripper-lowpass-alpha", str(float(gripper_lowpass_alpha)),
         "--gripper-hysteresis", str(float(gripper_hysteresis)),
         "--gripper-confirm-steps", str(int(gripper_confirm_steps)),
+        "--eef-goal-position-tolerance-m", str(float(eef_goal_position_tolerance_m)),
+        "--eef-goal-rotation-tolerance-rad", str(float(eef_goal_rotation_tolerance_rad)),
+        "--eef-goal-timeout-s", str(float(eef_goal_timeout_s)),
         "--gripper-open-lookahead-steps", str(int(gripper_open_lookahead_steps) if gripper_open_lookahead_enabled else "0"),
         "--ik-max-joint-step-rad", str(float(ik_max_joint_step_rad)),
         "--blend-steps", str(int(blend_steps) if blend_enabled and not rtc_enabled else 0),
@@ -1188,6 +1219,14 @@ class CollectorGUI:
             name: tk.StringVar(value=str(preferences.get("inference_pose_" + name, default)))
             for name, default in vars(PoseTrajectoryConfig()).items()
         }
+        mode = str(preferences.get("inference_eef_control_mode", "local_ik_joint"))
+        if mode not in {"local_ik_joint", "piper_eef"}:
+            mode = "local_ik_joint"
+        self.inference_eef_control_mode_var = tk.StringVar(value=mode)
+        self._eef_mode_active = mode
+        self._eef_pose_profiles = load_eef_pose_profiles(preferences)
+        self._load_eef_pose_profile(mode)
+        self.inference_eef_control_mode_var.trace_add("write", self._on_eef_control_mode_changed)
         self.inference_joint_lowpass_var = tk.BooleanVar(
             value=bool(preferences.get("inference_joint_lowpass_enabled", legacy_lowpass))
         )
@@ -1250,14 +1289,19 @@ class CollectorGUI:
             value=str(preferences.get("inference_gripper_confirm_steps") or "2")
         )
         self.inference_gripper_lookahead_var = tk.BooleanVar(
-            value=bool(preferences.get("inference_gripper_open_lookahead_enabled", True))
+            value=bool(preferences.get("inference_gripper_open_lookahead_enabled", False))
         )
         self.inference_gripper_lookahead_steps_var = tk.StringVar(
             value=str(
                 preferences.get("inference_gripper_open_lookahead_steps")
-                if preferences.get("inference_gripper_open_lookahead_steps") is not None else "30"
+                if preferences.get("inference_gripper_open_lookahead_steps") is not None else "0"
             )
         )
+        self.inference_eef_goal_vars = {
+            name: tk.StringVar(value=str(preferences.get("inference_" + name, default)))
+            for name, default in (("eef_goal_position_tolerance_m", .005),
+                                  ("eef_goal_rotation_tolerance_rad", .05), ("eef_goal_timeout_s", 2.))
+        }
         self.inference_ik_rate_limit_var = tk.BooleanVar(
             value=bool(preferences.get("inference_ik_rate_limit_enabled", True))
         )
@@ -2006,7 +2050,13 @@ class CollectorGUI:
         motion.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         motion.columnconfigure(0, weight=1)
         tabs = ttk.Notebook(motion)
-        tabs.grid(row=0, column=0, sticky="nsew")
+        selector = ttk.Frame(motion)
+        selector.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(selector, text="EEF control").pack(side="left")
+        self.inference_eef_mode_selector = ttk.Combobox(selector, textvariable=self.inference_eef_control_mode_var,
+            values=("local_ik_joint", "piper_eef"), state="readonly", width=19)
+        self.inference_eef_mode_selector.pack(side="right")
+        tabs.grid(row=1, column=0, sticky="nsew")
         chunk_tab = ttk.Frame(tabs, padding=10)
         joint_tab = ttk.Frame(tabs, padding=10)
         pose_tab = ttk.Frame(tabs, padding=10)
@@ -2015,11 +2065,15 @@ class CollectorGUI:
         tabs.add(joint_tab, text="Joint reference planner")
         tabs.add(pose_tab, text="End-effector reference")
         tabs.add(gripper_tab, text="Gripper")
+        def refresh_eef_mode(*_):
+            tabs.tab(joint_tab, state="disabled" if self.inference_eef_control_mode_var.get() == "piper_eef" else "normal")
+        self.inference_eef_control_mode_var.trace_add("write", refresh_eef_mode)
+        refresh_eef_mode()
 
         for tab in (chunk_tab, joint_tab, pose_tab, gripper_tab):
             tab.columnconfigure(1, weight=1)
 
-        pose_switch = ttk.Checkbutton(pose_tab, text="Smooth end-effector targets before IK",
+        pose_switch = ttk.Checkbutton(pose_tab, text="EEF target smoothing (host)",
                                       variable=self.inference_pose_trajectory_var)
         pose_switch.grid(row=0, column=0, columnspan=3, sticky="w")
         for row, (name, label, unit) in enumerate((
@@ -2037,10 +2091,11 @@ class CollectorGUI:
             entry = ttk.Entry(pose_tab, textvariable=self.inference_pose_settings[name], width=9)
             entry.grid(row=row, column=2, sticky="e")
             enable_when(entry, (self.inference_pose_trajectory_var, True))
-        ttk.Label(pose_tab, text="Applies only to end-effector policies; requires Ruckig.\n"
-                  "Smooths translation and shortest-path rotation before IK.\n"
-                  "Adds response delay; joint limits remain on the Joint tab.\n"
-                  "The policy's RTC prefix is unchanged.", foreground="#68707d",
+        ttk.Label(pose_tab, text="local_ik_joint: local IK → Ruckig → JointCtrl.\n"
+                  "piper_eef: firmware IK → MOVE P + EndPoseCtrl.\n"
+                  "Smoothing settings are saved separately for each mode.\n"
+                  "RTC bypasses normal target smoothing; disable RTC to test it.\n"
+                  "This is host filtering, not a firmware IK switch.", foreground="#68707d",
                   justify="left").grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         rtc_checkbox = ttk.Checkbutton(
@@ -2211,7 +2266,7 @@ class CollectorGUI:
         gripper_controls = (
             ("Opening low-pass", self.inference_gripper_lowpass_var, self.inference_gripper_lowpass_alpha_var, "α"),
             ("Endpoint hysteresis", self.inference_gripper_endpoint_var, self.inference_gripper_hysteresis_var, "fraction"),
-            ("Opening lookahead", self.inference_gripper_lookahead_var, self.inference_gripper_lookahead_steps_var, "steps"),
+            ("Opening lookahead (joint/legacy only)", self.inference_gripper_lookahead_var, self.inference_gripper_lookahead_steps_var, "steps"),
         )
         for row, (label, enabled_var, value_var, unit) in enumerate(gripper_controls):
             ttk.Checkbutton(gripper_tab, text=label, variable=enabled_var).grid(row=row, column=0, sticky="w", pady=5)
@@ -2223,8 +2278,14 @@ class CollectorGUI:
         confirm_entry = ttk.Entry(gripper_tab, textvariable=self.inference_gripper_confirm_steps_var, width=9)
         confirm_entry.grid(row=3, column=2, sticky="e")
         enable_when(confirm_entry, (self.inference_gripper_endpoint_var, True))
-        ttk.Label(gripper_tab, text="Hard robot safety checks remain active.",
-                  foreground="#68707d", wraplength=390).grid(row=4, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        for row, (name, label) in enumerate((
+                ("eef_goal_position_tolerance_m", "Recovery arrival distance (m)"),
+                ("eef_goal_rotation_tolerance_rad", "Recovery arrival angle (rad)"),
+                ("eef_goal_timeout_s", "Recovery arrival timeout (s)")), start=4):
+            ttk.Label(gripper_tab, text=label).grid(row=row, column=0, sticky="w", pady=5)
+            ttk.Entry(gripper_tab, textvariable=self.inference_eef_goal_vars[name], width=9).grid(row=row, column=2, sticky="e")
+        ttk.Label(gripper_tab, text="Normal EEF tracking stays continuous. IK recovery holds grip until arrival; timeout stops motion.",
+                  foreground="#68707d", wraplength=390).grid(row=7, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
         action = ttk.Frame(frame)
         action.grid(row=2, column=0, columnspan=2, sticky="nsew")
@@ -2497,6 +2558,8 @@ class CollectorGUI:
 
     def _update_mode_controls(self) -> None:
         running = self._inference_running()
+        if hasattr(self, "inference_eef_mode_selector"):
+            self.inference_eef_mode_selector.configure(state="disabled" if running else "readonly")
         collection_active = self.app_mode == "collection"
         inference_active = self.app_mode == "inference"
         data_process_active = self.app_mode == "data_process"
@@ -2624,8 +2687,35 @@ class CollectorGUI:
                 child.configure(takefocus=False)
             self._disable_button_focus(child)
 
+    def _store_eef_pose_profile(self):
+        self._eef_pose_profiles[self._eef_mode_active] = dict(
+            enabled=self.inference_pose_trajectory_var.get(),
+            settings={name: value.get().strip() for name, value in self.inference_pose_settings.items()})
+
+    def _load_eef_pose_profile(self, mode):
+        profile = self._eef_pose_profiles[mode]
+        self.inference_pose_trajectory_var.set(profile["enabled"])
+        for name, value in self.inference_pose_settings.items():
+            value.set(profile["settings"][name])
+
+    def _on_eef_control_mode_changed(self, *_):
+        mode = self.inference_eef_control_mode_var.get()
+        if mode == self._eef_mode_active:
+            return
+        if mode not in self._eef_pose_profiles or self._inference_running():
+            self.inference_eef_control_mode_var.set(self._eef_mode_active)
+            if self._inference_running():
+                messagebox.showwarning("Control mode locked", "Stop the client before switching EEF control modes.")
+            return
+        self._store_eef_pose_profile()
+        self._eef_mode_active = mode
+        self._load_eef_pose_profile(mode)
+
     def _save_gui_preferences(self) -> None:
+        self._store_eef_pose_profile()
         values: dict[str, object] = {
+            "inference_eef_control_mode": self.inference_eef_control_mode_var.get(),
+            "inference_eef_pose_profiles": self._eef_pose_profiles,
             "can_selector": self.can_var.get().strip(),
             "left_can_selector": self.left_can_var.get().strip(),
             "right_can_selector": self.right_can_var.get().strip(),
@@ -2687,6 +2777,7 @@ class CollectorGUI:
             "inference_gripper_confirm_steps": self.inference_gripper_confirm_steps_var.get().strip(),
             "inference_gripper_open_lookahead_enabled": self.inference_gripper_lookahead_var.get(),
             "inference_gripper_open_lookahead_steps": self.inference_gripper_lookahead_steps_var.get().strip(),
+            **{"inference_" + name: value.get().strip() for name, value in self.inference_eef_goal_vars.items()},
             "inference_ik_rate_limit_enabled": self.inference_ik_rate_limit_var.get(),
             "inference_ik_max_joint_step_rad": self.inference_ik_max_step_var.get().strip(),
             "left_wrist_device": self.left_wrist_var.get().strip(),
@@ -3321,6 +3412,7 @@ class CollectorGUI:
             gripper_lowpass_alpha=gripper_lowpass_alpha,
             trajectory_shaping_enabled=self.inference_trajectory_shaping_var.get(),
             servo_backend=self.inference_servo_backend_var.get(),
+            eef_control_mode=self.inference_eef_control_mode_var.get(),
             servo_hz=servo_hz,
             pose_trajectory_enabled=self.inference_pose_trajectory_var.get(),
             pose_trajectory_settings={name: float(value.get()) for name, value in self.inference_pose_settings.items()},
@@ -3350,6 +3442,7 @@ class CollectorGUI:
             gripper_confirm_steps=gripper_confirm_steps,
             gripper_open_lookahead_enabled=self.inference_gripper_lookahead_var.get(),
             gripper_open_lookahead_steps=gripper_lookahead_steps,
+            **{name: float(value.get()) for name, value in self.inference_eef_goal_vars.items()},
             ik_rate_limit_enabled=self.inference_ik_rate_limit_var.get(),
             ik_max_joint_step_rad=ik_max_step,
             auto_next_inference=bool(self.inference_auto_next_var.get()),
@@ -3429,9 +3522,13 @@ class CollectorGUI:
         command += ["--initial-pose-file", pose_path]
         self.inference_session_command = list(command)
         self.inference_return_only = False
-        self._launch_inference_process(command, endpoint)
+        self._launch_inference_process(command, endpoint, device_check=device_check)
 
-    def _launch_inference_process(self, command, endpoint):
+    def _launch_inference_process(self, command, endpoint, *, device_check=None):
+        if self.inference_log_widget is not None:
+            self.inference_log_widget.configure(state="normal")
+            self.inference_log_widget.delete("1.0", "end")
+            self.inference_log_widget.configure(state="disabled")
         self._append_inference_log("$ " + " ".join(command))
         self.inference_stop_requested = False
         try:
@@ -3454,10 +3551,6 @@ class CollectorGUI:
         checked = " · RLSOK UNCHANGED (saved setup)" if device_check is not None else ""
         self.inference_status_var.set(f"Inference running · {endpoint}{checked}")
         self.inference_pid_var.set(f"PID {process.pid}")
-        if self.inference_log_widget is not None:
-            self.inference_log_widget.configure(state="normal")
-            self.inference_log_widget.delete("1.0", "end")
-            self.inference_log_widget.configure(state="disabled")
 
         def reader() -> None:
             assert process.stdout is not None
@@ -3520,12 +3613,19 @@ class CollectorGUI:
             return
         self.inference_stop_requested = True
         self.inference_status_var.set("Stopping inference...")
+        self._append_inference_log(f"[GUI stop requested: SIGINT to client PID {process.pid}]")
         if self.inference_stop_button is not None:
             self.inference_stop_button.configure(state="disabled")
         try:
-            os.killpg(os.getpgid(process.pid), signal.SIGINT)
-        except (OSError, ProcessLookupError):
+            # Let the actuator owner brake and reap its compute workers.
+            # Interrupting IK workers simultaneously can break its cleanup.
             process.send_signal(signal.SIGINT)
+        except OSError as exc:
+            self.inference_stop_requested = False
+            self.inference_status_var.set(f"Stop signal failed: {exc}")
+            if self.inference_stop_button is not None:
+                self.inference_stop_button.configure(state="normal")
+            self._append_inference_log(f"[Stop signal failed: {exc}]")
 
     def trigger_next_inference(self) -> None:
         path = self.inference_manual_trigger_path
@@ -3537,6 +3637,10 @@ class CollectorGUI:
             self.status_var.set(f"Could not trigger next inference: {exc}")
 
     def _finish_inference(self, return_code: int | None, requested: bool) -> None:
+        process = getattr(self, "inference_process", None)
+        if process is not None and process.poll() is not None:
+            from bimanual_vla.deployment.process_control import close_owned_process_group
+            close_owned_process_group(process, grace_s=0.)
         restart_requested = self.inference_restart_requested
         return_after_stop = getattr(self, "inference_return_after_stop", False)
         self.inference_return_after_stop = False
@@ -3553,7 +3657,7 @@ class CollectorGUI:
             except OSError:
                 pass
             self.inference_manual_trigger_path = None
-        if requested or return_code == 0:
+        if return_code == 0:
             self.inference_status_var.set("Inference idle")
         else:
             self.inference_status_var.set(f"Inference exited with code {return_code}")
@@ -3561,9 +3665,9 @@ class CollectorGUI:
             self.inference_status_var.set("已回到原始位置" if return_code == 0 else "回位失败，请查看日志")
         self._set_connection_config_enabled(True)
         self._update_mode_controls()
-        if return_after_stop:
+        if return_code == 0 and return_after_stop:
             self.root.after(250, self.return_inference_to_initial)
-        elif restart_requested:
+        elif return_code == 0 and restart_requested:
             self.root.after(250, self.start_inference)
 
     def _finish_can_activation(
@@ -4386,6 +4490,9 @@ class CollectorGUI:
 
     def _replay_inference_defaults(self):
         """Snapshot effective execution settings without starting inference."""
+        mode = getattr(self, "inference_eef_control_mode_var", None)
+        if mode is not None and mode.get() == "piper_eef":
+            raise ValueError("Dataset replay uses local IK; select local_ik_joint before opening replay")
         from bimanual_vla.collection.replay import ReplayConfig
         defaults = ReplayConfig()
         backend = self.inference_servo_backend_var.get() if self.inference_trajectory_shaping_var.get() else 'off'
@@ -4543,24 +4650,14 @@ class CollectorGUI:
                     process.kill()
             if self.dataset_task_thread is not None:
                 self.dataset_task_thread.join(timeout=3.0)
-        if self._inference_running():
-            self.stop_inference()
+        if self.inference_process is not None:
             process = self.inference_process
+            self.stop_inference()
             if process is not None:
-                try:
-                    process.wait(timeout=3.0)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                    except OSError:
-                        process.terminate()
-                    try:
-                        process.wait(timeout=1.0)
-                    except subprocess.TimeoutExpired:
-                        try:
-                            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                        except OSError:
-                            process.kill()
+                from bimanual_vla.deployment.process_control import close_owned_process_group
+                if close_owned_process_group(process):
+                    self._append_inference_log(
+                        "[Client process group forcibly terminated; robot stop is unverified]")
         if self.recording:
             if not messagebox.askyesno("Exit", "The current episode has not been saved. Exit anyway?"):
                 return

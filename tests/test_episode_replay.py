@@ -527,6 +527,8 @@ def test_partial_send_failure_never_disables_or_takes_control_of_an_uncommanded_
 def test_stop_holds_fresh_measured_joints_without_disabling_or_reenabling(unsafe):
     hardware = PiperReplayHardware(('left', 'right'), {}, ReplayConfig())
     hardware.arms = {'left': Mock(), 'right': Mock()}
+    for arm in hardware.arms.values():
+        arm._vla_joint_limits = JOINT_LIMITS_RAD.copy()
     hardware.commanded = {'left'}
     hardware.check_ownership = Mock()
     q = np.array([.2, 1., -1., .1, -.1, .2, .014])

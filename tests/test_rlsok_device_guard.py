@@ -109,6 +109,12 @@ class DeviceGuardTest(unittest.TestCase):
         piper.DisconnectPort.assert_called_once()
 
     def test_live_can_feedback_loss_exits_without_old_command_or_auto_return(self):
+        self._check_runtime_failure(startup=False)
+
+    def test_startup_failure_is_not_masked_by_stopped_camera(self):
+        self._check_runtime_failure(startup=True)
+
+    def _check_runtime_failure(self, *, startup):
         args = SimpleNamespace(
             arm_mode="single", arm_side="right", can="can0", left_can="can1", right_can="can2",
             cam_high_device="auto", cam_wrist_device="auto",
@@ -124,6 +130,8 @@ class DeviceGuardTest(unittest.TestCase):
             auto_return=True, reconnect_delay=0.0,
         )
         camera = MagicMock(spec=CameraCapture)
+        camera.resize_mode = "stretch"
+        camera._policy_image_hw = (224, 224)
         camera.verify.return_value = {
             key: dict(ok=True, selected_device="/dev/video4", video_device="/dev/video4",
                       shape=(240, 424, 3), latency_ms=1.0)
@@ -142,7 +150,9 @@ class DeviceGuardTest(unittest.TestCase):
         monitoring = MagicMock()
         monitoring.level = "compact"
         protocol = MagicMock()
-        protocol.schema = "joint"
+        protocol.schema = "delivery" if startup else "joint"
+        protocol.image_resize_mode = "stretch"
+        protocol.image_size = 224
         protocol.camera_keys = ("cam_high", "cam_wrist")
         piper = MagicMock()
         with ExitStack() as stack:
@@ -161,13 +171,23 @@ class DeviceGuardTest(unittest.TestCase):
             worker.return_value.in_flight = False
             policy = stack.enter_context(patch("bimanual_vla.deployment.client.connect_policy", return_value=(MagicMock(), protocol)))
             auto_return = stack.enter_context(patch("bimanual_vla.deployment.client.return_pipers_to_initial"))
-            with self.assertRaisesRegex(DeviceCheckRejected, "synthetic CAN unplug"):
+            if startup:
+                camera.assert_background_healthy.side_effect = [None, RuntimeError("background camera capture is not running")]
+                stack.enter_context(patch("bimanual_vla.deployment.client.move_pipers_to_safe_startup_pose",
+                                          side_effect=rtc_client.ExecutionBlocked("arm_status=4 target joint limit exceeded")))
+            expected = "EEF startup approach failed: arm_status=4" if startup else "synthetic CAN unplug"
+            with self.assertRaisesRegex(DeviceCheckRejected, expected):
                 run_rtc_client(args)
         execution.discard_pending_actions.assert_called_once()
         execution.execute_next.assert_not_called()
         policy.assert_called_once()
         auto_return.assert_not_called()
         piper.DisconnectPort.assert_called_once()
+        if startup:
+            camera.assert_background_healthy.assert_called_once()
+            events = [call.args[0] for call in monitoring.record.call_args_list]
+            self.assertIn("runtime_hardware_fault", events)
+            self.assertNotIn("policy_connection_error", events)
 
     @patch("bimanual_vla.device_guard.check_devices")
     def test_runtime_recheck_latches_role_change_off_control_thread(self, check):
