@@ -135,6 +135,47 @@ class JointServoTest(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("ruckig"), "requires ruckig==0.12.2")
 class ServoLoopTest(unittest.TestCase):
+    def test_independent_arms_use_one_writer_and_timeout_brakes_both(self):
+        from bimanual_vla.deployment.servo import IndependentArmJointPlanner
+        feedback = np.zeros(14)
+        publications = []
+
+        def publish(command):
+            feedback[:] = command
+            publications.append(threading.get_ident())
+            return {}
+
+        loop = ServoLoop(feedback.copy(), -np.ones(14), np.ones(14),
+            ServoConfig(independent_arms=True, target_timeout_s=.04), lambda: feedback.copy(), publish)
+        self.addCleanup(loop.close)
+        self.assertIsInstance(loop.planner, IndependentArmJointPlanner)
+        loop.submit(np.full(14, .1))
+        deadline = time.monotonic()+1.
+        while time.monotonic()<deadline and not loop.metrics()['state']['braking']:
+            time.sleep(.01)
+        self.assertTrue(loop.metrics()['state']['braking'])
+        self.assertTrue(loop.close())
+        self.assertEqual(len(set(publications)), 1)
+
+    def test_unchanged_goal_refresh_does_not_restart_trajectory(self):
+        from unittest.mock import Mock
+        loop, published = self.make_loop()
+        with loop._condition:
+            loop.servo.retarget = Mock(wraps=loop.servo.retarget)
+        target = np.full(7, .1)
+        first = loop.submit(target)
+        for _ in range(6):
+            latest = loop.submit(target)
+        self.assertEqual(loop.servo.retarget.call_count, 1)
+        self.assertGreater(latest['sequence'], first['sequence'])
+        self.assertGreater(latest['qpos'][0], first['qpos'][0])
+        loop.submit(np.full(7, .15))
+        self.assertEqual(loop.servo.retarget.call_count, 2)
+        # A hold invalidates the cached plan, even when resuming the same goal.
+        loop.submit(target, hold=True)
+        loop.submit(np.full(7, .15))
+        self.assertEqual(loop.servo.retarget.call_count, 3)
+
     def test_records_measured_feedback_separately_from_planned_command(self):
         feedback = np.zeros(7)
         published = []

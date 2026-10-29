@@ -529,24 +529,33 @@ class ContinuousIKTest(unittest.TestCase):
             float(np.linalg.norm(xyz - target_xyz)),
         )
 
-    def test_accepts_small_zero_offset_and_does_not_move_farther_outward(self):
+    def test_feedback_tolerance_cannot_authorize_out_of_bounds_targets(self):
         joints = self.joints.copy()
         joints[1] = -0.0345
         joints[2] = 0.0491
         xyz, rotation = self.solver.pose(joints)
         target_rpy = Rotation.from_matrix(rotation).as_euler("xyz", degrees=True)
-        solved = self.solver.solve(
-            joints,
-            xyz,
-            target_rpy,
-            max_joint_step_rad=0.08,
-            position_tolerance_m=0.0015,
-            rotation_tolerance_rad=0.02,
-            max_nfev=100,
-        )
-        np.testing.assert_allclose(solved, joints, atol=2e-6)
-        self.assertGreaterEqual(solved[1], joints[1] - 1e-8)
-        self.assertLessEqual(solved[2], joints[2] + 1e-8)
+        # This linear FK requires the same illegal joints to hit this pose.
+        # Accepting the feedback does not make that commanded pose legal.
+        with self.assertRaisesRegex(ExecutionBlocked, 'could not reach'):
+            self.solver.solve(joints, xyz, target_rpy, max_joint_step_rad=.08,
+                position_tolerance_m=.0015, rotation_tolerance_rad=.02, max_nfev=100)
+
+    def test_recorded_small_negative_j2_solves_inside_driver_bounds(self):
+        from bimanual_vla.deployment.client import JOINT_LIMITS_RAD
+        from bimanual_vla.deployment.ik_workers import solve_ik_request
+        solver = PiperContinuousIK()
+        q = np.array([1.6754462718963623, -.0009250244474969804, -.13842205703258514,
+                      .007504915352910757, .33543482422828674, .024347342550754547])
+        xyz, rot = solver.pose(q)
+        kwargs = dict(max_joint_step_rad=.3, search_joint_radius_rad=.3,
+            position_tolerance_m=.0015, rotation_tolerance_rad=.02, max_nfev=100,
+            joint_limits=JOINT_LIMITS_RAD)
+        result = solve_ik_request(solver, (q, xyz, Rotation.from_matrix(rot).as_euler('xyz', degrees=True)), kwargs)
+        solved = result['solution_joints_rad']
+        self.assertTrue(np.all(solved >= JOINT_LIMITS_RAD[:, 0]))
+        self.assertTrue(np.all(solved <= JOINT_LIMITS_RAD[:, 1]))
+        self.assertLess(abs(solved[1]), .002)
 
     def test_rejects_feedback_beyond_zero_offset_tolerance(self):
         joints = self.joints.copy()
@@ -661,6 +670,53 @@ class EnableHoldTest(unittest.TestCase):
             with self.assertRaisesRegex(ExecutionBlocked, "enable timed out"):
                 execution._enable_robot("right", piper, measured)
         self.assertNotIn("right", execution.robot_enabled)
+
+    def test_enable_waits_past_cached_native_limit_rejection(self):
+        piper = FakePiper()
+        execution = ExecutionController(piper, execution_args(enable_timeout_s=.1))
+        measured = np.array([0., 0., -.2, 0., 0., 0., .035])
+        def frame(stamp, mode, status=0):
+            return dict(ctrl_mode=1, mode_feed=mode, arm_status=status, err_code=0,
+                        feedback_fresh=True, feedback_timestamp=stamp)
+        frames = [frame(99.997, 0, 4), frame(99.997, 0, 4),
+                  frame(100.01, 1), frame(100.02, 1), frame(100.03, 1)]
+        with patch('bimanual_vla.deployment.client.time.time', return_value=100.), \
+             patch('bimanual_vla.deployment.client.time.sleep'), \
+             patch('bimanual_vla.deployment.client.arm_status_dict', side_effect=frames):
+            execution._enable_robot('right', piper, measured)
+        self.assertIn('right', execution.robot_enabled)
+        self.assertEqual(len([c for c in piper.calls if c[0] == 'JointCtrl']), 5)
+        piper_calls = [c[0] for c in piper.calls]
+        self.assertNotIn('EndPoseCtrl', piper_calls)
+        self.assertNotIn('DisableArm', piper_calls)
+
+    def test_enable_does_not_defer_new_limit_fault_or_other_old_faults(self):
+        for stamp, mode, status, err in ((100.01, 0, 4, 0), (100.01, 1, 4, 0),
+                                         (99.997, 1, 4, 0), (99.997, 0, 7, 0),
+                                         (99.997, 0, 4, 1)):
+            with self.subTest(stamp=stamp, mode=mode, status=status, err=err):
+                piper = FakePiper()
+                execution = ExecutionController(piper, execution_args(enable_timeout_s=.1))
+                frame = dict(ctrl_mode=1, mode_feed=mode, arm_status=status, err_code=err,
+                             feedback_fresh=True, feedback_timestamp=stamp)
+                with patch('bimanual_vla.deployment.client.time.time', return_value=100.), \
+                     patch('bimanual_vla.deployment.client.arm_status_dict', return_value=frame):
+                    with self.assertRaisesRegex(ExecutionBlocked, 'became unhealthy'):
+                        execution._enable_robot('right', piper, np.array([0., 0., -.2, 0., 0., 0., .035]))
+                self.assertNotIn('right', execution.robot_enabled)
+                self.assertEqual(len([c for c in piper.calls if c[0] == 'JointCtrl']), 1)
+
+    def test_cached_native_limit_rejection_cannot_confirm_or_wait_forever(self):
+        piper = FakePiper()
+        execution = ExecutionController(piper, execution_args(enable_timeout_s=.01))
+        frame = dict(ctrl_mode=1, mode_feed=0, arm_status=4, err_code=0,
+                     feedback_fresh=True, feedback_timestamp=99.997)
+        with patch('bimanual_vla.deployment.client.time.time', return_value=100.), \
+             patch('bimanual_vla.deployment.client.time.sleep'), \
+             patch('bimanual_vla.deployment.client.arm_status_dict', return_value=frame):
+            with self.assertRaisesRegex(ExecutionBlocked, 'enable timed out'):
+                execution._enable_robot('right', piper, np.array([0., 0., -.2, 0., 0., 0., .035]))
+        self.assertNotIn('right', execution.robot_enabled)
 
     def test_enable_waits_for_all_six_driver_enable_bits(self):
         class DriverFeedbackPiper(FakePiper):
@@ -1391,6 +1447,16 @@ class ClientTransportTimingTest(unittest.TestCase):
 
 
 class AsyncInferencePipelineTest(unittest.TestCase):
+    def test_independent_arm_planning_is_scoped_to_local_delivery(self):
+        joint, _ = self.configured_execution(self.joint_protocol)
+        local, _ = self.configured_execution(self.delivery_protocol)
+        native, _ = self.configured_execution(self.delivery_protocol, eef_control_mode="piper_eef")
+        opted_out, _ = self.configured_execution(self.delivery_protocol, ik_independent_arms=False)
+        self.assertFalse(joint._servo_config().independent_arms)
+        self.assertTrue(local._servo_config().independent_arms)
+        self.assertFalse(native._servo_config().independent_arms)
+        self.assertFalse(opted_out._servo_config().independent_arms)
+
     def test_invalid_future_chunk_point_is_dropped_without_pausing_writer(self):
         from unittest.mock import Mock
         protocol = replace(self.joint_protocol, rtc_supported=True, rtc_mode="trained",
@@ -3007,6 +3073,662 @@ class ExecutionQueueTest(unittest.TestCase):
     def setUp(self):
         self.raw_state = delivery_state(opening_fraction=0.5)
         self.qpos = np.array([0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.035])
+
+    def recovery_execution(self, *, exhausted=False, full_solve=False, initial_failure=False):
+        from dataclasses import asdict
+        from unittest.mock import Mock
+        from bimanual_vla.deployment.ik_workers import IKUnreachableError
+        protocol = validate_policy_metadata(BIMANUAL_DELIVERY_METADATA, "both", "bimanual")
+        pipers = {side: FakePiper() for side in ("left", "right")}
+        execution = ExecutionController(pipers, execution_args(
+            arm_mode="bimanual", arm_side="both", servo_backend="ruckig", rtc_enabled=True))
+        execution.configure_protocol(protocol)
+        execution.robot_enabled = set(pipers)
+        execution.ik_solver = RecordingContinuousIK()
+        solved = execution._solve_delivery_ik(self.qpos[:6], self.raw_state[:3], np.zeros(3), side="right")
+        solved.solution_joints_rad[0] = .02
+        def solve(requests, **kwargs):
+            nonlocal initial_failure
+            fraction = requests['right'][1]['recovery_fraction']
+            if exhausted or (fraction == 1. and (not full_solve or initial_failure)):
+                initial_failure = False
+                raise IKUnreachableError('right geometric failure')
+            results = {side: dict(asdict(solved), recovery=dict(fraction=fraction,
+                xyz_m=self.raw_state[:3].tolist(), rpy_deg=[0., 0., 0.],
+                goal_score_before=10., goal_score_after=5., progress=True)) for side in pipers}
+            if fraction == 1.:
+                for result in results.values():
+                    result.pop('recovery')
+            return results
+        execution.ik_workers = Mock(last_wall_ms=1., solve=Mock(side_effect=solve))
+        qpos = np.tile(self.qpos, 2)
+        state = np.tile(self.raw_state, 2)
+        actions = np.zeros((4, 14))
+        actions[:, [6, 13]] = .8  # Must not open either gripper during recovery.
+        now = time.time()
+        execution.queue_result(execution_result(actions), state, qpos, protocol,
+                               {key: now for key in protocol.camera_keys}, .01)
+        execution.servo_loop = Mock()
+        # These continuation tests model a stationary initial writer. Moving
+        # handoff behavior is exercised separately with measured settling.
+        execution._recovery_needs_braking = Mock(return_value=False)
+        execution._servo_publish_target = Mock(return_value={
+            "qpos": qpos.copy(), "sides": {s: {} for s in pipers}, "sequence": 1})
+        return execution, protocol, state, qpos
+
+    def test_shrink_recovery_holds_grippers_clears_suffix_and_waits_for_arrival(self):
+        execution, protocol, state, qpos = self.recovery_execution()
+        self.assertTrue(execution.execute_next(state, qpos, protocol))
+        self.assertEqual(execution.state, 'recovering')
+        self.assertEqual(execution.pending_actions, [])
+        prepared = execution._servo_publish_target.call_args.args[1]
+        for side in ('left', 'right'):
+            self.assertEqual(prepared[side][1], .035)
+            self.assertEqual(execution.last_actuator_command['sides'][side]['ik_recovery']['fraction'], .5)
+        target = execution.ik_recovery_target.copy()
+        self.assertIsNone(execution.rtc_request_metadata(protocol)['previous_chunk_generation'])
+        launch, arrived = inference_launch(state, qpos, generation=50)
+        self.assertFalse(execution.accept_inference_result(
+            execution_result(np.zeros((4, 14))), launch, protocol,
+            arrived_at=arrived, min_steps_override=1))
+        self.assertIn('still moving', execution.rejected_result['reason'])
+        indices = [i for i in range(14) if i % 7 != 6]
+        execution.servo_loop.metrics.return_value = dict(fault=None, paused=False, stopping=False,
+            state=dict(position=target[indices], velocity=np.zeros(12), acceleration=np.zeros(12)))
+        execution.servo_loop.submit.side_effect = lambda reference, **kw: {'qpos': reference.copy()}
+        goal = execution.eef_goal_action
+        far_state = state.copy()
+        far_state[0] += .02
+        # Planner arrival alone is insufficient: measured joints must arrive too.
+        execution._advance_ik_recovery(qpos, time.monotonic(), raw_delivery_state=far_state, protocol=protocol)
+        self.assertIsNotNone(execution.ik_recovery_target)
+        # Reaching the intermediate reference still cannot release the grippers.
+        execution._advance_ik_recovery(target, time.monotonic(), raw_delivery_state=far_state, protocol=protocol)
+        self.assertIs(execution.eef_goal_action, goal)
+        self.assertEqual(execution.eef_goal_step_count, 2)
+        np.testing.assert_array_equal(execution.servo_loop.submit.call_args.args[0][[6, 13]], [.035, .035])
+        requests = execution.ik_workers.solve.call_args.args[0]
+        np.testing.assert_array_equal(requests['left'][1]['progress_goal'][0], goal.absolute_target[:3])
+        self.assertTrue(requests['right'][1]['hold_position'])
+        self.assertFalse(requests['left'][1]['hold_position'])
+        # Only original-goal feedback permits filtering/ramping the opening.
+        feedback = target.copy()
+        for _ in range(30):
+            execution._advance_ik_recovery(feedback, time.monotonic(), raw_delivery_state=state, protocol=protocol)
+            feedback = execution.servo_loop.submit.call_args.args[0].copy()
+            if execution.ik_recovery_target is None:
+                break
+        self.assertIsNone(execution.ik_recovery_target)
+        self.assertIsNone(execution.eef_goal_action)
+        np.testing.assert_allclose(feedback[[6, 13]], [.056, .056], atol=.0005)
+        self.assertTrue(execution.servo_loop.submit.call_args.kwargs['context']['eef_goal'])
+        barrier = execution.ik_recovery_barrier
+        actions = np.zeros((4, 14))
+        actions[:, [6, 13]] = .5
+        for offset, accepted in ((-.01, False), (.01, True)):
+            launch, arrived = inference_launch(state, target, generation=51,
+                captured_monotonic=barrier+offset)
+            self.assertEqual(execution.accept_inference_result(execution_result(actions), launch,
+                protocol, arrived_at=arrived, arrived_monotonic=barrier+.02,
+                min_steps_override=1, skip_steps_override=0, blend_steps_override=0), accepted)
+        self.assertFalse(execution.ik_recovery_prefix_reset)
+
+    def test_moving_recovery_brakes_then_resolves_from_fresh_settled_feedback(self):
+        from unittest.mock import Mock
+        execution, protocol, raw, qpos = self.recovery_execution()
+        execution._recovery_needs_braking.return_value = True
+        indices = [i for i in range(14) if i % 7 != 6]
+        execution.servo_loop.metrics.return_value = dict(state=dict(position=qpos[indices]))
+        stamp = [100.]
+        for piper in execution.pipers.values():
+            piper.GetArmJointMsgs = Mock(side_effect=lambda: SimpleNamespace(time_stamp=stamp[0]))
+        self.assertTrue(execution.execute_next(raw, qpos, protocol))
+        self.assertTrue(execution.ik_recovery_braking)
+        self.assertTrue(execution._servo_publish_target.call_args.kwargs['hold'])
+        for i, side in enumerate(('left', 'right')):
+            np.testing.assert_array_equal(execution._servo_publish_target.call_args.args[1][side][0], qpos[i*7:i*7+6])
+        self.assertEqual(execution.pending_action_count, 0)
+        self.assertIsNone(execution.rtc_request_metadata(protocol)['previous_chunk_generation'])
+        calls = execution.ik_workers.solve.call_count
+        indices = [i for i in range(14) if i % 7 != 6]
+        measured = qpos.copy(); measured[0] = .04
+        state = dict(position=measured[indices].copy(), velocity=np.ones(12)*.3,
+                     acceleration=np.ones(12))
+        execution.servo_loop.metrics.return_value = dict(fault=None, paused=False, stopping=False, state=state)
+        started = execution.ik_recovery_started
+        far = raw.copy(); far[0] += .03
+        def tick(dt, *, fresh=True):
+            if fresh:
+                stamp[0] = 100.+dt
+            execution._advance_ik_recovery(measured.copy(), started+dt,
+                raw_delivery_state=far, protocol=protocol, feedback_at=100.+dt)
+        tick(.03)
+        state['velocity'][:] = 0.; state['acceleration'][:] = 0.
+        # A stationary planner with lagging feedback cannot authorize handoff.
+        state['position'][0] += .04
+        tick(.07); tick(.11)
+        self.assertTrue(execution.ik_recovery_braking)
+        state['position'][:] = measured[indices]
+        tick(.15)
+        # Wall clock advancing with frozen encoder timestamps is not settling.
+        tick(.4, fresh=False)
+        self.assertTrue(execution.ik_recovery_braking)
+        execution.servo_loop.submit.assert_not_called()
+        self.assertEqual(execution.ik_workers.solve.call_count, calls)
+        execution.servo_loop.submit.side_effect = lambda target, **kw: {'qpos': target.copy()}
+        for dt in (.45, .49, .53, .57, .61):
+            tick(dt)
+            if not execution.ik_recovery_braking:
+                break
+        self.assertFalse(execution.ik_recovery_braking)
+        requests = execution.ik_workers.solve.call_args.args[0]
+        np.testing.assert_array_equal(requests['left'][0][0], measured[:6])
+        self.assertIsNone(requests['left'][1]['initial_joints_rad'])
+        for call in execution.servo_loop.submit.call_args_list:
+            np.testing.assert_array_equal(call.args[0][[6, 13]], [.035, .035])
+
+    def test_recovery_retains_fast_sent_command_tracking_guard(self):
+        execution, protocol, raw, qpos = self.recovery_execution()
+        execution.execute_next(raw, qpos, protocol)
+        indices = [i for i in range(14) if i % 7 != 6]
+        sent = qpos[indices].copy(); sent[0] += .12
+        execution.servo_loop.metrics.return_value = dict(fault=None, paused=False, stopping=False,
+            state=dict(position=sent, velocity=np.ones(12)*.2, acceleration=np.zeros(12)))
+        execution.servo_loop.submit.side_effect = lambda target, **kw: {'qpos': target.copy()}
+        started = execution.ik_recovery_started
+        for dt in (.03, .03, .03, .06):
+            execution._advance_ik_recovery(qpos, started+dt, raw_delivery_state=raw, protocol=protocol)
+        self.assertEqual(execution._recovery_tracking_cycles, 2)
+        self.assertIsNone(execution.ik_recovery_fault)
+        execution._advance_ik_recovery(qpos, started+.09, raw_delivery_state=raw, protocol=protocol)
+        self.assertIn('sent-command tracking lag', execution.ik_recovery_fault)
+        execution.servo_loop.hold.assert_called()
+        self.assertIsNone(execution.ik_recovery_target)
+
+    def test_shrink_recovery_exhaustion_latches_stop_without_partial_publication(self):
+        execution, protocol, state, qpos = self.recovery_execution(exhausted=True)
+        self.assertFalse(execution.execute_next(state, qpos, protocol))
+        execution._servo_publish_target.assert_not_called()
+        self.assertEqual(execution.ik_workers.solve.call_count, 3)
+        self.assertEqual(execution.pending_actions, [])
+        self.assertEqual(execution.state, 'blocked')
+        self.assertIn('stop and restart', execution.ik_recovery_fault)
+        schedule = PeriodicSchedule(2., next_at=0.)
+        self.assertFalse(execution.async_launch_due(schedule, time.monotonic()))
+        launch, arrived = inference_launch(state, qpos, generation=50)
+        self.assertFalse(execution.accept_inference_result(
+            execution_result(np.zeros((4, 14))), launch, protocol,
+            arrived_at=arrived, min_steps_override=1))
+
+    def test_full_ik_gripper_transition_keeps_continuous_queue(self):
+        execution, protocol, state, qpos = self.recovery_execution()
+        execution.gripper_endpoint_filter = False
+        execution.rtc_enabled = True
+        sent_openings = []
+        def publish(current, prepared, sides, **kwargs):
+            sent_openings.extend(prepared[side][1] for side in sides)
+            return {"qpos": qpos.copy(), "sides": {s: {} for s in sides}, "sequence": 1}
+        execution._servo_publish_target.side_effect = publish
+        solve = execution.ik_workers.solve.side_effect
+        def full_solve(requests, **kw):
+            result = solve({side: (args, dict(options, recovery_fraction=.5))
+                            for side, (args, options) in requests.items()}, **kw)
+            for value in result.values():
+                value.pop('recovery')
+            return result
+        execution.ik_workers.solve.side_effect = full_solve
+        self.assertTrue(execution.execute_next(state, qpos, protocol))
+        self.assertIsNone(execution.last_ik_recovery)
+        self.assertIsNone(execution.eef_goal_action)
+        self.assertIsNone(execution.ik_recovery_target)
+        self.assertGreater(execution.pending_action_count, 0)
+        self.assertFalse(execution.ik_recovery_prefix_reset)
+        self.assertTrue(all(opening > .035 for opening in sent_openings))
+
+    def test_real_ik_continues_multiple_local_steps_to_original_goal(self):
+        self._check_real_ik_goal_continuation(smoothing=False)
+
+    def test_rtc_projected_targets_and_grippers_do_not_stop_each_row(self):
+        execution, protocol, state, qpos = self.recovery_execution(full_solve=True)
+        execution.rtc_enabled = True
+        execution.args.pose_trajectory = True
+        execution.gripper_endpoint_filter = False
+        execution.args.max_translation_step_m = .008
+        for index, row in enumerate(execution.pending_actions):
+            goal = row.absolute_target.copy()
+            goal[[0, 10]] += .02
+            execution.pending_actions[index] = replace(row, absolute_target=goal)
+        rows = list(execution.pending_actions)
+        for row in rows:
+            with patch('bimanual_vla.deployment.client.time.monotonic', return_value=row.target_monotonic):
+                self.assertTrue(execution.execute_next(state, qpos, protocol))
+            self.assertFalse(execution.tracking_lag_active)
+            self.assertIsNone(execution.eef_goal_action)
+            self.assertFalse(execution.ik_recovery_prefix_reset)
+            self.assertEqual(execution.last_safe_target.source_index, row.source_index)
+            self.assertFalse(execution._pose_trajectories)
+            for side in ('left', 'right'):
+                trace = execution.last_actuator_command['sides'][side]
+                self.assertTrue(trace['pre_ik_eef_target']['projected_for_local_ik'])
+                self.assertEqual(trace['pose_trajectory_bypass_reason'], 'rtc_continuous_tracking')
+                self.assertNotIn('original_goal_retained', trace)
+        execution.servo_loop.hold.assert_not_called()
+
+    def test_tracking_guard_detects_policy_lag_even_when_sent_joints_track(self):
+        for error_kind in ('policy_position', 'policy_rotation'):
+            with self.subTest(error_kind=error_kind):
+                execution, protocol, state, qpos = self.recovery_execution(full_solve=True)
+                execution.args.pose_trajectory = True
+                self.assertTrue(execution.execute_next(state, qpos, protocol))
+                trace = execution.last_actuator_command
+                for side in ('left', 'right'):
+                    issued = trace['sides'][side]
+                    issued['commanded_joints_rad'] = qpos[:6].tolist()
+                    issued['full_ik_solution_joints_rad'] = qpos[:6].copy()
+                    target = state[:10].copy()
+                    if error_kind == 'policy_position':
+                        target[0] += .06
+                    else:
+                        target[3:9] = matrix_to_rotation6d(Rotation.from_euler('z', .25).as_matrix())
+                    issued['policy_eef_target'] = target
+                for tick in range(11):
+                    execution._pending_feedback_command = trace
+                    execution._complete_pending_command_feedback(state, qpos, protocol, feedback_at=100.+tick*.05)
+                    if tick < 10:
+                        self.assertFalse(execution.tracking_lag_active)
+                        self.assertGreater(execution.pending_action_count, 0)
+                self.assertTrue(execution.tracking_lag_active)
+                self.assertEqual(execution.pending_action_count, 0)
+                execution.servo_loop.hold.assert_called_once()
+                self.assertIsNone(execution.tracking_lag_required_after_monotonic)
+                self.assertIsNone(execution.rtc_request_metadata(protocol)['previous_chunk_generation'])
+                self.assertFalse(execution.async_launch_due(PeriodicSchedule(2., next_at=0.), time.monotonic()))
+                self.assertAlmostEqual(execution.last_command_feedback['max_joint_abs_error_rad'], 0.)
+
+                # Braking/feedback convergence is required before new inference.
+                joints = np.delete(qpos, [6, 13])
+                metrics = dict(fault=None, paused=False, stopping=False,
+                    state=dict(position=joints, velocity=np.ones(12)*.01, acceleration=np.zeros(12)))
+                execution.servo_loop.metrics.return_value = metrics
+                sent_count = execution._servo_publish_target.call_count
+                self.assertFalse(execution.execute_next(state, qpos, protocol))
+                self.assertEqual(execution._servo_publish_target.call_count, sent_count)
+                # Independent fake clock for the explicit settling sequence.
+                execution.tracking_lag_settle_feedback_at = None
+                execution._update_tracking_lag_settle(qpos, 200., feedback_at=100.15)
+                self.assertIsNone(execution.tracking_lag_required_after_monotonic)
+                result = execution_result(np.tile(np.array([0.]*6+[.5]+[0.]*6+[.5]), (4, 1)))
+                launch, arrived = inference_launch(state, qpos, generation=50, captured_monotonic=200.01)
+                self.assertFalse(execution.accept_inference_result(result, launch, protocol,
+                    arrived_at=arrived, arrived_monotonic=200.02,
+                    min_steps_override=1, skip_steps_override=0, blend_steps_override=0))
+                self.assertIn('still settling', execution.rejected_result['reason'])
+                metrics['state']['velocity'][:] = 0.
+                for _ in range(4):
+                    execution._update_tracking_lag_settle(qpos, 200.01, feedback_at=100.15)
+                self.assertIsNone(execution.tracking_lag_required_after_monotonic)
+                for tick in range(1, 4):
+                    execution._update_tracking_lag_settle(qpos, 200.+tick*.05, feedback_at=100.15+tick*.05)
+                barrier = execution.tracking_lag_required_after_monotonic
+                self.assertIsNotNone(barrier)
+                for offset, accepted in ((-.01, False), (.01, True)):
+                    launch, arrived = inference_launch(state, qpos, generation=51, captured_monotonic=barrier+offset)
+                    self.assertEqual(execution.accept_inference_result(result, launch, protocol,
+                        arrived_at=arrived, arrived_monotonic=barrier+.02,
+                        min_steps_override=1, skip_steps_override=0, blend_steps_override=0), accepted)
+                self.assertFalse(execution.tracking_lag_active)
+
+    def test_transient_or_duplicate_feedback_does_not_trigger_recovery(self):
+        execution, protocol, state, qpos = self.recovery_execution(full_solve=True)
+        self.assertTrue(execution.execute_next(state, qpos, protocol))
+        trace = execution.last_actuator_command
+        for tick, lag in enumerate((.2, .2, 0., .2, 0.)):
+            for side in ('left', 'right'):
+                trace['sides'][side]['full_ik_solution_joints_rad'] = qpos[:6] + lag
+            for repeat in range(3):
+                execution._pending_feedback_command = trace
+                execution._complete_pending_command_feedback(state, qpos, protocol, feedback_at=100.+tick*.05)
+            self.assertFalse(execution.tracking_lag_active)
+        self.assertEqual(execution.tracking_lag_consecutive_cycles, 0)
+        self.assertGreater(execution.pending_action_count, 0)
+        execution.servo_loop.hold.assert_not_called()
+
+    def test_planner_acceleration_lag_does_not_repeatedly_brake(self):
+        execution, protocol, state, qpos = self.recovery_execution(full_solve=True)
+        self.assertTrue(execution.execute_next(state, qpos, protocol))
+        trace = execution.last_actuator_command
+        # A persistent unsent IK difference alone must not stop a robot whose
+        # sent joints AND task-space pose track, even across chunk changes.
+        for tick in range(24):
+            lag = .30
+            trace['generation'] = tick // 3
+            for side in ('left', 'right'):
+                issued = trace['sides'][side]
+                issued['commanded_joints_rad'] = qpos[:6].tolist()
+                issued['full_ik_solution_joints_rad'] = qpos[:6] + lag
+                issued['policy_eef_target'] = state[:10].copy()
+            execution._pending_feedback_command = trace
+            execution._complete_pending_command_feedback(state, qpos, protocol, feedback_at=100.+tick*.05)
+            self.assertFalse(execution.tracking_lag_active)
+            self.assertAlmostEqual(execution.last_command_feedback['reference_joint_error_rad'], .3)
+            self.assertAlmostEqual(execution.last_command_feedback['tracking_guard_joint_error_rad'], 0.)
+        execution.servo_loop.hold.assert_not_called()
+
+    def test_reference_lag_evidence_requires_fresh_continuous_feedback(self):
+        execution, protocol, state, qpos = self.recovery_execution(full_solve=True)
+        self.assertTrue(execution.execute_next(state, qpos, protocol))
+        trace = execution.last_actuator_command
+        for side in ('left', 'right'):
+            trace['sides'][side]['commanded_joints_rad'] = qpos[:6].tolist()
+            trace['sides'][side]['full_ik_solution_joints_rad'] = qpos[:6] + .3
+            trace['sides'][side]['policy_eef_target'] = state[:10].copy()
+            trace['sides'][side]['policy_eef_target'][0] += .06
+        for stamp in (100., 100.05, 100.1, 100.1, 101., 101., 101.05, 101.1):
+            execution._pending_feedback_command = trace
+            execution._complete_pending_command_feedback(state, qpos, protocol, feedback_at=stamp)
+            self.assertFalse(execution.tracking_lag_active)
+        self.assertEqual(execution.tracking_reference_lag_cycles, 3)
+        self.assertAlmostEqual(execution.tracking_reference_lag_since, 101.)
+
+    def test_sent_tracking_fault_still_fast_during_reference_grace(self):
+        execution, protocol, state, qpos = self.recovery_execution(full_solve=True)
+        self.assertTrue(execution.execute_next(state, qpos, protocol))
+        trace = execution.last_actuator_command
+        for side in ('left', 'right'):
+            trace['sides'][side]['commanded_joints_rad'] = qpos[:6] + .2
+            trace['sides'][side]['full_ik_solution_joints_rad'] = qpos[:6] + .3
+        for tick in range(3):
+            execution._pending_feedback_command = trace
+            execution._complete_pending_command_feedback(state, qpos, protocol, feedback_at=100.+tick*.05)
+        self.assertTrue(execution.tracking_lag_active)
+        self.assertIn('source=sent_joint', execution.blocked_reason)
+        self.assertLess(execution.last_command_feedback['tracking_lag_evidence']['reference_duration_s'], .5)
+        execution.servo_loop.hold.assert_called_once()
+
+    def test_normal_local_projection_cannot_hide_original_workspace_violation(self):
+        execution, protocol, state, qpos = self.recovery_execution(full_solve=True)
+        execution.args.max_translation_step_m = .008
+        for index, row in enumerate(execution.pending_actions):
+            goal = row.absolute_target.copy()
+            goal[0] = float(execution.args.workspace_x[1]) + .01
+            execution.pending_actions[index] = replace(row, absolute_target=goal)
+        self.assertFalse(execution.execute_next(state, qpos, protocol))
+        execution._servo_publish_target.assert_not_called()
+        self.assertIn('workspace', execution.blocked_reason)
+
+    def test_real_ik_smoothed_goal_retains_reference_state_until_arrival(self):
+        self._check_real_ik_goal_continuation(smoothing=True)
+
+    def _check_real_ik_goal_continuation(self, *, smoothing):
+        from bimanual_vla.deployment.ik_workers import solve_ik_request
+        execution, protocol, _, _ = self.recovery_execution()
+        execution.args.pose_trajectory = smoothing
+        execution.control_hz = 30.
+        solver = PiperContinuousIK()
+        q = np.array([.2, 1., -1., .1, .2, -.1])
+        goal_q = q + [.25, .06, -.04, .06, .04, .02]
+        xyz, rot = solver.pose(goal_q)
+        goal = np.tile(delivery_state(xyz, rot, .8), 2)
+        execution.pending_actions = [replace(row, absolute_target=goal.copy())
+                                     for row in execution.pending_actions]
+        execution.args.max_translation_step_m = .008
+        execution.args.workspace_x = execution.args.workspace_y = execution.args.workspace_z = None
+        initial_failure = True
+        def solve(requests, **kw):
+            nonlocal initial_failure
+            if initial_failure:
+                from bimanual_vla.deployment.ik_workers import IKUnreachableError
+                initial_failure = False
+                raise IKUnreachableError('exercise real half-step recovery')
+            return {side: solve_ik_request(solver, args, options)
+                    for side, (args, options) in requests.items()}
+        execution.ik_workers.solve.side_effect = solve
+        feedback = np.tile(np.append(q, .035), 2)
+        def observation():
+            return np.concatenate([delivery_state(*solver.pose(feedback[i:i+6]), feedback[i+6]/.07)
+                                   for i in (0, 7)])
+        state = observation()
+        self.assertTrue(execution.execute_next(state, feedback, protocol))
+        retained = execution.eef_goal_action
+        self.assertIsNotNone(retained)
+        shapers = dict(execution._pose_trajectories)
+        published = []
+        def submit(reference, **kw):
+            # Ideal actuator, real numerical IK/FK. No hardware transport.
+            feedback[:] = reference
+            published.append(reference.copy())
+            return {'qpos': reference.copy()}
+        execution.servo_loop.submit.side_effect = submit
+        indices = [i for i in range(14) if i % 7 != 6]
+        started = execution.ik_recovery_started
+        for tick in range(1, 61):
+            feedback[:] = execution.ik_recovery_target
+            execution.servo_loop.metrics.return_value = dict(fault=None, paused=False, stopping=False,
+                state=dict(position=feedback[indices].copy(), velocity=np.zeros(12), acceleration=np.zeros(12)))
+            raw = observation()
+            before = len(published)
+            arrived = all(v['arrived'] for v in execution._eef_arrival_errors(raw, goal, ('left', 'right')).values())
+            now = started + tick/30.
+            with patch('bimanual_vla.deployment.client.time.monotonic', return_value=now):
+                execution._advance_ik_recovery(feedback.copy(), now, raw_delivery_state=raw, protocol=protocol)
+            self.assertFalse(execution.ik_recovery_fault, execution.ik_recovery_fault)
+            if smoothing:
+                for side, shaper in shapers.items():
+                    self.assertIs(execution._pose_trajectories[side], shaper)
+                if not shapers:
+                    shapers = dict(execution._pose_trajectories)
+            if not arrived:
+                for reference in published[before:]:
+                    np.testing.assert_array_equal(reference[[6, 13]], [.035, .035])
+            if execution.ik_recovery_target is None:
+                break
+            self.assertIs(execution.eef_goal_action, retained)
+        self.assertIsNone(execution.ik_recovery_target)
+        self.assertGreater(execution.eef_goal_step_count, 2)
+        self.assertTrue(all(v['arrived'] for v in execution._eef_arrival_errors(observation(), goal, ('left', 'right')).values()))
+        np.testing.assert_allclose(feedback[[6, 13]], [.056, .056], atol=.0005)
+
+    def test_smoothed_goal_updates_while_joint_reference_is_still_moving(self):
+        execution, protocol, state, qpos = self.recovery_execution(full_solve=True, initial_failure=True)
+        execution.args.pose_trajectory = True
+        for index, row in enumerate(execution.pending_actions):
+            goal = row.absolute_target.copy()
+            goal[[0, 10]] += .02
+            execution.pending_actions[index] = replace(row, absolute_target=goal)
+        self.assertTrue(execution.execute_next(state, qpos, protocol))
+        self._settle_first_shrunk_step(execution, protocol, state)
+        shapers = dict(execution._pose_trajectories)
+        target = execution.ik_recovery_target.copy()
+        indices = [i for i in range(14) if i % 7 != 6]
+        execution.servo_loop.metrics.return_value = dict(fault=None, paused=False, stopping=False,
+            state=dict(position=qpos[indices], velocity=np.full(12, .01), acceleration=np.zeros(12)))
+        count = execution.ik_workers.solve.call_count
+        now = execution.ik_recovery_started + 2/30
+        with patch('bimanual_vla.deployment.client.time.monotonic', return_value=now):
+            execution._advance_ik_recovery(qpos, now, raw_delivery_state=state, protocol=protocol)
+        self.assertEqual(execution.ik_workers.solve.call_count, count+1)
+        for side, shaper in shapers.items():
+            self.assertIs(execution._pose_trajectories[side], shaper)
+            self.assertEqual(execution.eef_goal_pose_metrics[side]['algorithm'], 'stopping_distance_reference_v2')
+        np.testing.assert_array_equal(execution.ik_recovery_target[[6, 13]], target[[6, 13]])
+
+    def test_smoothed_recovery_reanchors_only_after_planner_and_feedback_settle(self):
+        execution, protocol, state, qpos = self.recovery_execution()
+        execution.args.pose_trajectory = True
+        self.assertTrue(execution.execute_next(state, qpos, protocol))
+        self.assertTrue(execution.eef_goal_pose_reset_pending)
+        target = execution.ik_recovery_target.copy()
+        indices = [i for i in range(14) if i % 7 != 6]
+        count = execution.ik_workers.solve.call_count
+        now = execution.ik_recovery_started + 1/30
+        for velocity, measured in ((.01, target), (0., qpos)):
+            execution.servo_loop.metrics.return_value = dict(fault=None, paused=False, stopping=False,
+                state=dict(position=target[indices], velocity=np.full(12, velocity), acceleration=np.zeros(12)))
+            with patch('bimanual_vla.deployment.client.time.monotonic', return_value=now):
+                execution._advance_ik_recovery(measured, now, raw_delivery_state=state, protocol=protocol)
+            self.assertEqual(execution.ik_workers.solve.call_count, count)
+            self.assertTrue(execution.eef_goal_pose_reset_pending)
+            self.assertFalse(execution.eef_goal_releasing)
+        # The next solve succeeds without shrinking; fresh reference state is
+        # created only after both measured joints and the planner have stopped.
+        old_solve = execution.ik_workers.solve.side_effect
+        def full_solve(requests, **kwargs):
+            results = old_solve({s: (args, dict(kw, recovery_fraction=.5))
+                                 for s, (args, kw) in requests.items()})
+            for result in results.values():
+                result.pop('recovery')
+            return results
+        execution.ik_workers.solve.side_effect = full_solve
+        with patch('bimanual_vla.deployment.client.time.monotonic', return_value=now):
+            execution._advance_ik_recovery(target, now, raw_delivery_state=state, protocol=protocol)
+        self.assertEqual(execution.ik_workers.solve.call_count, count+1)
+        self.assertFalse(execution.eef_goal_pose_reset_pending)
+        self.assertEqual(set(execution._pose_trajectories), {'left', 'right'})
+        np.testing.assert_array_equal(execution.ik_recovery_target[[6, 13]], target[[6, 13]])
+
+    def test_measured_arrival_does_not_release_grippers_with_moving_pose_reference(self):
+        execution, protocol, state, qpos = self.recovery_execution(full_solve=True, initial_failure=True)
+        execution.args.pose_trajectory = True
+        self.assertTrue(execution.execute_next(state, qpos, protocol))
+        self._settle_first_shrunk_step(execution, protocol, state)
+        target = execution.ik_recovery_target.copy()
+        indices = [i for i in range(14) if i % 7 != 6]
+        execution.servo_loop.metrics.return_value = dict(fault=None, paused=False, stopping=False,
+            state=dict(position=target[indices], velocity=np.zeros(12), acceleration=np.zeros(12)))
+        for shaper in execution._pose_trajectories.values():
+            shaper.linear_velocity[:] = [.01, 0., 0.]
+        now = execution.ik_recovery_started + 2/30
+        with patch('bimanual_vla.deployment.client.time.monotonic', return_value=now):
+            execution._advance_ik_recovery(target, now, raw_delivery_state=state, protocol=protocol)
+        self.assertTrue(all(value['arrived'] for value in execution.eef_goal_errors.values()))
+        self.assertFalse(execution.eef_goal_releasing)
+        self.assertIsNotNone(execution.eef_goal_action)
+        np.testing.assert_array_equal(execution.ik_recovery_target[[6, 13]], target[[6, 13]])
+
+    def _settle_first_shrunk_step(self, execution, protocol, state):
+        target = execution.ik_recovery_target.copy()
+        indices = [i for i in range(14) if i % 7 != 6]
+        execution.servo_loop.metrics.return_value = dict(fault=None, paused=False, stopping=False,
+            state=dict(position=target[indices], velocity=np.zeros(12), acceleration=np.zeros(12)))
+        now = execution.ik_recovery_started + 1/30
+        with patch('bimanual_vla.deployment.client.time.monotonic', return_value=now):
+            execution._advance_ik_recovery(target, now, raw_delivery_state=state, protocol=protocol)
+        self.assertFalse(execution.eef_goal_pose_reset_pending)
+
+    def test_eef_lookahead_disabled_even_with_old_saved_setting(self):
+        for metadata, mode, side, expected in ((BIMANUAL_DELIVERY_METADATA, 'bimanual', 'both', 0),
+                                               (JOINT_METADATA, 'single', 'right', 30)):
+            execution = ExecutionController(FakePiper(), execution_args(
+                servo_backend='ruckig', gripper_open_lookahead_steps=30))
+            execution.configure_protocol(validate_policy_metadata(metadata, side, mode))
+            self.assertEqual(execution.gripper_open_lookahead_steps, expected)
+
+    def test_shrink_recovery_timeout_cancels_target_and_holds(self):
+        execution, protocol, state, qpos = self.recovery_execution()
+        self.assertTrue(execution.execute_next(state, qpos, protocol))
+        execution.servo_loop.metrics.return_value = dict(fault=None, paused=False, stopping=False)
+        execution._advance_ik_recovery(qpos, execution.ik_recovery_started + 2.01,
+                                      raw_delivery_state=state, protocol=protocol)
+        self.assertIsNone(execution.ik_recovery_target)
+        self.assertEqual(execution.state, 'blocked')
+        self.assertIn('did not settle', execution.ik_recovery_fault)
+        execution.servo_loop.hold.assert_called_once()
+
+    def test_pose_drift_during_gripper_release_brakes_without_reopening(self):
+        execution, protocol, state, qpos = self.recovery_execution()
+        self.assertTrue(execution.execute_next(state, qpos, protocol))
+        target = execution.ik_recovery_target.copy()
+        indices = [i for i in range(14) if i % 7 != 6]
+        execution.servo_loop.metrics.return_value = dict(fault=None, paused=False, stopping=False,
+            state=dict(position=target[indices], velocity=np.zeros(12), acceleration=np.zeros(12)))
+        # Writer has not finished the opening ramp yet.
+        execution.servo_loop.submit.return_value = {'qpos': qpos.copy()}
+        execution._advance_ik_recovery(target, time.monotonic(), raw_delivery_state=state, protocol=protocol)
+        self.assertTrue(execution.eef_goal_releasing)
+        count = execution.servo_loop.submit.call_count
+        drifted = state.copy()
+        drifted[0] += .02
+        execution._advance_ik_recovery(target, time.monotonic(), raw_delivery_state=drifted, protocol=protocol)
+        self.assertEqual(execution.servo_loop.submit.call_count, count)
+        self.assertIsNone(execution.ik_recovery_target)
+        self.assertIn('pose drifted', execution.ik_recovery_fault)
+        execution.servo_loop.hold.assert_called_once()
+
+    def test_j5_hold_within_driver_limits_is_not_rejected_by_rounded_sdk_default(self):
+        from bimanual_vla.deployment.servo import RuckigJointPlanner, ServoConfig
+        piper = FakePiper()
+        piper._vla_joint_limits = np.deg2rad([
+            [-150, 150], [0, 180], [-170, 0], [-100, 100], [-70, 70], [-180, 180]])
+        execution = ExecutionController(piper, execution_args())
+        qpos = self.qpos.copy()
+        qpos[4] = 1.221381426  # Exact feedback from the failed 10:09 run.
+        qpos[5] = np.deg2rad(150)
+        lower, upper = execution._trajectory_limits(qpos)
+        planner = RuckigJointPlanner(qpos[:6], lower[:6], upper[:6], ServoConfig())
+        planner.retarget(qpos[:6])
+        np.testing.assert_allclose(planner.target, qpos[:6])
+
+    def test_hardware_fault_discards_even_populated_queue_without_masking_fault(self):
+        for count in (0, 3):
+            with self.subTest(count=count):
+                execution = ExecutionController(FakePiper(), execution_args())
+                execution.pending_actions = [object()] * count
+                execution.queued_action_index = 0
+                execution.discard_pending_actions("right CAN transmit failed", kind="hardware_fault")
+                self.assertEqual(execution.pending_actions, [])
+                self.assertIsNone(execution.queued_action_index)
+                self.assertEqual(execution.unsafe_drop_count, count)
+                self.assertTrue(execution.unsafe_active)
+                self.assertEqual(execution.last_queue_drop_kind, "hardware_fault")
+                self.assertEqual(execution.last_queue_drop_reason, "right CAN transmit failed")
+
+    def test_process_ik_batch_is_atomic_at_controller_publication(self):
+        from dataclasses import asdict
+        from unittest.mock import Mock
+        from bimanual_vla.deployment.ik_workers import IKWorkerError
+
+        protocol = validate_policy_metadata(BIMANUAL_DELIVERY_METADATA, "both", "bimanual")
+        for failure in (False, True):
+            with self.subTest(worker_failure=failure):
+                pipers = {side: FakePiper() for side in ("left", "right")}
+                execution = ExecutionController(
+                    pipers, execution_args(arm_mode="bimanual", arm_side="both"))
+                execution.configure_protocol(protocol)
+                execution.robot_enabled = set(pipers)
+                # Reuse the injected test solver's diagnostic adapter; the real
+                # spawned solver is tested independently in test_ik_workers.
+                execution.ik_solver = RecordingContinuousIK()
+                result = execution._solve_delivery_ik(
+                    self.qpos[:6], self.raw_state[:3], np.zeros(3), side="right")
+                pool = Mock(last_wall_ms=1.)
+                if failure:
+                    pool.solve.side_effect = IKWorkerError("right: no feasible solution")
+                else:
+                    pool.solve.return_value = {side: asdict(result) for side in pipers}
+                execution.ik_workers = pool
+                qpos = np.tile(self.qpos, 2)
+                state = np.tile(self.raw_state, 2)
+                actions = np.zeros((1, 14))
+                actions[0, [6, 13]] = .5
+                now = time.time()
+                execution.queue_result(
+                    execution_result(actions), state, qpos, protocol,
+                    {key: now for key in protocol.camera_keys}, .01)
+                self.assertEqual(execution.execute_next(
+                    state, qpos, protocol, feedback_captured_at=time.time()), not failure)
+                pool.solve.assert_called_once()
+                self.assertEqual(set(pool.solve.call_args.args[0]), set(pipers))
+                for piper in pipers.values():
+                    names = [call[0] for call in piper.calls]
+                    self.assertEqual("JointCtrl" in names, not failure)
+                    self.assertEqual("GripperCtrl" in names, not failure)
+                if failure:
+                    self.assertFalse(execution._ik_warm_starts)
+                else:
+                    trace = execution.metadata()["last_actuator_command"]
+                    for side in pipers:
+                        self.assertEqual(trace["sides"][side]["ik_diagnostics"][
+                            "parallel_batch_wall_ms"], 1.)
 
     def test_joint_queue_executes_first_four_at_individual_indices(self):
         protocol = validate_policy_metadata(JOINT_METADATA, "right")

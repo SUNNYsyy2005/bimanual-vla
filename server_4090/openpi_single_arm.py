@@ -3463,9 +3463,12 @@ def warmup_policy(policy: Any, metadata: dict[str, Any], prompt: str | None) -> 
         for key in metadata["camera_keys"]
     }
     warmup_session = "__server_warmup__"
+    planner_prefix = bool(metadata.get("rtc_capabilities", {}).get("client_planner_prefix"))
+    prefix_source = "client_planner" if planner_prefix else "server_previous_chunk"
     client_metadata: dict[str, Any] = {"source_name": warmup_session}
     if metadata.get("rtc_supported"):
         client_metadata["rtc"] = {
+            "prefix_source": prefix_source,
             "session_id": warmup_session,
             "inference_generation": 1,
             "inference_delay_steps": 0,
@@ -3473,8 +3476,16 @@ def warmup_policy(policy: Any, metadata: dict[str, Any], prompt: str | None) -> 
             "config_revision": 1,
             "config": {"enabled": True},
         }
+    state = np.zeros(int(metadata["state_dim"]), dtype=np.float32)
+    if metadata.get("schema") == "delivery":
+        # Delivery observations store XYZ + rotation6d + gripper per arm.
+        # A zero rotation is undefined and cannot serve as a chunk origin.
+        if len(state) not in (10, 20):
+            raise ValueError(f"invalid delivery warmup state dimension: {len(state)}")
+        for offset in range(0, len(state), 10):
+            state[offset + 3 : offset + 9] = (1, 0, 0, 0, 1, 0)
     observation = {
-        "state": np.zeros(int(metadata["state_dim"]), dtype=np.float32),
+        "state": state,
         "images": images,
         "prompt": prompt or "Move safely.",
         "client_metadata": client_metadata,
@@ -3489,6 +3500,7 @@ def warmup_policy(policy: Any, metadata: dict[str, Any], prompt: str | None) -> 
         guided_observation["client_metadata"] = {
             "source_name": warmup_session,
             "rtc": {
+                "prefix_source": prefix_source,
                 "session_id": warmup_session,
                 "inference_generation": 2,
                 "previous_chunk_generation": 1,
@@ -3500,6 +3512,18 @@ def warmup_policy(policy: Any, metadata: dict[str, Any], prompt: str | None) -> 
                 ),
             },
         }
+        if planner_prefix:
+            # Synthetic stationary executable prefix, solely for compilation.
+            # Do not feed a raw prediction back as if hardware had executed it.
+            rtc = guided_observation["client_metadata"]["rtc"]
+            delay = rtc["inference_delay_steps"]
+            hz = float(metadata["action_hz"])
+            rtc["planned_prefix"] = {
+                "plan_id": "__warmup_stationary_plan__",
+                "action_hz": hz,
+                "sample_offsets_s": ((np.arange(delay) + 1) / hz).tolist(),
+                "actions": np.repeat(observation["state"][None, :], delay, axis=0).tolist(),
+            }
         guided_started = time.monotonic()
         guided_result = policy.infer(guided_observation)
         guided_actions = np.asarray(guided_result["actions"])
@@ -3546,6 +3570,7 @@ def run_serve(args: argparse.Namespace) -> None:
         if contract is None:
             raise RuntimeError("RTC requires the resolved Piper dataset contract")
         reanchor_action_mask = None
+        delivery_reanchor_arm_count = 0
         if contract.schema == "joint":
             arm_count = 2 if contract.arm_mode == "bimanual" else 1
             joint_dims_per_arm = contract.model_action_dim // arm_count - 1
@@ -3554,6 +3579,10 @@ def run_serve(args: argparse.Namespace) -> None:
                 mask_values.extend([True] * joint_dims_per_arm)
                 mask_values.append(False)  # Gripper remains an absolute action.
             reanchor_action_mask = tuple(mask_values)
+        elif (contract.schema == "delivery"
+              and policy_metadata.get("wire_action_convention") == "chunk_origin"
+              and policy_metadata.get("raw_action_semantics") == "absolute_eef_target"):
+            delivery_reanchor_arm_count = 2 if contract.arm_mode == "bimanual" else 1
         rtc_config = RTCConfig(
             enabled=True,
             mode=rtc_mode,
@@ -3563,6 +3592,7 @@ def run_serve(args: argparse.Namespace) -> None:
             prefix_attention_schedule=args.rtc_prefix_attention_schedule,
             physical_action_dim=int(contract.model_action_dim),
             reanchor_action_mask=reanchor_action_mask,
+            delivery_reanchor_arm_count=delivery_reanchor_arm_count,
             temporal_consistency=bool(args.rtc_temporal_consistency),
             temporal_seed=int(args.rtc_temporal_seed),
             inference_diagnostics_enabled=bool(args.inference_diagnostics),
@@ -3584,7 +3614,8 @@ def run_serve(args: argparse.Namespace) -> None:
                                   "real_time_chunking_prefix_guidance"),
                 "rtc_backend": rtc_backend,
                 "rtc_physical_action_dim": rtc_config.physical_action_dim,
-                "rtc_chunk_origin_reanchoring": bool(reanchor_action_mask),
+                "rtc_chunk_origin_reanchoring": bool(rtc_config.reanchor_action_mask),
+                "rtc_eef_prefix_reanchoring": bool(delivery_reanchor_arm_count),
                 "rtc_temporal_consistency": bool(rtc_config.temporal_consistency),
                 "rtc_temporal_seed": int(rtc_config.temporal_seed),
             }

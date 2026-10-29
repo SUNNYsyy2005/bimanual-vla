@@ -5,10 +5,41 @@ from unittest.mock import Mock, patch
 import numpy as np
 from bimanual_vla.deployment.hardware_safety import (
     query_limits, effective_limits, effective_speed, recover_return_faults, joint_speed_unit,
+    install_can_send_guard, require_can_send_healthy,
 )
 
 
 class HardwareSafetyTest(unittest.TestCase):
+    def test_reusing_sdk_instance_guards_new_bus_without_clearing_existing_fault(self):
+        bus = NS(SendCanMessage=Mock(return_value=-1), CAN_STATUS=NS(SEND_MESSAGE_SUCCESS=0))
+        piper = NS(GetCanBus=lambda: bus, GetCanName=lambda: 'can1')
+        install_can_send_guard(piper)
+        with self.assertRaises(RuntimeError):
+            bus.SendCanMessage(0x151, [])
+        install_can_send_guard(piper)
+        with self.assertRaises(RuntimeError):
+            require_can_send_healthy({'right': piper})
+        bus = NS(SendCanMessage=Mock(return_value=0), CAN_STATUS=NS(SEND_MESSAGE_SUCCESS=0))
+        install_can_send_guard(piper)
+        require_can_send_healthy({'right': piper})
+        self.assertEqual(bus.SendCanMessage(0x151, []), 0)
+
+    def test_send_failure_latches_before_any_later_can_frames(self):
+        for failure in (-1, OSError("CAN queue full")):
+            with self.subTest(failure=failure):
+                raw_send = Mock(side_effect=[0, failure, 0])
+                bus = NS(SendCanMessage=raw_send, CAN_STATUS=NS(SEND_MESSAGE_SUCCESS=0))
+                piper = NS(GetCanBus=lambda: bus, GetCanName=lambda: 'can1')
+                install_can_send_guard(piper)
+                self.assertEqual(bus.SendCanMessage(0x151, []), 0)
+                with self.assertRaisesRegex(RuntimeError, 'can1.*0x155'):
+                    bus.SendCanMessage(0x155, [])
+                with self.assertRaisesRegex(RuntimeError, 'right:.*can1'):
+                    require_can_send_healthy({'right': piper})
+                with self.assertRaises(RuntimeError):
+                    bus.SendCanMessage(0x156, [])
+                self.assertEqual(raw_send.call_count, 2)
+
     def test_move_j_percentage_limits_reference_speed_with_tracking_reserve(self):
         p = NS(_vla_joint_speeds=np.full(6, 3.))
         self.assertAlmostEqual(effective_speed({'left': p}, .6, speed_pct=10), .24)
@@ -77,7 +108,7 @@ class HardwareSafetyTest(unittest.TestCase):
             query_limits(p, timeout=.06)
         self.assertFalse(hasattr(p, '_vla_joint_limits'))
 
-    def test_query_units_and_intersection(self):
+    def test_query_units_and_driver_authoritative_limits(self):
         motors = [None] + [NS(motor_num=i, min_angle_limit=-1000,
                              max_angle_limit=1000, max_joint_spd=300) for i in range(1, 7)]
         p = NS(SearchAllMotorMaxAngleSpd=Mock(), GetAllMotorAngleLimitMaxSpd=lambda:
@@ -86,9 +117,20 @@ class HardwareSafetyTest(unittest.TestCase):
         limits, speeds = query_limits(p)
         np.testing.assert_allclose(limits, np.tile(np.deg2rad([-100, 100]), (6, 1)))
         np.testing.assert_allclose(speeds, .3)
-        np.testing.assert_allclose(effective_limits(p, np.tile([-1., 1.], (6, 1))), np.tile([-1., 1.], (6, 1)))
+        np.testing.assert_allclose(effective_limits(p, np.tile([-1., 1.], (6, 1))), limits)
         self.assertEqual(effective_speed({'left': p}, .6), .3)
         self.assertEqual(effective_speed({'left': p}, .2), .2)
+
+    def test_driver_limits_override_wider_and_narrower_software_defaults(self):
+        hardware = np.deg2rad([[-150, 150], [0, 180], [-170, 0],
+                              [-100, 100], [-70, 70], [-180, 180]])
+        for old in (np.tile([-1., 1.], (6, 1)), np.tile([-4., 4.], (6, 1))):
+            got = effective_limits(NS(_vla_joint_limits=hardware), old)
+            np.testing.assert_array_equal(got, hardware)
+            got[0, 0] = 0
+            self.assertLess(hardware[0, 0], 0)
+        with self.assertRaises(RuntimeError):
+            effective_limits(NS(_vla_joint_limits=np.zeros((6, 2))), old)
 
     def test_unknown_firmware_uses_operator_assumption_without_raising_gui_limit(self):
         motors = [None] + [NS(motor_num=i, min_angle_limit=-1000,

@@ -3,7 +3,7 @@
 
 RTC is not a client-side action interpolation.  During flow-matching denoising,
 this module guides the new chunk toward the still-unexecuted physical targets
-of the previous chunk.  Origin-dependent joint deltas are re-encoded around
+of the previous chunk. Origin-dependent joint/EEF deltas are re-encoded around
 the current observation before the guide is applied through the Jacobian of
 the predicted clean action, so the model itself resolves inference latency
 before the action chunk is unnormalized and sent back to the robot.
@@ -95,6 +95,7 @@ class RTCConfig:
     prefix_attention_schedule: str = "linear"
     physical_action_dim: int | None = None
     reanchor_action_mask: tuple[bool, ...] | None = None
+    delivery_reanchor_arm_count: int = 0
     temporal_consistency: bool = True
     temporal_seed: int = 0
     inference_diagnostics_enabled: bool = True
@@ -116,6 +117,13 @@ class RTCConfig:
             )
         if self.physical_action_dim is not None and self.physical_action_dim <= 0:
             raise ValueError("RTC physical_action_dim must be positive when provided")
+        if self.delivery_reanchor_arm_count not in (0, 1, 2):
+            raise ValueError("RTC delivery_reanchor_arm_count must be 0, 1 or 2")
+        if self.delivery_reanchor_arm_count:
+            mask = tuple(([True] * 6 + [False]) * self.delivery_reanchor_arm_count)
+            if self.reanchor_action_mask is not None and tuple(self.reanchor_action_mask) != mask:
+                raise ValueError("delivery RTC must reanchor XYZ/rotation and preserve absolute grippers")
+            object.__setattr__(self, "reanchor_action_mask", mask)
         if self.reanchor_action_mask is not None:
             mask = tuple(bool(value) for value in self.reanchor_action_mask)
             if not mask or not any(mask):
@@ -161,7 +169,7 @@ def _action_only_reanchor_encoding(
     names = [type(transform).__name__ for transform in pipeline]
     action_names = {
         "PiperInputs", "JointGripperMetersToFraction", "DeltaActions",
-        "Normalize", "PadStatesAndActions",
+        "Normalize", "PadStatesAndActions", "DeliveryAbsoluteEEFToChunkOrigin",
     }
     ignored_names = {
         "RepackTransform", "InjectDefaultPrompt", "ResizeImages",
@@ -169,7 +177,9 @@ def _action_only_reanchor_encoding(
     }
     if any(name not in action_names | ignored_names for name in names):
         return None
-    if any(names.count(name) != 1 for name in ("PiperInputs", "DeltaActions", "Normalize", "PadStatesAndActions")):
+    if any(names.count(name) != 1 for name in ("PiperInputs", "Normalize", "PadStatesAndActions")):
+        return None
+    if sum(names.count(name) for name in ("DeltaActions", "DeliveryAbsoluteEEFToChunkOrigin")) != 1:
         return None
 
     data = dict(observation)
@@ -1127,6 +1137,7 @@ class RTCAwarePolicy:
             # legacy prefix source.
             if (enabled and self.config.mode == "trained"
                     and self.config.reanchor_action_mask is not None
+                    and not self.config.delivery_reanchor_arm_count
                     and prefix_source != "client_planner"):
                 raise ValueError(
                     "trained joint RTC requires prefix_source=client_planner; "
@@ -1180,7 +1191,8 @@ class RTCAwarePolicy:
                 and client_previous_generation == session.generation
             )
             if enabled and prefix_source == "client_planner":
-                if self.config.mode != "trained" or self.config.reanchor_action_mask is None:
+                if (self.config.mode != "trained" or self.config.reanchor_action_mask is None
+                        or self.config.delivery_reanchor_arm_count):
                     raise ValueError("client planner prefixes require trained joint RTC")
                 supplied = rtc.get("planned_prefix")
                 # Explicitly absent means startup/hold: never fall back to the
@@ -1392,6 +1404,17 @@ class RTCAwarePolicy:
                 if candidate_origin.ndim == 1 and np.all(np.isfinite(candidate_origin)):
                     current_origin_state = candidate_origin.copy()
 
+            if self.config.delivery_reanchor_arm_count:
+                # Delivery wire output is 7D per arm, relative to this request's
+                # origin. Cache physical 10D EEF targets, not these deltas, so
+                # the next request can run the normal input transforms around
+                # its NEW origin. SO(3) composition is handled by the contract.
+                from bimanual_vla.data.action_conventions import chunk_origin_deltas_to_absolute_eef_targets
+                absolute = chunk_origin_deltas_to_absolute_eef_targets(
+                    current_origin_state, absolute,
+                    arm_count=self.config.delivery_reanchor_arm_count)
+                absolute_valid = True
+
             session.normalized_actions = normalized.copy()
             session.absolute_actions = absolute.copy() if absolute_valid else None
             session.origin_state = (
@@ -1417,21 +1440,27 @@ class RTCAwarePolicy:
                 session.generation = requested_generation
 
         new_absolute_first = None
-        result_actions = np.asarray(result.get("actions"), dtype=np.float32)
+        result_actions = np.asarray(absolute if self.config.delivery_reanchor_arm_count
+                                    else result.get("actions"), dtype=np.float32)
         if result_actions.ndim == 3 and result_actions.shape[0] == 1:
             result_actions = result_actions[0]
         if result_actions.ndim == 2 and len(result_actions):
             new_absolute_first = result_actions[0].copy()
 
+        diagnostic_mask = self.config.reanchor_action_mask
+        if self.config.delivery_reanchor_arm_count:
+            # Absolute EEF states are 10D per arm; the model mask is 7D.
+            # These distance diagnostics use XYZ only, not rotation6d entries.
+            diagnostic_mask = tuple(([True] * 3 + [False] * 7) * self.config.delivery_reanchor_arm_count)
         origin_shift_l2 = _masked_l2(
             old_origin_state,
             current_origin_state,
-            self.config.reanchor_action_mask,
+            diagnostic_mask,
         )
         position_boundary_jump_l2 = _masked_l2(
             expected_absolute_first,
             new_absolute_first,
-            self.config.reanchor_action_mask,
+            diagnostic_mask,
         )
 
         result["rtc"] = {
@@ -1446,6 +1475,8 @@ class RTCAwarePolicy:
             "algorithm": ("real_time_chunking_clean_prefix" if self.config.mode == "trained" else
                           "real_time_chunking_prefix_guidance"),
             "reanchored": reanchored,
+            "reanchor_representation": ("absolute_eef_target" if self.config.delivery_reanchor_arm_count
+                                        else "absolute_joint_target" if self.config.reanchor_action_mask else None),
             "reanchor_error": reanchor_error,
             "fallback_reason": prefix_fallback_reason,
             "physical_action_dim": self.config.physical_action_dim,

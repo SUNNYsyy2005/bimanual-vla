@@ -12,6 +12,18 @@ from bimanual_vla.data.action_conventions import matrix_to_rotation6d
 
 
 class PoseTrajectoryTest(unittest.TestCase):
+    def test_nonfinite_candidate_is_rejected_without_mutating_reference(self):
+        shaper = PoseTrajectory(np.zeros(3), np.eye(3))
+        with patch('bimanual_vla.deployment.pose_trajectory._reference_velocity',
+                   return_value=(np.full(3, np.nan), {})):
+            with self.assertRaisesRegex(ValueError, 'candidate linear velocity'):
+                shaper.update([.01, 0., 0.], np.eye(3), dt=1/30,
+                              feedback_xyz=np.zeros(3), feedback_rotation=np.eye(3))
+        np.testing.assert_array_equal(shaper.xyz, np.zeros(3))
+        np.testing.assert_array_equal(shaper.linear_velocity, np.zeros(3))
+        np.testing.assert_array_equal(shaper.rotation, np.eye(3))
+        self.assertEqual(shaper.last_metrics, {})
+
     def test_reversals_and_changing_axes_preserve_vector_bounds(self):
         cfg = PoseTrajectoryConfig()
         shaper = PoseTrajectory(np.zeros(3), np.eye(3), cfg)
@@ -41,8 +53,7 @@ class PoseTrajectoryTest(unittest.TestCase):
         for _ in range(100):
             shaper.update(np.zeros(3), target, dt=0.05,
                           feedback_xyz=shaper.xyz, feedback_rotation=shaper.rotation)
-            # Acceleration-limited braking can overshoot the 2-degree goal;
-            # still remain within that arc plus one bounded angular step.
+            # Stay near the short arc instead of traversing the Euler wrap.
             self.assertLess(np.linalg.norm(Rotation.from_matrix(shaper.rotation @ initial.T).as_rotvec()),
                             np.deg2rad(2) + shaper.config.max_angular_speed_rad_s * .05)
         self.assertLess(np.linalg.norm(Rotation.from_matrix(shaper.rotation @ target.T).as_rotvec()), 1e-7)
@@ -150,10 +161,58 @@ class PoseTrajectoryTest(unittest.TestCase):
                 np.sqrt(np.mean(np.asarray(rotations)[100:]**2) / np.mean(noise_rot[100:]**2))))
         self.assertLess(ratios[0][0], .97)
         self.assertLess(ratios[0][1], .97)
-        # Faster response is not automatically better: this dataset-independent
-        # signal detects the noise amplification that rejected tau=0.05.
-        self.assertGreater(ratios[1][0], 1.05)
-        self.assertGreater(ratios[1][1], 1.05)
+        # The old explicit velocity tracker amplified this faster setting.
+        # Exact exponential response must remove that regression too.
+        self.assertLess(ratios[1][0], .97)
+        self.assertLess(ratios[1][1], .97)
+
+    def test_fixed_goals_from_rest_do_not_overshoot_at_any_update_rate(self):
+        for tau in (.02, .04, .06, .08):
+            for periods in ((1/30,), (.05,), (.01, .08, .033, .15)):
+                with self.subTest(tau=tau, periods=periods):
+                    cfg = replace(PoseTrajectoryConfig(), max_linear_speed_m_s=.35,
+                                  max_linear_acceleration_m_s2=2.4, max_angular_speed_rad_s=1.5,
+                                  max_angular_acceleration_rad_s2=12., response_time_s=tau)
+                    for distance, angle in ((.05, .18), (.1, .6), (.001, .01)):
+                        shaper = PoseTrajectory(np.zeros(3), np.eye(3), cfg)
+                        direction = np.array([1., -2., 3.]) / np.sqrt(14.)
+                        goal = distance * direction
+                        rotation = Rotation.from_rotvec(angle * direction).as_matrix()
+                        last_distance, last_angle = distance, angle
+                        for tick in range(200):
+                            dt = periods[tick % len(periods)]
+                            old = shaper.xyz.copy()
+                            p, r, _ = shaper.update(goal, rotation, dt=dt,
+                                feedback_xyz=shaper.xyz, feedback_rotation=shaper.rotation)
+                            self.assertLessEqual(float(p @ direction), distance + 1e-12)
+                            self.assertLessEqual(np.linalg.norm(p-goal), last_distance + 1e-12)
+                            rotvec = Rotation.from_matrix(r).as_rotvec()
+                            self.assertLessEqual(float(rotvec @ direction), angle + 1e-12)
+                            angular_error = Rotation.from_matrix(rotation @ r.T).magnitude()
+                            self.assertLessEqual(angular_error, last_angle + 1e-12)
+                            np.testing.assert_allclose((p-old)/dt, shaper.linear_velocity, atol=1e-12)
+                            last_distance, last_angle = np.linalg.norm(p-goal), angular_error
+                        self.assertLess(last_distance, 1e-8)
+                        self.assertLess(last_angle, 1e-8)
+
+    def test_target_inside_stopping_distance_brakes_without_zeroing_velocity(self):
+        shaper = PoseTrajectory(np.zeros(3), np.eye(3))
+        for _ in range(10):
+            shaper.update([.5, 0, 0], np.eye(3), dt=.02,
+                          feedback_xyz=shaper.xyz, feedback_rotation=shaper.rotation)
+        old_position, old_velocity = shaper.xyz.copy(), shaper.linear_velocity.copy()
+        goal = old_position - [1e-4, 0, 0]
+        p, _, metrics = shaper.update(goal, np.eye(3), dt=.02,
+                                     feedback_xyz=shaper.xyz, feedback_rotation=shaper.rotation)
+        self.assertTrue(metrics['linear_braking_for_target_change'])
+        self.assertGreater(p[0], old_position[0])  # Finite deceleration cannot stop instantly.
+        self.assertGreater(shaper.linear_velocity[0], 0)
+        self.assertLessEqual(np.linalg.norm(shaper.linear_velocity-old_velocity),
+                             shaper.config.max_linear_acceleration_m_s2 * .02 + 1e-12)
+        for _ in range(200):
+            shaper.update(goal, np.eye(3), dt=.02,
+                          feedback_xyz=shaper.xyz, feedback_rotation=shaper.rotation)
+        np.testing.assert_allclose(shaper.xyz, goal, atol=1e-8)
 
     def test_selected_limits_reverse_and_attenuate_a_pulse_without_persistent_motion(self):
         shaper = PoseTrajectory(np.zeros(3), np.eye(3))

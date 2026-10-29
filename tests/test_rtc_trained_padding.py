@@ -39,8 +39,10 @@ class TrainedPrefixPaddingTest(unittest.TestCase):
         result = self.sample(previous, 3)
         np.testing.assert_array_equal(result[0, :3, :14], previous[:3, :14])
         np.testing.assert_array_equal(result[0, :3, 14:], np.zeros((3, 18)))
-        # The predicted postfix must keep its original noise/flow distribution.
-        np.testing.assert_allclose(result[0, 3:, 14:], 0.8 ** 5, atol=1e-6)
+        # Physical postfix actions retain their noise/flow distribution. The
+        # trained sampler explicitly zeros nonphysical output dimensions.
+        np.testing.assert_allclose(result[0, 3:, :14], 0.8 ** 5, atol=1e-6)
+        np.testing.assert_array_equal(result[0, 3:, 14:], np.zeros((5, 18)))
         np.testing.assert_array_equal(previous[:, 14:], np.full((8, 18), 7.0))
 
     def test_no_prefix_output_is_unchanged(self):

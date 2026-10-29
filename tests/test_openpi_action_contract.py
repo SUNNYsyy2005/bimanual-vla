@@ -123,6 +123,69 @@ HELPER = _load_openpi_helper()
 
 
 class PolicyWarmupTest(unittest.TestCase):
+    def test_delivery_warmup_has_valid_origins_for_both_inference_paths(self):
+        from bimanual_vla.data.action_conventions import (
+            chunk_origin_deltas_to_absolute_eef_targets,
+            rotation6d_to_matrix,
+        )
+
+        for arm_count in (1, 2):
+            with self.subTest(arm_count=arm_count):
+                policy = mock.Mock()
+                requests = []
+
+                def infer(observation):
+                    actions = np.zeros((50, 7 * arm_count), dtype=np.float32)
+                    absolute = chunk_origin_deltas_to_absolute_eef_targets(
+                        observation["state"], actions, arm_count=arm_count,
+                    )
+                    for arm in range(arm_count):
+                        np.testing.assert_allclose(
+                            rotation6d_to_matrix(absolute[0, arm * 10 + 3 : arm * 10 + 9]),
+                            np.eye(3),
+                        )
+                    requests.append(observation)
+                    return {"actions": actions, "rtc": {"enabled": len(requests) == 2}}
+
+                policy.infer.side_effect = infer
+                HELPER.warmup_policy(policy, {
+                    "schema": "delivery", "state_dim": 10 * arm_count,
+                    "action_dim": 7 * arm_count, "camera_keys": ["cam_high"],
+                    "rtc_supported": True,
+                }, "test")
+                self.assertEqual(len(requests), 2)
+                policy.reset.assert_called_once()
+
+    def test_trained_joint_warmup_uses_stationary_client_plan(self):
+        class StrictPolicy:
+            def __init__(self):
+                self.requests = []
+                self.reset_called = False
+
+            def infer(self, observation):
+                rtc = observation['client_metadata']['rtc']
+                if rtc.get('prefix_source') != 'client_planner':
+                    raise ValueError('trained joint RTC requires prefix_source=client_planner')
+                self.requests.append(rtc)
+                return {'actions': np.ones((50, 14), dtype=np.float32),
+                        'rtc': {'enabled': 'planned_prefix' in rtc}}
+
+            def reset(self):
+                self.reset_called = True
+
+        policy = StrictPolicy()
+        HELPER.warmup_policy(policy, {
+            'state_dim': 14, 'action_dim': 14, 'camera_keys': ['cam_high'],
+            'rtc_supported': True, 'rtc_capabilities': {'client_planner_prefix': True},
+            'action_hz': 30., 'rtc_training_max_delay': 12,
+        }, 'test')
+        self.assertNotIn('planned_prefix', policy.requests[0])
+        prefix = policy.requests[1]['planned_prefix']
+        self.assertEqual(prefix['action_hz'], 30.)
+        np.testing.assert_allclose(prefix['sample_offsets_s'], np.arange(1, 7)/30.)
+        np.testing.assert_array_equal(prefix['actions'], np.zeros((6, 14)))
+        self.assertTrue(policy.reset_called)
+
     def test_warmup_runs_inference_with_contract_shaped_synthetic_observation(self):
         class FakePolicy:
             def __init__(self):

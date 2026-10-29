@@ -7,6 +7,20 @@ end-effector targets before IK** with the Ruckig joint planner selected.
 The Joint reference planner tab still controls the downstream physical joint
 speed/acceleration/jerk bounds. Neither setting starts or enables the robot.
 
+The GUI switch is now labelled **EEF target smoothing (host)**, with separate
+settings for `local_ik_joint` and `piper_eef`. The latter sends shaped EEF
+references to firmware without a local joint planner. See
+[the two control modes](NATIVE_EEF_CONTROL.md) for the mode selector and limits.
+
+With RTC enabled, normal streaming execution **bypasses this point-to-point
+shaper** to avoid reserving stopping distance at every policy row. The switch
+then applies only to IK recovery, after the old RTC suffix is invalidated.
+Gripper changes and bounded local projections no longer create stop-at-goal
+barriers. Normal tracking follows the policy clock; sustained sent/reference
+joint or original-policy EEF error triggers braking and fresh-observation
+replanning. See [continuous tracking](RTC_CLIENT_GUIDE.md#连续跟踪与持续失配2026-10-28).
+Without RTC, the existing opt-in shaper remains available on normal references.
+
 ## What questVR actually does
 
 Source reviewed: [agilexrobotics/questVR_ws](https://github.com/agilexrobotics/questVR_ws),
@@ -44,21 +58,38 @@ chunk discontinuities or camera/control latency.
 `pose_trajectory.py` maintains translation plus base-frame linear/angular
 velocity across new policy targets. It uses the shortest SO(3) rotation error
 and integrates rotations on SO(3), avoiding Euler wrap and invalid rotation6d
-interpolation. Euclidean vector speed and acceleration bounds apply before IK.
+interpolation. The `stopping_distance_reference_v2` algorithm uses an exact
+first-order response gain `1-exp(-dt/tau)` and selects a step speed satisfying
+`speed*dt + speed²/(2*acceleration_limit) <= remaining_distance`, together with
+the speed cap and vector velocity-change bound. Position advances by `v*dt`.
+Velocities mean reference increments divided by the update interval; acceleration
+bounds apply to changes between these sampled velocities, not continuous motor
+acceleration. The downstream joint writer still owns physical motion bounds.
 Defaults are 0.20 m/s, 1.20 m/s², 0.75 rad/s, 8.0 rad/s², and a 0.06 s response
 time. The original continuous IK retains measured-joint regularization, a
 previous-solution warm start, joint bounds and residual checks. Ruckig owns
 joint jerk bounds and the sole CAN writer; the pose layer has no actuator thread.
 
 This is a **causal online reference shaper at the client reference rate**, not
-whole-chunk Cartesian planning or a Cartesian jerk guarantee. Braking after a
-target reversal can overshoot that target; every shaped position is checked
+whole-chunk Cartesian planning or a Cartesian jerk guarantee. Fixed goals from
+rest converge monotonically in the offline tests. A moving target that suddenly
+jumps inside the stopping distance or changes direction can make an aligned
+step infeasible. The shaper then brakes its existing velocity without instantly
+zeroing it or clipping its position; temporary motion away from the new target
+is possible. This is explicitly recorded as `braking_for_target_change`.
+Every shaped position is checked
 against the configured workspace before IK. This is not collision avoidance.
 Feedback initializes a new reference and subsequently checks tracking (defaults
 0.10 m / 0.80 rad); it does not reset the trajectory state each tick. Clock gaps
 over 0.15 s fail closed. Holds, faults, protocol changes and shutdown discard
 the pose state; resumed motion initializes from fresh feedback and remains
-subject to the existing writer's safe-stop/ownership rules.
+subject to the existing writer's safe-stop/ownership rules. Original-goal
+continuation preserves the same shaper and advances it each control tick, even
+while the joint reference is moving. A half/quarter IK recovery waits for both
+planner and measured joints to settle before reinitializing from feedback.
+During IK recovery, gripper release requires measured arrival, joint settling
+and pose-reference settling. Small shaped intermediate steps need not each improve the original
+goal by 1%; IK residual checks and the overall goal timeout remain in force.
 
 Both arms finish target checks and IK before a writer submission. If either arm
 fails, the shared failure path discards both pose states and holds the writer.
@@ -71,15 +102,28 @@ the shaped motion. Increasing response time or tightening limits may worsen
 tracking and wrist-camera visibility; the defaults are starting limits, not
 validated task-optimal settings. Logs record the original absolute policy
 target, shaped target, translation/rotation lag, velocities, accelerations,
-tracking deviation, limiting flags, and the existing IK residuals in each arm's
+tracking deviation, speed/slew/stopping-distance limiting flags, target-change
+braking flags, and the existing IK residuals in each arm's
 `command_pipeline.pose_trajectory` / `ik_diagnostics` data. Use these together
 with measured feedback, timestamps and images when assessing grasp accuracy.
 When deployment recording is active, `trajectory.jsonl` also persists these
 under each arm's `pose_diagnostics` independently of optional monitoring.
+Retained-goal updates also expose the current reference diagnostics through
+`continuous_ik.shrink_recovery.pose_reference` and the reanchor wait through
+`pose_reset_waiting_for_stop`.
 
 ### Parameter selection and when defaults take effect
 
-The 2026-10-20 preset was selected by staged offline replay of 25 `fix`
+The 2026-10-28 audit of the current 30 Hz container dataset found that these
+20 Hz defaults substantially lag its demonstrations. The original shaper
+overshot fixed steps; the corrected stopping law removes that failure in the
+offline tests but increases continuous-target lag for faster candidate settings.
+No replacement runtime preset has been adopted; shaping remains opt-in.
+See [the optimization results](../../analysis/eef_parameters_20261028/OPTIMIZATION.md)
+before applying the older selection below to another task or control frequency.
+
+The following figures describe the **historical algorithm**, not v2. The
+2026-10-20 preset was selected by staged offline replay of 25 `fix`
 demonstrations (12067 frames, 20 Hz) and independent seeded-noise, reversal and
 single-frame pulse tests. This preserves one shared response time for
 translation/rotation and all existing tracking/workspace limits.

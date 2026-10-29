@@ -728,5 +728,98 @@ class RTCAwarePolicyTest(unittest.TestCase):
 
 
 
+class RTCDeliveryReanchorTest(unittest.TestCase):
+    def test_delivery_config_derives_pose_mask_without_grippers(self):
+        for count in (1, 2):
+            config = RTCConfig(delivery_reanchor_arm_count=count)
+            self.assertEqual(config.physical_action_dim, count*7)
+            self.assertEqual(config.reanchor_action_mask, tuple(([True]*6+[False])*count))
+        with self.assertRaises(ValueError):
+            RTCConfig(delivery_reanchor_arm_count=2, physical_action_dim=20)
+        with self.assertRaises(ValueError):
+            RTCConfig(delivery_reanchor_arm_count=3)
+
+    def test_moving_rotating_origin_preserves_full_physical_prefix(self):
+        from scipy.spatial.transform import Rotation
+        from bimanual_vla.data.action_conventions import (
+            matrix_to_rotation6d, absolute_eef_targets_to_chunk_origin as encode,
+            chunk_origin_deltas_to_absolute_eef_targets as decode,
+        )
+        for count in (1, 2):
+            with self.subTest(arms=count):
+                config = RTCConfig(execution_horizon=3, delivery_reanchor_arm_count=count)
+                adapter, policy = RTCAwarePolicyTest._make(self, config)
+                # Exercise trained admission independently of model-weight/backend loading.
+                adapter.config = rtc_openpi.replace(config, mode='trained', training_max_delay=2)
+                policy._model.action_horizon = 4
+                old = np.concatenate([np.r_[[.1, -.2, .3], matrix_to_rotation6d(
+                    Rotation.from_euler('xyz', [.2, -.4, .5+i]).as_matrix()), .2] for i in range(count)]).astype(np.float32)
+                new = np.concatenate([np.r_[[.14, -.16, .32], matrix_to_rotation6d(
+                    Rotation.from_euler('xyz', [-.3, .2, -.1+i]).as_matrix()), .9] for i in range(count)]).astype(np.float32)
+                old_copy, new_copy = old.copy(), new.copy()
+                wire = np.tile(np.array([.01, .02, -.01, .02, -.01, .03, .4]*count, np.float32), (4, 1))
+                wire[:, 0] += np.arange(4)*.003
+                wire[:, 6] = [.1, .3, .6, .8]
+                mean = np.linspace(-.1, .1, count*7, dtype=np.float32)
+                scale = np.linspace(.2, 2., count*7, dtype=np.float32)
+                def encoder(data):
+                    delta = encode(data['state'], data['actions'], arm_count=count)
+                    normalized = np.zeros((len(delta), 32), dtype=np.float32)
+                    normalized[:, :count*7] = (delta-mean)/scale
+                    return dict(actions=normalized)
+                policy.input_transform = encoder
+                physical = decode(old, wire, arm_count=count)
+                policy.next_absolute = wire.copy()  # Delivery output is NOT absolute.
+                policy.next_normalized = encoder(dict(state=old, actions=physical))['actions']
+                old_normalized = policy.next_normalized.copy()
+                adapter.infer(RTCAwarePolicyTest._observation(generation=1, state=old))
+                np.testing.assert_allclose(adapter._sessions['test-session'].absolute_actions, physical, atol=1e-6)
+                expected = physical[1:]
+                new_wire = encode(new, np.concatenate([expected, expected[-1:]]), arm_count=count)
+                policy.next_absolute = new_wire
+                policy.next_normalized = encoder(dict(state=new, actions=decode(new, new_wire, arm_count=count)))['actions']
+                response = adapter.infer(RTCAwarePolicyTest._observation(
+                    generation=2, previous_generation=1, offset=1, delay=2, state=new))
+                prefix = np.asarray(policy.seen_sample_kwargs[-1]['prev_chunk_left_over'])[:3]
+                decoded = decode(new, prefix[:, :count*7]*scale+mean, arm_count=count)
+                np.testing.assert_allclose(decoded, expected, atol=5e-7)
+                for arm in range(count):
+                    np.testing.assert_array_equal(prefix[:, arm*7+6], old_normalized[1:, arm*7+6])
+                np.testing.assert_array_equal(prefix[:, count*7:], old_normalized[1:, count*7:])
+                self.assertTrue(response['rtc']['enabled'])
+                self.assertTrue(response['rtc']['reanchored'])
+                self.assertEqual(response['rtc']['reanchor_representation'], 'absolute_eef_target')
+                self.assertLess(response['rtc']['position_boundary_jump_l2'], 1e-6)
+                np.testing.assert_allclose(response['rtc']['new_absolute_first_target'], expected[0], atol=5e-7)
+                np.testing.assert_array_equal(old, old_copy)
+                np.testing.assert_array_equal(new, new_copy)
+                # Unknown previous generation must not reuse a cached prefix.
+                response = adapter.infer(RTCAwarePolicyTest._observation(
+                    generation=3, previous_generation=None, offset=1, delay=2, state=new))
+                self.assertFalse(response['rtc']['enabled'])
+
+    def test_delivery_does_not_advertise_or_accept_joint_planner_prefix(self):
+        config = RTCConfig(execution_horizon=3, delivery_reanchor_arm_count=1)
+        adapter, policy = RTCAwarePolicyTest._make(self, config)
+        adapter.config = rtc_openpi.replace(config, mode='trained', training_max_delay=2)
+        policy._model.action_horizon = 4
+        observation = RTCAwarePolicyTest._observation(generation=1)
+        observation['client_metadata']['rtc']['prefix_source'] = 'client_planner'
+        with self.assertRaisesRegex(ValueError, 'trained joint RTC'):
+            adapter.infer(observation)
+        self.assertEqual(policy.seen_sample_kwargs, [])
+
+    def test_invalid_delivery_origin_cannot_be_cached(self):
+        config = RTCConfig(execution_horizon=3, delivery_reanchor_arm_count=1)
+        adapter, policy = RTCAwarePolicyTest._make(self, config)
+        policy.next_absolute = np.zeros((4, 7), dtype=np.float32)
+        policy.next_normalized = np.zeros((4, 32), dtype=np.float32)
+        for state in (None, [0.]*7, [float('nan')]*10, [0.]*10):
+            with self.subTest(state=state), self.assertRaises(ValueError):
+                adapter.infer(RTCAwarePolicyTest._observation(generation=1, state=state))
+            self.assertIsNone(adapter._sessions['test-session'].generation)
+            self.assertIsNone(adapter._sessions['test-session'].absolute_actions)
+
+
 if __name__ == "__main__":
     unittest.main()

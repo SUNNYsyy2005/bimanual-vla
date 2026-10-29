@@ -55,10 +55,11 @@ class ServoConfig:
     target_timeout_s: float = 0.15
     max_gripper_velocity: float = 0.08
     follow_waypoint_velocity: bool = False
+    independent_arms: bool = False
 
     def __post_init__(self) -> None:
         for name, value in vars(self).items():
-            if name == "follow_waypoint_velocity":
+            if name in {"follow_waypoint_velocity", "independent_arms"}:
                 continue
             if not math.isfinite(float(value)) or float(value) <= 0:
                 raise ValueError(f"servo {name} must be finite and positive")
@@ -307,6 +308,88 @@ class RuckigJointPlanner:
                 "acceleration": self.acceleration.tolist(), "braking": self.braking}
 
 
+class IndependentArmJointPlanner:
+    """Two six-axis planners advanced by the same single actuator writer.
+
+    Each arm retains its own q/v/a and synchronized joint trajectory. Target
+    admission checks both trajectories before the writer can publish either.
+    An error propagates to the shared ServoLoop fault/stop path.
+    """
+
+    def __init__(self, initial, lower, upper, config):
+        initial, lower, upper = (np.asarray(x, dtype=float) for x in (initial, lower, upper))
+        if any(x.shape != (12,) for x in (initial, lower, upper)):
+            raise ValueError("independent-arm planner requires twelve joints")
+        self.config, self.lower, self.upper = config, lower.copy(), upper.copy()
+        self.arms = tuple(RuckigJointPlanner(initial[k:k+6], lower[k:k+6], upper[k:k+6], config)
+                          for k in (0, 6))
+
+    @property
+    def position(self):
+        return np.concatenate([arm.position for arm in self.arms])
+
+    @property
+    def velocity(self):
+        return np.concatenate([arm.velocity for arm in self.arms])
+
+    @property
+    def acceleration(self):
+        return np.concatenate([arm.acceleration for arm in self.arms])
+
+    @property
+    def target(self):
+        return np.concatenate([arm.target for arm in self.arms])
+
+    @property
+    def braking(self):
+        return all(arm.braking for arm in self.arms)
+
+    @braking.setter
+    def braking(self, value):
+        for arm in self.arms:
+            arm.braking = bool(value)
+
+    def retarget(self, position, velocity=None):
+        target = np.asarray(position, dtype=float)
+        speed = np.zeros(12) if velocity is None else np.asarray(velocity, dtype=float)
+        if target.shape != (12,) or speed.shape != (12,) or not np.isfinite(speed).all():
+            raise ServoError("invalid independent-arm target")
+        # Validate both endpoints before mutating either planner. Planning
+        # failures leave generated q/v/a untouched and are fatal to the writer.
+        for index, arm in enumerate(self.arms):
+            arm._check_bounds(target[index*6:index*6+6], stage=f"arm {index} target")
+        for index, arm in enumerate(self.arms):
+            try:
+                arm.retarget(target[index*6:index*6+6], speed[index*6:index*6+6])
+            except ServoError as exc:
+                raise ServoError(f"independent arm {index}: {exc}") from exc
+
+    def set_state(self, position, velocity, acceleration):
+        arrays = [np.asarray(x, dtype=float) for x in (position, velocity, acceleration)]
+        if any(x.shape != (12,) or not np.isfinite(x).all() for x in arrays):
+            raise ServoError("invalid independent-arm planned state")
+        for index, arm in enumerate(self.arms):
+            arm.set_state(*(x[index*6:index*6+6] for x in arrays))
+
+    def brake(self):
+        for arm in self.arms:
+            arm.brake()
+
+    def advance(self):
+        # The caller publishes only after BOTH checks/updates succeed.
+        for index, arm in enumerate(self.arms):
+            try:
+                arm.advance()
+            except ServoError as exc:
+                raise ServoError(f"independent arm {index}: {exc}") from exc
+        return self.position
+
+    def metrics(self):
+        return dict(position=self.position.tolist(), velocity=self.velocity.tolist(),
+                    acceleration=self.acceleration.tolist(), braking=self.braking,
+                    synchronization="per_arm")
+
+
 class RuckigJointServo(RuckigJointPlanner):
     """Compatibility adapter for existing guarded planning/return callers."""
 
@@ -334,7 +417,9 @@ class ServoLoop:
             raise ValueError("Piper servo requires a 7D/14D initial state")
         self.joint_indices = np.array([i for i in range(len(initial)) if i % 7 != 6])
         self.gripper_indices = np.array([i for i in range(len(initial)) if i % 7 == 6])
-        self.planner = RuckigJointPlanner(initial[self.joint_indices],
+        planner_type = (IndependentArmJointPlanner if config.independent_arms and len(initial) == 14
+                        else RuckigJointPlanner)
+        self.planner = planner_type(initial[self.joint_indices],
                                      np.asarray(lower)[self.joint_indices],
                                      np.asarray(upper)[self.joint_indices], config)
         self.servo = self.planner  # Existing metrics and shutdown API compatibility.
@@ -350,6 +435,8 @@ class ServoLoop:
         self._last_reference: np.ndarray | None = None
         self._reference_at: float | None = None
         self._target_velocity = np.zeros(len(self.joint_indices))
+        self._applied_target = None
+        self._applied_target_velocity = None
         self._revision = 0
         self._applied_revision = 0
         self._published_revision = 0
@@ -706,6 +793,7 @@ class ServoLoop:
                     braking = self._hold or expired
                     command = feedback.copy()
                     if self._plan is not None and not braking:
+                        self._applied_target = None
                         plan = self._plan
                         # Sample the time-indexed trajectory at the current
                         # clock. Sending only one queued 10 ms row per slow
@@ -731,10 +819,21 @@ class ServoLoop:
                         self._grippers = command[self.gripper_indices].copy()
                         self._context = plan.context_at(now)
                     elif braking:
+                        self._applied_target = None
                         if not self.servo.braking:
                             self.servo.brake()
                     elif self._applied_revision != self._revision:
-                        self.servo.retarget(self._target[self.joint_indices], self._target_velocity)
+                        target = self._target[self.joint_indices]
+                        # A heartbeat for a retained recovery goal must not
+                        # repeatedly rebuild a synchronized trajectory while
+                        # it is braking/reversing. Only changed endpoints or
+                        # terminal velocities require another retarget.
+                        if (self._applied_target is None
+                                or not np.array_equal(target, self._applied_target)
+                                or not np.array_equal(self._target_velocity, self._applied_target_velocity)):
+                            self.servo.retarget(target, self._target_velocity)
+                            self._applied_target = target.copy()
+                            self._applied_target_velocity = self._target_velocity.copy()
                     self._applied_revision = self._revision
                     if self._plan is None or braking:
                         command[self.joint_indices] = self.planner.advance()
