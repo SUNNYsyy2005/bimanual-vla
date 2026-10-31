@@ -6811,7 +6811,9 @@ print(json.dumps(rows, ensure_ascii=False))
                     # Only this page gets per-episode event/annotation details.
                     detail = eval_video_metadata(item["root"], item["relative_path"])
                     routing = {"id", "group_id", "root", "relative_path", "url", "source", "remote", "playable", "syncable", "deletable",
-                               "video_source", "task", "experiment", "mtime", "updated_at"}
+                               "video_source", "task", "experiment", "experiment_label", "mtime", "updated_at",
+                               "artifact_experiment", "artifact_experiment_label", "artifact_role", "training_run_id",
+                               "training_run_ref", "lineage_evidence"}
                     item.update({key: value for key, value in detail.items() if key not in routing})
                 except (FileNotFoundError, OSError):
                     item.update(playable=False, deletable=False, missing=True)

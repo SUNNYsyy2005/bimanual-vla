@@ -18,11 +18,13 @@ try:
     from .eval_video_browser import publish_index
     from .dataset_transfer_runner import clean_transport_env
     from .artifact_inventory import Inventory
+    from .eval_video_lineage import training_lineage
 except ImportError:
     import eval_video_catalog as catalog
     from eval_video_browser import publish_index
     from dataset_transfer_runner import clean_transport_env
     from artifact_inventory import Inventory
+    from eval_video_lineage import training_lineage
 
 
 def organize_row(row: dict, destination: Path, registry: dict) -> str:
@@ -71,11 +73,13 @@ def refresh(config: dict, *, apply: bool, local_only: bool = False) -> dict:
             rows.extend(catalog.scan_source(source))
     # Directory inventory discovers canonical runs outside the historical
     # video roots. Pick up their new videos in this background process too.
+    manifests = catalog.read_object(Path(config['workspace_root']) / 'artifact-run-inventory.json', max_bytes=128 * 1024 * 1024).get('runs', [])
     for root in Inventory(config).roots():
         for path in root.glob('*/*/*/*/run.json'):
             manifest = catalog.read_object(path)
             if manifest.get('schema') != 'experiment_run.v1':
                 continue
+            manifests.append(dict(manifest, path=str(path.parent)))
             context = {k: manifest[k] for k in ('video_source', 'task', 'experiment', 'run_id') if manifest.get(k)}
             rows.extend(catalog.scan_source(dict(context, root=str(path.parent), storage_source='local_4090')))
     summary = {"local_videos": len(rows), "by_source": {}, "outcomes": {}, "unknown_tasks": 0}
@@ -119,7 +123,7 @@ def refresh(config: dict, *, apply: bool, local_only: bool = False) -> dict:
         enabled = {s["storage_source"] for s in sources if s.get("ssh_host")}
         by_source = {k: v for k, v in by_source.items() if k in enabled}
         catalog.atomic_write(inventory_path, {"sources": by_source, "errors": errors, "updated_at": time.time()})
-    publish_index(destination, indexed_rows, by_source)
+    publish_index(destination, indexed_rows, by_source, lineage=training_lineage(manifests))
     summary.update(remote_videos=sum(len(v["videos"]) for v in by_source.values()), errors=errors, updated_at=time.time())
     catalog.atomic_write(destination / "status.json", summary)
     return summary
