@@ -319,6 +319,8 @@ def main():
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: return
         print(json.dumps(inventory.reconcile(), ensure_ascii=False))
+    from .artifact_index_repair import request_repair
+    request_repair(args.config)
 
 
 if __name__ == '__main__': main()

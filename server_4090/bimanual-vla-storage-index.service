@@ -5,5 +5,6 @@ Type=oneshot
 WorkingDirectory=%h/bimanual-vla
 ExecStart=%h/miniconda3/envs/openpi/bin/python -m server_4090.storage_catalog --config %h/bimanual-vla/server_4090/config.simulation.json --action refresh --scheduled
 Nice=10
+KillMode=process
 TimeoutStartSec=30min
 UMask=0077

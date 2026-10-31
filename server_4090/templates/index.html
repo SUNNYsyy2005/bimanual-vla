@@ -2006,7 +2006,7 @@ async function loadEvalVideoScopes(force = false) {
       }
       document.getElementById('navEvalVideoCount').textContent = String(data.total || 0);
       document.getElementById('evalVideoScopeSummary').textContent = data.ready
-        ? `${evalVideoGroupData.length} 组实验 · ${data.total} 个视频 · 可按任务全选，或跨实验多选。索引更新于 ${new Date(data.updated_at * 1000).toLocaleString()}。`
+        ? `${evalVideoGroupData.length} 组实验 · ${data.total} 个独立视频${data.duplicate_count ? ` · 已识别 ${data.duplicate_count} 条重复索引` : ''} · 可按任务全选，或跨实验多选。索引更新于 ${new Date(data.updated_at * 1000).toLocaleString()}。${data.repair?.refreshing ? '后台正在补索引，可继续查看已有视频。' : data.repair?.error ? '后台补索引暂未完成，当前显示上次可用结果。' : ''}`
         : '视频索引尚未生成。点击“发现新视频”，完成后刷新实验分组。';
       renderEvalVideoScopes();
     } catch (error) {
@@ -2062,11 +2062,11 @@ async function loadEvalVideos(includeRemote = false) {
       document.getElementById('evalVideoSelectAll').checked = false;
     }
     const navCount = document.getElementById('navEvalVideoCount');
-    if (navCount) navCount.textContent = String(evalVideoGroupData.reduce((n, g) => n + g.count, 0));
+    // The global count comes from the unique inventory, not overlapping groups.
     const pageVideos = videos;
     const success = (data.facets && data.facets.success) || {};
     const remoteErrors = Object.entries(data.remote_errors || {}).map(([k, v]) => `${k}: ${String(v).slice(0, 160)}`);
-    summary.textContent = `已加载 ${activeEvalVideoGroups.length} 组实验 · 本页 ${videos.length}/${data.total ?? videos.length} 个视频 · 成功 ${success.success || 0} · 失败 ${success.failed || 0} · 未知 ${success.unknown || 0}${remoteErrors.length ? ' · 远端提示: ' + remoteErrors.join(' ; ') : ''}`;
+    summary.textContent = `已加载 ${activeEvalVideoGroups.length} 组实验 · 本页 ${videos.length}/${data.total ?? videos.length} 个视频${data.duplicate_count ? ` · 已合并 ${data.duplicate_count} 条重复索引` : ''} · 成功 ${success.success || 0} · 失败 ${success.failed || 0} · 未知 ${success.unknown || 0}${remoteErrors.length ? ' · 远端提示: ' + remoteErrors.join(' ; ') : ''}`;
     detachedPlayers = detachEvalVideoPlayers();
     list.classList.toggle('compare', Boolean(document.getElementById('evalVideoCompareLayout')?.checked) && activeEvalVideoGroups.length > 1);
     list.innerHTML = renderEvalVideoGroups(pageVideos) || '<div class="muted">没有找到符合筛选条件的 mp4/webm/mov/mkv/avi/gif 文件。</div>';
@@ -2353,7 +2353,8 @@ function renderEvalVideoRow(video) {
   const modelInfo = video.model_name ? `model=${esc(video.model_name)}${video.checkpoint_id ? ` · ckpt=${esc(video.checkpoint_id)}` : ''}` : (video.checkpoint_id ? `ckpt=${esc(video.checkpoint_id)}` : '');
   const layoutInfo = video.video_layout ? `layout=${esc(video.video_layout)}${Array.isArray(video.video_views) && video.video_views.length ? ` · views=${esc(video.video_views.join(' + '))}` : ''}` : '';
   const instructionInfo = video.instruction ? `instruction=${esc(video.instruction)}` : '';
-  const diagnosticInfo = [modelInfo, layoutInfo, instructionInfo].filter(Boolean).map(item => `<br><span class="muted eval-video-diagnostic">${item}</span>`).join('');
+  const seedInfo = video.episode_seed == null ? '' : `episode seed=${esc(video.episode_seed)}`;
+  const diagnosticInfo = [modelInfo, layoutInfo, instructionInfo, seedInfo].filter(Boolean).map(item => `<br><span class="muted eval-video-diagnostic">${item}</span>`).join('');
   const holderId = evalPlayerId(esc(video.id));
   const label = video.display_name || video.name || video.relative_path;
   const checkbox = video.deletable
@@ -2363,9 +2364,10 @@ function renderEvalVideoRow(video) {
     ? `<button class="inline" type="button" data-source="${esc(video.source)}" data-root="${esc(video.root)}" data-relative-path="${esc(video.relative_path)}" onclick="syncEvalVideo(this.dataset.source, this.dataset.root, this.dataset.relativePath)">同步到 4×4090</button>`
     : `<button class="inline" type="button" data-video-id="${esc(video.id)}" onclick="playEvalVideo(this.dataset.videoId)">${expandedEvalVideoIds.has(video.id) ? '收起播放器' : '加载 / 播放'}</button><button class="inline danger" type="button" data-video-id="${esc(video.id)}" data-video-label="${esc(label)}" onclick="deleteEvalVideo(this.dataset.videoId, this.dataset.videoLabel)">删除</button>`;
   const eventSummary = renderEvalEventSummary(video);
+  const copies = video.duplicate_count ? `<details><summary>已合并 ${esc(video.duplicate_count)} 条相同视频记录</summary>${(video.duplicate_records || []).map(copy => `<div class="muted path">${esc(copy.experiment || '')} / ${esc(copy.run_id || '')} · ${esc(copy.source || '')}<br>${esc(copy.relative_path || '')}</div>`).join('')}</details>` : '';
   return `<div class="eval-video-card${video.remote ? ' remote' : ''}" data-video-id="${esc(video.id)}">
     <header><div class="eval-video-header"><div class="eval-video-select-cell">${checkbox}</div><div class="eval-video-title"><strong>${esc(video.display_name || video.name || video.relative_path)}</strong> <span class="${statusClass}">${statusLabel}</span><br><code class="path">${esc(video.catalog_relative_path || video.relative_path)}</code><br><span class="muted">${meta}${video.score == null ? '' : ` · score=${esc(video.score)}`}</span>${diagnosticInfo}${eventSummary}</div></div><div class="eval-video-actions">${action}</div></header>
-    <div id="${holderId}"></div>
+    ${copies}<div id="${holderId}"></div>
   </div>`;
 }
 

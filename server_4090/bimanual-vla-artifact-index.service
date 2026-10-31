@@ -4,9 +4,9 @@ Description=Refresh simulation experiment and rollout artifact indexes
 [Service]
 Type=oneshot
 WorkingDirectory=%h/bimanual-vla
-ExecStart=%h/miniconda3/bin/python %h/bimanual-vla/server_4090/eval_video_catalog_runner.py --config %h/bimanual-vla/server_4090/config.simulation.json --apply
-ExecStart=%h/miniconda3/bin/python %h/bimanual-vla/server_4090/artifact_history_runner.py --config %h/bimanual-vla/server_4090/config.simulation.json
+ExecStart=%h/miniconda3/envs/openpi/bin/python -m server_4090.artifact_index_repair --config %h/bimanual-vla/server_4090/config.simulation.json --request --remote
 Nice=10
+KillMode=process
 TimeoutStartSec=20min
 UMask=0077
 

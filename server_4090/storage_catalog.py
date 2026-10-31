@@ -287,6 +287,9 @@ def main():
                 return dict(node=name,error=str(exc))
         with ThreadPoolExecutor(max_workers=3) as pool:results=list(pool.map(one,names))
         if names:registry.inventory.reconcile()
+        if any('error' not in result for result in results):
+            from .artifact_index_repair import request_repair
+            request_repair(args.config, remote=any(not available[result['node']]['local'] for result in results if 'error' not in result and result.get('node') in available))
         print(json.dumps(results))
         if any('error' in r for r in results):raise SystemExit(1)
         return
@@ -307,6 +310,8 @@ def main():
         try:refresh_node(config,node,quick=copy['kind']!='dataset')
         except Exception as exc:print('Replica operation completed; inventory refresh pending: '+str(exc),flush=True)
     registry.inventory.reconcile()
+    from .artifact_index_repair import request_repair
+    request_repair(args.config, remote=any(not locations(config)[node]['local'] for node in dict.fromkeys([copy['node']]+([args.target] if args.target else []))))
 
 
 if __name__=='__main__':main()
