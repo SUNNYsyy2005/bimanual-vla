@@ -10,10 +10,10 @@ import time
 
 try:
     from .eval_video_identity import deduplicate_videos, local_identities
-    from .eval_video_lineage import apply_lineage
+    from .eval_video_lineage import apply_lineage, apply_families
 except ImportError:
     from eval_video_identity import deduplicate_videos, local_identities
-    from eval_video_lineage import apply_lineage
+    from eval_video_lineage import apply_lineage, apply_families
 
 
 def group_id(row):
@@ -21,7 +21,7 @@ def group_id(row):
     return base64.urlsafe_b64encode(json.dumps(key,separators=(',',':')).encode()).decode().rstrip('=')
 
 
-def publish_index(destination, local_rows, remote_sources, *, lineage=None):
+def publish_index(destination, local_rows, remote_sources, *, lineage=None, families=None):
     """Called only by the background catalog refresh, never by a page request."""
     rows=[];synced=set();seen=set()
     for original in local_identities(local_rows, destination):
@@ -40,14 +40,14 @@ def publish_index(destination, local_rows, remote_sources, *, lineage=None):
             row.update(source=source,id=base64.urlsafe_b64encode(key.encode()).decode().rstrip('='),
                        remote=True,playable=False,syncable=True,deletable=False)
             rows.append(row)
-    rows = apply_lineage(rows, lineage or {})
+    rows = apply_families(apply_lineage(rows, lineage or {}), families or {})
     groups={};lean=[];scope_aliases={}
     fields={'video_source','task','experiment','experiment_label','run_id','phase','checkpoint_id','success','safe_success',
             'source','root','relative_path','catalog_relative_path','name','display_name','mtime','size_mib','size_bytes',
             'id','url','remote','playable','syncable','deletable','has_events','instruction','provenance','episode_seed',
             'episode_status','rollout_round','video_layout','video_views','model_name','score','counted_in_success_rate',
             'file_identity','content_sha256','artifact_experiment','artifact_experiment_label','artifact_role',
-            'training_run_id','training_run_ref','lineage_evidence'}
+            'training_run_id','training_run_ref','lineage_evidence','experiment_family','experiment_variant','experiment_variant_label'}
     for row in rows:
         if row['id'] in seen:continue
         seen.add(row['id'])
@@ -55,9 +55,9 @@ def publish_index(destination, local_rows, remote_sources, *, lineage=None):
         row['mtime']=float(row.get('mtime') or 0)
         row['updated_at']=time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(row['mtime']))
         gid=group_id(row);row['group_id']=gid;lean.append(row)
-        if row.get('artifact_experiment') and row['artifact_experiment'] != row['experiment']:
-            old_id = group_id(dict(row, experiment=row['artifact_experiment']))
-            scope_aliases[old_id] = gid
+        for old_experiment in (row.get('artifact_experiment'), row.get('experiment_variant')):
+            if old_experiment and old_experiment != row['experiment']:
+                scope_aliases[group_id(dict(row, experiment=old_experiment))] = gid
         group=groups.setdefault(gid,dict(id=gid,video_source=row.get('video_source','unknown'),task=row.get('task','unknown'),
                experiment=row.get('experiment','unknown'),label=row.get('experiment_label') or row.get('experiment','unknown'),
                count=0,local_count=0,remote_count=0,latest_mtime=0,run_ids=set()))
@@ -74,7 +74,18 @@ def publish_index(destination, local_rows, remote_sources, *, lineage=None):
         group['independent_eval_count'] = sum(r.get('artifact_role') == 'independent_eval' for r in members)
         group['independent_eval_run_count'] = len({str(r.get('run_id') or 'unknown') for r in members if r.get('artifact_role') == 'independent_eval'})
         group['process_run_count'] = len({str(r.get('run_id') or 'unknown') for r in members if r.get('artifact_role') != 'independent_eval'})
-        group['artifact_experiments'] = sorted({r.get('artifact_experiment') or r.get('experiment') for r in members})
+        group['artifact_experiments'] = sorted({name for r in members for name in (r.get('artifact_experiment'), r.get('experiment_variant'), r.get('experiment')) if name})
+        variants = {}
+        for row in lean:
+            if row['group_id'] == group['id'] and row.get('experiment_variant'):
+                variants.setdefault(row['experiment_variant'], []).append(row)
+        if variants:
+            group['variants'] = []
+            for variant, values in sorted(variants.items()):
+                unique_variant = deduplicate_videos(values)
+                group['variants'].append(dict(id=variant,label=values[0]['experiment_variant_label'],count=len(unique_variant),
+                    independent_eval_count=sum(r.get('artifact_role') == 'independent_eval' for r in unique_variant),
+                    phase_counts={phase:sum(r.get('phase') == phase for r in unique_variant) for phase in ('train','eval')}))
         group['run_count']=len(group['run_ids']);group['run_ids']=sorted(group['run_ids'])
     ordered=sorted(groups.values(),key=lambda g:(-g['latest_mtime'],g['id']))
     updated=time.time()
@@ -150,8 +161,10 @@ def matches(row,args):
     for key in ('task','experiment','run_id','checkpoint_id'):
         value=args.get(key,'').strip().lower().replace('_','-')
         haystack=str(row.get(key,'')).lower().replace('_','-')
-        if key=='experiment':haystack+=' '+' '.join(str(row.get(k,'')) for k in ('experiment_label','artifact_experiment','artifact_experiment_label')).lower().replace('_','-')
+        if key=='experiment':haystack+=' '+' '.join(str(row.get(k,'')) for k in ('experiment_label','artifact_experiment','artifact_experiment_label','experiment_variant','experiment_variant_label')).lower().replace('_','-')
         if value and value not in haystack:return False
+    variant=args.get('variant','').strip()
+    if variant and variant!='all' and variant!=row.get('experiment_variant'):return False
     query=args.get('q','').strip().lower()
     return not query or query in ' '.join(str(row.get(k,'')) for k in
-        ('relative_path','catalog_relative_path','name','task','experiment','experiment_label','artifact_experiment','artifact_experiment_label','run_id','checkpoint_id','instruction')).lower()
+        ('relative_path','catalog_relative_path','name','task','experiment','experiment_label','artifact_experiment','artifact_experiment_label','experiment_variant','experiment_variant_label','run_id','checkpoint_id','instruction')).lower()

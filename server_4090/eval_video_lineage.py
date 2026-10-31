@@ -68,3 +68,34 @@ def apply_lineage(rows, lineage):
             row['experiment_label'] = labels.get((row.get('video_source'), row.get('task'), row['experiment']), row['experiment'])
         result.append(row)
     return result
+
+
+def experiment_families(config):
+    """Families are explicit display configuration, not inferred run identity."""
+    rules = {}
+    for family in config.get('rollout_experiment_families', []):
+        if not all(isinstance(family.get(k), str) and family[k] for k in ('id', 'label', 'video_source')):
+            raise ValueError('A rollout experiment family needs id, label and video_source')
+        for variant in family.get('experiments', []):
+            if not all(isinstance(variant.get(k), str) and variant[k] for k in ('id', 'label')):
+                raise ValueError('A rollout experiment variant needs id and label')
+            key = (family['video_source'], variant['id'])
+            value = dict(id=family['id'], label=family['label'], variant_label=variant['label'])
+            if key in rules and rules[key] != value:
+                raise ValueError('Conflicting rollout experiment family for ' + variant['id'])
+            rules[key] = value
+    return rules
+
+
+def apply_families(rows, rules):
+    result = []
+    for original in rows:
+        row = dict(original)
+        family = rules.get((row.get('video_source'), row.get('experiment')))
+        if family:
+            row.setdefault('artifact_experiment', row['experiment'])
+            row.setdefault('artifact_experiment_label', row.get('experiment_label') or row['experiment'])
+            row.update(experiment_variant=row['experiment'], experiment_variant_label=family['variant_label'],
+                       experiment=family['id'], experiment_label=family['label'], experiment_family=family['id'])
+        result.append(row)
+    return result

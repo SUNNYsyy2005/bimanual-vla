@@ -1491,3 +1491,18 @@ evaluation fallback profile is never used as proof of a historical model's ident
 Unknown historical runs require verified metadata before checkpoint reuse/evaluation.
 New run manifests persist the contract. New SFT checkpoint markers record the actual
 dataset robot type instead of the previous hardcoded Piper label.
+
+### Rollout experiment families
+
+`rollout_experiment_families` explicitly groups related experiment variants into
+one video-selection entry. It changes display ownership only: different training
+settings remain separate variants and video files, run IDs and source provenance
+are preserved. Family definitions require `id`, `label`, `video_source`, and an
+`experiments` array of `{id, label}` records. Similar names or a shared initial
+checkpoint do not create a family automatically.
+
+`GET /api/eval-videos/groups` returns each family's `variants` and maps previous
+experiment IDs through `scope_aliases`. Indexed browsing supports `variant=<id>`
+alongside phase filters, including `phase=independent_eval`. Independent evaluations
+first resolve their declared training reference, then inherit the training variant.
+Background directory refresh applies both mappings when publishing a new index.

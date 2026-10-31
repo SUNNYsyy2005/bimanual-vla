@@ -53,6 +53,7 @@
     "${HOME}/TSQ/tsq_rl/results",
     "/mnt/sda1_16T/${USER}/tsq-archive/eval-videos"
   ],
+  "rollout_experiment_families": [],
   "local_storage_locations": {
     "local_4090_hdd": {
       "label": "4×4090 HDD（归档）",

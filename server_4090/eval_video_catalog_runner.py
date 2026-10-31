@@ -18,13 +18,13 @@ try:
     from .eval_video_browser import publish_index
     from .dataset_transfer_runner import clean_transport_env
     from .artifact_inventory import Inventory
-    from .eval_video_lineage import training_lineage
+    from .eval_video_lineage import training_lineage, experiment_families
 except ImportError:
     import eval_video_catalog as catalog
     from eval_video_browser import publish_index
     from dataset_transfer_runner import clean_transport_env
     from artifact_inventory import Inventory
-    from eval_video_lineage import training_lineage
+    from eval_video_lineage import training_lineage, experiment_families
 
 
 def organize_row(row: dict, destination: Path, registry: dict) -> str:
@@ -123,7 +123,7 @@ def refresh(config: dict, *, apply: bool, local_only: bool = False) -> dict:
         enabled = {s["storage_source"] for s in sources if s.get("ssh_host")}
         by_source = {k: v for k, v in by_source.items() if k in enabled}
         catalog.atomic_write(inventory_path, {"sources": by_source, "errors": errors, "updated_at": time.time()})
-    publish_index(destination, indexed_rows, by_source, lineage=training_lineage(manifests))
+    publish_index(destination, indexed_rows, by_source, lineage=training_lineage(manifests), families=experiment_families(config))
     summary.update(remote_videos=sum(len(v["videos"]) for v in by_source.values()), errors=errors, updated_at=time.time())
     catalog.atomic_write(destination / "status.json", summary)
     return summary
