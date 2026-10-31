@@ -6813,7 +6813,7 @@ print(json.dumps(rows, ensure_ascii=False))
                     routing = {"id", "group_id", "root", "relative_path", "url", "source", "remote", "playable", "syncable", "deletable",
                                "video_source", "task", "experiment", "experiment_label", "mtime", "updated_at",
                                "artifact_experiment", "artifact_experiment_label", "artifact_role", "training_run_id",
-                               "training_run_ref", "lineage_evidence"}
+                               "training_run_ref", "lineage_evidence", "experiment_family", "experiment_variant", "experiment_variant_label"}
                     item.update({key: value for key, value in detail.items() if key not in routing})
                 except (FileNotFoundError, OSError):
                     item.update(playable=False, deletable=False, missing=True)

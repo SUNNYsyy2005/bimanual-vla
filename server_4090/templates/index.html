@@ -1035,6 +1035,7 @@ ${item.path}
         <div class="eval-filter-grid">
           <div><label>视频来源</label><select id="evalVideoSourceFilter"><option value="all">全部来源</option></select></div>
           <div><label>具体任务</label><input id="evalVideoTaskFilter" list="evalVideoTasks" placeholder="如 tsa-moka / handover-mic"><datalist id="evalVideoTasks"></datalist></div>
+          <div><label>场景版本</label><select id="evalVideoVariantFilter"><option value="all">全部场景版本</option></select></div>
           <div><label>实验来源</label><input id="evalVideoExperimentFilter" list="evalVideoExperiments" placeholder="实验 ID 或名称"><datalist id="evalVideoExperiments"></datalist></div>
           <div><label>视频阶段</label><select id="evalVideoPhaseFilter"><option value="all">训练与评测</option><option value="train">训练 rollout</option><option value="eval">全部评测 rollout</option><option value="independent_eval">独立评测（已关联训练）</option><option value="unknown">阶段未知</option></select></div>
           <div><label>任务结果</label><select id="evalVideoSuccessFilter"><option value="all">全部</option><option value="success">成功</option><option value="failed">失败</option><option value="unknown">未知</option></select></div>
@@ -1934,6 +1935,22 @@ function evalVideoGroupSummary(group) {
   return `${runs} · ${group.count} 个视频${detail}${group.remote_count ? ` · ${group.remote_count} 个待同步` : ''}`;
 }
 
+function evalVideoScopeGroup(group) {
+  const label = `<label class="eval-scope-choice"><input type="checkbox" data-scope-ids="${esc(group.id)}" ${selectedEvalVideoGroups.has(group.id) ? 'checked' : ''} onchange="chooseEvalVideoScopes(this.dataset.scopeIds, this.checked)"><span>${esc(group.label)}<br><small class="muted">${esc(evalVideoGroupSummary(group))}</small></span></label>`;
+  if (!group.variants?.length) return label;
+  return `<div>${label}<details class="muted"><summary>场景版本明细（${group.variants.length}）</summary>${group.variants.map(variant => `<p>${esc(variant.label)} · ${variant.count} 个视频${variant.independent_eval_count ? ` · 其中独立评测 ${variant.independent_eval_count}` : ''}</p>`).join('')}</details></div>`;
+}
+
+function fillEvalVideoVariantFilter() {
+  const select = document.getElementById('evalVideoVariantFilter');
+  if (!select) return;
+  const scopes = new Set(activeEvalVideoGroups.length ? activeEvalVideoGroups : selectedEvalVideoGroups);
+  const variants = new Map(evalVideoGroupData.filter(group => scopes.has(group.id)).flatMap(group => (group.variants || []).map(variant => [variant.id, variant])));
+  const previous = select.value;
+  select.innerHTML = '<option value="all">全部场景版本</option>' + [...variants.values()].map(variant => `<option value="${esc(variant.id)}">${esc(variant.label)}</option>`).join('');
+  select.value = variants.has(previous) ? previous : 'all';
+}
+
 function renderEvalVideoScopes() {
   const holder = document.getElementById('evalVideoScopeList');
   if (!holder) return;
@@ -1954,14 +1971,15 @@ function renderEvalVideoScopes() {
     const partial = !checked && groups.some(g => selectedEvalVideoGroups.has(g.id));
     const ids = groups.map(g => g.id).join(',');
     return `<details class="eval-scope-task" open><summary>${esc(evalVideoSourceLabel(groups[0].video_source))} / ${esc(groups[0].task)} · ${groups.length} 组实验</summary>
-      <label class="eval-scope-choice"><input type="checkbox" data-scope-ids="${esc(ids)}" data-partial="${partial}" ${checked ? 'checked' : ''} onchange="chooseEvalVideoScopes(this.dataset.scopeIds, this.checked)">选择此任务${experiment ? '匹配的' : '全部'}实验（${groups.reduce((n,g) => n+g.count,0)} 个视频）</label>
-      ${groups.map(g => `<label class="eval-scope-choice"><input type="checkbox" data-scope-ids="${esc(g.id)}" ${selectedEvalVideoGroups.has(g.id) ? 'checked' : ''} onchange="chooseEvalVideoScopes(this.dataset.scopeIds, this.checked)"><span>${esc(g.label)}<br><small class="muted">${esc(g.experiment)} · ${esc(evalVideoGroupSummary(g))}</small></span></label>`).join('')}
+      ${groups.length > 1 ? `<label class="eval-scope-choice"><input type="checkbox" data-scope-ids="${esc(ids)}" data-partial="${partial}" ${checked ? 'checked' : ''} onchange="chooseEvalVideoScopes(this.dataset.scopeIds, this.checked)">选择此任务${experiment ? '匹配的' : '全部'}实验（${groups.reduce((n,g) => n+g.count,0)} 个视频）</label>` : ''}
+      ${groups.map(evalVideoScopeGroup).join('')}
       </details>`;
   }).join('') || '<div class="muted">没有匹配的实验。可更改筛选，或点击“发现新视频”更新后台索引。</div>';
   holder.querySelectorAll('[data-partial="true"]').forEach(input => { input.indeterminate = true; });
   const count = document.getElementById('evalVideoScopeCount');
   if (count) count.textContent = String(selectedEvalVideoGroups.size);
   document.getElementById('evalVideoApplyScopes').disabled = !selectedEvalVideoGroups.size;
+  fillEvalVideoVariantFilter();
 }
 
 function clearEvalVideoPage(message) {
@@ -2050,7 +2068,7 @@ async function loadEvalVideos(includeRemote = false) {
   const params = new URLSearchParams({limit: String(pageState.pageSize), offset: String((pageState.page - 1) * pageState.pageSize)});
   params.set('browse', '1');
   activeEvalVideoGroups.forEach(id => params.append('scope', id));
-  for (const [id, key] of [ ['evalVideoPhaseFilter','phase'], ['evalVideoSafeSuccessFilter','safe_success'], ['evalVideoEventFilter','events']]) {
+  for (const [id, key] of [ ['evalVideoPhaseFilter','phase'], ['evalVideoSafeSuccessFilter','safe_success'], ['evalVideoEventFilter','events'], ['evalVideoVariantFilter','variant']]) {
     const value = document.getElementById(id)?.value;
     if (value && value !== 'all') params.set(key, value);
   }
@@ -2370,7 +2388,8 @@ function renderEvalVideoRow(video) {
   const instructionInfo = video.instruction ? `instruction=${esc(video.instruction)}` : '';
   const seedInfo = video.episode_seed == null ? '' : `episode seed=${esc(video.episode_seed)}`;
   const lineageInfo = video.artifact_role === 'independent_eval' ? `评测产物：${esc(video.artifact_experiment)} · 对应训练：${esc(video.training_run_id)}` : '';
-  const diagnosticInfo = [modelInfo, layoutInfo, instructionInfo, seedInfo, lineageInfo].filter(Boolean).map(item => `<br><span class="muted eval-video-diagnostic">${item}</span>`).join('');
+  const variantInfo = video.experiment_variant_label ? `场景版本：${esc(video.experiment_variant_label)}` : '';
+  const diagnosticInfo = [modelInfo, layoutInfo, instructionInfo, seedInfo, lineageInfo, variantInfo].filter(Boolean).map(item => `<br><span class="muted eval-video-diagnostic">${item}</span>`).join('');
   const holderId = evalPlayerId(esc(video.id));
   const label = video.display_name || video.name || video.relative_path;
   const checkbox = video.deletable
@@ -6957,7 +6976,7 @@ document.getElementById('baseModelSourceFilter')?.addEventListener('change', () 
 ['evalVideoTaskFilter', 'evalVideoExperimentFilter'].forEach(id => document.getElementById(id)?.addEventListener('input', renderEvalVideoScopes));
 document.getElementById('evalVideoQueryFilter')?.addEventListener('input', scheduleEvalVideoRefresh);
 document.getElementById('evalVideoSourceFilter')?.addEventListener('change', renderEvalVideoScopes);
-['evalVideoPhaseFilter', 'evalVideoSuccessFilter', 'evalVideoSafeSuccessFilter', 'evalVideoEventFilter'].forEach(id => document.getElementById(id)?.addEventListener('change', scheduleEvalVideoRefresh));
+['evalVideoPhaseFilter', 'evalVideoVariantFilter', 'evalVideoSuccessFilter', 'evalVideoSafeSuccessFilter', 'evalVideoEventFilter'].forEach(id => document.getElementById(id)?.addEventListener('change', scheduleEvalVideoRefresh));
 document.getElementById('policyPort').addEventListener('input', updateClientCommand);
 document.getElementById('editorDataset').addEventListener('change', () => {
   episodeDatasetData = null;
