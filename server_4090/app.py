@@ -4194,23 +4194,55 @@ def create_app(config_path: Path) -> Flask:
     rlinf_discovery_snapshots = {}
     rlinf_discovery_lock = threading.Lock()
 
-    def visible_rlinf_runs():
+    def cached_rlinf_runs():
+        with rlinf_list_snapshot.lock:
+            base = list(rlinf_list_snapshot.data or [])
+        with live_rlinf_overlay_lock:
+            combined = dict(live_rlinf_overlay)
+        combined.update({r['id']: r for r in base})
+        return list(combined.values())
+
+    from server_4090.rlinf_status import RunStatusCache
+    rlinf_status_cache = RunStatusCache(config, Path(config['workspace_root']) / 'rlinf-job-status.json', cached_rlinf_runs)
+
+    def rlinf_identity_keys(run):
+        from server_4090.rlinf_run_dedup import identity_keys
+        return identity_keys(run)
+
+    def visible_rlinf_runs(snapshot=None):
         with tasks.lock:
             deleted = set(read_json(rlinf_history_path, []) or [])
             task_list = tasks.list()
-        snapshot = rlinf_list_snapshot.get()
+        snapshot = snapshot or rlinf_list_snapshot.get()
         current_tasks = {task["id"]: task for task in task_list}
         runs = []
-        combined={r["id"]:r for r in snapshot["data"] or []}
-        combined.update(live_rlinf_overlay)
-        for run in combined.values():
+        with live_rlinf_overlay_lock:
+            combined = dict(live_rlinf_overlay)
+        combined.update({r['id']: r for r in snapshot['data'] or []})
+        job_snapshot = rlinf_status_cache.snapshot.get()
+        # A configured live mirror and a discovered node path can be one run.
+        # Prefer the refreshed configured mirror, matching node AND path aliases.
+        seen = set()
+        from server_4090.rlinf_run_dedup import deduplicate_runs
+        candidates, _ = deduplicate_runs(combined.values())
+        for run in candidates:
+            # Legacy discovery errors have no observation time. Fresh scans
+            # republish current failures; an old exception is not current health.
+            if run.get('state') == 'unavailable' and not run.get('checked_at'):
+                continue
+            keys = rlinf_identity_keys(run)
+            if keys & seen:
+                continue
+            seen.update(keys)
             if run["id"] in deleted:
                 continue
             run = dict(run)
             linked = current_tasks.get(run.get("task_id"))
             if linked:
                 run["state"] = linked["state"]
-            elif time.time() - snapshot["updated_at"] > 120 and run.get("state") in {"running", "queued"}:
+            elif run.get('job_id'):
+                run = rlinf_status_cache.apply(run, job_snapshot)
+            elif time.time() - float(run.get('_status_checked_at') or (snapshot['updated_at'] if run['id'] not in live_rlinf_overlay else 0)) > 120 and run.get("state") in {"running", "queued"}:
                 run["state"] = "observed"
                 run["status_reason"] = "Cached status is stale; background refresh pending"
             from server_4090.rlinf_identity import annotate_run
@@ -4223,6 +4255,19 @@ def create_app(config_path: Path) -> Flask:
         run = live_rlinf_overlay.get(run_id)
         from server_4090.rlinf_identity import annotate_run
         run = dict(run) if run else rlinf_list_snapshot.find(run_id)
+        if run:
+            keys = rlinf_identity_keys(run)
+            from server_4090.rlinf_run_dedup import deduplicate_runs
+            candidates, _ = deduplicate_runs(cached_rlinf_runs())
+            for current in candidates:
+                if keys & rlinf_identity_keys(current):
+                    run = dict(current, id=run_id)
+                    break
+            run = rlinf_status_cache.apply(run, rlinf_status_cache.snapshot.get())
+            if run.get('task_id') and tasks._path(run['task_id']).is_file():
+                linked = read_json(tasks._path(run['task_id']), {})
+                if linked.get('state'):
+                    run = dict(run, state=linked['state'])
         return annotate_run(config, run) if run else None
 
     def delete_rlinf_records(run_ids):
@@ -9289,16 +9334,17 @@ print(json.dumps(rows, ensure_ascii=False))
         task_rows=tasks.list()
         def read_source(source):
             scoped=dict(config,rlinf_dashboard=dict(config.get('rlinf_dashboard',{}),sources=[source]))
-            return scan_runs(scoped,task_rows)
+            return source['id'], scan_runs(scoped,task_rows)
         rows=[]
         base_runs=rlinf_list_snapshot.get()['data'] or []
         with ThreadPoolExecutor(max_workers=3) as pool:
             for future in as_completed([pool.submit(read_source,source) for source in sources]):
-                rows.extend(future.result())
-                publish_discovered_rlinf_runs(rows,base_runs)
-        return dict(runs=public_runs(publish_discovered_rlinf_runs(rows,base_runs,persist=True)),scopes=[s['root'] for s in sources])
+                source_id, fresh = future.result()
+                rows.extend(fresh)
+                publish_discovered_rlinf_runs(fresh,base_runs,refreshed_sources=[source_id])
+        return dict(runs=public_runs(publish_discovered_rlinf_runs(rows,base_runs,persist=True,refreshed_sources=[s['id'] for s in sources])),scopes=[s['root'] for s in sources])
 
-    def publish_discovered_rlinf_runs(rows,base_runs,persist=False):
+    def publish_discovered_rlinf_runs(rows,base_runs,persist=False,refreshed_sources=()):
         deleted=set(read_json(rlinf_history_path,[]) or [])
         def identities(row):
             target=str(row.get('target','')).lower()
@@ -9320,6 +9366,10 @@ print(json.dumps(rows, ensure_ascii=False))
             if row['id'] not in deleted:unique.append(row)
         rows=unique
         with live_rlinf_overlay_lock:
+            refreshed = set(refreshed_sources)
+            for ident, old in list(live_rlinf_overlay.items()):
+                if ident.startswith('source-error-') and old.get('source_id') in refreshed:
+                    del live_rlinf_overlay[ident]
             live_rlinf_overlay.update({r['id']:r for r in rows})
             if persist:atomic_json(live_rlinf_overlay_path,live_rlinf_overlay)
         return rows
@@ -9356,22 +9406,22 @@ print(json.dumps(rows, ensure_ascii=False))
         # Run roots may live on the 4x4090 host, H100's shared filesystem, or
         # a NAS-backed H200 export.  The source map is server-owned; clients
         # can select a run but can never submit an arbitrary filesystem path.
-        runs = visible_rlinf_runs()
         snapshot = rlinf_list_snapshot.get()
+        runs = visible_rlinf_runs(snapshot)
         return jsonify({"runs": public_runs(runs), "index_updated_at": snapshot["updated_at"],
                         "refreshing": snapshot["refreshing"], "ready": snapshot["ready"], "error": snapshot["error"]})
 
     def check_rlinf_run_now(run):
-        from server_4090.selected_resource import job_status
+        from server_4090.rlinf_status import job_identity, job_statuses
         if run.get('task_id') and tasks._path(run['task_id']).is_file():
             task=tasks.get(run['task_id']);run=dict(run,state=task['state'])
         job_id=run.get('job_id') or run.get('origin',{}).get('job_id')
         if job_id:
-            source=run.get('_source') or {}
-            target=config.get('rlinf_dashboard',{}).get('targets',{}).get(str(run.get('target','')).lower(),{})
-            host=source.get('ssh_host') or target.get('submit_host')
-            if not host: raise ValueError('Cannot resolve Slurm submit host')
-            run=dict(run,**job_status(host,job_id))
+            identity = job_identity(config, run)
+            if not identity: raise ValueError('Cannot resolve Slurm submit host')
+            status = job_statuses(identity[0], [job_id])[str(job_id)]
+            rlinf_status_cache.remember(run, status)
+            run = dict(run, **status)
         return dict(run, checked_at=time.time())
 
     @app.get("/api/rlinf/runs/<run_id>/status")
@@ -9402,7 +9452,11 @@ print(json.dumps(rows, ensure_ascii=False))
     def rlinf_dashboard_run_metrics(run_id: str):
         run=selected_rlinf_run(run_id)
         if not run:raise ValueError('Unknown RLinf run')
-        return jsonify(mirrored_rlinf_metrics(run))
+        result = mirrored_rlinf_metrics(run)
+        # The metric mirror owns curves; current task status comes from the list.
+        if result.get('run'):
+            result['run'].update({key: run[key] for key in ('state', 'status_reason', 'checked_at', 'slurm_state', 'finished_at') if key in run})
+        return jsonify(result)
 
     @app.get("/api/rlinf/runs/<run_id>/log")
     def rlinf_run_log(run_id: str):

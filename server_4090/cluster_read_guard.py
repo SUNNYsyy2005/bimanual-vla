@@ -10,7 +10,7 @@ def admit_read(target, prefix):
         if result.returncode:raise RuntimeError('无法核对节点状态；未提交远端索引任务')
         return result.stdout
     states=query(['sinfo','-h','-N','-n',node,'-o','%T']).split()
-    if not states or any(state.lower() not in {'idle','mixed','allocated'} for state in states):
+    if not states or any(state.lower().removesuffix('-') not in {'idle','mixed','allocated'} for state in states):
         raise RuntimeError(f'{node} 当前不可调度（{" / ".join(states) or "unknown"}）；保留固定索引，未提交作业')
     rows=query(['squeue','--me','-h','-o','%j|%T|%n']).splitlines()
     for row in rows:

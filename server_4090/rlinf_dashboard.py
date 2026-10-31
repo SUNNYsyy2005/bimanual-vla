@@ -95,6 +95,9 @@ def bounded_walk(root):
   global scan_warning
   pending=[root];visited=set();entries=0
   while pending:
+    if time.monotonic()-scan_started>8:
+      scan_warning='目录探测达到本轮限额；已保留发现结果，请选择具体实验范围'
+      return
     current=pending.pop();real=str(current.resolve())
     if real in visited:continue
     visited.add(real);dirs=[];files=[]
@@ -113,6 +116,9 @@ def bounded_walk(root):
     # New experiment groups are read first; never walk model/rollout payloads.
     dirs.sort(key=lambda name:(current/name).stat().st_mtime if (current/name).exists() else 0)
     pending.extend(current/name for name in dirs)
+if not root.is_dir():
+  print(json.dumps({'exists':False,'curves':{},'events':{}}))
+  sys.exit(0)
 if root.is_dir():
   for current, dirs, files in bounded_walk(root):
     directory_count+=1
@@ -154,6 +160,7 @@ if root.is_dir():
       existing=metadata.setdefault(metadata_rel.as_posix(),{})
       for key,value in meta.items():existing.setdefault(key,value)
     for name in files:
+      if time.monotonic()-scan_started>8:break
       if name not in tracked_names and not name.endswith(tracked_suffixes): continue
       path=pathlib.Path(current)/name
       try: tracked[str(path.relative_to(root))]=path.stat().st_mtime
@@ -213,7 +220,7 @@ if len(sys.argv)>4 and sys.argv[4]=='1':
     try:
       # Query the user's queue: one expired ID must not invalidate all active IDs.
       import getpass
-      result=subprocess.run(['squeue','-h','-u',getpass.getuser(),'-o','%A|%i|%T'],capture_output=True,text=True,timeout=8)
+      result=subprocess.run(['squeue','-r','-h','-u',getpass.getuser(),'-o','%A|%i|%T'],capture_output=True,text=True,timeout=8)
       if result.returncode==0:
         job_states={job:'NOT_IN_QUEUE' for job in ids}
         for line in result.stdout.splitlines():
@@ -378,29 +385,22 @@ def _run_updated_at(relative: str, tracked: dict[str, Any]) -> float | None:
 
 def _scan_root(source: dict[str, Any], root: str, max_depth: int, *, parse_events: bool = False) -> dict[str, Any]:
     if source.get('storage_location'):
-        from .storage_catalog import storage_worker
+        from server_4090.storage_catalog import storage_worker
         return storage_worker(source['storage_location'], dict(action='run_summary', root=root, max_depth=max_depth,
-                              parse_events=parse_events, scan_code=REMOTE_SCAN))
+                              parse_events=parse_events, query_slurm=source.get('query_slurm', True), scan_code=REMOTE_SCAN))
     python = str(source.get("python") or sys.executable)
     query_slurm = source.get("query_slurm", bool(source.get("ssh_host")) and str(source.get("target", "")).lower() in {"h100", "h200"})
     flags = ["1" if parse_events else "0", "1" if query_slurm else "0"]
     command = shlex.join([python, "-c", REMOTE_SCAN, root, str(max_depth), *flags])
-    if source.get("ssh_host"):
-        host = str(source.get("ssh_host") or "").strip()
-        if not host:
-            raise ValueError("remote RLinf metric source is missing ssh_host")
+    host = str(source.get('ssh_host') or '').strip()
+    args = (["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, command]
+            if host else [python, "-c", REMOTE_SCAN, root, str(max_depth), *flags])
+    try:
         result = subprocess.run(
-            ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, command],
-            capture_output=True,
-            text=True,
-            timeout=35,
-            check=False,
+            args, capture_output=True, text=True, timeout=45, check=False,
         )
-    else:
-        result = subprocess.run(
-            [python, "-c", REMOTE_SCAN, root, str(max_depth), *flags],
-            capture_output=True, text=True, timeout=35, check=False,
-        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"读取实验目录超时（45 秒）：{host or 'local'}:{root}；已保留上次发现结果") from None
     if result.returncode:
         raise RuntimeError((result.stderr or result.stdout or "remote metric scan failed").strip()[-1200:])
     value = json.loads(result.stdout)
@@ -426,9 +426,12 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
             continue
         depth = max(1, min(8, int(source.get("max_depth", 5))))
         statuses, metadata, job_states, resolved_paths = {}, {}, {}, {}
+        scan, partial = {}, False
         try:
             if source.get("ssh_host") or source.get("python"):
                 scan = _scan_root(source, root, depth, parse_events=False)
+                if scan.get('exists') is False:
+                    raise FileNotFoundError(f'configured curve root does not exist: {root}')
                 curves = scan.get("curves", {})
                 event_runs = scan.get("events", {})
                 tracked_mtimes = scan.get("tracked", {})
@@ -444,6 +447,7 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
             if not source.get("ssh_host") and not source.get('storage_location') and not Path(root).is_dir():
                 raise FileNotFoundError(f"configured curve root does not exist: {root}")
             source_error = scan.get('scan_warning') if source.get('ssh_host') or source.get('python') else None
+            partial = bool(source_error)
         except Exception as exc:
             curves, event_runs, tracked_mtimes, source_error = {}, {}, {}, str(exc)
         grouped: dict[str, dict[str, Any]] = {}
@@ -538,7 +542,7 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
             if source.get("status_from_process") and relative in statuses and not task:
                 status = statuses[relative]
                 state = {"PASS": "completed", "COMPLETE": "completed", "COMPLETED": "completed", "FAILED": "failed", "INTERRUPTED": "stopped",
-                         "RUNNING": "running"}.get(status.get("status"), "observed")
+                         "RUNNING": "running", "COMPLETING": "running", "PENDING": "queued", "CONFIGURING": "queued"}.get(status.get("status"), "observed")
                 age = time.time() - float(status.get("exported_unix") or 0)
                 phase = status.get("phase") or {}
                 synced_at = status.get('exported_unix')
@@ -564,7 +568,9 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
                 status_reason = f"Slurm {protocol.get('job_id', '-')}; {job_state or status}; {phase.get('name', '')}"
                 if state == 'observed' and str(status).upper() in {'RUNNING', 'STARTING'}:
                     status_reason += '; protocol is stale or execution could not be verified'
-                if completion.get('error'):
+                if job_state in {'RUNNING','COMPLETING','PENDING','CONFIGURING'}:
+                    state = 'running' if job_state in {'RUNNING','COMPLETING'} else 'queued'
+                if completion.get('error') and job_state not in {'RUNNING','COMPLETING','PENDING','CONFIGURING'}:
                     status_reason += '; ' + str(completion['error'])[:300]
             if manifest.get('state') in {'created','planned'} and not protocol.get('job_id') and not curves_for_run['training'] and not curves_for_run['evaluation']:
                 continue
@@ -587,7 +593,7 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
                 "run_id": manifest.get("run_id"),
                 "_canonical": bool(manifest),
                 "_aliases": [run_path]+[str(Path(run_path)/manifest["native_output"])] if manifest.get("native_output") else [run_path]+([manifest["origin"]["legacy_path"]] if manifest.get("origin",{}).get("legacy_path") else []),
-                "job_id": protocol.get('job_id'),
+                "job_id": protocol.get('job_id') or statuses.get(relative, {}).get('job_id'),
                 "phase": phase.get('name'),
                 "current_round": phase.get('round'),
                 "planned_rounds": cfg.get('rounds'),
@@ -600,6 +606,7 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
                 "completed_training_round": max((point.get("round", point.get("actor_updates", 0)) for point in curves_for_run["training"]), default=0),
                 "completed_evaluation_round": max((point.get("round", point.get("actor_updates", 0)) for point in eval_points), default=0),
                 "state": state,
+                "_status_checked_at": time.time(),
                 "task_id": task.get("id") if task else None,
                 "launch_profile": task.get("metadata", {}).get("launch_profile") if task else None,
                 "execution_target": manifest.get("execution_node") or manifest.get("execution_target") or (task.get("metadata", {}).get("execution_target") if task else source.get("target")),
@@ -623,6 +630,7 @@ def scan_runs(config: dict[str, Any], tasks: list[dict[str, Any]] | None = None)
             runs.append({"id": f"source-error-{source_id}", "source_id": source_id,
                          "source_label": source.get("label", source_id), "target": source.get("target", "unknown"),
                          "name": source.get("label", source_id), "state": "unavailable", "error": source_error,
+                         "partial": partial, "checked_at": time.time(),
                          "metrics": [], "latest": {}, "training_points": 0, "evaluation_points": 0})
     runs.sort(key=lambda item: (item.get("state") == "unavailable", -float(item.get("updated_at") or 0), item.get("name", "")))
     return runs
@@ -743,6 +751,9 @@ def live_metrics_for_run(run):
     root = run['path']
     source['query_slurm']=False
     scanned = _scan_root(source, root, 2, parse_events=False)
+    if scanned.get('exists') is False:
+        return metrics_for_run([dict(run, _event_files=[], availability='missing',
+            availability_reason='历史运行目录已移走或清理；保留已记录的状态和曲线')], run['id'])
     curves = scanned.get('curves', {})
     events=scanned.get('events',{})
     if events and not any(key.endswith('training_curve.json') for key in curves):

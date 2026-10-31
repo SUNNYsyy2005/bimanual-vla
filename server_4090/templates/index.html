@@ -7089,8 +7089,12 @@ async function discoverRlinfNow() {
   try { const source=document.getElementById('rlinfDiscoverySource').value;if(!source)return;
     output.textContent='正在读取所选运行目录的新日志 / 曲线…';
     const data=await api('/api/rlinf/runs/discover',{method:'POST',body:JSON.stringify({source}),signal:controller.signal});
-    const rows=new Map(rlinfRuns.map(r=>[r.id,r]));for(const run of data.runs||[])rows.set(run.id,run);rlinfRuns=[...rows.values()];
-    renderRlinfRuns();const failures=(data.runs||[]).filter(r=>r.state==='unavailable');output.textContent=(data.ready?`${new Date(data.checked_at*1000).toLocaleTimeString()} 已读取 ${data.runs.length-failures.length} 条运行（含历史）`:'正在后台发现新实验，现有列表可继续使用')+(data.refreshing?' · 后台更新中':'')+(data.error?'；发现失败：'+data.error:'')+(failures.length?'；部分目录不可用：'+failures.map(r=>r.error||r.name).join('；'):'');
+    const canonical=await api('/api/rlinf/runs',{signal:controller.signal});
+    rlinfRuns=canonical.runs||[];
+    renderRlinfRuns();
+    const failures=(data.runs||[]).filter(r=>r.state==='unavailable'&&!r.partial);
+    const warnings=(data.runs||[]).filter(r=>r.partial);
+    output.textContent=(data.ready?`${new Date(data.checked_at*1000).toLocaleTimeString()} 已读取 ${(data.runs||[]).filter(r=>r.state!=='unavailable').length} 条运行（含历史）`:'正在后台发现新实验，现有列表可继续使用')+(data.refreshing?' · 后台更新中':'')+(data.error?'；发现失败：'+data.error:'')+(failures.length?'；部分目录不可用：'+failures.map(r=>r.error||r.name).join('；'):'')+(warnings.length?'；部分目录仅返回本轮范围内的结果，可选择具体实验范围继续发现':'');
   }catch(error){output.textContent='实时发现失败：'+error.message;}finally{clearTimeout(timeout);rlinfLiveDiscovery=false;}
 }
 let selectedResourceRequest = false;
@@ -7449,7 +7453,7 @@ function renderRlinfRuns() {
   const filtered = filteredRlinfRuns();
   document.getElementById('rlinfRunsPagination').innerHTML = renderListPagination('rlinfRuns', filtered.length);
   body.innerHTML = paginateList('rlinfRuns', filtered).map(run => {
-    if (run.state === 'unavailable') return `<tr><td>—</td><td>${esc(run.source_label)}</td><td class="bad">不可用</td><td colspan="5">${esc(run.error || '')}</td></tr>`;
+    if (run.state === 'unavailable') return `<tr><td>—</td><td>${esc(run.source_label)}</td><td class="${run.partial?'warn':'bad'}">${run.partial?'部分结果':'不可用'}</td><td colspan="5">${esc(run.error || '')}</td></tr>`;
     const selected = rlinfSelected.has(run.id) ? 'checked' : '';
     const roundCount = `训练 ${run.completed_training_round ?? run.training_points ?? 0}${run.planned_rounds ? ` / ${run.planned_rounds}` : ''}<br>Actor 更新 ${run.actor_updates ?? '—'} · 评测 ${run.evaluation_points ? run.completed_evaluation_round : '待评测'}${run.next_evaluation_round != null ? `<br><span class="muted">下次评测：第 ${run.next_evaluation_round} 轮</span>` : ''}`;
     const sr = run.latest?.['eval.SR@ode'] ?? run.latest?.['eval.SR@sde'] ?? run.latest?.['eval.SR'] ?? run.latest?.['eval.success_at_end'];
@@ -7508,6 +7512,7 @@ async function loadRlinfSelectedMetrics() {
       if(serial!==rlinfMetricRequest)return;
       if(data.sync?.error)failures.push(`${data.run?.name||id}：同步失败，保留已同步曲线 · ${data.sync.error}`);
       else if(data.sync&&!data.sync.ready)failures.push(`${data.run?.name||id}：正在同步曲线到 Dashboard…`);
+      else if(data.run?.availability==='missing')failures.push(`${data.run?.name||id}：${data.run.availability_reason}`);
       rlinfMetricData.set(id,data);
       const run=rlinfRuns.find(r=>r.id===id);if(run&&data.run){for(const key of ['training_points','evaluation_points','latest','completed_training_round','completed_evaluation_round','actor_updates'])if(data.run[key]!=null)run[key]=data.run[key];}
       renderRlinfMetricData();
