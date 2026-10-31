@@ -1036,7 +1036,7 @@ ${item.path}
           <div><label>视频来源</label><select id="evalVideoSourceFilter"><option value="all">全部来源</option></select></div>
           <div><label>具体任务</label><input id="evalVideoTaskFilter" list="evalVideoTasks" placeholder="如 tsa-moka / handover-mic"><datalist id="evalVideoTasks"></datalist></div>
           <div><label>实验来源</label><input id="evalVideoExperimentFilter" list="evalVideoExperiments" placeholder="实验 ID 或名称"><datalist id="evalVideoExperiments"></datalist></div>
-          <div><label>视频阶段</label><select id="evalVideoPhaseFilter"><option value="all">训练与评测</option><option value="train">训练 rollout</option><option value="eval">评测 rollout</option><option value="unknown">阶段未知</option></select></div>
+          <div><label>视频阶段</label><select id="evalVideoPhaseFilter"><option value="all">训练与评测</option><option value="train">训练 rollout</option><option value="eval">全部评测 rollout</option><option value="independent_eval">独立评测（已关联训练）</option><option value="unknown">阶段未知</option></select></div>
           <div><label>任务结果</label><select id="evalVideoSuccessFilter"><option value="all">全部</option><option value="success">成功</option><option value="failed">失败</option><option value="unknown">未知</option></select></div>
           <div><label>安全成功</label><select id="evalVideoSafeSuccessFilter"><option value="all">全部</option><option value="success">安全成功</option><option value="failed">未安全成功</option><option value="unknown">无安全结果</option></select></div>
           <div><label>任务事件</label><select id="evalVideoEventFilter"><option value="all">全部</option><option value="with">有事件标注</option><option value="without">无事件标注</option></select></div>
@@ -1924,6 +1924,16 @@ let evalVideoGroupsPromise = null;
 let evalVideoRequestVersion = 0;
 let evalVideoAbortController = null;
 
+function evalVideoGroupSummary(group) {
+  const runs = group.independent_eval_run_count
+    ? `${group.process_run_count} 次训练 / 过程评测运行 · ${group.independent_eval_run_count} 次独立评测`
+    : `${group.run_count} 次运行`;
+  const phases = group.phase_counts;
+  const independent = group.independent_eval_count || 0;
+  const detail = phases ? ` · 训练 ${phases.train || 0} · ${independent ? '训练期评测' : '评测'} ${Math.max(0, (phases.eval || 0) - independent)}${independent ? ` · 独立评测 ${independent}` : ''}${phases.unknown ? ` · 阶段未知 ${phases.unknown}` : ''}` : '';
+  return `${runs} · ${group.count} 个视频${detail}${group.remote_count ? ` · ${group.remote_count} 个待同步` : ''}`;
+}
+
 function renderEvalVideoScopes() {
   const holder = document.getElementById('evalVideoScopeList');
   if (!holder) return;
@@ -1933,7 +1943,7 @@ function renderEvalVideoScopes() {
   const buckets = new Map();
   evalVideoGroupData.filter(g => (source === 'all' || g.video_source === source)
     && (!task || g.task.toLowerCase().includes(task))
-    && (!experiment || [g.experiment, g.label, ...(g.run_ids || [])].join(' ').toLowerCase().includes(experiment)))
+    && (!experiment || [g.experiment, g.label, ...(g.artifact_experiments || []), ...(g.run_ids || [])].join(' ').toLowerCase().includes(experiment)))
     .forEach(group => {
       const key = JSON.stringify([group.video_source, group.task]);
       if (!buckets.has(key)) buckets.set(key, []);
@@ -1945,7 +1955,7 @@ function renderEvalVideoScopes() {
     const ids = groups.map(g => g.id).join(',');
     return `<details class="eval-scope-task" open><summary>${esc(evalVideoSourceLabel(groups[0].video_source))} / ${esc(groups[0].task)} · ${groups.length} 组实验</summary>
       <label class="eval-scope-choice"><input type="checkbox" data-scope-ids="${esc(ids)}" data-partial="${partial}" ${checked ? 'checked' : ''} onchange="chooseEvalVideoScopes(this.dataset.scopeIds, this.checked)">选择此任务${experiment ? '匹配的' : '全部'}实验（${groups.reduce((n,g) => n+g.count,0)} 个视频）</label>
-      ${groups.map(g => `<label class="eval-scope-choice"><input type="checkbox" data-scope-ids="${esc(g.id)}" ${selectedEvalVideoGroups.has(g.id) ? 'checked' : ''} onchange="chooseEvalVideoScopes(this.dataset.scopeIds, this.checked)"><span>${esc(g.label)}<br><small class="muted">${esc(g.experiment)} · ${g.run_count} 次运行 · ${g.count} 个视频${g.remote_count ? ` · ${g.remote_count} 个待同步` : ''}</small></span></label>`).join('')}
+      ${groups.map(g => `<label class="eval-scope-choice"><input type="checkbox" data-scope-ids="${esc(g.id)}" ${selectedEvalVideoGroups.has(g.id) ? 'checked' : ''} onchange="chooseEvalVideoScopes(this.dataset.scopeIds, this.checked)"><span>${esc(g.label)}<br><small class="muted">${esc(g.experiment)} · ${esc(evalVideoGroupSummary(g))}</small></span></label>`).join('')}
       </details>`;
   }).join('') || '<div class="muted">没有匹配的实验。可更改筛选，或点击“发现新视频”更新后台索引。</div>';
   holder.querySelectorAll('[data-partial="true"]').forEach(input => { input.indeterminate = true; });
@@ -1992,6 +2002,11 @@ async function loadEvalVideoScopes(force = false) {
     try {
       const data = await api('/api/eval-videos/groups');
       evalVideoGroupData = data.groups || []; evalVideoGroupsFetchedAt = Date.now();
+      const aliases = data.scope_aliases || {};
+      for (const id of [...selectedEvalVideoGroups]) {
+        if (aliases[id]) { selectedEvalVideoGroups.delete(id); selectedEvalVideoGroups.add(aliases[id]); }
+      }
+      activeEvalVideoGroups = [...new Set(activeEvalVideoGroups.map(id => aliases[id] || id))];
       const valid = new Set(evalVideoGroupData.map(g => g.id));
       for (const id of selectedEvalVideoGroups) if (!valid.has(id)) selectedEvalVideoGroups.delete(id);
       if (activeEvalVideoGroups.some(id => !valid.has(id))) {
@@ -2347,14 +2362,15 @@ async function refreshEvalVideoCatalog() {
 function renderEvalVideoRow(video) {
   const statusClass = video.success === 'success' ? 'ok' : video.success === 'failed' ? 'bad' : 'warn';
   const statusLabel = video.success === 'success' ? '成功' : video.success === 'failed' ? '失败' : '未知';
-  const phaseLabel = ({train: '训练 rollout', eval: '评测 rollout', unknown: '阶段未知'})[video.phase || 'unknown'];
+  const phaseLabel = video.artifact_role === 'independent_eval' ? '独立评测 rollout' : ({train: '训练 rollout', eval: '评测 rollout', unknown: '阶段未知'})[video.phase || 'unknown'];
   const safeLabel = video.safe_success === 'success' ? '安全成功' : video.safe_success === 'failed' ? '未安全成功' : '';
   const meta = `${esc(evalVideoSourceLabel(video.video_source || 'unknown'))} · ${esc(phaseLabel)} · run=${esc(video.run_id || '-')} · ${esc(video.source || '-')} · ${esc(video.updated_at)} · ${esc(video.size_mib)} MiB${safeLabel ? ' · ' + safeLabel : ''}${video.rollout_round == null ? '' : ' · rollout round=' + esc(video.rollout_round)}`;
   const modelInfo = video.model_name ? `model=${esc(video.model_name)}${video.checkpoint_id ? ` · ckpt=${esc(video.checkpoint_id)}` : ''}` : (video.checkpoint_id ? `ckpt=${esc(video.checkpoint_id)}` : '');
   const layoutInfo = video.video_layout ? `layout=${esc(video.video_layout)}${Array.isArray(video.video_views) && video.video_views.length ? ` · views=${esc(video.video_views.join(' + '))}` : ''}` : '';
   const instructionInfo = video.instruction ? `instruction=${esc(video.instruction)}` : '';
   const seedInfo = video.episode_seed == null ? '' : `episode seed=${esc(video.episode_seed)}`;
-  const diagnosticInfo = [modelInfo, layoutInfo, instructionInfo, seedInfo].filter(Boolean).map(item => `<br><span class="muted eval-video-diagnostic">${item}</span>`).join('');
+  const lineageInfo = video.artifact_role === 'independent_eval' ? `评测产物：${esc(video.artifact_experiment)} · 对应训练：${esc(video.training_run_id)}` : '';
+  const diagnosticInfo = [modelInfo, layoutInfo, instructionInfo, seedInfo, lineageInfo].filter(Boolean).map(item => `<br><span class="muted eval-video-diagnostic">${item}</span>`).join('');
   const holderId = evalPlayerId(esc(video.id));
   const label = video.display_name || video.name || video.relative_path;
   const checkbox = video.deletable

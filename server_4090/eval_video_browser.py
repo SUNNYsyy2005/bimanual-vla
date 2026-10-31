@@ -10,8 +10,10 @@ import time
 
 try:
     from .eval_video_identity import deduplicate_videos, local_identities
+    from .eval_video_lineage import apply_lineage
 except ImportError:
     from eval_video_identity import deduplicate_videos, local_identities
+    from eval_video_lineage import apply_lineage
 
 
 def group_id(row):
@@ -19,7 +21,7 @@ def group_id(row):
     return base64.urlsafe_b64encode(json.dumps(key,separators=(',',':')).encode()).decode().rstrip('=')
 
 
-def publish_index(destination, local_rows, remote_sources):
+def publish_index(destination, local_rows, remote_sources, *, lineage=None):
     """Called only by the background catalog refresh, never by a page request."""
     rows=[];synced=set();seen=set()
     for original in local_identities(local_rows, destination):
@@ -38,12 +40,14 @@ def publish_index(destination, local_rows, remote_sources):
             row.update(source=source,id=base64.urlsafe_b64encode(key.encode()).decode().rstrip('='),
                        remote=True,playable=False,syncable=True,deletable=False)
             rows.append(row)
-    groups={};lean=[]
+    rows = apply_lineage(rows, lineage or {})
+    groups={};lean=[];scope_aliases={}
     fields={'video_source','task','experiment','experiment_label','run_id','phase','checkpoint_id','success','safe_success',
             'source','root','relative_path','catalog_relative_path','name','display_name','mtime','size_mib','size_bytes',
             'id','url','remote','playable','syncable','deletable','has_events','instruction','provenance','episode_seed',
             'episode_status','rollout_round','video_layout','video_views','model_name','score','counted_in_success_rate',
-            'file_identity','content_sha256'}
+            'file_identity','content_sha256','artifact_experiment','artifact_experiment_label','artifact_role',
+            'training_run_id','training_run_ref','lineage_evidence'}
     for row in rows:
         if row['id'] in seen:continue
         seen.add(row['id'])
@@ -51,6 +55,9 @@ def publish_index(destination, local_rows, remote_sources):
         row['mtime']=float(row.get('mtime') or 0)
         row['updated_at']=time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(row['mtime']))
         gid=group_id(row);row['group_id']=gid;lean.append(row)
+        if row.get('artifact_experiment') and row['artifact_experiment'] != row['experiment']:
+            old_id = group_id(dict(row, experiment=row['artifact_experiment']))
+            scope_aliases[old_id] = gid
         group=groups.setdefault(gid,dict(id=gid,video_source=row.get('video_source','unknown'),task=row.get('task','unknown'),
                experiment=row.get('experiment','unknown'),label=row.get('experiment_label') or row.get('experiment','unknown'),
                count=0,local_count=0,remote_count=0,latest_mtime=0,run_ids=set()))
@@ -63,12 +70,17 @@ def publish_index(destination, local_rows, remote_sources):
         group['count'] = len(members)
         group['local_count'] = sum(not r['remote'] for r in members)
         group['remote_count'] = sum(r['remote'] for r in members)
+        group['phase_counts'] = {phase:sum(r.get('phase') == phase for r in members) for phase in ('train','eval','unknown')}
+        group['independent_eval_count'] = sum(r.get('artifact_role') == 'independent_eval' for r in members)
+        group['independent_eval_run_count'] = len({str(r.get('run_id') or 'unknown') for r in members if r.get('artifact_role') == 'independent_eval'})
+        group['process_run_count'] = len({str(r.get('run_id') or 'unknown') for r in members if r.get('artifact_role') != 'independent_eval'})
+        group['artifact_experiments'] = sorted({r.get('artifact_experiment') or r.get('experiment') for r in members})
         group['run_count']=len(group['run_ids']);group['run_ids']=sorted(group['run_ids'])
     ordered=sorted(groups.values(),key=lambda g:(-g['latest_mtime'],g['id']))
     updated=time.time()
     for filename,payload in [('browse-index.json',dict(version=1,updated_at=updated,videos=lean)),
                              ('browse-groups.json',dict(version=2,updated_at=updated,total=len(unique),raw_total=len(lean),
-                                                       duplicate_count=len(lean)-len(unique),groups=ordered))]:
+                                                       duplicate_count=len(lean)-len(unique),groups=ordered,scope_aliases=scope_aliases))]:
         path=Path(destination)/filename;temporary=path.with_suffix('.tmp')
         temporary.write_text(json.dumps(payload,ensure_ascii=False,separators=(',',':'))+'\n',encoding='utf-8')
         temporary.replace(path)
@@ -96,6 +108,7 @@ class VideoBrowser:
         limit=int(args.get('limit',25));offset=int(args.get('offset',0))
         if not 1<=limit<=1000 or not 0<=offset<=10000000:raise ValueError('Invalid video page')
         summary=self.groups()
+        scopes=list(dict.fromkeys(summary.get('scope_aliases', {}).get(scope, scope) for scope in scopes))
         if not scopes:return dict(videos=[],total=0,offset=offset,limit=limit,selection_required=True,ready=summary['ready'],facets={})
         if not summary['ready']:return dict(videos=[],total=0,offset=offset,limit=limit,ready=False,facets={})
         allowed={g['id'] for g in summary['groups']}
@@ -130,12 +143,15 @@ def matches(row,args):
     if events in ('with','without') and bool(row.get('has_events'))!=(events=='with'):return False
     for key in ('video_source','phase','source','success','safe_success'):
         value=args.get(key,'').strip().lower()
+        if key == 'phase' and value == 'independent_eval':
+            if row.get('artifact_role') != 'independent_eval':return False
+            continue
         if value and value!='all' and value!=str(row.get(key,'unknown')).lower():return False
     for key in ('task','experiment','run_id','checkpoint_id'):
         value=args.get(key,'').strip().lower().replace('_','-')
         haystack=str(row.get(key,'')).lower().replace('_','-')
-        if key=='experiment':haystack+=' '+str(row.get('experiment_label','')).lower().replace('_','-')
+        if key=='experiment':haystack+=' '+' '.join(str(row.get(k,'')) for k in ('experiment_label','artifact_experiment','artifact_experiment_label')).lower().replace('_','-')
         if value and value not in haystack:return False
     query=args.get('q','').strip().lower()
     return not query or query in ' '.join(str(row.get(k,'')) for k in
-        ('relative_path','catalog_relative_path','name','task','experiment','experiment_label','run_id','checkpoint_id','instruction')).lower()
+        ('relative_path','catalog_relative_path','name','task','experiment','experiment_label','artifact_experiment','artifact_experiment_label','run_id','checkpoint_id','instruction')).lower()
