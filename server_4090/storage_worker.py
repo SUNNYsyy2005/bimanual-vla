@@ -625,7 +625,7 @@ def discover_models(request):
 
 def run_summary(request):
     args=[sys.executable,'-c',request['scan_code'],request['root'],str(min(6,int(request.get('max_depth',6)))),
-          '1' if request.get('parse_events') else '0','0']
+          '1' if request.get('parse_events') else '0','1' if request.get('query_slurm') else '0']
     result=subprocess.run(args,capture_output=True,text=True,timeout=30,check=True)
     return json.loads(result.stdout)
 
