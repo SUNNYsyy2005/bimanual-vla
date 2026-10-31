@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import socket
 from typing import Any
 
 SCHEMA = "evaluation_video.v1"
@@ -264,7 +265,9 @@ def scan_source(source: dict) -> list[dict]:
         metadata = classify(root, rel, source)
         rows.append({**metadata, "name": path.name, "root": str(root), "relative_path": rel,
                      "size_mib": round(stat.st_size / 1024**2, 2), "size_bytes": stat.st_size,
-                     "mtime": stat.st_mtime})
+                     "mtime": stat.st_mtime,
+                     "file_identity": dict(host=socket.gethostname(), device=stat.st_dev, inode=stat.st_ino,
+                                           size=stat.st_size, mtime_ns=stat.st_mtime_ns)})
     return rows
 
 

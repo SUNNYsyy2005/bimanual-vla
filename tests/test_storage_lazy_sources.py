@@ -53,8 +53,9 @@ def test_scheduled_refresh_ignores_remote_dirty_markers(tmp_path, monkeypatch):
     with registry.inventory.connect() as db:
         db.execute("INSERT OR REPLACE INTO meta VALUES('storage_dirty_remote','1')")
     monkeypatch.setattr('sys.argv',['storage','--config',str(path),'--action','refresh','--scheduled'])
-    with patch.object(sc,'locations',return_value={'local':{'local':True},'remote':{'local':False}}),patch.object(sc,'refresh_node',return_value={}) as refresh,patch.object(sc.Inventory,'reconcile'):
+    with patch.object(sc,'locations',return_value={'local':{'local':True},'remote':{'local':False}}),patch.object(sc,'refresh_node',return_value={}) as refresh,patch.object(sc.Inventory,'reconcile'),patch('server_4090.artifact_index_repair.request_repair') as repair:
         sc.main()
+        repair.assert_called_once_with(str(path),remote=False)
         assert refresh.call_count==1 and refresh.call_args.args[1]=='local'
 
 

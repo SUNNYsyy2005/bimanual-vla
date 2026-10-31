@@ -6838,6 +6838,9 @@ print(json.dumps(rows, ensure_ascii=False))
                     "mtime": stat.st_mtime, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
                     "url": f"/api/eval-videos/{encode_video_id(path)}", "remote": False, "playable": True,
                     "syncable": False, "deletable": True,
+                    "file_identity": dict(host=socket.gethostname(), device=stat.st_dev, inode=stat.st_ino,
+                                          size=stat.st_size, mtime_ns=stat.st_mtime_ns),
+                    "_file_signature": [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns],
                 })
         remote_videos, remote_errors = catalog_remote_videos()
         # Hide cached originals once their canonical local copy is available.
@@ -6865,10 +6868,14 @@ print(json.dumps(rows, ensure_ascii=False))
                     return False
             query = str(request.args.get("q", "")).strip().lower()
             return not query or query in " ".join(str(item.get(k, "")) for k in ("relative_path", "catalog_relative_path", "name", "task", "experiment", "experiment_label", "run_id", "checkpoint_id", "source", "video_source", "instruction")).lower()
-        videos = [v for v in videos if video_matches(v)]
+        from server_4090.eval_video_identity import deduplicate_videos, cached_identities
+        filtered = cached_identities([v for v in videos if video_matches(v)], destination)
+        # The legacy endpoint shares identity rules; content hashing remains
+        # exclusively in the background publisher.
+        videos = deduplicate_videos(filtered)
         videos.sort(key=lambda v: (-v["mtime"], v["id"]))
         facets["success"] = {k: sum(v.get("success") == k for v in videos) for k in ("success", "failed", "unknown")}
-        return jsonify(videos=videos[offset:offset + limit], total=len(videos), offset=offset, limit=limit,
+        return jsonify(videos=videos[offset:offset + limit], total=len(videos), duplicate_count=len(filtered)-len(videos), offset=offset, limit=limit,
                        facets=facets, roots=[str(r) for r in eval_video_roots()], remote_errors=remote_errors,
                        catalog_status=video_catalog.read_object(destination / "status.json"))
 

@@ -17,10 +17,12 @@ try:
     from . import eval_video_catalog as catalog
     from .eval_video_browser import publish_index
     from .dataset_transfer_runner import clean_transport_env
+    from .artifact_inventory import Inventory
 except ImportError:
     import eval_video_catalog as catalog
     from eval_video_browser import publish_index
     from dataset_transfer_runner import clean_transport_env
+    from artifact_inventory import Inventory
 
 
 def organize_row(row: dict, destination: Path, registry: dict) -> str:
@@ -67,6 +69,15 @@ def refresh(config: dict, *, apply: bool, local_only: bool = False) -> dict:
     for source in sources:
         if not source.get("ssh_host"):
             rows.extend(catalog.scan_source(source))
+    # Directory inventory discovers canonical runs outside the historical
+    # video roots. Pick up their new videos in this background process too.
+    for root in Inventory(config).roots():
+        for path in root.glob('*/*/*/*/run.json'):
+            manifest = catalog.read_object(path)
+            if manifest.get('schema') != 'experiment_run.v1':
+                continue
+            context = {k: manifest[k] for k in ('video_source', 'task', 'experiment', 'run_id') if manifest.get(k)}
+            rows.extend(catalog.scan_source(dict(context, root=str(path.parent), storage_source='local_4090')))
     summary = {"local_videos": len(rows), "by_source": {}, "outcomes": {}, "unknown_tasks": 0}
     for row in rows:
         for field, key in (("video_source", "by_source"), ("success", "outcomes")):
