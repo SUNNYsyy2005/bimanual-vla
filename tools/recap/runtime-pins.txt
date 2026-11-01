@@ -1,0 +1,26 @@
+# Verified core versions; the installed Conda Pack also contains the other
+# RLinf/OpenPI dependencies. Install the OpenPI fork after stock transformers.
+torch==2.7.1
+torchvision==0.22.1
+transformers==4.53.2
+rlinf-transformer-openpi==4.53.2
+rlinf-openpi==0.1.1
+lerobot==0.3.3
+ray==2.47.1
+jax==0.5.3
+jaxlib==0.5.3
+orbax-checkpoint==0.11.13
+av==14.2.0
+torchcodec==0.4.0
+tyro==1.0.13
+tokenizers==0.21.0
+huggingface-hub==0.36.2
+numpy==1.26.4
+protobuf==6.33.6
+google-api-core==2.43.2
+googleapis-common-protos==1.76.0
+proto-plus==1.29.0
+rich==14.3.4
+swanlab==0.10.3
+wandb==0.25.0
+tensorboard==2.19.0
