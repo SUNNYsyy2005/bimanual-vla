@@ -6,7 +6,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%20%2F%203.11-3776AB?logo=python&logoColor=white)](docs/INSTALLATION.md) [![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04-E95420?logo=ubuntu&logoColor=white)](docs/INSTALLATION.md) [![LeRobot](https://img.shields.io/badge/LeRobot-v2.1-FFD21E)](https://github.com/huggingface/lerobot) [![OpenPI](https://img.shields.io/badge/OpenPI-pi0%20%7C%20pi0.5-6C5CE7)](https://github.com/Physical-Intelligence/openpi) [![RTC](https://img.shields.io/badge/Deployment-RTC_%2B_Ruckig-2E8B57)](#real-robot-deployment)
 
-[**Code**](https://github.com/SUNNYsyy2005/bimanual-vla) &nbsp;&middot;&nbsp; [**Documentation**](docs/README.md) &nbsp;&middot;&nbsp; [**Demo**](#demo) &nbsp;&middot;&nbsp; [**Models & Datasets**](#released-models-and-datasets) &nbsp;&middot;&nbsp; [**Installation**](docs/INSTALLATION.md)
+[**Code**](https://github.com/SUNNYsyy2005/bimanual-vla) &nbsp;&middot;&nbsp; [**Documentation**](docs/README.md) &nbsp;&middot;&nbsp; [**Wiki Guide**](wiki/Home.md) &nbsp;&middot;&nbsp; [**Demo**](#demo) &nbsp;&middot;&nbsp; [**Models & Datasets**](#released-models-and-datasets) &nbsp;&middot;&nbsp; [**Installation**](docs/INSTALLATION.md)
 
 </div>
 

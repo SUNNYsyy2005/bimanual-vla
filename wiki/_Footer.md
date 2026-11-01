@@ -1,0 +1,1 @@
+[代码仓库](https://github.com/SUNNYsyy2005/bimanual-vla) · [完整安装指南](https://github.com/SUNNYsyy2005/bimanual-vla/blob/master/docs/INSTALLATION.md) · [反馈问题](https://github.com/SUNNYsyy2005/bimanual-vla/issues) · 最后校对：2026-11-01

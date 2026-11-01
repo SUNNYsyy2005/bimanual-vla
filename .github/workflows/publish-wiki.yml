@@ -1,0 +1,38 @@
+name: Publish GitHub Wiki
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Wiki push token
+        env:
+          WIKI_PUSH_TOKEN: ${{ secrets.WIKI_PUSH_TOKEN }}
+        run: |
+          if [ -z "$WIKI_PUSH_TOKEN" ]; then
+            echo '::error::Set repository secret WIKI_PUSH_TOKEN first; see docs/WIKI_PUBLISHING.md'
+            exit 1
+          fi
+      - name: Publish Wiki pages
+        env:
+          WIKI_PUSH_TOKEN: ${{ secrets.WIKI_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${WIKI_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" "$RUNNER_TEMP/bimanual-wiki"
+          cp wiki/*.md "$RUNNER_TEMP/bimanual-wiki/"
+          cd "$RUNNER_TEMP/bimanual-wiki"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- '*.md'
+          if git diff --cached --quiet; then
+            echo 'Wiki already up to date'
+            exit 0
+          fi
+          git commit -m 'docs: sync bimanual-vla wiki pages'
+          git push origin HEAD

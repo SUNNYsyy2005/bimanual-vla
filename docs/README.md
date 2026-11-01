@@ -1,5 +1,8 @@
 # 文档索引
 
+> [**图文 Wiki（仓库内页面源文件）**](../wiki/Home.md) · [GitHub Wiki 发布说明](WIKI_PUBLISHING.md)
+
+
 ## 安装
 
 - [环境安装与硬件配置](INSTALLATION.md)
