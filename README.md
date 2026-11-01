@@ -4,7 +4,7 @@
 
 **Piper robot data collection, multi-node data management, SFT / RL training, and real-time deployment**
 
-[![Python](https://img.shields.io/badge/Python-3.10%20%2F%203.11-3776AB?logo=python&logoColor=white)](docs/INSTALLATION.md) [![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04-E95420?logo=ubuntu&logoColor=white)](docs/INSTALLATION.md) [![LeRobot](https://img.shields.io/badge/LeRobot-v2.1-FFD21E)](https://github.com/huggingface/lerobot) [![OpenPI](https://img.shields.io/badge/OpenPI-pi0%20%7C%20pi0.5-6C5CE7)](https://github.com/Physical-Intelligence/openpi) [![RTC](https://img.shields.io/badge/Deployment-RTC_%2B_Ruckig-2E8B57)](#real-robot-deployment)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-D22128.svg)](LICENSE) [![Python](https://img.shields.io/badge/Python-3.10%20%2F%203.11-3776AB?logo=python&logoColor=white)](docs/INSTALLATION.md) [![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04-E95420?logo=ubuntu&logoColor=white)](docs/INSTALLATION.md) [![LeRobot](https://img.shields.io/badge/LeRobot-v2.1-FFD21E)](https://github.com/huggingface/lerobot) [![OpenPI](https://img.shields.io/badge/OpenPI-pi0%20%7C%20pi0.5-6C5CE7)](https://github.com/Physical-Intelligence/openpi) [![RTC](https://img.shields.io/badge/Deployment-RTC_%2B_Ruckig-2E8B57)](#real-robot-deployment)
 
 [**Code**](https://github.com/SUNNYsyy2005/bimanual-vla) &nbsp;&middot;&nbsp; [**Documentation**](docs/README.md) &nbsp;&middot;&nbsp; [**Wiki Guide**](wiki/Home.md) &nbsp;&middot;&nbsp; [**Demo**](#demo) &nbsp;&middot;&nbsp; [**Models & Datasets**](#released-models-and-datasets) &nbsp;&middot;&nbsp; [**Installation**](docs/INSTALLATION.md)
 
@@ -489,6 +489,22 @@ python -m unittest discover -s tests -v
 
 Hardware and Policy smoke tests are available under `scripts/smoke/`. Run them
 only in the matching robot or inference-server environment.
+
+## License
+
+The original source code and documentation in this repository are available under
+the **[Apache License 2.0](LICENSE)**, except where otherwise indicated.
+
+- **Commercial use, modification and redistribution are permitted**, subject to
+  the terms of the license, including required attribution and preservation of
+  relevant license and notice files.
+- This repository incorporates or adapts work from other projects. See
+  [NOTICE](NOTICE) and any third-party license notices. Their original copyright
+  notices and license obligations continue to apply.
+- **Model checkpoints and datasets hosted outside this repository** are subject
+  to their respective model and dataset cards and licenses, not automatically
+  to this repository's license. External dependencies and third-party media
+  retain their own rights and license terms.
 
 ## Acknowledgements
 

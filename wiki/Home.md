@@ -34,6 +34,10 @@ Piper + RGB 相机
 
 仿真训练/评测是另一条路径：**仿真 Dashboard → RLinf 环境与算法配置 → Rollout、指标与评估视频**，不等同于直接对真实机械臂执行 RL。
 
+## 开源协议
+
+本项目原创源代码与文档采用 [Apache License 2.0](https://github.com/SUNNYsyy2005/bimanual-vla/blob/master/LICENSE)（另有注明的部分除外），第三方适配及署名参见 [NOTICE](https://github.com/SUNNYsyy2005/bimanual-vla/blob/master/NOTICE)。外部发布的数据集、模型权重以各自发布页面的授权为准。
+
 ## 当前功能与边界
 
 - **可用：** 单臂/双臂 Piper 数据采集与回放、joint/delivery 表示、LeRobot 转换、OpenPI SFT、Dashboard 管理、WebSocket RTC 客户端、Ruckig 控制和安全门。

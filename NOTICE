@@ -1,3 +1,10 @@
+bimanual-vla
+Copyright 2026 SUNNYsyy2005
+
+The original project source code and documentation are licensed under
+Apache License, Version 2.0 (see LICENSE), except where otherwise noted.
+The following notices for adapted third-party components remain applicable.
+
 Open-source adaptations in bimanual_vla/training/openpi_model.py:
 
 OpenPI
