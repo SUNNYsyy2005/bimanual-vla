@@ -834,6 +834,15 @@ ${item.path}
             <label>图像缩放</label><select name="image_resize_mode"><option value="stretch">直接缩放，不补黑边</option><option value="pad">等比例补边（旧模型）</option></select>
             <label>RTC 延迟采样权重（JSON 数组，索引为 0..最大步数；留空为均匀）</label><input name="rtc_training_delay_weights" placeholder="例如 [1, 1, 2, 4, 8, 16, 32]">
             <label>RTC 训练最大延迟（action steps）</label><input name="rtc_training_max_delay" type="number" value="8" min="1" max="49"><p class="muted">视觉编码器冻结。训练期 RTC 随机保留动作前缀，仅优化后缀；8 steps 在 20 Hz 下覆盖 400 ms。继续训练会沿用 checkpoint 的参数范围和 RTC 配置。</p>
+            {% if dashboard_profile != "simulation" %}
+            <details><summary>真机 RECAP（VR 接管数据）</summary>
+              <label>训练方式</label><select name="recap_enabled"><option value="false">普通 SFT</option><option value="true">RECAP：RLinf 价值学习 → 优势标注 → 当前策略训练</option></select>
+              <p class="muted">保留自主执行和人工纠正数据。交接／等待帧不参与策略损失，动作块不跨控制权边界；成功／失败完整回合用于价值学习。需要在所选节点配置独立 RLinf 环境和价值模型权重。</p>
+              <div class="row3"><div><label>N-step 优势步数</label><input name="recap_n_step" type="number" min="1" value="50"></div><div><label>自主动作正优势比例</label><input name="recap_positive_fraction" type="number" min="0.01" max="0.99" step="0.01" value="0.3"></div><div><label>价值训练步数</label><input name="recap_value_steps" type="number" min="1" value="8000"></div></div>
+              <div class="row3"><div><label>正样本条件丢弃概率</label><input name="recap_unconditional_probability" type="number" min="0" max="0.99" step="0.01" value="0.1"></div><div><label>失败终止奖励</label><input name="recap_failure_reward" type="number" max="-1" value="-300"></div></div>
+              <p class="muted">只对训练集计算优势阈值，保留独立回合验证。部署采用正优势条件（引导系数 1），继续使用当前 JAX、EEF 和 RTC 接口。</p>
+            </details>
+            {% endif %}
             <div class="row3"><div><label>执行目标</label><select name="execution_target" class="execution-target-select"><option value="local_4090">4×4090 本地</option></select></div><div><label>GPU IDs / 集群卡数</label><input name="gpu_ids" value="0,1" placeholder="本地 0,1；集群填 1/2/4"></div><div><label>FSDP</label><input name="fsdp_devices" type="number" value="2"></div></div>
             <label>机械臂侧</label><select name="arm_side"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select>
             <div class="row3"><div><label>Steps</label><input name="num_train_steps" type="number" value="30000"></div><div><label>全局 Batch</label><input name="batch_size" type="number" value="2"></div><div><label>Workers</label><input name="num_workers" type="number" value="2"></div></div>
@@ -1159,7 +1168,7 @@ ${item.path}
     <section id="module-policy" class="dashboard-module" data-module="policy" hidden>
       <div class="module-heading"><div><h2>Policy 管理</h2><p>从 checkpoint 启动、切换、健康检测和实机执行授权。</p></div></div>
       <div class="grid policy-workspace">
-        <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm" class="compact-submission"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><input type="hidden" name="model_variant" id="policyModelVariant" value="pi05"><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div></div><p class="muted">Prompt 与 RTC 运行参数由机械臂客户端配置；Policy 仅提供服务器能力上限。客户端改动后无需重启 Policy。</p><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
+        <div class="card third"><h2>新建 / 切换 Policy</h2><form id="policyForm" class="compact-submission"><label>操作对象</label><select name="replace_task_id" id="replacePolicy"><option value="">新建独立 Policy 进程</option></select><p id="replaceInfo" class="muted">留空会创建新进程。</p><label>训练所用数据集</label><select name="dataset_id" id="policyDataset" class="dataset-select"></select><div class="row"><div><label>机械臂侧</label><select name="arm_side" id="policyArm"><option value="right">right</option><option value="left">left</option><option value="both">both（双臂）</option></select></div><div><label>GPU ID</label><input name="gpu_ids" id="policyGpu" value="0"></div></div><label>Checkpoint</label><select name="checkpoint" id="checkpointSelect" required></select><input type="hidden" name="model_variant" id="policyModelVariant" value="pi05"><div id="checkpointInfo" class="muted">尚未发现匹配 checkpoint。</div><div class="row"><div><label>Policy port</label><input name="port" id="policyPort" type="number" value="8000"></div><div><label>服务端去噪步数</label><input name="denoising_steps" id="policyDenoisingSteps" type="number" min="1" max="50" step="1" value="5"></div></div><p class="muted">Prompt 与 RTC 运行参数由机械臂客户端配置；去噪步数可在下方运行中的 Policy 直接调整。</p><p><button id="policySubmit" type="submit">新建 Policy 进程</button></p><p class="warn">切换模型会断开旧 WebSocket，但不会自动开启动作执行。</p></form></div>
         <div class="card two-third"><h2>Policy 进程</h2><p class="muted">动作执行由客户端 <code>--allow-execution</code> 控制，并要求 <code>action_horizon &gt;= 16</code> 和本地逐 20 Hz command 安全检查。异步客户端按所选固定频率或 chunk 步数触发推理，旧 chunk 在推理期间持续执行；新 chunk 到达后按实际延迟过期 prefix，再融合切换 generation。已结束的历史进程可删除记录和日志。</p><div class="toolbar task-bulk-toolbar"><button class="inline danger" type="button" onclick="batchDeleteSelectedTasks('policy')" disabled data-bulk-delete-scope="policy">批量删除已选日志（<span data-selected-task-count>0</span>）</button><span class="muted">仅可选择已结束 Policy；不会删除模型或其他输出。</span></div><div class="table-wrap"><table><thead><tr><th class="task-selection-cell"><input type="checkbox" class="task-select-all" data-task-scope="policy" onchange="toggleTaskSelection('policy', this.checked)" aria-label="全选当前页 Policy 历史任务"></th><th>Policy / PID</th><th>进程与健康</th><th>GPU / 端口 / Schema</th><th>模型</th><th>客户端状态 / 延迟摘要</th><th>操作</th></tr></thead><tbody id="policies"></tbody></table></div><div id="policyTasksPagination"></div></div>
         <div class="card" id="policyTaskLogCard"><h2>Policy 进程日志</h2><p class="muted">从 Policy 进程表点击“日志”查看最近输出。</p><pre id="policyTaskLog">尚未选择 Policy 进程。</pre></div>
         <div class="card"><h2>机械臂客户端命令</h2><p class="muted">以下只生成连接/设备示例；prompt 和 RTC 运行参数属于客户端。连接后以 telemetry 中的 client prompt/RTC 为准。</p><pre id="policyClientCommand">bin/bimanual-vla rtc-client --host 192.168.101.9 --port 8000 --hz 4 --arm-mode single --arm-side right --can can0 --cam-high-device /dev/video8 --cam-wrist-device /dev/video16</pre></div>
@@ -4571,6 +4580,10 @@ function updateTrainingExperimentInfo() {
   } else {
     info.textContent = `新实验 ${name}；模型列表按任务场景提供基础模型及 SFT / RLinf checkpoint。`;
   }
+  const datasetId = document.querySelector('#trainForm [name="dataset_id"]')?.value;
+  if (datasetById(datasetId)?.recap) {
+    info.textContent += ' 当前数据集含 RECAP 接管标注；请选择 RECAP 训练方式。';
+  }
 }
 
 function fillCheckpointExperimentFilter(items) {
@@ -4739,6 +4752,14 @@ function syncTrainingFinetuning() {
   if (form.dataset.finetuningSource === source) return;
   form.dataset.finetuningSource = source;
   const checkpoint = [...((latestStatus && latestStatus.checkpoints)||[]),...trainingModelCatalog].find(item=>item.path===source);
+  const recap = checkpoint?.recap || checkpoint?.action_contract?.recap || {
+    enabled: false, n_step: 50, positive_fraction: 0.3, unconditional_probability: 0.1,
+    value_steps: 8000, failure_reward: -300,
+  };
+  for (const [key, value] of Object.entries(recap)) {
+    const input = form.querySelector(`[name="recap_${key}"]`);
+    if (input) input.value = String(value);
+  }
   const config = checkpoint ? (checkpoint.finetuning || {
     action_expert_tuning: 'lora', llm_lora: true, rtc_training: false, rtc_training_max_delay: 8, rtc_training_delay_weights: null, image_resize_mode: 'pad',
   }) : {action_expert_tuning: 'full', llm_lora: false, rtc_training: false, rtc_training_max_delay: 8, rtc_training_delay_weights: null, image_resize_mode: 'stretch'};
@@ -5890,7 +5911,29 @@ function telemetrySummary(t) {
 }
 
 function policyControlButtons(task) {
-  return '<span class="muted">执行由机械臂客户端控制</span>';
+  if (task.state !== 'running') return '<span class="muted">执行由机械臂客户端控制</span>';
+  if (!(task.metadata || {}).denoising_steps) return '<span class="muted">重启 Policy 后可调整去噪步数</span>';
+  const steps = Number((task.metadata || {}).denoising_steps || 5);
+  return `<label class="muted">去噪步数 <input id="policySteps-${esc(task.id)}" type="number" min="1" max="50" step="1" value="${esc(steps)}" style="width:4.5em"></label> <button class="inline secondary" onclick="setPolicyDenoisingSteps('${esc(task.id)}')">应用</button>`;
+}
+
+async function setPolicyDenoisingSteps(taskId) {
+  const input = document.getElementById(`policySteps-${taskId}`);
+  const steps = Number(input?.value);
+  if (!Number.isInteger(steps) || steps < 1 || steps > 50) {
+    show('去噪步数须为 1–50 的整数');
+    return;
+  }
+  try {
+    await api(`/api/tasks/${encodeURIComponent(taskId)}/denoising-steps`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({denoising_steps: steps}),
+    });
+    show(`Policy ${taskId} 的去噪步数已设为 ${steps}，下一次推理生效`, false);
+    await refreshAll();
+  } catch (error) {
+    show(error.message);
+  }
 }
 
 function jobDependencySummary(task) {

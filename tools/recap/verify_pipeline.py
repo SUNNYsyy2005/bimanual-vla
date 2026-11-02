@@ -47,8 +47,15 @@ for experiment, expected in [("synthetic_value", 12), ("synthetic_cfg", 6)]:
         for key in accumulator.Tags()["scalars"]:
             metric_values.setdefault(key, []).extend((e.step, e.value) for e in accumulator.Scalars(key))
     assert metric_values, f"No scalar metrics for {experiment}"
+    diagnostic_std_nan = {}
     for key, values in metric_values.items():
-        assert all(math.isfinite(v) for _, v in values), f"Non-finite {key}"
+        nan_count = sum(math.isnan(v) for _, v in values)
+        if nan_count and key.endswith("_std"):
+            # The upstream logger uses unbiased std() on a one-item batch.
+            # Its diagnostic is NaN; losses and gradients must remain finite.
+            diagnostic_std_nan[key] = nan_count
+        assert all(math.isfinite(v) or (key.endswith("_std") and math.isnan(v))
+                   for _, v in values), f"Non-finite {key}"
     loss_keys = [k for k in metric_values if k.startswith("train/") and "loss" in k]
     assert loss_keys
     max_step = max(s for key in loss_keys for s, _ in metric_values[key])
@@ -56,7 +63,8 @@ for experiment, expected in [("synthetic_value", 12), ("synthetic_cfg", 6)]:
     gradients = [v for k, values in metric_values.items() if "grad_norm" in k for _, v in values]
     assert gradients and max(gradients) > 0, "No nonzero training gradients"
     result["metrics"][experiment] = {"last_step": max_step + 1,
-        "losses": {k: sorted(metric_values[k]) for k in loss_keys}, "max_grad_norm": max(gradients)}
+        "losses": {k: sorted(metric_values[k]) for k in loss_keys},
+        "max_grad_norm": max(gradients), "diagnostic_std_nan": diagnostic_std_nan}
 
 with initialize_config_dir(version_base="1.1", config_dir=str(root / "configs")):
     cfg = compose(config_name="cfg")

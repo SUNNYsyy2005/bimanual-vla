@@ -940,6 +940,24 @@ class RTCAwarePolicy:
                 sample_actions = nnx_utils.module_jit(model.sample_actions)
             except ImportError as exc:  # pragma: no cover - deployment-only path
                 raise RuntimeError("RTC JAX adapter requires OpenPI's nnx_utils") from exc
+        jax_step_samplers: dict[int, Any] = {}
+
+        def sampler_for_steps(steps: int) -> Any:
+            """Bind JAX's Python step count before tracing the model method."""
+            sampler = jax_step_samplers.pop(steps, None)
+            if sampler is None:
+                original_method = model.sample_actions.__func__
+
+                def fixed_steps(module: Any, *args: Any, **kwargs: Any) -> Any:
+                    return original_method(module, *args, num_steps=steps, **kwargs)
+
+                sampler = nnx_utils.module_jit(
+                    types.MethodType(fixed_steps, model)
+                )
+            jax_step_samplers[steps] = sampler
+            if len(jax_step_samplers) > 4:
+                jax_step_samplers.pop(next(iter(jax_step_samplers)))
+            return sampler
 
         # Inspect the patched Python sampler, not the JAX jit wrapper, so an
         # upstream explicit num_steps override is visible in each result.
@@ -973,7 +991,22 @@ class RTCAwarePolicy:
             sampler_started = time.monotonic() if self._diagnostics_enabled else None
             if sampler_started is not None:
                 self._last_sampler_started_at = sampler_started
-            output = sample_actions(*args, **kwargs)
+            selected_sampler = sample_actions
+            if not self._is_pytorch and "num_steps" in kwargs:
+                steps = int(kwargs.pop("num_steps"))
+                if not 1 <= steps <= 50:
+                    raise ValueError("denoising steps must be in [1, 50]")
+                # Only the trained clean-prefix sampler accepts a traced step
+                # count; guided RTC patches a sampler that needs a Python int.
+                if (self.config.mode == "trained"
+                        and getattr(model, "supports_dynamic_denoising_steps", False) is True):
+                    # Fixed scalar shape/dtype across startup warmup and live
+                    # updates: changing 5 -> 2 must not compile another model.
+                    kwargs["num_steps"] = np.asarray(steps, dtype=np.int32)
+                else:
+                    # Stock samplers still use Python validation/loop bounds.
+                    selected_sampler = sampler_for_steps(steps)
+            output = selected_sampler(*args, **kwargs)
             raw_output = output
             if hasattr(raw_output, "detach"):
                 raw_output = raw_output.detach().float().cpu().numpy()

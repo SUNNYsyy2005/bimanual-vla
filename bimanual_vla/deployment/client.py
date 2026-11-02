@@ -127,6 +127,12 @@ DEFAULT_MAX_IMAGE_STATE_SKEW_S = 0.100  # Allow 100 ms to avoid frequent frame d
 DEFAULT_TRACKING_LAG_THRESHOLD_RAD = 0.10
 DEFAULT_TRACKING_LAG_CONFIRM_CYCLES = 3
 DEFAULT_ARM_HOLD_TOLERANCE_RAD = 0.05
+# A stationary arm offset from its braking reference (contact, deflection)
+# is re-anchored at the measured joints after this long.
+TRACKING_LAG_REANCHOR_S = 1.0
+# A closed Piper gripper may stall a few millimetres from its startup reading
+# (or report slightly negative opening); that still counts as returned.
+DEFAULT_RETURN_GRIPPER_TOLERANCE_M = 0.003
 DEFAULT_JOINT_LIMIT_TOLERANCE_RAD = 0.10
 DEFAULT_TRAJECTORY_SMOOTHING_CUTOFF_HZ = 3.0
 DEFAULT_TRAJECTORY_TRACKING_TIME_CONSTANT_S = 0.25
@@ -170,11 +176,14 @@ IK_FEEDBACK_LIMIT_TOLERANCE_RAD = 0.06
 # farther along the same joint branch, then the returned command is rate
 # limited to this value so a Cartesian target cannot produce a wrist jump.
 DEFAULT_IK_MAX_JOINT_STEP_RAD = 0.02
-DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD = 0.30
+# Bounded LM replay of the 2026-11-02 policy targets with a lagged arm
+# (1.2 rad/s): 0.40/0.20 removed the remaining geometric block of 0.30/0.12
+# without raising the joint/EEF step ratio (p95 3.6 vs 4.2 for the old IK).
+DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD = 0.40
 # 30 Hz blue-container demonstrations: per-arm maximum joint increment
 # train P99=.0479, P99.9=.0713, max=.0973 rad (continuous source frames).
 # This bounds branch search around the previous reference, not command speed.
-DEFAULT_IK_REFERENCE_JOINT_RADIUS_RAD = 0.12
+DEFAULT_IK_REFERENCE_JOINT_RADIUS_RAD = 0.20
 # A light preference for the previous branch: stronger regularization adds
 # pose residual and can defer motion until an unregularized fallback takes over.
 DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT = 0.25
@@ -687,6 +696,7 @@ class PiperContinuousIK:
         joint_regularization_weight: float = DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT,
         joint_limits: np.ndarray | None = None,
         minimum_motion: bool = True,
+        progress_goal: tuple[np.ndarray, np.ndarray] | None = None,
     ) -> np.ndarray:
         return self.solve_with_diagnostics(
             current_joints_rad,
@@ -702,6 +712,7 @@ class PiperContinuousIK:
             joint_regularization_weight=joint_regularization_weight,
             joint_limits=joint_limits,
             minimum_motion=minimum_motion,
+            progress_goal=progress_goal,
         ).command_joints_rad.copy()
 
     def solve_with_diagnostics(
@@ -720,6 +731,7 @@ class PiperContinuousIK:
         joint_regularization_weight: float = DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT,
         joint_limits: np.ndarray | None = None,
         minimum_motion: bool = True,
+        progress_goal: tuple[np.ndarray, np.ndarray] | None = None,
     ) -> PiperIKSolveResult:
         solve_started = time.perf_counter()
         current = np.asarray(current_joints_rad, dtype=np.float64)
@@ -783,207 +795,95 @@ class PiperContinuousIK:
         initial = np.clip(initial_source, lower + 1e-8, upper - 1e-8)
         target_rotation = Rotation.from_euler("xyz", target_rpy, degrees=True).as_matrix()
 
-        # Adjacent 30 Hz EEF targets normally stay on one local IK branch.
-        # Try a bounded damped-Jacobian update first; the full scipy solve is
-        # retained as a fallback for larger changes or near-singular poses.
         task_scales = np.asarray(
             [position_tolerance_m] * 3 + [rotation_tolerance_rad] * 3,
             dtype=np.float64,
         )
 
-        cached_q = cached_error = cached_jacobian = None
-
-        def analytic_task(candidate):
-            nonlocal cached_q, cached_error, cached_jacobian
-            if cached_q is None or not np.array_equal(candidate, cached_q):
-                from bimanual_vla.deployment.piper_kinematics import rotation_error_jacobian
-                xyz, rotation, geometric = self._kinematics.evaluate(candidate, jacobian=True)
-                rotation_error = Rotation.from_matrix(target_rotation @ rotation.T).as_rotvec()
-                cached_error = np.concatenate((xyz - target_xyz, rotation_error))
-                cached_jacobian = np.concatenate((geometric[:3],
-                    rotation_error_jacobian(rotation_error, geometric[3:])), axis=0)
-                cached_q = candidate.copy()
-            return cached_error, cached_jacobian
-
         def task_error(candidate: np.ndarray) -> np.ndarray:
-            if self._kinematics is not None:
-                return analytic_task(candidate)[0]
             xyz, rotation = self.pose(candidate)
             rotation_error = Rotation.from_matrix(target_rotation @ rotation.T).as_rotvec()
             return np.concatenate((xyz - target_xyz, rotation_error))
 
-        def fast_local_solve(seed: np.ndarray) -> np.ndarray:
-            """Solve the common small local update without scipy iteration."""
-            candidate = np.clip(np.asarray(seed, dtype=np.float64), lower, upper)
-            for _ in range(4):
+        def scaled_task(candidate: np.ndarray):
+            """Tolerance-scaled pose error and joint Jacobian at ``candidate``."""
+            if self._kinematics is not None:
+                from bimanual_vla.deployment.piper_kinematics import rotation_error_jacobian
+                xyz, rotation, geometric = self._kinematics.evaluate(candidate, jacobian=True)
+                rotation_error = Rotation.from_matrix(target_rotation @ rotation.T).as_rotvec()
+                error = np.concatenate((xyz - target_xyz, rotation_error))
+                jacobian = np.concatenate((geometric[:3],
+                    rotation_error_jacobian(rotation_error, geometric[3:])), axis=0)
+            else:
+                # Injected FK without an analytic model: central differences
+                # that never evaluate outside the solve bounds.
                 error = task_error(candidate)
-                if np.max(np.abs(error / task_scales)) <= 0.25:
-                    break
-                jacobian = (analytic_task(candidate)[1] if self._kinematics is not None
-                            else np.empty((6, 6), dtype=np.float64))
-                for column in range(0 if self._kinematics is not None else 6):
-                    step = 1e-4
-                    plus = min(float(candidate[column] + step), float(upper[column]))
-                    minus = max(float(candidate[column] - step), float(lower[column]))
+                jacobian = np.zeros((6, 6), dtype=np.float64)
+                for column in range(6):
+                    plus = min(float(candidate[column] + 1e-4), float(upper[column]))
+                    minus = max(float(candidate[column] - 1e-4), float(lower[column]))
                     if plus <= minus:
-                        jacobian[:, column] = 0.0
                         continue
-                    q_plus = candidate.copy()
-                    q_minus = candidate.copy()
-                    q_plus[column] = plus
-                    q_minus[column] = minus
-                    jacobian[:, column] = (
-                        task_error(q_plus) - task_error(q_minus)
-                    ) / (plus - minus)
-                scaled_jacobian = jacobian / task_scales[:, None]
-                scaled_error = error / task_scales
-                regularizer = regularization_weight / (IK_JOINT_REGULARIZATION_SCALE_RAD ** 2)
-                system = scaled_jacobian.T @ scaled_jacobian
-                system += (regularizer + 1e-4) * np.eye(6)
-                rhs = (
-                    -scaled_jacobian.T @ scaled_error
-                    + regularizer * (continuity_anchor - candidate)
-                )
-                try:
-                    delta = np.linalg.solve(system, rhs)
-                except np.linalg.LinAlgError:
-                    return candidate
-                if not np.all(np.isfinite(delta)):
-                    return candidate
-                candidate = np.clip(candidate + delta, lower, upper)
-            return candidate
-
-        def residual(candidate: np.ndarray, *, joint_weight=regularization_weight) -> np.ndarray:
-            error = task_error(candidate) / task_scales
-            if joint_weight == 0:
-                return error
-            joint_regularization = (
-                math.sqrt(joint_weight)
-                * (candidate - continuity_anchor)
-                / IK_JOINT_REGULARIZATION_SCALE_RAD
-            )
-            return np.concatenate((error, joint_regularization))
-
-        def residual_jacobian(candidate, *, joint_weight):
-            jacobian = analytic_task(candidate)[1] / task_scales[:, None]
-            if joint_weight == 0:
-                return jacobian
-            return np.concatenate((jacobian, np.eye(6) * (
-                math.sqrt(joint_weight) / IK_JOINT_REGULARIZATION_SCALE_RAD)), axis=0)
-
-        def optimize(seed: np.ndarray, *, joint_weight: float):
-            """Run one bounded local solve from a seed on this joint branch."""
-            # Numerical optimization is only needed for delivery control; keep
-            # joint-only deployments from importing scipy.optimize at startup.
-            from scipy.optimize import least_squares
-            return least_squares(
-                lambda q: residual(q, joint_weight=joint_weight),
-                np.clip(np.asarray(seed, dtype=np.float64), lower + 1e-8, upper - 1e-8),
-                bounds=(lower, upper),
-                jac=(lambda q: residual_jacobian(q, joint_weight=joint_weight))
-                    if self._kinematics is not None else "2-point",
-                max_nfev=max_nfev,
-                # Jacobian scaling helps when a wrist joint is close to a
-                # bound and the translational/rotational residuals have very
-                # different numerical curvature.
-                x_scale="jac",
-                xtol=1e-8,
-                ftol=1e-8,
-                gtol=1e-8,
-            )
+                    q_plus, q_minus = candidate.copy(), candidate.copy()
+                    q_plus[column], q_minus[column] = plus, minus
+                    jacobian[:, column] = (task_error(q_plus) - task_error(q_minus)) / (plus - minus)
+            return error / task_scales, jacobian / task_scales[:, None]
 
         def pose_errors(joints):
             xyz, rotation = self.pose(joints)
             return (float(np.linalg.norm(xyz - target_xyz)), float(np.linalg.norm(
                 Rotation.from_matrix(target_rotation @ rotation.T).as_rotvec())))
 
-        minimum = None
-        if minimum_motion and self._kinematics is not None:
-            from bimanual_vla.deployment.ik_continuity import minimum_motion_candidate
-            minimum = minimum_motion_candidate(analytic_task, continuity_anchor, lower, upper,
-                position_tolerance_m, rotation_tolerance_rad,
-                max_iterations=min(max_nfev, 24))
-        minimum_accepted = minimum is not None and minimum.joints is not None
-        fast_candidate = minimum.joints if minimum_accepted else fast_local_solve(initial)
-        fast_position_error, fast_rotation_error = pose_errors(fast_candidate)
-        fast_accepted = (
-            fast_position_error <= position_tolerance_m
-            and fast_rotation_error <= rotation_tolerance_rad
-        )
-        if fast_accepted:
-            class _FastResult:
-                success = True
-                status = 1
-                nfev = 0
+        def within_tolerance(errors):
+            return errors[0] <= position_tolerance_m and errors[1] <= rotation_tolerance_rad
 
-                def __init__(self, x):
-                    self.x = x
+        from bimanual_vla.deployment.ik_continuity import bounded_regularized_solve
 
-            result = _FastResult(fast_candidate)
-            solved = fast_candidate
-            optimizer_nfev = 0
-        else:
-            # The fast candidate is still a bounded, same-branch point.  Use
-            # it as the scipy seed when it did not quite meet tolerance; this
-            # reduces iterations for the difficult tail without changing the
-            # fallback's limits or acceptance gates.
-            result = optimize(fast_candidate, joint_weight=regularization_weight)
-            solved = np.asarray(result.x, dtype=np.float64)
-
-        position_error, rotation_error = pose_errors(solved)
+        # Solve toward the target centre with a joint-motion penalty about the
+        # previous solution. Bounds (driver limits, measured and reference
+        # neighbourhoods) are constraints of every step, so the result never
+        # needs clipping and stays on the current branch. The penalty is never
+        # removed: an unpenalized retry chased residuals along the near-null
+        # J4/J6 direction at the wrist singularity, producing 0.2-0.3 rad
+        # steps for millimetre-level pose changes (2026-11-02 logs).
+        penalty = regularization_weight / IK_JOINT_REGULARIZATION_SCALE_RAD ** 2
+        solved, optimizer_nfev = bounded_regularized_solve(
+            scaled_task, initial, continuity_anchor, lower, upper, penalty=penalty)
+        errors = pose_errors(solved)
+        selection_method = "bounded_lm"
+        fallback_position_tolerance = max(position_tolerance_m, DEFAULT_IK_FALLBACK_POSITION_TOLERANCE_M)
+        fallback_rotation_tolerance = max(rotation_tolerance_rad, DEFAULT_IK_FALLBACK_ROTATION_TOLERANCE_RAD)
+        # While streaming, a small penalized step within the bounded fallback
+        # tolerance wins: the residual is tracked over the next ticks instead
+        # of buying exactness with a large joint move. A recovery leg (with a
+        # retained goal) starts from settled feedback and must land on its
+        # intermediate target. Otherwise retry with a weaker (never zero)
+        # penalty inside the same bounds, and from measured feedback if the
+        # warm start differs.
+        retry_threshold = ((position_tolerance_m, rotation_tolerance_rad) if progress_goal is not None
+                           else (fallback_position_tolerance, fallback_rotation_tolerance))
+        if errors[0] > retry_threshold[0] or errors[1] > retry_threshold[1]:
+            candidates = [(solved, errors, selection_method)]
+            retries = [(solved, penalty / 16., "bounded_lm_reduced_penalty")]
+            if not np.array_equal(initial, np.clip(current, lower, upper)):
+                retries.append((current, penalty, "bounded_lm_measured_seed"))
+            for seed, weight, method in retries:
+                candidate, evaluations = bounded_regularized_solve(
+                    scaled_task, seed, continuity_anchor, lower, upper, penalty=weight)
+                optimizer_nfev += evaluations
+                candidates.append((candidate, pose_errors(candidate), method))
+            feasible = [item for item in candidates if within_tolerance(item[1])]
+            if feasible:
+                solved, errors, selection_method = min(
+                    feasible, key=lambda item: float(np.max(np.abs(item[0] - continuity_anchor))))
+            else:
+                solved, errors, selection_method = min(candidates, key=lambda item: (
+                    item[1][0] / position_tolerance_m + item[1][1] / rotation_tolerance_rad))
+        position_error, rotation_error = errors
+        optimizer_success = within_tolerance(errors)
         tolerance_relaxed = False
         accepted_position_tolerance = position_tolerance_m
         accepted_rotation_tolerance = rotation_tolerance_rad
-        if position_error > position_tolerance_m or rotation_error > rotation_tolerance_rad:
-            # Proximity is a soft preference; it must not make a reachable
-            # target fail the hard pose tolerances.  A bounded least-squares
-            # solve can stop at a wrist bound from one seed even though the
-            # same local branch has a valid solution from another nearby seed.
-            # Retry only the local problem (never enlarge limits/radius) from
-            # a small, deterministic set of existing branch states.
-            seeds = [solved, current, initial]
-            if initial_joints_rad is not None:
-                seeds.append(np.asarray(initial_joints_rad, dtype=np.float64))
-            def candidate_record(candidate, candidate_result):
-                pos, rot = pose_errors(candidate)
-                return (pos, rot, float(np.linalg.norm(candidate-continuity_anchor)),
-                        candidate, candidate_result)
-
-            # Do not throw away the regularized solution when an unregularized
-            # retry has a marginally smaller residual but a large joint swing.
-            candidates = [candidate_record(solved, result)]
-            total_nfev = int(getattr(result, "nfev", 0))
-            for seed in seeds:
-                candidate_result = optimize(seed, joint_weight=0.0)
-                candidate = np.asarray(candidate_result.x, dtype=np.float64)
-                candidate_position_error, candidate_rotation_error = pose_errors(candidate)
-                candidates.append((candidate_position_error, candidate_rotation_error,
-                                   float(np.linalg.norm(candidate - continuity_anchor)), candidate,
-                                   candidate_result))
-                total_nfev += int(getattr(candidate_result, "nfev", 0))
-            feasible = [item for item in candidates
-                        if item[0] <= position_tolerance_m and item[1] <= rotation_tolerance_rad]
-            if feasible:
-                # Preserve continuity among feasible solutions while making
-                # pose tolerances the hard criterion.
-                _, _, _, solved, result = min(feasible, key=lambda item: item[2])
-                position_error, rotation_error = pose_errors(solved)
-            else:
-                relaxed = [item for item in candidates
-                           if item[0] <= max(position_tolerance_m, DEFAULT_IK_FALLBACK_POSITION_TOLERANCE_M)
-                           and item[1] <= max(rotation_tolerance_rad, DEFAULT_IK_FALLBACK_ROTATION_TOLERANCE_RAD)]
-                if initial_joints_rad is not None and relaxed:
-                    _, _, _, solved, result = min(relaxed, key=lambda item: item[2])
-                else:
-                    _, _, _, solved, result = min(
-                        candidates, key=lambda item: (item[0] / position_tolerance_m
-                                                      + item[1] / rotation_tolerance_rad, item[2]))
-                position_error, rotation_error = pose_errors(solved)
-            # nfev is diagnostic only; report all bounded retries so a caller
-            # can distinguish a genuine local-limit failure from early stop.
-            optimizer_nfev = total_nfev
-        else:
-            optimizer_nfev = int(getattr(result, "nfev", 0))
         solved_joint_step = float(np.max(np.abs(solved - current)))
         if np.any(solved < limits[:, 0]) or np.any(solved > limits[:, 1]):
             raise IKGeometryBlocked("continuous IK target is outside driver joint limits")
@@ -1030,16 +930,14 @@ class PiperContinuousIK:
                 solution_reference_step_rad=float(np.max(np.abs(solved-continuity_anchor))),
                 command_position_error_m=position_error,
                 command_rotation_error_rad=rotation_error,
-                optimizer_success=bool(result.success),
-                optimizer_status=int(result.status),
+                optimizer_success=optimizer_success,
+                optimizer_status=0 if optimizer_success else 1,
                 optimizer_nfev=optimizer_nfev,
                 tolerance_relaxed=tolerance_relaxed,
                 accepted_position_tolerance_m=accepted_position_tolerance,
                 accepted_rotation_tolerance_rad=accepted_rotation_tolerance,
                 solve_elapsed_s=time.perf_counter() - solve_started,
-                selection_method="minimum_motion" if minimum_accepted else "regularized",
-                minimum_motion_elapsed_s=minimum.elapsed_s if minimum is not None else 0.,
-                minimum_motion_timed_out=minimum.timed_out if minimum is not None else False,
+                selection_method=selection_method,
             )
 
         # Follow the regularized solution direction with a bounded 20 Hz servo
@@ -1087,16 +985,14 @@ class PiperContinuousIK:
             solution_reference_step_rad=float(np.max(np.abs(solved-continuity_anchor))),
             command_position_error_m=command_position_error,
             command_rotation_error_rad=command_rotation_error,
-            optimizer_success=bool(result.success),
-            optimizer_status=int(result.status),
+            optimizer_success=optimizer_success,
+            optimizer_status=0 if optimizer_success else 1,
             optimizer_nfev=optimizer_nfev,
             tolerance_relaxed=tolerance_relaxed,
             accepted_position_tolerance_m=accepted_position_tolerance,
             accepted_rotation_tolerance_rad=accepted_rotation_tolerance,
             solve_elapsed_s=time.perf_counter() - solve_started,
-            selection_method="minimum_motion" if minimum_accepted else "regularized",
-            minimum_motion_elapsed_s=minimum.elapsed_s if minimum is not None else 0.,
-            minimum_motion_timed_out=minimum.timed_out if minimum is not None else False,
+            selection_method=selection_method,
         )
 
 
@@ -2927,6 +2823,7 @@ class ExecutionController:
         # the last command tick.
         self.current_timed_target_action: DecodedQueuedAction | None = None
         self._filtered_gripper_opening: dict[str, float] = {}
+        self.resume_gripper_targets: dict[str, float] = {}
         self._gripper_extreme_candidate: dict[str, str | None] = {}
         self._gripper_extreme_count: dict[str, int] = {}
         self._gripper_extreme_latch: dict[str, str | None] = {}
@@ -2960,6 +2857,7 @@ class ExecutionController:
         self.unsafe_active = False
         self.ik_recovery_target = None
         self.ik_recovery_started = None
+        self.ik_recovery_phase_started = None
         self.ik_recovery_barrier = None
         self.ik_recovery_fault = None
         self.ik_recovery_prefix_reset = False
@@ -3052,6 +2950,7 @@ class ExecutionController:
         self.tracking_lag_settle_cycles = 0
         self.tracking_lag_settle_joints = None
         self.tracking_lag_settle_feedback_at = None
+        self.tracking_lag_offset_since = None
         self.tracking_lag_active = False
         self.tracking_lag_started_at: float | None = None
         self.tracking_lag_required_after_monotonic: float | None = None
@@ -3258,9 +3157,10 @@ class ExecutionController:
             servo.max_acceleration, servo.max_jerk,
         )
         if self._local_ik_delivery:
-            logging.info("Local IK: minimum_motion=%s position_tolerance=%.4fm rotation_tolerance=%.4frad "
-                         "servo_synchronization=%s",
-                bool(getattr(self.args, "ik_minimum_motion", True)),
+            logging.info("Local IK: bounded_lm reference_radius=%.3frad search_radius=%.3frad "
+                         "position_tolerance=%.4fm rotation_tolerance=%.4frad servo_synchronization=%s",
+                float(getattr(self.args, "ik_reference_joint_radius_rad", DEFAULT_IK_REFERENCE_JOINT_RADIUS_RAD)),
+                float(getattr(self.args, "ik_search_joint_radius_rad", DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD)),
                 float(getattr(self.args, "ik_position_tolerance_m", DEFAULT_IK_POSITION_TOLERANCE_M)),
                 float(getattr(self.args, "ik_rotation_tolerance_rad", DEFAULT_IK_ROTATION_TOLERANCE_RAD)),
                 "per_arm" if servo.independent_arms else "all_joints")
@@ -3292,11 +3192,16 @@ class ExecutionController:
                             "parallel_processes" if self.ik_workers is not None else "in_process"),
                 "worker_pids": ({s: p.pid for s, p in self.ik_workers.processes.items()}
                                 if self.ik_workers is not None else {}),
-                "solver": "firmware" if self.eef_control_mode == "piper_eef" else "analytic_jacobian",
-                "minimum_motion": bool(self._local_ik_delivery and getattr(self.args, "ik_minimum_motion", True)),
+                "solver": ("firmware" if self.eef_control_mode == "piper_eef"
+                           else "bounded_levenberg_marquardt"),
                 "position_tolerance_m": float(getattr(self.args, "ik_position_tolerance_m", DEFAULT_IK_POSITION_TOLERANCE_M)),
                 "rotation_tolerance_rad": float(getattr(self.args, "ik_rotation_tolerance_rad", DEFAULT_IK_ROTATION_TOLERANCE_RAD)),
-                "minimum_motion_budget_s": .008,
+                "reference_joint_radius_rad": float(getattr(
+                    self.args, "ik_reference_joint_radius_rad", DEFAULT_IK_REFERENCE_JOINT_RADIUS_RAD)),
+                "search_joint_radius_rad": float(getattr(
+                    self.args, "ik_search_joint_radius_rad", DEFAULT_IK_SEARCH_JOINT_RADIUS_RAD)),
+                "joint_regularization_weight": float(getattr(
+                    self.args, "ik_joint_regularization_weight", DEFAULT_IK_JOINT_REGULARIZATION_WEIGHT)),
             },
             "servo": {
                 "backend": self.servo_backend,
@@ -3628,7 +3533,8 @@ class ExecutionController:
                 xyz, rpy, opening, _ = _check_delivery_absolute_target(current, float(qpos[index*7+6]), target,
                     gripper_semantics=protocol.gripper_semantics,
                     max_translation_step_m=float("inf"), max_rotation_step_rad=float("inf"),
-                    max_gripper_step=float(getattr(self.args, "max_gripper_step", DEFAULT_MAX_GRIPPER_STEP)),
+                    # The filter above already rate-limited the gripper command.
+                    max_gripper_step=float("inf"),
                     gripper_range_tolerance=float(getattr(self.args, "gripper_range_tolerance", DEFAULT_GRIPPER_RANGE_TOLERANCE)),
                     workspace_x=getattr(self.args, "workspace_x", None), workspace_y=delivery_workspace_y(self.args, side),
                     workspace_z=getattr(self.args, "workspace_z", None))
@@ -3762,8 +3668,13 @@ class ExecutionController:
                                         gripper_ctrl_at=time.time(), gripper_ctrl_monotonic=time.monotonic())
                 return traces
 
-            self.servo_loop = ServoLoop(qpos, lower, upper, self._servo_config(), feedback,
+            initial = np.asarray(qpos, dtype=np.float64).copy()
+            for index, side in enumerate(sides):
+                if side in self.resume_gripper_targets:
+                    initial[index * 7 + 6] = self.resume_gripper_targets[side] * GRIPPER_MAX_M
+            self.servo_loop = ServoLoop(initial, lower, upper, self._servo_config(), feedback,
                                         publish, self.servo_sample_callback)
+            self.resume_gripper_targets.clear()
         target = np.asarray(qpos, dtype=np.float64).copy()
         for index, side in enumerate(sides):
             joints, gripper = prepared[side]
@@ -3992,6 +3903,18 @@ class ExecutionController:
                 "allow_execution": bool(getattr(self.args, "allow_execution", False)),
                 "execution_state": self.state,
                 "blocked_reason": self.blocked_reason,
+                "driver_faults": {side: dict(status) for side, status in self.robot_driver_enable_status.items()
+                                  if status.get("faulted") is True},
+                "ik_recovery": {
+                    "moving": self.ik_recovery_target is not None,
+                    "braking": self.ik_recovery_braking,
+                    "releasing": self.eef_goal_releasing,
+                    "phase_started_monotonic": self.ik_recovery_phase_started,
+                    "fault": self.ik_recovery_fault,
+                    "goal_errors": self.eef_goal_errors,
+                    # Compact monitoring must still permit exact fault replay.
+                    "last_requests": self.last_ik_requests if self.ik_recovery_fault else None,
+                },
                 "tracking_lag_guard": {
                     "active": self.tracking_lag_active,
                     "trigger_count": self.tracking_lag_trigger_count,
@@ -4573,6 +4496,12 @@ class ExecutionController:
         requested_at = time.time()
         logged_previous_mode_rejection = False
         while time.monotonic() < deadline:
+            # Never turn a reported motor fault into an enable retry. The
+            # caller must latch it and suppress automatic shutdown motion.
+            driver_status = driver_enable_status_dict(piper)
+            self.robot_driver_enable_status[side] = driver_status
+            if driver_status["faulted"] is True:
+                raise RuntimeHardwareFault(f"{side} Piper driver fault before enable: {driver_status}")
             enabled_feedback = bool(piper.EnablePiper())
             self._send_enable_hold(side, piper, hold_joints, hold_gripper_m)
             self._refresh_known_enable_holds(exclude_side=side)
@@ -4607,7 +4536,7 @@ class ExecutionController:
                     or last_status["err_code"] != 0
                 )
             ) or driver_status["faulted"] is True:
-                raise ExecutionBlocked(
+                raise RuntimeHardwareFault(
                     f"{side} Piper became unhealthy during enable: "
                     f"arm_status={last_status} driver_status={driver_status} "
                     f"requested_at={requested_at:.6f} post_request_status={post_request_status}"
@@ -5034,8 +4963,12 @@ class ExecutionController:
                         else 0.25
                     )
             max_step = float(max_step_value)
+            # Rate-limit the command itself. A gripper closed on an object
+            # stops short of its command, so bounding the command around the
+            # measured opening would weaken the grasp and, with feedback just
+            # outside [0, ceiling], reject every step and freeze the gripper.
             filtered = float(
-                np.clip(filtered, current - max_step, current + max_step)
+                np.clip(filtered, previous - max_step, previous + max_step)
             )
             filtered = float(np.clip(filtered, 0.0, ceiling))
             self._filtered_gripper_opening[side] = filtered
@@ -5159,7 +5092,9 @@ class ExecutionController:
                        fraction=kwargs.get("recovery_fraction", 1.),
                        hold_position=kwargs.get("hold_position", False),
                        progress_goal=([np.asarray(v).tolist() for v in kwargs["progress_goal"]]
-                                      if kwargs.get("progress_goal") is not None else None))
+                                      if kwargs.get("progress_goal") is not None else None),
+                       solver_kwargs={key: value.tolist() if isinstance(value, np.ndarray) else value
+                                      for key, value in kwargs.items() if key != "progress_goal"})
             for side, (args, kwargs) in requests.items()
         }
         if self.ik_workers is not None:
@@ -5212,10 +5147,52 @@ class ExecutionController:
                     and np.linalg.norm(shaper.linear_velocity) < 1e-4
                     and np.linalg.norm(shaper.angular_velocity) < 1e-3)
 
+    def _held_gripper_openings(self, qpos_m, sides):
+        """Gripper openings to keep while holding, braking or recovering.
+
+        A gripper closed on an object stops short of its command. Replacing the
+        command with that measured opening removes the squeeze and can drop the
+        object, so keep the last published command whenever a writer has one.
+        """
+        measured = np.asarray(qpos_m, dtype=np.float64)[6::7][:len(sides)].copy()
+        last = getattr(self.servo_loop, "last_published_command", None)
+        published = last() if callable(last) else None
+        if (published is None or published.shape != (7 * len(sides),)
+                or not np.isfinite(published[6::7]).all()):
+            return measured
+        return published[6::7].copy()
+
     def _recovery_needs_braking(self):
         # An existing writer may carry velocity/acceleration or actuator lag.
         # Even zero generated velocity alone is not proof of measured settling.
         return self.servo_loop is not None
+
+    def _retain_eef_goal(self, goal, target, held_grippers, *, braking, recovery, pose_metrics=None):
+        """Invalidate timed suffix once, then approach one goal after settling."""
+        self.discard_pending_actions("original EEF goal retained; invalidated old RTC suffix", kind="other")
+        self.ik_recovery_target = np.asarray(target).copy()
+        self.eef_goal_action = goal
+        self.eef_goal_held_grippers = np.asarray(held_grippers).copy()
+        self.ik_recovery_target[6::7] = self.eef_goal_held_grippers
+        self.ik_recovery_braking = braking
+        self._recovery_settle_feedback = None
+        self._recovery_stable_since = None
+        self._recovery_tracking_at = None
+        self._recovery_tracking_cycles = 0
+        self.eef_goal_releasing = False
+        self.eef_goal_pose_reset_pending = bool(recovery and getattr(self.args, "pose_trajectory", False))
+        self.eef_goal_pose_metrics = pose_metrics or {}
+        self.eef_goal_step_count = 0 if braking else 1
+        self.ik_recovery_started = time.monotonic()
+        self.ik_recovery_phase_started = self.ik_recovery_started
+        self.ik_recovery_barrier = self.ik_recovery_started
+        self.ik_recovery_prefix_reset = True
+        # Re-anchor only after measured braking completes, in _advance_ik_recovery.
+        if not braking:
+            self._ik_warm_starts.clear()
+        self.last_ik_recovery = recovery
+        self.state = "recovering"
+        self.blocked_reason = "IK recovery braking; waiting for fresh measured settling" if braking else ""
 
     def _advance_ik_recovery(self, qpos, now, *, raw_delivery_state, protocol, feedback_at=None):
         """Reach the retained original goal, then release grippers and reobserve."""
@@ -5226,10 +5203,14 @@ class ExecutionController:
         metrics = self.servo_loop.metrics() if self.servo_loop is not None else {}
         if metrics.get("fault"):
             raise RuntimeHardwareFault(f"servo failed during EEF goal approach: {metrics['fault']}")
+        phase = ("braking" if self.ik_recovery_braking else
+                 "gripper release" if self.eef_goal_releasing else "approach")
+        phase_started = (self.ik_recovery_phase_started if self.ik_recovery_phase_started is not None
+                         else self.ik_recovery_started)
         if (goal is None or self.servo_loop is None or metrics.get("paused") or metrics.get("stopping")
-                or now - self.ik_recovery_started > self.eef_goal_timeout_s):
+                or now - phase_started > self.eef_goal_timeout_s):
             self.ik_recovery_fault = (f"original EEF goal did not settle within {self.eef_goal_timeout_s:g}s; "
-                                      "grippers held; stop and restart required")
+                                      f"phase={phase}; grippers held; stop and restart required")
             return self._block("blocked", self.ik_recovery_fault)
         indices = [i for i in range(len(target)) if i % 7 != 6]
         grippers = [i*7+6 for i in range(len(sides))]
@@ -5260,6 +5241,10 @@ class ExecutionController:
             # Discard the pre-brake IK candidate. Re-solve the retained original
             # goal from the actual settled pose, with no artificial state reset.
             self.ik_recovery_braking = False
+            # Braking, geometric approach, and gripper filtering each get one
+            # bounded deadline. Arrival near the old global deadline must not
+            # abort a healthy opening ramp. No phase can restart its own clock.
+            self.ik_recovery_phase_started = now
             target = np.asarray(qpos).copy()
             target[grippers] = self.eef_goal_held_grippers
             self.ik_recovery_target = target
@@ -5301,7 +5286,9 @@ class ExecutionController:
                 # The original pose, not an intermediate IK point, authorizes
                 # gripper filtering. Keep the original pose while the writer
                 # ramps the requested opening; contact need not reach zero.
-                self.eef_goal_releasing = True
+                if not self.eef_goal_releasing:
+                    self.ik_recovery_phase_started = now
+                    self.eef_goal_releasing = True
                 filtered = self._filter_gripper_target(goal, qpos, protocol)
                 target[grippers] = self._eef_goal_openings(filtered, protocol, sides)
                 sample = self.servo_loop.submit(target, hold=False, context=context)
@@ -5369,7 +5356,7 @@ class ExecutionController:
                     and np.all(joints >= limits[:, 0]) and np.all(joints <= limits[:, 1]))
                 requests[side] = ((joints, target_xyz, target_rpy), kwargs)
             results = solve_recovering(self._solve_ik_batch, requests)
-            if time.monotonic() - self.ik_recovery_started > self.eef_goal_timeout_s:
+            if time.monotonic() - self.ik_recovery_phase_started > self.eef_goal_timeout_s:
                 raise IKWorkerError("original EEF goal deadline exceeded during IK")
             next_target = target.copy()
             for index, side in enumerate(sides):
@@ -5677,6 +5664,7 @@ class ExecutionController:
                 self.tracking_lag_settle_cycles = 0
                 self.tracking_lag_settle_joints = None
                 self.tracking_lag_settle_feedback_at = None
+                self.tracking_lag_offset_since = None
                 self.ik_recovery_target = None
                 self.eef_goal_action = None
                 self.eef_goal_pose_reset_pending = False
@@ -5733,22 +5721,51 @@ class ExecutionController:
                 and feedback_at - previous_feedback_at > max(.2, 3 / self.control_hz)):
             self.tracking_lag_settle_cycles = 0
             self.tracking_lag_settle_joints = None
+            self.tracking_lag_offset_since = None
         self.tracking_lag_settle_feedback_at = feedback_at
         metrics = self.servo_loop.metrics()
         if metrics.get("fault") or metrics.get("paused") or metrics.get("stopping"):
             raise RuntimeHardwareFault("servo unavailable while settling tracking-lag hold")
+        # A disabled or faulted joint never reaches the braking reference;
+        # stop now instead of waiting for a settle that cannot happen
+        # (2026-11-02 12:15: left J3 disabled, hold waited 28 s).
+        for side, piper in self.pipers.items():
+            status = driver_enable_status_dict(piper)
+            if status.get("faulted") is True or (status.get("healthy") and not status.get("ready")):
+                raise RuntimeHardwareFault(f"{side} Piper driver fault during tracking-lag hold: {status}")
         state = metrics.get("state", {})
         joints = np.delete(np.asarray(qpos), np.arange(6, len(qpos), 7))
         position = np.asarray(state.get("position"), dtype=float)
         velocity = np.asarray(state.get("velocity"), dtype=float)
         acceleration = np.asarray(state.get("acceleration"), dtype=float)
-        stable = (all(value.shape == joints.shape and np.isfinite(value).all()
-                      for value in (position, velocity, acceleration))
-                  and np.max(np.abs(position-joints)) < .01
-                  and np.max(np.abs(velocity)) < 1e-4
-                  and np.max(np.abs(acceleration)) < 1e-3
-                  and self.tracking_lag_settle_joints is not None
-                  and np.max(np.abs(joints-self.tracking_lag_settle_joints)) < .001)
+        stationary = (all(value.shape == joints.shape and np.isfinite(value).all()
+                          for value in (position, velocity, acceleration))
+                      and np.max(np.abs(velocity)) < 1e-4
+                      and np.max(np.abs(acceleration)) < 1e-3
+                      and self.tracking_lag_settle_joints is not None
+                      and np.max(np.abs(joints-self.tracking_lag_settle_joints)) < .001)
+        offset = float(np.max(np.abs(position-joints))) if stationary else 0.
+        stable = stationary and offset < .01
+        if stationary and not stable:
+            # Contact or joint deflection can hold a healthy arm still away
+            # from the braking reference forever. Once stationary for a
+            # while, hold at the measured joints (grippers keep their last
+            # command) so the settle can complete instead of hanging.
+            if self.tracking_lag_offset_since is None:
+                self.tracking_lag_offset_since = feedback_at
+            elif feedback_at - self.tracking_lag_offset_since >= TRACKING_LAG_REANCHOR_S:
+                command = self.servo_loop.last_published_command()
+                if command is not None and command.shape == np.asarray(qpos).shape:
+                    command[[i for i in range(len(command)) if i % 7 != 6]] = joints
+                    try:
+                        self.servo_loop.submit(command, hold=True)
+                    except ServoError as exc:
+                        raise RuntimeHardwareFault(f"servo failed to re-anchor tracking-lag hold: {exc}") from exc
+                    logging.warning("Tracking-lag hold re-anchored at measured joints after a %.4f rad "
+                                    "stationary offset (contact or deflection)", offset)
+                self.tracking_lag_offset_since = None
+        else:
+            self.tracking_lag_offset_since = None
         self.tracking_lag_settle_joints = joints.copy()
         self.tracking_lag_settle_cycles = self.tracking_lag_settle_cycles + 1 if stable else 0
         if self.tracking_lag_settle_cycles >= self.tracking_lag_confirm_cycles:
@@ -6344,6 +6361,9 @@ class ExecutionController:
                 }
             )
             self.robot_driver_enable_status.update(active_driver_statuses)
+            for side, driver_status in active_driver_statuses.items():
+                if driver_status["faulted"] is True:
+                    raise RuntimeHardwareFault(f"{side} Piper driver fault: {driver_status}")
             lost_control_mode = [
                 side
                 for side in sides
@@ -6513,9 +6533,10 @@ class ExecutionController:
                     if holding or safety_hold_only:
                         self._pose_trajectories.pop(side, None)
                         self._pose_reference_at.pop(side, None)
+                        gripper_hold = float(self._held_gripper_openings(qpos_m, sides)[index])
                         prepared[side] = (
                             qpos_slice[:6].copy(),
-                            float(qpos_slice[6]),
+                            gripper_hold,
                         )
                         command_pipeline[side] = {
                             "control_path": "delivery_safety_hold",
@@ -6523,7 +6544,7 @@ class ExecutionController:
                             "pre_ik_eef_target": None,
                             "full_ik_solution_joints_rad": None,
                             "commanded_joints_rad": qpos_slice[:6].tolist(),
-                            "commanded_gripper_m": float(qpos_slice[6]),
+                            "commanded_gripper_m": gripper_hold,
                             "ik_rate_limited": None,
                             "ik_diagnostics": None,
                         }
@@ -6573,9 +6594,10 @@ class ExecutionController:
                                 DEFAULT_MAX_ROTATION_STEP_RAD,
                             )
                         )),
-                        max_gripper_step=float(
-                            getattr(self.args, "max_gripper_step", DEFAULT_MAX_GRIPPER_STEP)
-                        ),
+                        # The gripper filter (or the planner) rate-limits the
+                        # command; contact makes feedback differ from it by
+                        # design, so the gripper never blocks the arm target.
+                        max_gripper_step=float("inf"),
                         gripper_range_tolerance=float(
                             getattr(
                                 self.args,
@@ -6665,9 +6687,9 @@ class ExecutionController:
                         joint_limits=effective_limits(self.pipers[side], JOINT_LIMITS_RAD),
                         max_joint_step_rad=(float("inf") if self.servo_backend == "ruckig"
                                             else float(getattr(self.args, "max_joint_step_rad", 0.3))),
-                        max_gripper_step=(float("inf") if self.planner_prefix_enabled else
-                                          getattr(self.args, "max_joint_gripper_step", None)),
-                        max_gripper_step_m=getattr(self.args, "max_joint_gripper_step_m", None),
+                        # Rate limited by the gripper filter or the planner;
+                        # never compared with contact-limited feedback.
+                        max_gripper_step=float("inf"),
                         joint_limit_tolerance_rad=float(
                             getattr(
                                 self.args,
@@ -6711,6 +6733,21 @@ class ExecutionController:
                     else:
                         results = self.ik_workers.solve(ik_requests)
                 except IKRecoveryExhausted as exc:
+                    if self.servo_loop is not None and any(
+                            kwargs.get("initial_joints_rad") is not None
+                            for _, kwargs in ik_requests.values()):
+                        # A moving branch anchor can exclude the measured pose
+                        # and every safe descent direction. Brake before clearing
+                        # it; retry the original goal once from settled feedback.
+                        # Exhaustion in _advance_ik_recovery still latches a stop.
+                        (self._filtered_gripper_opening, self._gripper_extreme_candidate,
+                         self._gripper_extreme_count, self._gripper_extreme_latch) = filter_snapshot
+                        held_grippers = self._held_gripper_openings(qpos_m, sides)
+                        self.servo_loop.hold()
+                        self._retain_eef_goal(original_queued, qpos_m, held_grippers,
+                                              braking=True, recovery={"branch_blocked": str(exc)})
+                        logging.warning("IK branch blocked; braking before one measured-pose recovery: %s", exc)
+                        return False
                     self.ik_recovery_fault = str(exc) + "; stop and restart required"
                     self.ik_recovery_prefix_reset = True
                     raise ExecutionBlocked(self.ik_recovery_fault) from exc
@@ -6724,8 +6761,9 @@ class ExecutionController:
                      self._gripper_extreme_count, self._gripper_extreme_latch) = filter_snapshot
                     self._pose_trajectories.clear()
                     self._pose_reference_at.clear()
+                    held_grippers = self._held_gripper_openings(qpos_m, sides)
                     for index, side in enumerate(sides):
-                        prepared[side] = (None, float(qpos_m[index * 7 + 6]))
+                        prepared[side] = (None, float(held_grippers[index]))
                         command_pipeline[side]["ik_recovery"] = recovery[side]
                         # Interpolation is about FK, which can differ slightly
                         # from reported EEF feedback; recheck workspace bounds.
@@ -6775,9 +6813,10 @@ class ExecutionController:
                 self._check_eef_goal_workspace(original_queued.absolute_target, sides)
                 (self._filtered_gripper_opening, self._gripper_extreme_candidate,
                  self._gripper_extreme_count, self._gripper_extreme_latch) = filter_snapshot
+                held_grippers = self._held_gripper_openings(qpos_m, sides)
                 for index, side in enumerate(sides):
-                    prepared[side] = (prepared[side][0], float(qpos_m[index*7+6]))
-                    command_pipeline[side]["commanded_gripper_m"] = float(qpos_m[index*7+6])
+                    prepared[side] = (prepared[side][0], float(held_grippers[index]))
+                    command_pipeline[side]["commanded_gripper_m"] = float(held_grippers[index])
                     command_pipeline[side]["original_goal_retained"] = original_queued.absolute_target[index*10:index*10+10].tolist()
                 recovery_target = np.concatenate([
                     np.append(prepared[side][0], prepared[side][1]) for side in sides])
@@ -6786,9 +6825,10 @@ class ExecutionController:
                 # The geometric candidate was computed before braking. Retain
                 # it for diagnostics only; do not make it an active waypoint.
                 braking_position = np.asarray(self.servo_loop.metrics()["state"]["position"])
+                held_grippers = self._held_gripper_openings(qpos_m, sides)
                 for index, side in enumerate(sides):
                     prepared[side] = (braking_position[index*6:index*6+6].copy(),
-                                      float(qpos_m[index*7+6]))
+                                      float(held_grippers[index]))
             self._shape_prepared_targets(
                 qpos_m,
                 prepared,
@@ -7090,27 +7130,11 @@ class ExecutionController:
             self.state = "executing"
             self.blocked_reason = ""
         if goal_gate:
-            self.discard_pending_actions("original EEF goal retained; invalidated old RTC suffix", kind="other")
-            self.ik_recovery_target = recovery_target
-            self.eef_goal_action = original_queued
-            self.eef_goal_held_grippers = np.array([prepared[side][1] for side in sides])
-            self.ik_recovery_target[[i*7+6 for i in range(len(sides))]] = self.eef_goal_held_grippers
-            self.ik_recovery_braking = recovery_braking
-            self._recovery_settle_feedback = None
-            self._recovery_stable_since = None
-            self._recovery_tracking_at = None
-            self._recovery_tracking_cycles = 0
-            self.eef_goal_releasing = False
-            self.eef_goal_pose_reset_pending = bool(recovery and getattr(self.args, "pose_trajectory", False))
-            self.eef_goal_pose_metrics = {side: command_pipeline[side].get("pose_trajectory") for side in sides}
-            self.eef_goal_step_count = 1
+            self._retain_eef_goal(original_queued, recovery_target,
+                [prepared[side][1] for side in sides], braking=recovery_braking,
+                recovery=recovery,
+                pose_metrics={side: command_pipeline[side].get("pose_trajectory") for side in sides})
             self.eef_goal_errors = self._eef_arrival_errors(raw_delivery_state, original_queued.absolute_target, sides)
-            self.ik_recovery_started = time.monotonic()
-            self.ik_recovery_barrier = self.ik_recovery_started
-            self.ik_recovery_prefix_reset = True
-            self._ik_warm_starts.clear()
-            self.last_ik_recovery = recovery
-            self.state = "recovering"
             logging.info("Original EEF goal retained after IK recovery (shrink=%s projected=%s); "
                          "grippers held until arrival; old RTC suffix cleared; braking_handoff=%s",
                          next(iter(recovery.values()))["fraction"] if recovery else None,
@@ -7480,6 +7504,7 @@ def return_pipers_to_initial(
     command_lookahead_rad: float = DEFAULT_TRAJECTORY_COMMAND_LOOKAHEAD_RAD,
     max_tracking_error_rad: float = DEFAULT_TRAJECTORY_MAX_TRACKING_ERROR_RAD,
     hold_tolerance_rad: float = DEFAULT_ARM_HOLD_TOLERANCE_RAD,
+    gripper_tolerance_m: float = DEFAULT_RETURN_GRIPPER_TOLERANCE_M,
     servo_backend: str = "legacy",
     servo_hz: float = DEFAULT_SERVO_HZ,
     on_sample: Callable[[dict[str, Any]], None] | None = None,
@@ -7565,6 +7590,19 @@ def return_pipers_to_initial(
     sent = 0
     joint_error = float("inf")
     gripper_error = float("inf")
+    gripper_stall_since = None
+    gripper_stall_reference = None
+    gripper_contact = False
+
+    def check_return_health():
+        for side in sides:
+            status = arm_status_dict(pipers[side])
+            driver_status = driver_enable_status_dict(pipers[side])
+            if (status.get("arm_status") != PIPER_ARM_STATUS_NORMAL
+                    or status.get("err_code") != 0 or driver_status["faulted"] is True
+                    or (driver_status.get("available") is True and driver_status.get("ready") is not True)):
+                raise RuntimeHardwareFault(
+                    f"{side} Piper unhealthy during return: arm={status} driver={driver_status}")
 
     def send_exact_home() -> None:
         """Leave the firmware with the exact captured target, without lookahead."""
@@ -7597,6 +7635,9 @@ def return_pipers_to_initial(
         current = np.concatenate(
             [read_output_qpos(pipers[side], max_feedback_age_s=max_feedback_age_s) for side in sides]
         ).astype(np.float32)
+        # Check every arm before either the normal path or exact-home path
+        # writes anything, including when the measured pose already matches.
+        check_return_health()
         if on_sample is not None and sent % max(1, round(hz / 10)) == 0:
             on_sample({"elapsed_s": tick - started, "feedback": current.tolist(),
                        "home": home.tolist(), "sent_commands": sent,
@@ -7607,7 +7648,28 @@ def return_pipers_to_initial(
             np.max(np.abs(shaper.position - home[joint_indices])) < 1e-5
             and np.max(np.abs(shaper.velocity)) < 1e-4
             and np.max(np.abs(shaper.acceleration)) < 1e-3))
-        if trajectory_settled and joint_error <= float(hold_tolerance_rad) and gripper_error <= 0.001:
+        # A gripper holding an object stops short of its commanded opening;
+        # that is normal. Once the arms are home and the gripper command has
+        # arrived, a stalled opening completes the return as gripper contact
+        # instead of resending a closing force until the timeout.
+        arms_arrived = trajectory_settled and joint_error <= float(hold_tolerance_rad)
+        gripper_command_arrived = np.max(np.abs(previous_gripper-home[gripper_indices])) <= 1e-5
+        if arms_arrived and gripper_command_arrived and gripper_error > float(gripper_tolerance_m):
+            opening = current[gripper_indices]
+            if (gripper_stall_reference is None
+                    or np.max(np.abs(opening-gripper_stall_reference)) > .0001):
+                gripper_stall_since = tick
+                gripper_stall_reference = opening.copy()
+            elif tick-gripper_stall_since >= 1. and not gripper_contact:
+                gripper_contact = True
+                logging.warning("Return: arms reached home; gripper stopped short (contact or "
+                                "calibration): gripper_errors_m=%s",
+                                {side: float(opening[i]-home[gripper_indices[i]])
+                                 for i, side in enumerate(sides)})
+        else:
+            gripper_stall_since = gripper_stall_reference = None
+        if (trajectory_settled and joint_error <= float(hold_tolerance_rad)
+                and (gripper_contact or gripper_error <= float(gripper_tolerance_m))):
             send_exact_home()
             sent += 1
             time.sleep(min(0.15, 2.0 * period))
@@ -7619,25 +7681,24 @@ def return_pipers_to_initial(
                     for side in sides
                 ]
             ).astype(np.float32)
+            check_return_health()
             joint_error = float(
                 np.max(np.abs(final[joint_indices] - home[joint_indices]))
             )
             gripper_error = float(
                 np.max(np.abs(final[gripper_indices] - home[gripper_indices]))
             )
-            if joint_error <= float(hold_tolerance_rad) and gripper_error <= 0.001:
+            if joint_error <= float(hold_tolerance_rad) and (
+                    gripper_contact or gripper_error <= float(gripper_tolerance_m)):
                 return {
                     "returned": True,
                     "elapsed_s": time.monotonic() - started,
                     "sent_commands": sent,
                     "joint_error_rad": joint_error,
                     "gripper_error_m": gripper_error,
+                    "gripper_contact": gripper_contact,
                 }
             current = final
-        for side in sides:
-            status = arm_status_dict(pipers[side])
-            if status.get("arm_status") != PIPER_ARM_STATUS_NORMAL or status.get("err_code") != 0:
-                raise ExecutionBlocked(f"{side} Piper unhealthy during return: {status}")
         if servo_backend == "ruckig":
             leg_settled = (np.max(np.abs(shaper.position - shaper.target)) < 1e-5
                            and np.max(np.abs(shaper.velocity)) < 1e-4
@@ -7844,6 +7905,8 @@ def move_pipers_to_safe_startup_pose(
             getattr(args, "trajectory_max_tracking_error_rad", DEFAULT_TRAJECTORY_MAX_TRACKING_ERROR_RAD)
         ),
         hold_tolerance_rad=arrival_tolerance,
+        gripper_tolerance_m=float(getattr(args, "return_gripper_tolerance_m",
+                                          DEFAULT_RETURN_GRIPPER_TOLERANCE_M)),
     )
     wait_for_return_stationary(pipers, args)
     if native:
@@ -7887,7 +7950,8 @@ def run_return_only(args):
             max_joint_acceleration_rad_s2=args.trajectory_max_acceleration_rad_s2,
             max_joint_jerk_rad_s3=args.trajectory_max_jerk_rad_s3,
             max_tracking_error_rad=args.trajectory_max_tracking_error_rad,
-            hold_tolerance_rad=args.arm_hold_tolerance_rad)
+            hold_tolerance_rad=args.arm_hold_tolerance_rad,
+            gripper_tolerance_m=args.return_gripper_tolerance_m)
         logging.info("Return to initial pose completed: %s", result)
     finally:
         for piper in pipers.values():
@@ -8020,7 +8084,28 @@ def run_rtc_client(args: argparse.Namespace) -> None:
     prompt_revision = 0
     prompt_sent_revision: int | None = None
     control_period = 1.0 / float(getattr(args, "control_hz", DEFAULT_ACTION_HZ))
+    recap = None
     try:
+        if getattr(args, "recap_control_dir", None):
+            from bimanual_vla.deployment.recap_runtime import RecapRuntime
+
+            def reset_recap_policy():
+                nonlocal execution, prompt_sent_revision
+                next_generation = execution._next_inference_generation
+                execution = ExecutionController(pipers, args)
+                execution._next_inference_generation = next_generation
+                execution.robot_enabled = set(pipers)
+                execution.servo_sample_callback = recorder.record_servo_tick
+                execution.configure_protocol(protocol)
+                execution.configure_ik_workers(protocol)
+                execution.ik_recovery_prefix_reset = True
+                # New server session prevents hidden temporal/RTC state from
+                # joining a pre-intervention chunk to this fresh observation.
+                args.rtc_session_id = uuid.uuid4().hex
+                prompt_sent_revision = None
+                return execution
+
+            recap = RecapRuntime(execution, args, recorder, monitoring, reset_recap_policy)
         cameras.open()
         camera_checks = cameras.verify()
         for key, info in camera_checks.items():
@@ -8142,6 +8227,13 @@ def run_rtc_client(args: argparse.Namespace) -> None:
         def handle_inference_completion(completion: InferenceCompletion) -> bool:
             nonlocal policy, count, once_result_accepted
             assert protocol is not None
+            if recap is not None and not recap.accepts(completion):
+                recorder.record_model_result(
+                    launch=completion.launch, result=completion.result,
+                    arrived_at=completion.arrived_at, arrived_monotonic=completion.arrived_monotonic,
+                    protocol=protocol, accepted=False, rejection="RECAP ownership/observation barrier",
+                    error=completion.error)
+                return False
             refresh_reference = False
             if completion.error is not None:
                 execution.reject_inference_completion(completion)
@@ -8446,7 +8538,23 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                             )
                             logging.warning("Policy connection unavailable: %s", exc)
 
-                if protocol is not None:
+                if recap is not None:
+                    try:
+                        if protocol is not None and protocol.schema != "delivery":
+                            raise RuntimeError("VR RECAP currently requires the delivery EEF data contract")
+                        if recap.poll(protocol):
+                            break
+                        if recap.session.owner == "human":
+                            completion = worker.poll()
+                            if completion is not None:
+                                handle_inference_completion(completion)
+                            recap.step_human(protocol)
+                        else:
+                            recap.hold_until_policy()
+                    except Exception as exc:
+                        raise RuntimeHardwareFault(f"RECAP control failed: {exc}") from exc
+
+                if protocol is not None and (recap is None or recap.session.owner == "policy"):
                     reading_hardware_feedback = True
                     sides = (
                         ("left", "right") if args.arm_mode == "bimanual" else (args.arm_side,)
@@ -8847,6 +8955,15 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                             ),
                             execution_state=execution.state,
                             blocked_reason=execution.blocked_reason,
+                            recap_epoch=recap.session.epoch if recap is not None else 0,
+                            command_gripper_fraction=(
+                                # Holds re-send the measured opening, which can exceed
+                                # the nominal 70 mm; clip rather than drop the row.
+                                np.clip([execution.last_actuator_command["sides"][s]["commanded_gripper_m"] / GRIPPER_MAX_M
+                                         for s in sides], 0., 1.)
+                                if command_sent and execution.last_actuator_command is not None
+                                and all("commanded_gripper_m" in execution.last_actuator_command["sides"].get(s, {})
+                                        for s in sides) else None),
                             pose_diagnostics=(
                                 {side: {"pose_trajectory": trace["pose_trajectory"],
                                         "ik_diagnostics": trace.get("ik_diagnostics")}
@@ -8953,7 +9070,8 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                 next_control_at += missed * control_period
             try:
                 wake_at = next_control_at
-                if execution.async_inference and execution.inference_trigger_mode == "periodic":
+                if (execution.async_inference and execution.inference_trigger_mode == "periodic"
+                        and (recap is None or recap.session.owner == "policy")):
                     wake_at = launch_schedule.wakeup_deadline(
                         next_control_at, time.monotonic(), in_flight=worker.in_flight)
                 reference_refresh_tick = worker.wait_until(wake_at, handle_inference_completion)
@@ -8967,6 +9085,12 @@ def run_rtc_client(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         logging.info("Stopping policy references; braking the active servo before shutdown.")
     finally:
+        if recap is not None:
+            try:
+                recap.close()
+            except Exception as exc:
+                hardware_fault = f"RECAP handoff shutdown failed: {exc}"
+                logging.exception("RECAP shutdown failed")
         servo_stopped_safely = execution.close_servo()
         execution.close_ik_workers()
         if not servo_stopped_safely and hardware_fault is None:
@@ -9064,11 +9188,15 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                     hold_tolerance_rad=float(
                         getattr(args, "arm_hold_tolerance_rad", DEFAULT_ARM_HOLD_TOLERANCE_RAD)
                     ),
+                    gripper_tolerance_m=float(getattr(
+                        args, "return_gripper_tolerance_m", DEFAULT_RETURN_GRIPPER_TOLERANCE_M)),
                 )
                 returned_to_initial = bool(return_summary.get("returned"))
                 logging.info("Return to initial pose completed: %s", return_summary)
                 monitoring.record("return_to_initial_completed", **return_summary)
             except Exception as exc:
+                if isinstance(exc, RuntimeHardwareFault):
+                    hardware_fault = str(exc)
                 monitoring.record(
                     "return_to_initial_failed",
                     error=repr(exc),
@@ -9280,6 +9408,11 @@ def main() -> None:
                         help="joint reference planner backend (not motor servo); default Ruckig unless shaping is disabled")
     parser.add_argument("--eef-control-mode", choices=("local_ik_joint", "piper_eef"), default="local_ik_joint",
                         help="delivery execution: local IK + JointCtrl, or firmware IK via MOVE P + EndPoseCtrl")
+    parser.add_argument("--recap-control-dir", default=None,
+                        help="private GUI mailbox directory for explicit VR intervention")
+    parser.add_argument("--recap-session-id", default="")
+    parser.add_argument("--recap-quest-model-dir", default="")
+    parser.add_argument("--recap-adb-serial", default="")
     parser.add_argument("--servo-hz", type=float, default=DEFAULT_SERVO_HZ,
                         help="actuator publication frequency, independent of policy action Hz")
     parser.add_argument("--servo-target-timeout-s", type=float, default=0.15)
@@ -9385,7 +9518,7 @@ def main() -> None:
     parser.add_argument("--eef-goal-rotation-tolerance-rad", type=float, default=.05,
                         help="measured original-goal rotation tolerance before gripper release")
     parser.add_argument("--eef-goal-timeout-s", type=float, default=2.,
-                        help="total original-goal approach and gripper-publication deadline")
+                        help="deadline per recovery phase: braking, original-goal approach, gripper publication")
     parser.add_argument(
         "--latency-skip-compensation-steps",
         type=int,
@@ -9547,7 +9680,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--ik-minimum-motion", action=argparse.BooleanOptionalAction, default=True,
-        help="prefer the nearest joint solution inside the IK pose tolerances",
+        help="deprecated and ignored: IK always solves toward the target centre with a "
+             "joint-motion penalty (bounded Levenberg-Marquardt)",
     )
     parser.add_argument(
         "--ik-independent-arms", action=argparse.BooleanOptionalAction, default=True,
@@ -9600,6 +9734,11 @@ def main() -> None:
         help="maximum joint error before leaving the post-enable hold (default 0.05 rad)",
     )
     parser.add_argument(
+        "--return-gripper-tolerance-m", type=float, default=DEFAULT_RETURN_GRIPPER_TOLERANCE_M,
+        help="gripper opening error treated as fully returned; a larger stalled opening is "
+             "reported as gripper contact, not a failure (default 0.003 m)",
+    )
+    parser.add_argument(
         "--workspace-x", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
         help="optional EEF x bounds; omitted means no Cartesian x envelope",
     )
@@ -9648,6 +9787,12 @@ def main() -> None:
     args = parser.parse_args()
     args.servo_backend = args.servo_backend or ("ruckig" if args.trajectory_shaping else "off")
     args.trajectory_shaping = args.servo_backend != "off"
+    if args.recap_control_dir:
+        if (not args.allow_execution or args.no_recording or not args.recap_session_id
+                or args.eef_control_mode != "local_ik_joint" or args.servo_backend != "ruckig"):
+            parser.error("RECAP requires execution, recording, a session id, and local_ik_joint + ruckig policy mode")
+        if not Path(args.recap_control_dir).is_dir():
+            parser.error("RECAP control directory must already exist")
     try:
         PoseTrajectoryConfig(**{name: getattr(args, "pose_" + name)
                                 for name in vars(PoseTrajectoryConfig())})
@@ -9730,6 +9875,7 @@ def main() -> None:
         args.return_timeout_s,
         args.arm_settle_s,
         args.arm_hold_tolerance_rad,
+        args.return_gripper_tolerance_m,
         args.enable_timeout_s,
         args.record_video_fps if args.record_video_fps is not None else 1.0,
     )

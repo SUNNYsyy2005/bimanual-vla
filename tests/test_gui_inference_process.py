@@ -6,10 +6,42 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from bimanual_vla.collection.gui import CollectorGUI
+from bimanual_vla.collection.gui import CollectorGUI, RETURN_POSE_PATH
 
 
 class InferenceProcessTest(unittest.TestCase):
+    def test_explicit_home_return_does_not_reuse_or_overwrite_session_pose(self):
+        session_command = ['python', '-m', 'client', '--initial-pose-file', '/tmp/session.json',
+                           '--return-target-file', '/tmp/legacy-target.json']
+        original = session_command.copy()
+        ui = SimpleNamespace(
+            _replay_running=lambda: False, _inference_running=lambda: False,
+            _can_activation_running=lambda: False, inference_stop_requested=False,
+            inference_return_only=False, recording=False, piper=None,
+            arm_mode='bimanual', arm_side='both', can_var=Mock(), left_can_var=Mock(), right_can_var=Mock(),
+            inference_session_command=session_command, _launch_inference_process=Mock())
+        with patch('bimanual_vla.collection.gui.return_pose_matches_inference_config', return_value=True):
+            CollectorGUI.return_inference_to_initial(ui)
+        command = ui._launch_inference_process.call_args.args[0]
+        self.assertEqual(command[command.index('--initial-pose-file') + 1], str(RETURN_POSE_PATH))
+        self.assertNotIn('/tmp/session.json', command)
+        self.assertNotIn('--return-target-file', command)
+        self.assertIn('--return-only', command)
+        self.assertIn('--allow-execution', command)
+        self.assertEqual(session_command, original)
+
+    def test_explicit_home_request_during_inference_runs_after_session_stop(self):
+        ui = SimpleNamespace(
+            _replay_running=lambda: False, _inference_running=lambda: True,
+            _can_activation_running=lambda: False, inference_stop_requested=False,
+            inference_return_only=False, recording=False, piper=None,
+            inference_session_command=['client', '--allow-execution'],
+            stop_inference=Mock(), inference_status_var=Mock())
+        CollectorGUI.return_inference_to_initial(ui)
+        ui.stop_inference.assert_called_once()
+        self.assertTrue(ui.inference_return_after_stop)
+        self.assertFalse(ui.inference_restart_requested)
+
     def gui(self):
         return SimpleNamespace(
             inference_log_widget=Mock(), _append_inference_log=Mock(),

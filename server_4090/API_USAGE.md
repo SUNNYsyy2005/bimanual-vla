@@ -908,6 +908,7 @@ Content-Type: application/json
   "arm_side":"right",
   "gpu_ids":"0",
   "port":8000,
+  "denoising_steps":5,
   "default_prompt":"pick up the cube",
   "replace_task_id":""
 }
@@ -918,6 +919,14 @@ Content-Type: application/json
 ```json
 {"ws_url":"ws://192.168.101.9:8000","telemetry_session":"..."}
 ```
+
+`denoising_steps` 为 1–50 的整数，默认 5。运行中的 Policy 可在 Dashboard
+进程表修改，或调用 `POST /api/tasks/<task_id>/denoising-steps`，请求体为
+`{"denoising_steps":3}`。新值从下一次推理请求生效；JAX 首次使用某个步数时
+会编译对应采样器，首次请求可能更慢。模型每次请求计算当前图像、状态和 prompt
+的前缀 KV cache，并在该请求的各去噪步复用。非离散 state 模型会缓存固定 prompt
+的分词结果；当前 π0.5 把实时 state 编进语言输入，每次仍需重新分词。图像和语言
+前缀使用双向注意力，新观测不能使用旧请求的 transformer KV。
 
 ### 8.2 获取执行安全门状态
 
@@ -1506,3 +1515,24 @@ experiment IDs through `scope_aliases`. Indexed browsing supports `variant=<id>`
 alongside phase filters, including `phase=independent_eval`. Independent evaluations
 first resolve their declared training reference, then inherit the training variant.
 Background directory refresh applies both mappings when publishing a new index.
+
+# 真机 VR RECAP
+
+RECAP 使用现有 `/api/tasks/train`，不新增独立训练服务。
+在已完成训练/测试集划分及 norm 的真机双臂 v3 delivery 数据集上，增加：
+
+```json
+{
+  "recap_enabled": true,
+  "recap_n_step": 50,
+  "recap_positive_fraction": 0.3,
+  "recap_unconditional_probability": 0.1,
+  "recap_value_steps": 8000,
+  "recap_failure_reward": -300
+}
+```
+
+完整回合用于 RLinf 价值学习；有效自主/人工动作块用于优势条件策略训练。
+数据集必须包含 `meta/info.json.recap.version=1` 和逐回合标注，后端须在所选执行节点
+配置 `recap_backend`。仿真 Dashboard、未标注数据及改变 RECAP 设置的完整续训会被拒绝。
+详细安装、导出、断点恢复和验证边界见 [RECAP.md](../docs/RECAP.md)。

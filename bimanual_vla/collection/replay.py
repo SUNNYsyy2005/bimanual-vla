@@ -35,6 +35,19 @@ from bimanual_vla.deployment.execution_defaults import (
 from bimanual_vla.collection.replay_errors import ReplayBlocked, ReplayFeedbackPending, ReplayCancelled
 
 
+def normalize_replay_gripper_feedback(opening_m):
+    """Treat the observed -100 um closed-stop offset as zero, not as opening.
+
+    Only measurement is normalized. Command limits and larger invalid readings
+    remain rejected. The tiny epsilon covers float32 conversion, not sensor drift.
+    """
+    from bimanual_vla.deployment.gripper_limits import GRIPPER_MAX_M as physical_max
+    value = float(opening_m)
+    if not math.isfinite(value) or value < -.0001 - 1e-9 or value > physical_max:
+        raise ReplayBlocked(f'invalid measured gripper opening: {value} m')
+    return max(0., value)
+
+
 @dataclass(frozen=True)
 class ReplayEpisode:
     path: Path
@@ -128,7 +141,7 @@ class ReplayConfig:
     max_gripper_speed: float = DEFAULT_GRIPPER_SPEED_M_S
     ik_rate_limit: bool = True
     ik_max_joint_step_rad: float = .02
-    ik_search_joint_radius_rad: float = .30
+    ik_search_joint_radius_rad: float = .40
     ik_joint_regularization_weight: float = 1.0
     ik_position_tolerance_m: float = .0015
     ik_rotation_tolerance_rad: float = .02
@@ -284,12 +297,17 @@ class PiperReplayHardware:
                 eef, qpos = read_output_state(arm, max_feedback_age_s=self.config.feedback_max_age)
             except ExecutionBlocked as exc:
                 raise ReplayFeedbackPending(f'{side}: {exc}') from exc
-            from bimanual_vla.deployment.gripper_limits import GRIPPER_MAX_M as physical_gripper_max
-            if not np.isfinite(qpos).all() or not 0 <= qpos[6] <= physical_gripper_max:
+            if not np.isfinite(qpos).all():
                 raise ReplayBlocked(f'{side}: invalid measured joint/gripper feedback')
+            raw_gripper_m = float(qpos[6])
+            qpos = np.asarray(qpos, dtype=float).copy()
+            try:
+                qpos[6] = normalize_replay_gripper_feedback(raw_gripper_m)
+            except ReplayBlocked as exc:
+                raise ReplayBlocked(f'{side}: {exc}') from exc
             eef = np.asarray(eef, dtype=float).copy()
             eef[9] = qpos[6]  # replay's internal gripper unit is always metres
-            result[side] = {'joint': np.asarray(qpos, dtype=float), 'eef': eef}
+            result[side] = {'joint': qpos, 'eef': eef, 'raw_gripper_m': raw_gripper_m}
             deadlines.extend(m.time_stamp + self.config.feedback_max_age for m in (
                 arm.GetArmJointMsgs(), arm.GetArmGripperMsgs(), arm.GetArmEndPoseMsgs()))
         self.feedback_deadline = min(deadlines)

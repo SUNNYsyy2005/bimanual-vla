@@ -407,6 +407,8 @@ class DeviceGuardTest(unittest.TestCase):
             ("rlsok_resolver_var", "/tmp/example-resolver"),
             ("arm_mode_var", "single"), ("arm_side_var", "right"),
             ("schema_var", DELIVERY_SCHEMA),
+            ("collection_control_source_var", "passive"),
+            ("quest_model_dir_var", ""), ("quest_adb_serial_var", ""),
         ):
             setattr(gui, name, SimpleNamespace(get=lambda value=value: value))
         with tempfile.TemporaryDirectory() as directory:

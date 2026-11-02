@@ -462,6 +462,7 @@ class Pi0LeRobotDatasetWriter:
         state_timestamps: np.ndarray | None = None,
         action_timestamps: np.ndarray | None = None,
         image_timestamps: dict[str, np.ndarray] | None = None,
+        allow_repeated_source_timestamps: bool = False,
     ) -> int:
         states = np.asarray(states, dtype=np.float32)
         actions = np.asarray(actions, dtype=np.float32)
@@ -491,6 +492,7 @@ class Pi0LeRobotDatasetWriter:
             state_timestamps=state_timestamps,
             action_timestamps=action_timestamps,
             image_timestamps=image_timestamps,
+            allow_repeated_source_timestamps=allow_repeated_source_timestamps,
         )
 
         frame_count = len(states)
@@ -630,6 +632,7 @@ class Pi0LeRobotDatasetWriter:
         state_timestamps: np.ndarray,
         action_timestamps: np.ndarray,
         image_timestamps: dict[str, np.ndarray],
+        allow_repeated_source_timestamps: bool = False,
     ) -> None:
         if states.ndim != 2 or actions.ndim != 2:
             raise ValueError("states/actions must be rank-2 arrays")
@@ -658,8 +661,8 @@ class Pi0LeRobotDatasetWriter:
                 raise ValueError(f"{name} must be rank 1 and match the number of frames")
             if not np.isfinite(values).all():
                 raise ValueError(f"{name} contains NaN or Inf")
-            if len(values) > 1 and np.any(np.diff(values) <= 0):
-                raise ValueError(f"{name} must be strictly increasing")
+            if len(values) > 1 and np.any(np.diff(values) < (0 if allow_repeated_source_timestamps else 1e-15)):
+                raise ValueError(f"{name} must be {'nondecreasing' if allow_repeated_source_timestamps else 'strictly increasing'}")
         for key in self.camera_keys:
             if key not in images:
                 raise ValueError(f"missing camera stream: {key}")

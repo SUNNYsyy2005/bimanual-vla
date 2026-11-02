@@ -28,6 +28,7 @@ import tempfile
 import sys
 import threading
 import time
+import uuid
 import tkinter as tk
 import tkinter.font as tkfont
 from dataclasses import replace
@@ -1009,6 +1010,23 @@ def format_arm_state_rows(
     return tuple(rows)
 
 
+def build_return_home_command(command, pose_path):
+    """Keep an explicit home return independent of the inference session pose."""
+    result = []
+    skip_value = False
+    for argument in command:
+        if skip_value:
+            skip_value = False
+        elif argument in ('--initial-pose-file', '--return-target-file'):
+            skip_value = True
+        elif argument != '--return-only':
+            result.append(argument)
+    result += ['--initial-pose-file', str(pose_path), '--return-only']
+    if '--allow-execution' not in result:
+        result.append('--allow-execution')
+    return result
+
+
 class CollectorGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -1071,6 +1089,18 @@ class CollectorGUI:
         self.episode_paths: dict[str, pathlib.Path] = {}
         self.preview_key_to_slot: dict[str, str] = {}
         self.arm_mode_var = tk.StringVar(value=BIMANUAL)
+        self.collection_control_source_var = tk.StringVar(value="passive")
+        self.quest_model_dir_var = tk.StringVar(value="")
+        self.quest_adb_serial_var = tk.StringVar(value="")
+        self.quest_device_status_var = tk.StringVar(value="")
+        self._quest_scan_busy = False
+        self.quest_status_var = tk.StringVar(value="")
+        self.quest_input_status_var = tk.StringVar(value="VR collection disconnected")
+        self.quest_hand_vars = {
+            side: tk.StringVar(value=f"{label}: tracking -- | buttons -- | trigger --")
+            for side, label in (("left", "Left"), ("right", "Right"))
+        }
+        self._pending_collection_reset = None
         self.schema_var = tk.StringVar(value="both")
         self.dataset_schema_var = tk.StringVar(value="joint")
         self.arm_side_var = tk.StringVar(value=str(self.gui_preferences.get("collection_arm_side") or "left"))
@@ -1176,6 +1206,12 @@ class CollectorGUI:
             value=bool(self.gui_preferences.get("inference_auto_next", True))
         )
         self.inference_manual_trigger_path: pathlib.Path | None = None
+        self.recap_enabled_var = tk.BooleanVar(value=False)
+        self.recap_status_var = tk.StringVar(value="RECAP disabled")
+        self.recap_directory = None
+        self.recap_session_id = ""
+        self.recap_pending_id = None
+        self.recap_buttons = {}
         self.inference_return_button = None
         self.inference_return_pose_path = (
             RETURN_POSE_PATH
@@ -1337,6 +1373,7 @@ class CollectorGUI:
         self.refresh_files()
         self._install_space_shortcut()
         self.root.after(100, self._poll_messages)
+        self.root.after(0, self._refresh_quest_devices)
 
     def _build_ui(self):
         colors = {
@@ -1550,6 +1587,11 @@ class CollectorGUI:
         task_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         task.columnconfigure(1, weight=1)
         task.columnconfigure(2, weight=0)
+        self.collection_options_frame = ttk.Frame(task, style="Card.TFrame")
+        self.collection_options_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.collection_options_frame.columnconfigure(1, weight=1)
+        self.collection_options_frame.grid_remove()
+        options = self.collection_options_frame
         selectors = [
             ("Arm mode", self.arm_mode_var, (("Single arm", SINGLE_ARM), ("Bimanual", BIMANUAL))),
             (
@@ -1562,12 +1604,12 @@ class CollectorGUI:
         self.mode_selectors = []
         self.mode_display_vars = []
         for row, (label, variable, values) in enumerate(selectors):
-            ttk.Label(task, text=label, width=18, style="Card.TLabel").grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Label(options, text=label, width=18, style="Card.TLabel").grid(row=row, column=0, sticky="w", pady=4)
             display_to_value = dict(values)
             value_to_display = {value: display for display, value in values}
             display_var = tk.StringVar(value=value_to_display[variable.get()])
             selector = ttk.Combobox(
-                task,
+                options,
                 textvariable=display_var,
                 values=tuple(display_to_value),
                 state="readonly",
@@ -1582,45 +1624,41 @@ class CollectorGUI:
             self.mode_selectors.append(selector)
             self.mode_display_vars.append(display_var)
 
-        ttk.Label(task, text="Dataset", width=18).grid(row=3, column=0, sticky="w", pady=3)
+        ttk.Label(task, text="Dataset", width=18).grid(row=0, column=0, sticky="w", pady=3)
         self.dataset_name_entry = ttk.Combobox(
             task,
             textvariable=self.dataset_name_var,
             values=(),
             state="readonly",
         )
-        self.dataset_name_entry.grid(row=3, column=1, sticky="ew", pady=3, padx=(8, 0))
+        self.dataset_name_entry.grid(row=0, column=1, sticky="ew", pady=3, padx=(8, 0))
         self.dataset_name_entry.bind("<<ComboboxSelected>>", self._dataset_selection_changed)
-        ttk.Label(task, text="Task name", width=18, style="Card.TLabel").grid(row=4, column=0, sticky="w", pady=4)
+        self.edit_dataset_button = ttk.Button(task, text="New", width=5, command=self.edit_dataset_name)
+        self.edit_dataset_button.grid(row=0, column=2, padx=(8, 0))
+        ttk.Label(task, text="Task", width=18, style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Label(
             task,
             textvariable=self.task_summary_var,
             style="Secondary.Card.TLabel",
             anchor="w",
-        ).grid(row=4, column=1, sticky="ew", pady=3, padx=(8, 0))
+        ).grid(row=1, column=1, sticky="ew", pady=3, padx=(8, 0))
         ttk.Button(
             task,
-            text="...",
-            width=3,
+            text="Edit",
+            width=5,
             command=self.open_task_settings,
-        ).grid(row=4, column=2, sticky="e", pady=3, padx=(8, 0))
-        ttk.Label(task, text="Instruction", width=18, style="Card.TLabel").grid(row=5, column=0, sticky="w", pady=4)
+        ).grid(row=1, column=2, sticky="e", pady=3, padx=(8, 0))
+        ttk.Label(options, text="Instruction", width=18, style="Card.TLabel").grid(row=3, column=0, sticky="w", pady=4)
         ttk.Label(
-            task,
+            options,
             textvariable=self.instruction_summary_var,
             style="Secondary.Card.TLabel",
             anchor="w",
             justify="left",
             wraplength=360,
-        ).grid(row=5, column=1, sticky="ew", pady=3, padx=(8, 0))
-        ttk.Button(
-            task,
-            text="...",
-            width=3,
-            command=self.open_task_settings,
-        ).grid(row=5, column=2, sticky="e", pady=3, padx=(8, 0))
-        device_bar = ttk.Frame(task, style="Card.TFrame")
-        device_bar.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        ).grid(row=3, column=1, columnspan=2, sticky="ew", pady=3, padx=(8, 0))
+        device_bar = ttk.Frame(options, style="Card.TFrame")
+        device_bar.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         device_bar.columnconfigure(0, weight=1)
         ttk.Label(
             device_bar,
@@ -1629,12 +1667,9 @@ class CollectorGUI:
             justify="left",
             wraplength=360,
         ).grid(row=0, column=0, sticky="w", padx=(0, 10))
-        self.device_settings_button = ttk.Button(
-            device_bar,
-            text="Device settings...",
-            command=self.open_device_settings,
-        )
-        self.device_settings_button.grid(row=0, column=1, sticky="e")
+        self.collection_settings_button = ttk.Button(
+            task, text="Settings +", command=self._toggle_collection_settings)
+        self.collection_settings_button.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         self.connection_entries = []
         self.device_rows = {"single": [], "bimanual": []}
         self.device_entries = []
@@ -1648,29 +1683,56 @@ class CollectorGUI:
         self.connect_button = ttk.Button(controls, text="Connect devices", command=self.toggle_connection, style="Accent.TButton")
         self.connect_button.grid(row=0, column=1, padx=3, pady=3, sticky="ew")
         self.start_button = ttk.Button(controls, text="Start episode", command=self.start_episode, state="disabled", style="Coral.TButton")
-        self.start_button.grid(row=0, column=2, padx=3, pady=3, sticky="ew")
+        self.start_button.grid(row=1, column=0, padx=3, pady=3, sticky="ew")
         self.stop_button = ttk.Button(controls, text="Stop episode", command=self.stop_episode, state="disabled", style="Violet.TButton")
-        self.stop_button.grid(row=1, column=0, padx=3, pady=3, sticky="ew")
+        self.stop_button.grid(row=1, column=1, padx=3, pady=3, sticky="ew")
+        self.device_settings_button = ttk.Button(controls, text="Devices...", command=self.open_device_settings)
+        self.device_settings_button.grid(row=0, column=2, padx=3, pady=3, sticky="ew")
         self.swap_camera_button = ttk.Checkbutton(
-            controls,
+            options,
             text="Swap wrist cameras",
             variable=self.swap_wrist_cameras_var,
             command=self.swap_camera_roles,
         )
-        self.swap_camera_button.grid(row=1, column=1, padx=3, pady=3, sticky="ew")
-        ttk.Button(controls, text="Refresh files", command=self.refresh_files).grid(
-            row=1, column=2, padx=3, pady=3, sticky="ew"
-        )
-        ttk.Button(controls, text="Replay episode", command=self.replay_selected).grid(
-            row=2, column=0, padx=3, pady=3, sticky="ew"
-        )
-        self.edit_dataset_button = ttk.Button(controls, text="Add dataset...", command=self.edit_dataset_name)
-        self.edit_dataset_button.grid(row=2, column=1, padx=3, pady=3, sticky="ew")
-        self.exit_button = ttk.Button(controls, text="Exit", command=self.close)
-        self.exit_button.grid(row=2, column=2, padx=3, pady=3, sticky="ew")
-        ttk.Label(controls, text="Space starts or stops an episode", foreground=colors["secondary"]).grid(
-            row=3, column=0, columnspan=3, sticky="w", padx=3, pady=(5, 0)
-        )
+        self.swap_camera_button.grid(row=8, column=0, columnspan=2, padx=3, pady=3, sticky="w")
+        ttk.Label(controls, text="Control source").grid(row=2, column=0, sticky="w", padx=3)
+        quest_source = ttk.Combobox(controls, textvariable=self.collection_control_source_var,
+                                   values=("passive", "quest_vr"), state="readonly", width=14)
+        quest_source.grid(row=2, column=1, columnspan=2, sticky="ew", padx=3, pady=3)
+        quest_source.bind('<<ComboboxSelected>>', lambda _: self._refresh_quest_devices())
+        self.mode_selectors.append(quest_source)
+        self.quest_stop_button = ttk.Button(controls, text="VR STOP", command=self._quest_emergency_stop)
+        self.quest_stop_button.grid(row=1, column=2, sticky="ew", padx=3)
+        ttk.Label(options, text="Quest model").grid(row=4, column=0, sticky="w", padx=3)
+        self.quest_model_entry = ttk.Entry(options, textvariable=self.quest_model_dir_var)
+        self.quest_model_entry.grid(row=4, column=1, columnspan=2, sticky="ew", padx=3)
+        ttk.Label(options, text="VR / ADB serial").grid(row=5, column=0, sticky="w", padx=3)
+        self.quest_serial_entry = ttk.Combobox(options, textvariable=self.quest_adb_serial_var)
+        self.quest_serial_entry.grid(row=5, column=1, sticky="ew", padx=3)
+        self.quest_refresh_button = ttk.Button(options, text="Refresh VR", command=self._refresh_quest_devices)
+        self.quest_refresh_button.grid(row=5, column=2, sticky="ew", padx=3)
+        ttk.Label(options, textvariable=self.quest_device_status_var, wraplength=440).grid(
+            row=6, column=0, columnspan=3, sticky="w", padx=3)
+        self.quest_controls = ttk.Frame(controls)
+        self.quest_controls.grid(row=3, column=0, columnspan=3, sticky="ew", padx=3, pady=3)
+        self.quest_controls.columnconfigure(0, weight=1)
+        self.quest_controls.columnconfigure(1, weight=1)
+        self.quest_reset_button = ttk.Button(self.quest_controls, text="Return to saved home",
+            command=lambda: self._request_collection_reset('saved'), state="disabled")
+        self.quest_reset_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ttk.Button(self.quest_controls, text="Controls help", command=self._show_collection_help).grid(
+            row=0, column=1, sticky="ew", padx=(3, 0))
+        self.quest_save_pose_button = ttk.Button(options, text="Save current pose as home",
+            command=self._save_collection_reset_pose, state="disabled")
+        self.quest_save_pose_button.grid(row=9, column=0, columnspan=3, sticky="ew", pady=4)
+        self.quest_live_card, quest_input = make_card(right, "VR input")
+        self.quest_live_card.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(quest_input, textvariable=self.quest_status_var, wraplength=700).pack(anchor="w")
+        ttk.Label(quest_input, textvariable=self.quest_input_status_var, wraplength=420).pack(anchor="w")
+        for var in self.quest_hand_vars.values():
+            ttk.Label(quest_input, textvariable=var, wraplength=420).pack(anchor="w", pady=2)
+        self.collection_control_source_var.trace_add('write', lambda *_: self._update_collection_source_ui())
+        self._update_collection_source_ui()
 
         arm_data_card, arm_data = make_card(left, "Robot and collection status")
         arm_data_card.grid(row=2, column=0, sticky="ew", pady=(0, 10))
@@ -1718,6 +1780,7 @@ class CollectorGUI:
             files,
             columns=("dataset", "episode"),
             show="headings",
+            height=5,
             selectmode="extended",
             style="Episodes.Treeview",
         )
@@ -1754,6 +1817,10 @@ class CollectorGUI:
             command=self.open_dataset_tools,
         )
         self.dataset_tools_button.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+        ttk.Button(file_actions, text="Replay selected", command=self.replay_selected).grid(
+            row=1, column=0, sticky="ew", padx=(0, 3), pady=(4, 0))
+        ttk.Button(file_actions, text="Refresh", command=self.refresh_files).grid(
+            row=1, column=1, sticky="ew", padx=(3, 0), pady=(4, 0))
 
         preview_card, preview = make_card(right, "Live cameras")
         preview_card.grid(row=0, column=0, sticky="nsew")
@@ -2281,7 +2348,7 @@ class CollectorGUI:
         for row, (name, label) in enumerate((
                 ("eef_goal_position_tolerance_m", "Recovery arrival distance (m)"),
                 ("eef_goal_rotation_tolerance_rad", "Recovery arrival angle (rad)"),
-                ("eef_goal_timeout_s", "Recovery arrival timeout (s)")), start=4):
+                ("eef_goal_timeout_s", "Recovery phase timeout (s)")), start=4):
             ttk.Label(gripper_tab, text=label).grid(row=row, column=0, sticky="w", pady=5)
             ttk.Entry(gripper_tab, textvariable=self.inference_eef_goal_vars[name], width=9).grid(row=row, column=2, sticky="e")
         ttk.Label(gripper_tab, text="Normal EEF tracking stays continuous. IK recovery holds grip until arrival; timeout stops motion.",
@@ -2309,7 +2376,7 @@ class CollectorGUI:
         )
         self.inference_stop_button.pack(side="left")
         self.inference_return_button = ttk.Button(
-            buttons, text="回到原始位置", command=self.return_inference_to_initial,
+            buttons, text="Return to saved home", command=self.return_inference_to_initial,
             state="disabled")
         self.inference_return_button.pack(side="left", padx=(8, 0))
         self.inference_next_button = ttk.Button(
@@ -2319,6 +2386,23 @@ class CollectorGUI:
             state="disabled",
         )
         self.inference_next_button.pack(side="left", padx=(8, 0))
+        recap_frame = ttk.LabelFrame(action, text="VR RECAP", padding=6)
+        recap_frame.grid(row=3, column=0, sticky="ew", pady=6)
+        ttk.Checkbutton(recap_frame, text="Record human takeovers",
+                        variable=self.recap_enabled_var).pack(anchor="w")
+        recap_buttons = ttk.Frame(recap_frame)
+        recap_buttons.pack(fill="x")
+        for command, label in (("takeover", "Take over"), ("resume", "Resume policy"),
+                               ("success", "Success"), ("failure", "Failure"), ("aborted", "Abort")):
+            button = ttk.Button(recap_buttons, text=label, state="disabled",
+                                command=lambda command=command: self._request_recap(command))
+            button.pack(side="left", padx=3)
+            self.recap_buttons[command] = button
+        ttk.Label(recap_frame, textvariable=self.recap_status_var, wraplength=700).pack(anchor="w")
+        ttk.Label(recap_frame, text="Y/B: clutch. Trigger: gripper. Release Y/B before re-engaging.",
+                  foreground="#68707d").pack(anchor="w")
+        ttk.Button(recap_frame, text="Export labelled episodes...", command=self._export_recap_runs).pack(anchor="w", pady=4)
+        ttk.Button(recap_frame, text="Upload RECAP dataset...", command=self._upload_recap_dataset).pack(anchor="w")
         ttk.Label(
             action,
             textvariable=self.inference_status_var,
@@ -2581,8 +2665,7 @@ class CollectorGUI:
         if self.inference_stop_button is not None:
             self.inference_stop_button.configure(state="normal" if running and not self.inference_stop_requested else "disabled")
         if getattr(self, "inference_return_button", None) is not None:
-            pose_path = self.inference_return_pose_path
-            available = (pose_path is not None and pose_path.is_file()
+            available = (RETURN_POSE_PATH.is_file()
                          and not self.inference_stop_requested and not self.inference_return_only
                          and not self.recording and self.piper is None)
             self.inference_return_button.configure(state="normal" if available else "disabled")
@@ -2616,6 +2699,8 @@ class CollectorGUI:
         selector_state = "readonly" if enabled else "disabled"
         for selector in self.mode_selectors:
             selector.configure(state=selector_state)
+        for entry in (self.quest_model_entry, self.quest_serial_entry):
+            entry.configure(state="normal" if enabled else "disabled")
         for selector in self.inference_mode_selectors:
             selector.configure(state=selector_state)
         self.device_settings_button.configure(state="normal" if enabled else "disabled")
@@ -2636,6 +2721,32 @@ class CollectorGUI:
         if self.inference_connect_button is not None:
             self.inference_connect_button.configure(state="normal" if enabled else "disabled")
         self._update_mode_controls()
+
+    def _toggle_collection_settings(self):
+        if self.collection_options_frame.winfo_manager():
+            self.collection_options_frame.grid_remove()
+            self.collection_settings_button.configure(text="Settings +")
+        else:
+            self.collection_options_frame.grid()
+            self.collection_settings_button.configure(text="Settings -")
+
+    def _update_collection_source_ui(self):
+        vr = self.collection_control_source_var.get() == 'quest_vr'
+        for widget in (self.quest_controls, self.quest_live_card, self.quest_stop_button):
+            if vr:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+    def _show_collection_help(self):
+        messagebox.showinfo(
+            "Collection controls",
+            "Space: start/stop an episode.\n"
+            "Hold Y (left) / B (right): move the arm. Release: hold position.\n"
+            "Trigger: 0 = released, 1 = fully pressed.\n"
+            "X: start/stop recording. Hold A for 1 second: return to the connection pose.\n"
+            "Return to saved home: use the fixed pose in return_pose.json.\n"
+            "Release Y/B before any return or re-engagement.", parent=self.root)
 
     def _refresh_dataset_choices(self) -> None:
         if hasattr(self, "dataset_name_entry"):
@@ -3140,6 +3251,10 @@ class CollectorGUI:
             or self.cameras is None
             or self.recording
             or self._dataset_task_running()
+            or (getattr(self, 'session', None) is not None
+                and (self.session.state is not SessionState.READY
+                     or (self.session.quest_controller is not None
+                         and self.session.quest_controller.resetting)))
         ):
             state = "disabled"
         else:
@@ -3452,21 +3567,29 @@ class CollectorGUI:
                 else None
             ),
         )
-        if return_pose_matches_inference_config(
-            RETURN_POSE_PATH,
-            arm_mode=self.arm_mode,
-            arm_side=self.arm_side,
-            can=self.can_var.get(),
-            left_can=self.left_can_var.get(),
-            right_can=self.right_can_var.get(),
-        ):
-            command += ["--return-target-file", str(RETURN_POSE_PATH)]
+        # Automatic shutdown return uses the measured session-start pose.
+        # The fixed home file is used only by an explicit Return action.
         endpoint = f"{self.inference_host_var.get().strip()}:{port}"
+        if getattr(self, "recap_enabled_var", None) is not None and self.recap_enabled_var.get():
+            if self.inference_eef_control_mode_var.get() != "local_ik_joint" or not ruckig:
+                raise ValueError("VR RECAP requires local_ik_joint and Ruckig for policy control; manual control bypasses Ruckig")
+            if self.recap_directory is not None:
+                self.recap_directory.cleanup()
+            self.recap_directory = tempfile.TemporaryDirectory(prefix="bimanual-recap-")
+            self.recap_session_id = uuid.uuid4().hex
+            self.recap_pending_id = None
+            command += ["--recap-control-dir", self.recap_directory.name,
+                        "--recap-session-id", self.recap_session_id,
+                        "--recap-quest-model-dir", self.quest_model_dir_var.get().strip(),
+                        "--recap-adb-serial", self.quest_adb_serial_var.get().strip()]
         if self.inference_async_enabled_var.get() and trigger_mode == "chunk_step":
             return command, f"{endpoint} @ chunk step {trigger_step}, control {control_hz:g} Hz"
         return command, f"{endpoint} @ {hz:g} Hz"
 
     def start_inference(self) -> None:
+        if self._dataset_task_running():
+            messagebox.showwarning("Cannot start inference", "Wait for the data conversion/upload task to finish.")
+            return
         if self._replay_running():
             messagebox.showwarning("Cannot start inference", "Stop hardware replay first.")
             return
@@ -3581,28 +3704,26 @@ class CollectorGUI:
             return
         if self._inference_running():
             self.inference_restart_requested = False
-            # A preview-only bridge sends no commands and therefore skips
-            # automatic return. Launch the explicit return after it releases CAN.
-            self.inference_return_after_stop = "--allow-execution" not in (self.inference_session_command or [])
+            # Stop/settle the session first, then perform the separate explicit
+            # fixed-home return after the bridge releases its CAN handles.
+            self.inference_return_after_stop = True
             self.stop_inference()
-            self.inference_status_var.set("正在停止推理并回到原始位置…")
+            self.inference_status_var.set("Stopping inference before returning to saved home...")
             return
-        if not self.inference_return_pose_path:
-            return
-        if not self.inference_session_command:
-            try:
+        try:
+            if not return_pose_matches_inference_config(
+                RETURN_POSE_PATH, arm_mode=self.arm_mode, arm_side=self.arm_side,
+                can=self.can_var.get(), left_can=self.left_can_var.get(), right_can=self.right_can_var.get()):
+                raise ValueError("No saved home matches the current arms and CAN bindings")
+            if self.inference_session_command:
+                command = list(self.inference_session_command)
+            else:
                 command, _ = self._validate_inference_settings()
-            except (ValueError, OSError) as exc:
-                messagebox.showerror("Cannot return", str(exc))
-                return
-            self.inference_session_command = command + ["--initial-pose-file", str(self.inference_return_pose_path)]
-        command = list(self.inference_session_command)
-        # Clicking Return explicitly authorizes this return-only operation;
-        # it does not change execution permission for future inference runs.
-        if "--allow-execution" not in command:
-            command.append("--allow-execution")
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Cannot return", str(exc))
+            return
         self.inference_return_only = True
-        self._launch_inference_process(command + ["--return-only"], "回到原始位置")
+        self._launch_inference_process(build_return_home_command(command, RETURN_POSE_PATH), "Return to saved home")
 
     def stop_inference(self) -> None:
         if self.inference_stop_requested:
@@ -3636,6 +3757,97 @@ class CollectorGUI:
         except OSError as exc:
             self.status_var.set(f"Could not trigger next inference: {exc}")
 
+    def _upload_recap_dataset(self):
+        if self._inference_running() or self.recording or self._dataset_task_running():
+            messagebox.showinfo("RECAP upload", "Stop inference, recording, and data tasks first.")
+            return
+        from tkinter import filedialog
+        source = filedialog.askdirectory(parent=self.root, title="Select an exported RECAP dataset",
+            initialdir=self.prepared_lerobot_path or str(self.dataset_root_dir))
+        if not source:
+            return
+        try:
+            source = pathlib.Path(source)
+            info = json.loads((source / "meta/info.json").read_text())
+            if info.get("recap", {}).get("version") != 1:
+                raise ValueError("This directory is not an exported RECAP dataset")
+            token = self.dataset_token_var.get().strip()
+            if len(token) < 20:
+                self.open_dataset_tools()
+                raise ValueError("Configure the Dashboard address and token in data tools before uploading")
+            offset = info.get("arm_base_offset") or self._dataset_arm_base_offset("upload")
+            command = build_dataset_tool_command(python_executable=sys.executable,
+                module_name=DATA_UPLOAD_MODULE, source_dir=source, dataset_name=source.name,
+                fps=None, action="upload", server=self.dataset_server_var.get(),
+                workers=int(self.dataset_workers_var.get()), install_mode="install", arm_base_offset=offset,
+                allow_incomplete_gripper_coverage=self.dataset_allow_gripper_var.get())
+            command += ["--dataset-origin", "real"]
+            environment = os.environ.copy()
+            environment["BIMANUAL_VLA_SERVER_TOKEN"] = token
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("RECAP upload", str(exc))
+            return
+        self._launch_dataset_command(command, "RECAP upload", environment)
+
+    def _export_recap_runs(self):
+        if self._inference_running() or self.recording or self._dataset_task_running():
+            messagebox.showinfo("RECAP export", "Stop inference and recording, and wait for data tasks to finish.")
+            return
+        from bimanual_vla.collection.recap_gui import choose_export
+        selected = choose_export(self.root,
+            pathlib.Path(os.environ.get("BIMANUAL_VLA_RECORD_ROOT", PROJECT_ROOT / "deployment_runs")),
+            self.dataset_root_dir)
+        if selected is None:
+            return
+        runs, destination = selected
+        command = [sys.executable, "-m", "bimanual_vla.data.recap_export", *map(str, runs),
+                   "--output", str(destination)]
+        try:
+            offset = self._dataset_arm_base_offset("prepare")
+        except ValueError as exc:
+            messagebox.showerror("RECAP export", str(exc))
+            return
+        if offset is not None:
+            command += ["--arm-base-offset", *map(str, offset)]
+        self.prepared_lerobot_path = None
+        self._launch_dataset_command(command, "RECAP export", os.environ.copy(), prepared_path=destination)
+
+    def _request_recap(self, command):
+        if not self._inference_running() or self.recap_directory is None or self.recap_pending_id:
+            return
+        from bimanual_vla.deployment.recap import atomic_json
+        self.recap_pending_id = uuid.uuid4().hex
+        atomic_json(pathlib.Path(self.recap_directory.name) / "request.json",
+                    dict(session_id=self.recap_session_id, id=self.recap_pending_id, command=command))
+        self.recap_status_var.set("Waiting for the controller to complete the handoff...")
+        for button in self.recap_buttons.values():
+            button.configure(state="disabled")
+
+    def _poll_recap(self):
+        if getattr(self, "recap_directory", None) is None:
+            return
+        try:
+            status = json.loads((pathlib.Path(self.recap_directory.name) / "status.json").read_text())
+        except (OSError, ValueError):
+            return
+        if status.get("session_id") != self.recap_session_id:
+            return
+        if status.get("request_id") == self.recap_pending_id:
+            self.recap_pending_id = None
+        available = (self._inference_running() and not self.recap_pending_id
+                     and time.time() - status.get("timestamp", 0) < 2
+                     and status.get("ready", False)
+                     and not status.get("error") and not status.get("finished"))
+        owner = status.get("owner")
+        for command, button in self.recap_buttons.items():
+            enabled = available and (command not in {"takeover", "resume"}
+                                    or (command == "takeover" and owner == "policy")
+                                    or (command == "resume" and owner == "human"))
+            button.configure(state="normal" if enabled else "disabled")
+        if not self.recap_pending_id:
+            self.recap_status_var.set(f"Owner: {owner} | Outcome: {status.get('outcome')} | "
+                                      f"{status.get('error') or status.get('vr_status', '')}")
+
     def _finish_inference(self, return_code: int | None, requested: bool) -> None:
         process = getattr(self, "inference_process", None)
         if process is not None and process.poll() is not None:
@@ -3662,7 +3874,7 @@ class CollectorGUI:
         else:
             self.inference_status_var.set(f"Inference exited with code {return_code}")
         if was_return_only:
-            self.inference_status_var.set("已回到原始位置" if return_code == 0 else "回位失败，请查看日志")
+            self.inference_status_var.set("Returned to saved home" if return_code == 0 else "Return failed; see log")
         self._set_connection_config_enabled(True)
         self._update_mode_controls()
         if return_code == 0 and return_after_stop:
@@ -3697,6 +3909,38 @@ class CollectorGUI:
         message = str(payload)
         self.status_var.set(f"CAN activation failed: {message}")
         messagebox.showerror("CAN activation failed", message)
+
+    def _refresh_quest_devices(self):
+        if self._quest_scan_busy:
+            return
+        self._quest_scan_busy = True
+        self.quest_refresh_button.configure(state='disabled')
+        self.quest_device_status_var.set('Scanning ADB devices...')
+        def worker():
+            from bimanual_vla.collection.quest.devices import discover_devices
+            try:
+                self.messages.put(('quest_devices', discover_devices(), None))
+            except Exception as exc:
+                self.messages.put(('quest_devices', [], str(exc)))
+        threading.Thread(target=worker, name='quest-device-scan', daemon=True).start()
+
+    def _finish_quest_devices(self, devices, error):
+        from bimanual_vla.collection.quest.devices import select_serial
+        self._quest_scan_busy = False
+        self.quest_refresh_button.configure(state='normal')
+        self.quest_serial_entry.configure(values=tuple(d.serial for d in devices))
+        if error:
+            self.quest_device_status_var.set(error)
+            return
+        try:
+            # Read the field now, not when scanning began: preserve user edits.
+            selected = select_serial(devices, self.quest_adb_serial_var.get())
+            if self.piper is None and not self._inference_running() and not self._replay_running():
+                self.quest_adb_serial_var.set(selected)
+            device = next(d for d in devices if d.serial == selected)
+            self.quest_device_status_var.set(f'Device: {device.model or "ADB device"} · {selected}')
+        except RuntimeError as exc:
+            self.quest_device_status_var.set(str(exc))
 
     def toggle_connection(self):
         if self._replay_running():
@@ -3739,6 +3983,9 @@ class CollectorGUI:
                     cam_left_wrist_device=self.left_wrist_var.get().strip(),
                     cam_right_wrist_device=self.right_wrist_var.get().strip(),
                     rlsok_resolver=self.rlsok_resolver_var.get().strip(),
+                    control_source=self.collection_control_source_var.get(),
+                    quest_model_dir=self.quest_model_dir_var.get().strip(),
+                    quest_adb_serial=self.quest_adb_serial_var.get().strip(),
                 )
             )
             checks = self.session.connect()
@@ -3886,6 +4133,9 @@ class CollectorGUI:
         self.root.after_idle(clear_if_main_still_focused)
 
     def start_episode(self):
+        if getattr(self, '_pending_collection_reset', None) is not None:
+            self.status_var.set('Save the current episode and finish resetting first')
+            return
         if self._replay_running():
             messagebox.showwarning("Cannot collect", "Stop hardware replay before starting an episode.")
             return
@@ -3920,6 +4170,141 @@ class CollectorGUI:
         self.progress_var.set("Frames: 0")
         self._update_dataset_action_buttons()
 
+    def _quest_emergency_stop(self):
+        self._pending_collection_reset = None
+        if self.session is not None and self.session.quest_controller is not None:
+            try:
+                self.session.quest_controller.emergency_stop()
+            except Exception as exc:
+                logging.exception("VR emergency stop failed")
+                self.status_var.set(f"VR EMERGENCY STOP FAILED: {exc}; use the hardware stop")
+                return
+            self.status_var.set("VR emergency stop requested; reconnect required")
+
+    def _request_collection_reset(self, source):
+        if self.session is None or self.session.quest_controller is None:
+            return
+        if self._replay_running() or self._inference_running():
+            self.status_var.set('Stop replay and inference before returning home')
+            return
+        controller = self.session.quest_controller
+        if controller.resetting:
+            return
+        try:
+            joints = None
+            if source == 'saved':
+                if not return_pose_matches_inference_config(RETURN_POSE_PATH,
+                        arm_mode=self.arm_mode, arm_side=self.arm_side, can=self.can_var.get(),
+                        left_can=self.left_can_var.get(), right_can=self.right_can_var.get()):
+                    raise ValueError('No saved home matches the current arms and CAN bindings; save a home pose in Settings')
+                saved = json.loads(RETURN_POSE_PATH.read_text())
+                q = np.asarray(saved['qpos'], dtype=float)
+                joints = {s: q[i*7:i*7+6].copy() for i,s in enumerate(controller.clutches)}
+            # The tuple distinguishes the initial-pose request (None) from no request.
+            self._pending_collection_reset = (joints,)
+            if self.recording:
+                self.stop_episode()
+                self.status_var.set('Recording stopped; save or discard this episode before returning home')
+            elif self.session.state is SessionState.REVIEW:
+                self.status_var.set('Save or discard this episode before returning home')
+            else:
+                self._execute_pending_collection_reset()
+        except Exception as exc:
+            self._pending_collection_reset = None
+            self.status_var.set(f'Cannot return home: {exc}')
+
+    def _execute_pending_collection_reset(self):
+        pending = self._pending_collection_reset
+        if pending is None or self.session is None or self.session.state is not SessionState.READY:
+            return
+        self._pending_collection_reset = None
+        try:
+            self.session.request_quest_reset(pending[0])
+            self._update_start_button()
+            self.status_var.set('Returning home; gripper target unchanged. Release Y/B before re-engaging.')
+        except Exception as exc:
+            self.status_var.set(f'Cannot return home: {exc}')
+
+    def _save_collection_reset_pose(self):
+        if self.session is None or self.session.quest_controller is None:
+            return
+        controller = self.session.quest_controller
+        if (self.session.state is not SessionState.READY or controller.resetting
+                or any(c.active for c in controller.clutches.values())):
+            self.status_var.set('Finish and save this episode, then release Y/B before saving a home pose')
+            return
+        try:
+            from bimanual_vla.deployment.recap import atomic_json
+            measured = controller.snapshot_feedback()
+            qpos = np.concatenate([np.r_[q[:6].astype(float), float(q[6])*.07] for q in measured.values()])
+            RETURN_POSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            if RETURN_POSE_PATH.exists():
+                backup = RETURN_POSE_PATH.with_name(f"return_pose.before_save_{uuid.uuid4().hex}.json")
+                shutil.copy2(RETURN_POSE_PATH, backup)
+            atomic_json(RETURN_POSE_PATH, dict(qpos=qpos.tolist(), arm_mode=self.arm_mode,
+                arm_side=self.arm_side, can=self.can_var.get(), left_can=self.left_can_var.get(),
+                right_can=self.right_can_var.get(), safe_to_return=False))
+            self.status_var.set('Saved home pose to return_pose.json')
+        except Exception as exc:
+            self.status_var.set(f'Could not save home pose: {exc}')
+
+    def _poll_quest_actions(self):
+        controller = self.session.quest_controller if self.session is not None else None
+        available = controller is not None and controller.error is None and not controller.resetting
+        self.quest_reset_button.configure(state='normal' if available else 'disabled')
+        self.quest_save_pose_button.configure(state='normal' if available and not self.recording else 'disabled')
+        if controller is None:
+            self._pending_collection_reset = None
+            return
+        while True:
+            try:
+                action = controller.ui_actions.get_nowait()
+            except queue.Empty:
+                break
+            if action == 'toggle_record' and not controller.resetting:
+                if self.recording:
+                    self.stop_episode()
+                elif self.session.state is SessionState.READY:
+                    self.start_episode()
+                else:
+                    self.status_var.set('Review this episode: save as success/failure or discard')
+            elif action == 'reset_initial':
+                self._request_collection_reset('initial')
+            elif action == 'reset_done':
+                self.status_var.set('Return complete; release Y/B before re-engaging')
+                self._update_start_button()
+        self._execute_pending_collection_reset()
+
+    def _update_quest_input(self):
+        """Read only the existing thread-safe snapshot; no ADB or CAN I/O."""
+        controller = self.session.quest_controller if self.session is not None else None
+        sample = None
+        status = "VR collection disconnected"
+        if controller is not None:
+            reader = controller.reader
+            try:
+                sample = reader.snapshot()
+                status = f"No fresh data (timeout {reader.max_age_s * 1000:.0f} ms)"
+            except RuntimeError as exc:
+                status = f"VR input error: {exc}"
+        if sample is not None:
+            age = max(0., time.monotonic() - sample.received_monotonic)
+            status = f"Receiving | age {age * 1000:.0f} ms"
+        self.quest_input_status_var.set(status)
+        for side, label, hand, keys in (("left", "Left", "l", ("X", "Y")),
+                                        ("right", "Right", "r", ("A", "B"))):
+            if sample is None:
+                text = f"{label}: tracking -- | buttons -- | trigger --"
+            else:
+                tracking = "OK" if hand in sample.poses else "LOST"
+                buttons = "  ".join(
+                    f"{key}:{'DOWN' if sample.buttons[key] else 'up'}"
+                    if key in sample.buttons else f"{key}:--" for key in keys)
+                trigger = sample.buttons.get(side + "Trig")
+                value = f"{trigger[0]:.3f}" if trigger else "--"
+                text = f"{label}: {tracking} | {buttons} | trigger {value}"
+            self.quest_hand_vars[side].set(text)
+
     def _capture_loop(self):
         assert self.capture_stop is not None
         fps = self.capture_fps
@@ -3942,6 +4327,8 @@ class CollectorGUI:
                     count = self.session.frame_count if is_recording else 0
                 if is_recording:
                     self.messages.put(("progress", count))
+                if self.session is not None and self.session.quest_controller is not None:
+                    self.messages.put(("quest_status", self.session.quest_controller.status))
                 camera_paced = (fps == self.camera_fps and self.session is not None
                                 and hasattr(self.session.cameras, "read_next"))
                 delay = 0 if camera_paced else dt - (time.monotonic() - t0)
@@ -4034,6 +4421,9 @@ class CollectorGUI:
                 self.arm_state_vars[side].set("Waiting for data")
 
     def _poll_messages(self):
+        self._poll_recap()
+        self._poll_quest_actions()
+        self._update_quest_input()
         with self.data_lock:
             preview = {key: value.copy() for key, value in self.latest_images.items()}
             state = None if self.latest_state is None else self.latest_state.copy()
@@ -4049,6 +4439,10 @@ class CollectorGUI:
                 kind, *payload = self.messages.get_nowait()
                 if kind == "progress":
                     self.progress_var.set(f"Recorded frames: {payload[0]}")
+                elif kind == "quest_status":
+                    self.quest_status_var.set(payload[0])
+                elif kind == "quest_devices":
+                    self._finish_quest_devices(payload[0], payload[1])
                 elif kind == "error":
                     self.status_var.set(f"Collection error: {payload[0]}")
                     if self.recording:
@@ -4398,6 +4792,12 @@ class CollectorGUI:
         else:
             self._append_dataset_log(f"Source NPZ episodes: {source_episode_count}")
 
+        self._launch_dataset_command(command, label, environment)
+
+    def _launch_dataset_command(self, command, label, environment, *, prepared_path=None):
+        self.dataset_task_name = label
+        self.status_var.set(f"Running {label}...")
+
         def worker():
             error: str | None = None
             return_code = -1
@@ -4416,6 +4816,8 @@ class CollectorGUI:
                 for line in process.stdout:
                     self.messages.put(("dataset_log", line.rstrip("\n")))
                 return_code = process.wait()
+                if return_code == 0 and prepared_path is not None:
+                    self.messages.put(("dataset_log", f"PREPARED_LEROBOT_PATH={prepared_path}"))
             except Exception as exc:
                 error = str(exc)
             finally:
@@ -4452,7 +4854,7 @@ class CollectorGUI:
             message = f"{label} failed: {error}"
         elif return_code != 0:
             message = f"{label} failed with exit code {return_code}; see progress log"
-        elif label == "LeRobot conversion" and self.prepared_lerobot_path:
+        elif label in {"LeRobot conversion", "RECAP export"} and self.prepared_lerobot_path:
             message = f"{label} completed: {self.prepared_lerobot_path}"
         else:
             message = f"{label} completed successfully"

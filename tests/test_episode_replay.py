@@ -941,3 +941,24 @@ def test_real_enable_boundary_alignment_never_publishes_negative_j2():
         states = [e['state'] for e in events]
         assert states.index('aligning_start_boundary') < states.index('enabled_hold_ready')
         assert clock.time >= 100.8
+
+
+@pytest.mark.parametrize('opening', [-.0001, float(np.float32(-.0001)), -.000001, 0., .01])
+def test_closed_stop_offset_normalizes_feedback_only_and_preserves_raw(opening):
+    with enable_device() as (hardware, live, clock, calls, enabled, _):
+        live['right']['joint'][6] = opening
+        data = hardware.read(require_ready=False)['right']
+        assert data['raw_gripper_m'] == opening
+        assert data['joint'][6] == max(0., opening)
+        assert data['eef'][9] == max(0., opening)
+        assert live['right']['joint'][6] == opening
+        assert calls == []
+
+
+@pytest.mark.parametrize('opening', [-.000101, -.01, float('nan'), float('inf'), .092])
+def test_gripper_offset_does_not_admit_larger_invalid_readings(opening):
+    with enable_device() as (hardware, live, clock, calls, enabled, _):
+        live['right']['joint'][6] = opening
+        with pytest.raises(ReplayBlocked, match='invalid measured'):
+            hardware.read(require_ready=False)
+        assert calls == []

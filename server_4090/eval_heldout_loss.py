@@ -103,6 +103,8 @@ def _create_test_loader(
         config.model,
         episodes,
         action_offset=int(config.policy_metadata["action_offset"]),
+        recap_settings=config.policy_metadata.get("recap"),
+        recap_evaluation=True,
     )
     dataset = data_loader.transform_dataset(raw_dataset, concrete, skip_norm_stats=False)
     available_batches = len(dataset) // batch_size

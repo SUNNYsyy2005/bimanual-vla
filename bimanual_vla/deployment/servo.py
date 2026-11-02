@@ -720,6 +720,13 @@ class ServoLoop:
             self._last_reference = None
             self._condition.notify_all()
 
+    def last_published_command(self):
+        """Copy the actual sent target for an exclusive writer handoff."""
+        with self._condition:
+            if self._last_sample is None:
+                return None
+            return np.asarray(self._last_sample["command_qpos"], dtype=float).copy()
+
     def close(self, *, stop_timeout_s: float = 3.0) -> bool:
         """Brake before ending a healthy writer; report whether it settled.
 

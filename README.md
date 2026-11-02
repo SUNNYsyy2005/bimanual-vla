@@ -107,6 +107,8 @@ conversion/upload. It supports:
 
 - single-arm and bimanual collection;
 - master/slave teleoperation or output-arm feedback recording;
+- [Quest VR collection without ROS or Ruckig](docs/QUEST_COLLECTION.md), with linear trigger gripper control;
+- [VR RECAP intervention recording and RLinf-backed training](docs/RECAP.md);
 - overhead plus left/right wrist RGB streams;
 - `joint` and `delivery` data schemas;
 - success/failure labeling and guarded episode publication.

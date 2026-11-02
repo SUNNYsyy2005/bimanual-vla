@@ -18,6 +18,7 @@ import logging
 import os
 from pathlib import Path
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -205,7 +206,7 @@ try:
 except ImportError:  # Keep the OpenPI helper usable while collection code is staged separately.
     _piper_action_conventions = None
 
-from bimanual_vla.deployment.rtc_policy import RTCConfig, build_rtc_policy
+from bimanual_vla.deployment.rtc_policy import RTCConfig, RTCAwarePolicy, build_rtc_policy
 from bimanual_vla.training.settings import FinetuningSettings
 
 
@@ -684,6 +685,7 @@ def _write_action_convention_marker(config: training_config.TrainConfig) -> Path
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "finetuning": metadata.get("finetuning"),
+        "recap": metadata.get("recap"),
         "version": ACTION_CONVENTION_MARKER_VERSION,
         "dataset_id": metadata.get("dataset_id"),
         "schema": metadata.get("schema"),
@@ -1637,6 +1639,13 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
                                          legacy=args.command == "serve" or resume,
                                          resume=resume or args.command == "serve")
     settings.validate_model(model_variant)
+    from bimanual_vla.training.recap_settings import RecapSettings
+    requested_recap = getattr(args, "recap_config", None)
+    recap = RecapSettings(**((requested_recap or {}).get("settings") or (marker or {}).get("recap") or {}))
+    if (resume or args.command == "serve") and recap.to_dict() != RecapSettings(**((marker or {}).get("recap") or {})).to_dict():
+        raise ValueError("resume/serve must retain checkpoint RECAP conditioning settings")
+    if recap.enabled and (model_variant != "pi05" or contract.arm_mode != "bimanual" or contract.schema != "delivery"):
+        raise ValueError("RECAP currently requires pi05 bimanual delivery")
     base_checkpoint = Path(args.base_checkpoint).expanduser().resolve()
     if args.command == "train" and not resume:
         base_marker = _read_action_contract_marker(_checkpoint_marker_for_step(base_checkpoint))
@@ -1698,6 +1707,7 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
         wandb_enabled=getattr(args, "wandb_enabled", False),
         policy_metadata={
             "finetuning": settings.to_dict(),
+            "recap": recap.to_dict() if recap.enabled else None,
             "image_resize_mode": settings.image_resize_mode,
             "robot_type": "piper_bimanual" if contract.arm_mode == "bimanual" else "piper_single_arm",
             "model_variant": model_variant,
@@ -1820,6 +1830,9 @@ def _create_torch_dataset_for_episodes(
     *,
     action_offset: int,
     load_images: bool = True,
+    recap_artifacts: Path | None = None,
+    recap_settings: dict | None = None,
+    recap_evaluation: bool = False,
 ):
     repo_id = data_config.repo_id
     if repo_id is None:
@@ -1847,6 +1860,12 @@ def _create_torch_dataset_for_episodes(
         for index, episode_index in enumerate(dataset.hf_dataset["episode_index"])
         if int(episode_index) in selected_episodes
     ]
+    if recap_settings or getattr(dataset_meta, "info", {}).get("recap"):
+        from bimanual_vla.training.recap_adapter import policy_admission
+        admitted = policy_admission(_dataset_root() / repo_id, episodes, action_horizon, action_offset)
+        frame_ids = dataset.hf_dataset["frame_index"]
+        episode_ids = dataset.hf_dataset["episode_index"]
+        sample_indices = [i for i in sample_indices if int(frame_ids[i]) in admitted[int(episode_ids[i])]]
     if not sample_indices:
         raise ValueError(f"episode subset for {repo_id!r} contains no frames")
     dataset = data_loader.torch.utils.data.Subset(dataset, sample_indices)
@@ -1855,11 +1874,15 @@ def _create_torch_dataset_for_episodes(
             dataset,
             [transforms.PromptFromLeRobotTask(dataset_meta.tasks)],
         )
+    if recap_settings and not recap_evaluation:
+        from bimanual_vla.training.recap_adapter import ConditionedDataset
+        dataset = ConditionedDataset(dataset, recap_artifacts, recap_settings["unconditional_probability"])
     return dataset
 
 
 def _install_training_episode_subset(
-    dataset_id: str, episodes: tuple[int, ...], *, action_offset: int
+    dataset_id: str, episodes: tuple[int, ...], *, action_offset: int,
+    recap_artifacts: Path | None = None, recap_settings: dict | None = None,
 ) -> None:
     """Make upstream OpenPI's training loader consume only selected episodes."""
     original = data_loader.create_torch_dataset
@@ -1869,7 +1892,8 @@ def _install_training_episode_subset(
         if data_config.repo_id != dataset_id:
             return original(data_config, action_horizon, model_config)
         return _create_torch_dataset_for_episodes(
-            data_config, action_horizon, model_config, episodes, action_offset=action_offset
+            data_config, action_horizon, model_config, episodes, action_offset=action_offset,
+            recap_artifacts=recap_artifacts, recap_settings=recap_settings,
         )
 
     data_loader.create_torch_dataset = create_subset
@@ -2088,21 +2112,43 @@ def _require_extended_contract_fields(
 
 def run_train(args: argparse.Namespace) -> None:
     config = build_config(args)
+    dataset_info = json.loads((_dataset_root() / args.dataset_id / "meta/info.json").read_text())
+    if dataset_info.get("recap") and not config.policy_metadata.get("recap"):
+        raise ValueError("annotated RECAP rollouts require RECAP conditioning settings")
+    if config.checkpoint_dir.exists() and not (args.resume or args.overwrite):
+        raise FileExistsError(
+            f"checkpoint directory already exists: {config.checkpoint_dir}; use --resume or --overwrite"
+        )
     contract_fingerprint = complete_action_contract_fingerprint(config.policy_metadata)
     split = _resolve_training_split(args, contract_fingerprint)
     _require_extended_contract_fields(
         config.assets_dirs / args.dataset_id / NORM_CONFIG_FILENAME,
         contract_fingerprint,
     )
+    recap_artifacts = None
+    recap_settings = config.policy_metadata.get("recap")
+    if recap_settings:
+        from bimanual_vla.training.recap_adapter import policy_admission
+        for name, episodes in (("train", split.train_episodes), ("heldout", split.test_episodes)):
+            admitted = policy_admission(_dataset_root() / args.dataset_id, episodes,
+                config.model.action_horizon, int(config.policy_metadata["action_offset"]))
+            if not any(admitted.values()):
+                raise ValueError(f"RECAP {name} split has no complete valid action chunks; collect longer continuous segments")
+        if not getattr(args, "recap_config", None) or not args.recap_config.get("backend"):
+            raise ValueError("RECAP requires the staged RLinf backend configuration")
+        recap_artifacts = config.checkpoint_dir.parent / (config.checkpoint_dir.name + "_recap")
+        subprocess.run([sys.executable, str(Path(__file__).with_name("recap_pipeline.py")),
+                        "--dataset", str(_dataset_root() / args.dataset_id),
+                        "--output", str(recap_artifacts),
+                        "--train-episodes", json.dumps(split.train_episodes),
+                        "--test-episodes", json.dumps(split.test_episodes),
+                        "--config", json.dumps(args.recap_config)], check=True)
     _install_training_episode_subset(
         args.dataset_id,
         split.train_episodes,
         action_offset=int(config.policy_metadata["action_offset"]),
+        recap_artifacts=recap_artifacts, recap_settings=recap_settings,
     )
-    if config.checkpoint_dir.exists() and not (args.resume or args.overwrite):
-        raise FileExistsError(
-            f"checkpoint directory already exists: {config.checkpoint_dir}; use --resume or --overwrite"
-        )
     marker = _write_action_convention_marker(config)
     print(f"Writing action contract marker to: {marker}", flush=True)
     train_module = _load_upstream_train_module(Path.cwd())
@@ -3398,6 +3444,126 @@ class ImageTransportPolicy:
             reset()
 
 
+class DenoisingStepsPolicy:
+    """Apply Dashboard step updates at the next inference request."""
+
+    def __init__(self, policy: Any, steps: int, control_file: Path | None = None):
+        self.policy = policy
+        self.steps = steps
+        self.control_file = control_file
+        self._lock = threading.Lock()
+        self._jax_samplers: dict[int, Any] = {}
+        current = policy
+        self._has_rtc_adapter = False
+        while hasattr(current, "policy"):
+            if isinstance(current, RTCAwarePolicy):
+                self._has_rtc_adapter = True
+            current = current.policy
+        self._base_policy = current
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return self.policy.metadata
+
+    def _read_steps(self) -> int:
+        if self.control_file is None or not self.control_file.exists():
+            return self.steps
+        try:
+            value = json.loads(self.control_file.read_text())["denoising_steps"]
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 50:
+                raise ValueError("denoising_steps must be an integer in [1, 50]")
+            self.steps = value
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            logging.warning("Ignoring invalid denoising control file: %s", exc)
+        return self.steps
+
+    def _jax_sampler(self, steps: int) -> Any:
+        sampler = self._jax_samplers.pop(steps, None)
+        if sampler is None:
+            import types
+            from openpi.shared import nnx_utils
+
+            model = self._base_policy._model
+            original_method = model.sample_actions.__func__
+
+            def fixed_steps(module: Any, *args: Any, **kwargs: Any) -> Any:
+                return original_method(module, *args, num_steps=steps, **kwargs)
+
+            sampler = nnx_utils.module_jit(
+                types.MethodType(fixed_steps, model)
+            )
+        self._jax_samplers[steps] = sampler
+        if len(self._jax_samplers) > 4:
+            self._jax_samplers.pop(next(iter(self._jax_samplers)))
+        return sampler
+
+    def infer(self, observation: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            steps = self._read_steps()
+            base = self._base_policy
+            old_kwargs = getattr(base, "_sample_kwargs", {})
+            old_sampler = getattr(base, "_sample_actions", None)
+            if (not self._has_rtc_adapter
+                    and not bool(getattr(base, "_is_pytorch_model", False))):
+                base._sample_actions = self._jax_sampler(steps)
+            else:
+                base._sample_kwargs = {**(old_kwargs or {}), "num_steps": steps}
+            try:
+                result = dict(self.policy.infer(observation))
+                result["denoising_steps"] = steps
+                return result
+            finally:
+                base._sample_kwargs = old_kwargs
+                if old_sampler is not None:
+                    base._sample_actions = old_sampler
+
+    def reset(self) -> None:
+        reset = getattr(self.policy, "reset", None)
+        if callable(reset):
+            reset()
+
+
+class _CachedTokenizePrompt:
+    """Reuse tokenization for a fixed prompt, keeping outputs independent."""
+
+    def __init__(self, original: Any):
+        self.original = original
+        self._tokenize = functools.lru_cache(maxsize=32)(
+            lambda prompt: original.tokenizer.tokenize(prompt, None)
+        )
+
+    def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
+        if self.original.discrete_state_input:
+            return self.original(data)
+        prompt = data.get("prompt")
+        if prompt is None:
+            return self.original(data)
+        if not isinstance(prompt, str):
+            prompt = prompt.item()
+        tokens, mask = self._tokenize(prompt)
+        output = dict(data)
+        output.pop("prompt", None)
+        output["tokenized_prompt"] = np.array(tokens, copy=True)
+        output["tokenized_prompt_mask"] = np.array(mask, copy=True)
+        return output
+
+
+def install_cached_prompt_tokenization(policy: Any) -> bool:
+    """Cache only prompt tokens; image-dependent transformer KV stays fresh."""
+    input_transform = getattr(policy, "_input_transform", None)
+    if not isinstance(input_transform, transforms.CompositeTransform):
+        return False
+    steps = list(input_transform.transforms)
+    for index, step in enumerate(steps):
+        if isinstance(step, transforms.TokenizePrompt) and not step.discrete_state_input:
+            steps[index] = _CachedTokenizePrompt(step)
+            policy._input_transform = dataclasses.replace(
+                input_transform, transforms=tuple(steps)
+            )
+            return True
+    return False
+
+
 class TelemetryPolicy:
     def __init__(self, policy: Any, telemetry: PolicyTelemetry):
         self.policy = policy
@@ -3542,17 +3708,17 @@ def warmup_policy(policy: Any, metadata: dict[str, Any], prompt: str | None) -> 
 def run_serve(args: argparse.Namespace) -> None:
     _install_websocket_probe_filter()
     config = build_config(args)
+    default_prompt = args.default_prompt
+    if config.policy_metadata.get("recap") and default_prompt is not None:
+        from bimanual_vla.training.recap_adapter import advantage_prompt
+        default_prompt = advantage_prompt(default_prompt)
     policy = policy_config.create_trained_policy(
         config,
         Path(args.checkpoint).expanduser().resolve(),
-        default_prompt=args.default_prompt,
+        default_prompt=default_prompt,
     )
     policy_metadata = dict(config.policy_metadata)
-    # OpenPI's JAX NNX module_jit treats keyword arguments as traced values.
-    # Passing ``num_steps`` through ``_sample_kwargs`` therefore turns the
-    # Python validation in the Pi05 sampler into a TracerBoolConversionError.
-    # Keep the CLI option for compatibility and diagnostics, while using the
-    # sampler's compiled default (the same path as the upstream Policy).
+    policy_metadata["prompt_token_cache"] = install_cached_prompt_tokenization(policy)
     policy_metadata["denoising_steps"] = int(args.denoising_steps)
     policy_metadata["inference_diagnostics_enabled"] = bool(args.inference_diagnostics)
     if args.inference_diagnostics:
@@ -3627,6 +3793,16 @@ def run_serve(args: argparse.Namespace) -> None:
             "max_guidance_weight": 0.0,
             "prefix_attention_schedules": [],
         }
+    if policy_metadata.get("recap"):
+        from bimanual_vla.training.recap_adapter import PositivePolicy
+        policy = PositivePolicy(policy)
+        policy_metadata["recap_condition"] = "positive"
+        policy_metadata["recap_guidance_scale"] = 1.0
+    control_file = (
+        Path(args.denoising_control_file).expanduser().resolve()
+        if args.denoising_control_file else None
+    )
+    policy = DenoisingStepsPolicy(policy, int(args.denoising_steps), control_file)
     # Three raw 224x224 RGB frames are roughly 450 KB per request.  JPEG is
     # the safer default for the observed 4090 client link; raw remains
     # available explicitly for a benchmark on a genuinely uncongested LAN.
@@ -3668,6 +3844,8 @@ def run_serve(args: argparse.Namespace) -> None:
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--recap-config", type=json.loads, default=None,
+                        help="RECAP settings and staged RLinf backend paths; supplied by Dashboard")
     parser.add_argument("--image-resize-mode", choices=("pad", "stretch"), default=None)
     parser.add_argument("--action-expert-tuning", choices=("full", "lora"), default=None)
     parser.add_argument("--llm-lora", action=argparse.BooleanOptionalAction, default=None)
@@ -3801,8 +3979,10 @@ def parse_args() -> argparse.Namespace:
     serve.add_argument("--rtc-execution-horizon", type=int, default=12)
     serve.add_argument(
         "--denoising-steps", type=int, default=5,
-        help="reported flow-matching denoising steps (JAX sampler default is 5)",
+        help="flow-matching denoising steps (1-50; default 5)",
     )
+    serve.add_argument("--denoising-control-file", default=None,
+                       help="Dashboard-owned JSON file for live denoising-step changes")
     serve.add_argument("--rtc-max-guidance-weight", type=float, default=5.0)
     serve.add_argument("--rtc-mode", choices=("auto", "guided", "trained"), default="auto")
     serve.add_argument(
@@ -3838,8 +4018,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--test-ratio must be in [0, 1)")
     if hasattr(args, "rtc_execution_horizon") and args.rtc_execution_horizon <= 0:
         parser.error("--rtc-execution-horizon must be positive")
-    if hasattr(args, "denoising_steps") and args.denoising_steps <= 0:
-        parser.error("--denoising-steps must be positive")
+    if hasattr(args, "denoising_steps") and not 1 <= args.denoising_steps <= 50:
+        parser.error("--denoising-steps must be in [1, 50]")
     if hasattr(args, "rtc_max_guidance_weight") and args.rtc_max_guidance_weight <= 0:
         parser.error("--rtc-max-guidance-weight must be positive")
     if hasattr(args, "image_jpeg_quality") and not 1 <= args.image_jpeg_quality <= 100:

@@ -1934,11 +1934,15 @@ class DatasetEditor:
         base_info = _read_json(base / "meta" / "info.json")
         if not isinstance(base_info, dict):
             raise ValueError(f"invalid target dataset: {base}")
+        if base_info.get("recap"):
+            raise ValueError("RECAP annotations require aligned episode/frame IDs; re-export the selected recordings instead of editing or merging this dataset")
         base_contract = _contract_metadata(base_info)
         for source, _updates in sources[1:]:
             source_info = _read_json(source / "meta" / "info.json")
             if not isinstance(source_info, dict):
                 raise ValueError(f"invalid source dataset: {source}")
+            if source_info.get("recap"):
+                raise ValueError("RECAP datasets must be exported together; ordinary dataset merging would discard intervention annotations")
             _validate_compatible(base_info, source_info)
 
         candidate = self.dataset_root / f".{dataset_id}.editing-{uuid.uuid4().hex}"

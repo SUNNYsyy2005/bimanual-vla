@@ -8,28 +8,37 @@
 
 | CLI 参数 | 值 | 作用 |
 |---|---:|---|
-| `--ik-search-joint-radius-rad` | 0.30 | 相对实测关节的局部求解范围，容纳反馈滞后 |
-| `--ik-reference-joint-radius-rad` | **0.12** | 同时限制相对上一成功发布解的搜索范围，防止相邻解跳到搜索区间另一侧 |
+| `--ik-search-joint-radius-rad` | **0.40** | 相对实测关节的局部求解范围，容纳反馈滞后 |
+| `--ik-reference-joint-radius-rad` | **0.20** | 同时限制相对上一成功发布解的搜索范围（单步上限），防止相邻解跳到其他分支 |
 | `--ik-joint-regularization-weight` | **0.25** | 轻量偏好上一解，避免过强正则积累位姿误差 |
 | `--ik-position-tolerance-m` | **0.003** | 正常求解位置残差 3 mm |
 | `--ik-rotation-tolerance-rad` | 0.02 | 正常求解朝向残差约 1.15° |
 | `--ik-max-nfev` | 100 | 每次数值优化的评估上限；双臂批次及缩步仍有总耗时截止 |
-| `--ik-minimum-motion` | 开启 | 在位姿容差内优先最小化相对上一发布解的关节移动 |
+| `--ik-minimum-motion` | 已废弃 | 不再生效；求解器固定为下文的有界 Levenberg–Marquardt |
 | `--ik-independent-arms` | 开启 | 本地双臂 EEF 跟踪分别规划六轴 Ruckig，避免左臂换向拉长右臂轨迹 |
 
-0.12 rad 是**几何搜索半径**，不是求解后把关节输出裁短，也不是 m/s 或 rad/s。
-求得的完整解仍需通过位姿残差和驱动硬限位检查。搜索半径不能保证所有目标可达。
-仅在已实测停稳的异常恢复续步中，允许使用 0.30 rad 范围，交给原有伺服动态约束执行。
+0.20 rad 是**几何搜索半径**，不是求解后把关节输出裁短，也不是 m/s 或 rad/s。
+搜索半径不能保证所有目标可达。仅在已实测停稳的异常恢复续步中，允许使用搜索
+半径（0.40 rad）范围，交给原有伺服动态约束执行。
 
-首先在原有局部搜索范围和硬限位内，约束位置、朝向残差的各自范数，最小化相对
-上一发布解的关节位移平方和。上一解已满足当前目标容差时可直接沿用，减少静止
-目标附近的关节游走。SLSQP 最多 24 次迭代，并在评估入口检查 8 ms 预算；这不是
-整个 IK 调用的硬耗时上限，单次评估及后续兜底仍需时间。
+### 求解器：有界 Levenberg–Marquardt（2026-11-02 起）
 
-未找到合格候选时沿用原有求解器。原有受限残差兜底（10 mm / 0.12 rad）保持，
-并明确记录 `tolerance_relaxed`，因此不能把所有输出都视作 3 mm 精度。诊断中的
-`selection_method`、`minimum_motion_elapsed_s`、`minimum_motion_timed_out` 区分
-所选方法、候选搜索耗时及预算耗尽。没有放宽硬限位或新增朝向改写。
+在容差缩放后的位姿误差上最小化 `|e(q)|² + λ|q − q_prev|²`，λ = 权重 / 0.08²，
+约束为驱动硬限位、实测 ± 搜索半径、上一解 ± 参考半径。每步线性化子问题按带
+约束最小二乘求解（越界时用 BVLS），因此某关节贴限位时其余关节会补偿，而不是
+求解后再裁剪。目标是位姿中心，不再选容差边界上的点。
+
+- 关节运动惩罚**永不去掉**。旧版在正则解未达容差时会无正则多初值重试，腕部
+  近奇异（J5≈0.2–0.35 rad）时会沿 J4/J6 反相方向为毫米级残差摆 0.2–0.3 rad。
+- 正常跟踪：正则解在受限残差兜底（10 mm / 0.12 rad）以内即采用（记录
+  `tolerance_relaxed`），残差由后续周期继续收敛，不用大步换精确。
+- 超出兜底或恢复续步未达容差时：在同一边界内用 1/16 惩罚重试，并在热启动与
+  实测不同时从实测反馈再解一次；仍不可达则照旧抛出 `could not reach`。
+- `selection_method` 为 `bounded_lm`、`bounded_lm_reduced_penalty` 或
+  `bounded_lm_measured_seed`。
+
+恢复续步的进展判据：总分须下降 ≥1%；某分量原在容差内则不得超过容差，原已超出
+则最多增加 0.1 倍容差（J2 贴限位时位置停滞 0.04 mm 曾被误判为无进展）。
 
 双臂独立规划保留共同的 100 Hz 单写入器，每臂六个关节仍在臂内同步；发布前
 两臂都要通过检查，任一失败进入共同停止路径。只用于 `local_ik_joint` 的双臂
@@ -39,20 +48,33 @@ EEF 跟踪，不改变关节策略的定时轨迹、松灵原生 EEF、启动及
 
 ```bash
 --eef-control-mode local_ik_joint --no-pose-trajectory --no-ik-rate-limit \
---ik-search-joint-radius-rad 0.30 --ik-reference-joint-radius-rad 0.12 \
+--ik-search-joint-radius-rad 0.40 --ik-reference-joint-radius-rad 0.20 \
 --ik-joint-regularization-weight 0.25 \
 --ik-position-tolerance-m 0.003 --ik-rotation-tolerance-rad 0.02 --ik-max-nfev 100 \
---ik-minimum-motion --ik-independent-arms
+--ik-independent-arms
 ```
 
 未显式传新参数时 CLI/GUI 都使用上述默认值。`piper_eef` 使用固件 IK，不读取本地
 求解参数。没有根据这次几何回放自动提高 Ruckig 的速度/加速度/jerk；几何样本不能
 证明机械臂能跟上更快的关节参考。
 
-对照旧版选择及双臂同步方式可用：
-`--no-ik-minimum-motion --no-ik-independent-arms --ik-position-tolerance-m 0.0015`。
+## 11 月 2 日求解器替换验证
 
-## 10 月 29 日连续回放补充
+离线闭环回放，机械臂按 1.2 rad/s 追随 IK 解并滞后一个周期（不含动力学、碰撞、
+相机），旧版为 HEAD 中的最小移动求解器：
+
+| 回放 | 指标 | 旧版 0.12/0.30 | 新版 0.12/0.30 | 新版 0.20/0.40 |
+|---|---|---:|---:|---:|
+| 训练示范 16558 目标 | 平均位姿误差 | 2.41 mm / 0.0158 rad | 0.08 mm / 0.0004 rad | 0.07 mm / 0.0004 rad |
+| 同上 | 单臂求解耗时 P99 | 6.8 ms | 0.8 ms | 1.0 ms |
+| 11-02 五次运行策略目标 866 个 | 几何阻塞 | 0 | 1 | 0 |
+| 同上 | 关节/末端步长比 P95（>0.05 rad 的步） | 4.2 | — | 3.6 |
+
+两版均未出现末端变化 <0.01（归一化）而关节步 >0.05 rad 的情况。J2=0 的起始
+位姿接近折叠，±x 方向 10 mm 目标每周期只能前进约 3 mm，换求解器无法改善。
+复现脚本：`analysis/ik_bounded_lm_20261102/`。结论不能替代实机验证。
+
+## 10 月 29 日连续回放补充（旧版最小移动求解器）
 
 对 10:43:30 实机记录的固定模型目标，使用新求得的关节解作为下一步反馈和参考，
 在记录中的保持间隙重新建立片段，失败即终止该片段。加入最小移动选择后，左臂
@@ -65,7 +87,7 @@ EEF 跟踪，不改变关节策略的定时轨迹、松灵原生 EEF、启动及
 `analysis/control_modes_20261029/continuity_chain_results.json`、
 `analysis/control_modes_20261029/continuity_chain_replay.py`。
 
-## 数据依据与离线验证
+## 数据依据与离线验证（旧版求解器，参考半径 0.12）
 
 本地当前训练导出对应的 90 个清理片段：
 `episodes_piper_v21/pick_place_clean_v3_20261025/ep_*.npz`。

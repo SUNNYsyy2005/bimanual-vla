@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from server_4090.app import create_app, policy_config_name
+from server_4090.app import TaskManager, create_app, policy_config_name
 
 
 class DashboardCheckpointManagementTest(unittest.TestCase):
@@ -58,6 +58,28 @@ class DashboardCheckpointManagementTest(unittest.TestCase):
             app = create_app(config_path)
             app.config["TESTING"] = True
         return app, env["BIMANUAL_VLA_SERVER_TOKEN"], experiment_dir, checkpoint_paths
+
+    def test_running_policy_denoising_steps_update_control_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, token, _, _ = self._make_app(root)
+            telemetry_dir = root / "telemetry"
+            telemetry_dir.mkdir()
+            task_dir = root / "workspace" / "tasks" / "policy-test"
+            task_dir.mkdir()
+            task = {"id": "policy-test", "type": "policy", "state": "running",
+                    "command": ["python", "serve", "--denoising-control-file", str(telemetry_dir / "denoising_steps.json")],
+                    "metadata": {"telemetry_dir": str(telemetry_dir), "denoising_steps": 5}}
+            headers = {"Authorization": f"Bearer {token}"}
+            with mock.patch.object(TaskManager, "get", return_value=task):
+                response = app.test_client().post(
+                    "/api/tasks/policy-test/denoising-steps", headers=headers,
+                    json={"denoising_steps": 7})
+            self.assertEqual(response.status_code, 200, response.get_json())
+            self.assertEqual(json.loads((telemetry_dir / "denoising_steps.json").read_text()),
+                             {"denoising_steps": 7})
+            self.assertEqual(json.loads((task_dir / "task.json").read_text())
+                             ["metadata"]["denoising_steps"], 7)
 
     def test_batch_delete_removes_selected_checkpoint_directories(self):
         with tempfile.TemporaryDirectory() as directory:

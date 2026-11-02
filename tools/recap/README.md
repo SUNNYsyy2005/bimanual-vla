@@ -36,6 +36,13 @@ Gemma3 需要具有访问权限的 Hugging Face 账号。可在已登录的机�
 
 2026-11-01 的部署状态：π0.5 与 SigLIP 视觉权重已就绪，Gemma3 授权权重尚未下载，完整训练检查尚未执行。`check_model_assets.py` 会明确记录缺失文件，启动器在权重未就绪时停止。GPU 训练结果以每台机器自己的结果文件为准。
 
+2026-11-02 更新：Gemma3 官方快照已在 H100 与 4×4090 工作目录就绪，权重 SHA-256
+与 Hugging Face 元数据一致。H100 的 `records/pipeline.json` 为 `passed`，
+`records/verification.json` 确认价值模型恢复到 12 步、策略恢复到 6 步，保存后推理输出有限。
+H100 的 Ray socket 路径改为短的 `/tmp/recap-ray-<jobid>`；验证脚本允许单样本
+`*_std` 诊断值为 NaN，仍要求 loss、梯度和动作有限。4×4090 的权重检查为 `ready`，
+完整 GPU 流水线仍等待符合 `train_4090.sh` 门槛的空闲显卡。
+
 ## 完整训练检查
 
 H100 必须从 login-server 提交 Slurm；不要在登录节点执行训练脚本：

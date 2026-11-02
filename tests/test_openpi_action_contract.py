@@ -279,6 +279,52 @@ class InferenceDiagnosticsTransportTest(unittest.TestCase):
         )
 
 
+class DenoisingStepsPolicyTest(unittest.TestCase):
+    def test_control_file_updates_next_inference_and_restores_sample_kwargs(self):
+        class FakePolicy:
+            _is_pytorch_model = True
+            _sample_kwargs = {"other": 1}
+            metadata = {}
+
+            def __init__(self):
+                self.seen = []
+
+            def infer(self, observation):
+                self.seen.append(dict(self._sample_kwargs))
+                return {"actions": [1]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            control = Path(tmp) / "steps.json"
+            base = FakePolicy()
+            policy = HELPER.DenoisingStepsPolicy(base, 3, control)
+            self.assertEqual(policy.infer({})["denoising_steps"], 3)
+            control.write_text('{"denoising_steps": 7}')
+            self.assertEqual(policy.infer({})["denoising_steps"], 7)
+            self.assertEqual(base.seen, [{"other": 1, "num_steps": 3},
+                                         {"other": 1, "num_steps": 7}])
+            self.assertEqual(base._sample_kwargs, {"other": 1})
+
+    def test_prompt_tokens_are_cached_without_sharing_mutable_outputs(self):
+        class Tokenizer:
+            def __init__(self):
+                self.calls = 0
+
+            def tokenize(self, prompt, state):
+                self.calls += 1
+                self.assert_state = state
+                return np.array([len(prompt)], dtype=np.int32), np.array([True])
+
+        tokenizer = Tokenizer()
+        original = types.SimpleNamespace(tokenizer=tokenizer, discrete_state_input=False)
+        cached = HELPER._CachedTokenizePrompt(original)
+        first = cached({"prompt": "pick"})
+        first["tokenized_prompt"][0] = 99
+        second = cached({"prompt": "pick"})
+        self.assertEqual(tokenizer.calls, 1)
+        self.assertEqual(second["tokenized_prompt"].tolist(), [4])
+        self.assertEqual(second["tokenized_prompt_mask"].tolist(), [True])
+
+
 def _rotation6d(matrix: np.ndarray) -> np.ndarray:
     return np.concatenate((matrix[:, 0], matrix[:, 1])).astype(np.float32)
 

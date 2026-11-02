@@ -179,12 +179,18 @@ class PiperPi0(pi0.Pi0):
     def compute_loss(self, rng, observation, actions, *, train=False):
         return self.compute_loss_per_dim(rng, observation, actions, train=train)[..., :self.loss_action_dim].mean(axis=-1)
 
+    @property
+    def supports_dynamic_denoising_steps(self):
+        return bool(self.rtc_training_max_delay)
+
     def sample_actions(self, rng, observation, *, num_steps=5, noise=None,
                        prev_chunk_left_over=None, inference_delay=None,
                        previous_left_over_steps=None, **kwargs):
         if not self.rtc_training_max_delay:
             return super().sample_actions(rng, observation, num_steps=num_steps, noise=noise)
-        if num_steps <= 0:
+        # Serving validates on the host. A scalar tracer lets the same compiled
+        # while loop serve different step counts without a cold RPC per value.
+        if not isinstance(num_steps, jax.core.Tracer) and int(num_steps) <= 0:
             raise ValueError("denoising steps must be positive")
         observation = model_lib.preprocess_observation(None, observation, train=False)
         batch = observation.state.shape[0]

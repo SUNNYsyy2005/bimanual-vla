@@ -273,6 +273,10 @@ class DeploymentRunRecorder:
         execution_state: str | None = None,
         blocked_reason: str | None = None,
         pose_diagnostics: Mapping[str, Any] | None = None,
+        recap_owner: str = "policy",
+        recap_epoch: int = 0,
+        recap_valid: bool | None = None,
+        command_gripper_fraction: np.ndarray | None = None,
     ) -> None:
         """Record measured state and command outcome for one control tick."""
         if not self.is_active:
@@ -302,6 +306,12 @@ class DeploymentRunRecorder:
                     f"command_joints_rad must have shape {command_joints.shape}, got {candidate.shape}"
                 )
             command_joints[:] = candidate
+        grippers = np.full(len(joints) // 7, np.nan, dtype=np.float32)
+        if command_gripper_fraction is not None:
+            candidate = _as_finite_array(command_gripper_fraction)
+            if candidate.shape != grippers.shape or np.any((candidate < 0) | (candidate > 1)):
+                raise ValueError(f"command_gripper_fraction must have shape {grippers.shape} and be in [0,1]")
+            grippers[:] = candidate
         row = {
             "timestamp": float(timestamp),
             "monotonic_timestamp": float(monotonic_timestamp),
@@ -320,6 +330,10 @@ class DeploymentRunRecorder:
             "command_hold": bool(command_hold),
             "execution_state": "" if execution_state is None else str(execution_state),
             "blocked_reason": "" if blocked_reason is None else str(blocked_reason)[:500],
+            "recap_owner": str(recap_owner),
+            "recap_epoch": int(recap_epoch),
+            "recap_valid": bool(command_sent and not command_hold) if recap_valid is None else bool(recap_valid),
+            "command_gripper_fraction": grippers,
         }
         if pose_diagnostics:
             # JSONL retains nested pose/IK diagnostics independently of the
@@ -592,6 +606,10 @@ class DeploymentRunRecorder:
                 "command_generation": np.empty((0,), dtype=np.int64),
                 "command_queue_index": np.empty((0,), dtype=np.int64),
                 "command_hold": np.empty((0,), dtype=np.bool_),
+                "command_gripper_fraction": np.empty((0, 0), dtype=np.float32),
+                "recap_owner": np.empty((0,), dtype="U10"),
+                "recap_epoch": np.empty((0,), dtype=np.int64),
+                "recap_valid": np.empty((0,), dtype=np.bool_),
             }
         else:
             data = {
@@ -615,6 +633,10 @@ class DeploymentRunRecorder:
     @staticmethod
     def _trajectory_arrays(rows: list[dict[str, Any]]) -> dict[str, np.ndarray]:
         return {
+            "recap_owner": np.asarray([row["recap_owner"] for row in rows]),
+            "recap_epoch": np.asarray([row["recap_epoch"] for row in rows], dtype=np.int64),
+            "recap_valid": np.asarray([row["recap_valid"] for row in rows], dtype=np.bool_),
+            "command_gripper_fraction": np.stack([row["command_gripper_fraction"] for row in rows]),
             "timestamp": np.asarray([row["timestamp"] for row in rows], dtype=np.float64),
             "monotonic_timestamp": np.asarray(
                 [row["monotonic_timestamp"] for row in rows], dtype=np.float64

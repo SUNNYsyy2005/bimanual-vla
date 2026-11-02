@@ -690,13 +690,31 @@ class RTCAwarePolicyTest(unittest.TestCase):
         self.assertNotIn("model_phase_timing", disabled_result)
 
     def test_jax_capture_reports_default_and_explicit_steps(self):
+        self._check_jax_step_capture(dynamic=False)
+
+    def test_jax_dynamic_steps_reuse_the_sampler_wrapper(self):
+        self._check_jax_step_capture(dynamic=True)
+
+    def test_guided_rtc_keeps_python_step_count_even_for_dynamic_model(self):
+        # Guided RTC samples with int(num_steps); a traced scalar fails warmup.
+        self._check_jax_step_capture(dynamic=True, mode="guided")
+
+    def _check_jax_step_capture(self, *, dynamic, mode=None):
+        mode = mode or ("trained" if dynamic else "guided")
+        sampled_steps = []
+        jit_wrappers = []
+
         def fake_sampler(self, rng, observation, *, num_steps=5, **kwargs):
+            sampled_steps.append(num_steps)
             return np.ones((1, 4, 2), dtype=np.float32)
 
         openpi = types.ModuleType("openpi")
         shared = types.ModuleType("openpi.shared")
         nnx_utils = types.ModuleType("openpi.shared.nnx_utils")
-        nnx_utils.module_jit = lambda sampler: sampler
+        def module_jit(sampler):
+            jit_wrappers.append(sampler)
+            return sampler
+        nnx_utils.module_jit = module_jit
         shared.nnx_utils = nnx_utils
         openpi.shared = shared
         modules = {
@@ -709,12 +727,18 @@ class RTCAwarePolicyTest(unittest.TestCase):
         ):
             policy = _FakePolicy()
             policy._is_pytorch_model = False
+            policy._model.supports_dynamic_denoising_steps = dynamic
             policy.call_sampler = True
             for name in ("embed_prefix", "embed_suffix", "PaliGemma", "action_out_proj"):
                 setattr(policy._model, name, object())
-            adapter = rtc_openpi.RTCAwarePolicy(
-                policy, RTCConfig(temporal_consistency=False)
-            )
+            config = RTCConfig(temporal_consistency=False)
+            if mode == "trained":
+                # Trained RTC keeps the model's own clean-prefix sampler.
+                policy._model.rtc_training_max_delay = 4
+                policy._model.action_horizon = 50
+                policy._model.sample_actions = types.MethodType(fake_sampler, policy._model)
+                config = RTCConfig(temporal_consistency=False, mode="trained", training_max_delay=4)
+            adapter = rtc_openpi.RTCAwarePolicy(policy, config)
             policy.adapter = adapter
             default = adapter.infer(self._observation(generation=1))
             policy._sample_kwargs = {"num_steps": 7}
@@ -724,6 +748,13 @@ class RTCAwarePolicyTest(unittest.TestCase):
         self.assertEqual(default["rtc"]["denoising_steps_source"], "sampler_default")
         self.assertEqual(overridden["rtc"]["denoising_steps"], 7)
         self.assertEqual(overridden["rtc"]["denoising_steps_source"], "explicit")
+        self.assertEqual(sampled_steps, [5, 7])
+        traced = dynamic and mode == "trained"
+        self.assertEqual(len(jit_wrappers), 1 if traced else 2)
+        if traced:
+            self.assertEqual(sampled_steps[-1].dtype, np.int32)
+        else:
+            self.assertIsInstance(sampled_steps[-1], int)
 
 
 

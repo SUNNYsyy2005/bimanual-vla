@@ -2,15 +2,6 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-if [[ -n "${BIMANUAL_VLA_PYTHON:-}" ]]; then
-  PYTHON_BIN="$BIMANUAL_VLA_PYTHON"
-elif [[ -n "${CONDA_PREFIX:-}" && -x "$CONDA_PREFIX/bin/python" ]]; then
-  PYTHON_BIN="$CONDA_PREFIX/bin/python"
-elif [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
-  PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
-else
-  PYTHON_BIN="python3"
-fi
 
 usage() {
   cat <<'EOF'
@@ -26,6 +17,7 @@ Collection:
 Data:
   data-check         Validate a LeRobot/pi0.5 dataset
   data-export        Export NPZ episodes to LeRobot
+  recap-export       Export labelled RECAP runs with intervention annotations
   data-upload        Upload a dataset to the Dashboard
   data-validate      Validate raw Piper episodes
   data-view          View a recorded episode
@@ -52,6 +44,7 @@ case "$command_name" in
   home-single) module="bimanual_vla.collection.home" ;;
   data-check) module="bimanual_vla.data.check" ;;
   data-export) module="bimanual_vla.data.export" ;;
+  recap-export) module="bimanual_vla.data.recap_export" ;;
   data-upload) module="bimanual_vla.data.upload" ;;
   data-validate) module="bimanual_vla.data.validate" ;;
   data-view) module="bimanual_vla.data.viewer" ;;
@@ -68,6 +61,50 @@ case "$command_name" in
     ;;
 esac
 
+quest_python=""
+if [[ "$module" == "bimanual_vla.collection.gui" && -z "${BIMANUAL_VLA_PYTHON:-}" ]]; then
+  # The VR GUI needs ADB and the Pinocchio/CasADi stack, not just Tk.
+  for conda_root in "${HOME}/miniconda3" "${HOME}/anaconda3" \
+    "${HOME}/mambaforge" "${HOME}/miniforge3" "${HOME}/.conda"; do
+    if [[ -x "$conda_root/envs/quest_collection/bin/python" ]]; then
+      quest_python="$conda_root/envs/quest_collection/bin/python"
+      break
+    fi
+  done
+fi
+if [[ -n "${BIMANUAL_VLA_PYTHON:-}" ]]; then
+  PYTHON_BIN="$BIMANUAL_VLA_PYTHON"
+elif [[ -n "$quest_python" ]]; then
+  PYTHON_BIN="$quest_python"
+elif [[ -n "${CONDA_PREFIX:-}" && -x "$CONDA_PREFIX/bin/python" ]]; then
+  PYTHON_BIN="$CONDA_PREFIX/bin/python"
+elif [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
+  PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
+else
+  PYTHON_BIN="python3"
+fi
+
+activate_selected_environment() {
+  local resolved_python env_prefix conda_base
+  resolved_python="$(command -v -- "$PYTHON_BIN")"
+  env_prefix="$(cd -- "$(dirname -- "$resolved_python")/.." && pwd)"
+  if [[ -d "$env_prefix/conda-meta" ]]; then
+    conda_base="${env_prefix%/envs/*}"
+    if [[ -f "$conda_base/etc/profile.d/conda.sh" ]]; then
+      source "$conda_base/etc/profile.d/conda.sh"
+      conda activate "$env_prefix"
+    fi
+    # Also cover environments whose parent conda installation moved. Use the
+    # selected interpreter's tools and native libraries, not the caller's env.
+    export PATH="$env_prefix/bin:$PATH"
+    export LD_LIBRARY_PATH="$env_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
+}
+
+if [[ "$module" == "bimanual_vla.collection.gui" ]]; then
+  activate_selected_environment
+fi
+
 if [[ "$module" == "bimanual_vla.collection.gui" ]] && ! "$PYTHON_BIN" -c 'import tkinter' >/dev/null 2>&1; then
   if [[ -z "${BIMANUAL_VLA_PYTHON:-}" ]]; then
     for conda_root in \
@@ -79,6 +116,7 @@ if [[ "$module" == "bimanual_vla.collection.gui" ]] && ! "$PYTHON_BIN" -c 'impor
       candidate="$conda_root/envs/dual_arm/bin/python"
       if [[ -x "$candidate" ]] && "$candidate" -c 'import tkinter' >/dev/null 2>&1; then
         PYTHON_BIN="$candidate"
+        activate_selected_environment
         break
       fi
     done
@@ -94,4 +132,7 @@ if [[ "$module" == "bimanual_vla.collection.gui" ]] && ! "$PYTHON_BIN" -c 'impor
 fi
 
 cd "$REPO_ROOT"
+if [[ "$module" == "bimanual_vla.collection.gui" ]]; then
+  printf 'GUI Python: %s\nGUI ADB: %s\n' "$PYTHON_BIN" "$(command -v adb || printf 'not found')" >&2
+fi
 exec "$PYTHON_BIN" -m "$module" "$@"

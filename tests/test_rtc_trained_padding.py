@@ -54,6 +54,30 @@ class TrainedPrefixPaddingTest(unittest.TestCase):
         result = self.sample(previous, 3, physical_dim=32)
         np.testing.assert_array_equal(result[0, :3], previous[:3])
 
+    def test_dynamic_step_counts_reuse_one_trace_and_preserve_sampler_math(self):
+        model = SimpleNamespace(
+            rtc_training_max_delay=10, action_horizon=8, action_dim=32, loss_action_dim=14,
+            embed_prefix=lambda obs: (jnp.zeros((1, 1, 32)),
+                jnp.ones((1, 1), dtype=bool), jnp.zeros((1,), dtype=bool)),
+            embed_suffix=lambda obs, actions, time: (actions,
+                jnp.ones((1, 8), dtype=bool), jnp.arange(8) == 0, None),
+            PaliGemma=SimpleNamespace(llm=lambda embeddings, **kwargs: (embeddings, {})),
+            action_out_proj=lambda values: values)
+        traces = []
+        def sample(steps):
+            traces.append(True)
+            return PiperPi0.sample_actions(model, jax.random.key(0),
+                SimpleNamespace(state=jnp.zeros((1, 32))), num_steps=steps,
+                noise=jnp.ones((1, 8, 32)))
+        compiled = jax.jit(sample)
+        with patch('bimanual_vla.training.openpi_model.model_lib.preprocess_observation',
+                   side_effect=lambda rng, obs, train: obs):
+            for steps in (5, 2, 7, 2):
+                result = np.asarray(compiled(np.asarray(steps, dtype=np.int32)))
+                np.testing.assert_allclose(result[..., :14], (1.-1./steps)**steps, atol=1e-6)
+                np.testing.assert_array_equal(result[..., 14:], 0.)
+        self.assertEqual(len(traces), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

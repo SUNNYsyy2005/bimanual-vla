@@ -116,7 +116,11 @@ class ReturnToInitialTest(unittest.TestCase):
 
 class ReturnButtonTest(unittest.TestCase):
     def gui(self, running):
+        saved_home = patch('bimanual_vla.collection.gui.return_pose_matches_inference_config', return_value=True)
+        saved_home.start()
+        self.addCleanup(saved_home.stop)
         return SimpleNamespace(
+            arm_mode='bimanual', arm_side='both', can_var=Mock(), left_can_var=Mock(), right_can_var=Mock(),
             inference_stop_requested=False, inference_return_only=False,
             recording=False, piper=None, _can_activation_running=lambda: False,
             _replay_running=lambda: False,
@@ -139,7 +143,9 @@ class ReturnButtonTest(unittest.TestCase):
         CollectorGUI.return_inference_to_initial(gui)
         command = gui._launch_inference_process.call_args.args[0]
         self.assertEqual(command[-1], '--return-only')
-        self.assertIn('/tmp/session.json', command)
+        from bimanual_vla.collection.gui import RETURN_POSE_PATH
+        self.assertIn(str(RETURN_POSE_PATH), command)
+        self.assertNotIn('/tmp/session.json', command)
         self.assertTrue(gui.inference_return_only)
         CollectorGUI.return_inference_to_initial(gui)
         gui._launch_inference_process.assert_called_once()

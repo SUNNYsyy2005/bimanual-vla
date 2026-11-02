@@ -5002,6 +5002,7 @@ def create_app(config_path: Path) -> Flask:
                     "frames": info.get("total_frames"),
                     "fps": info.get("fps"),
                     "robot_type": info.get("robot_type"),
+                    "recap": info.get("recap"),
                     **origin,
                     **schema,
                     "episode_split": split_info if isinstance(split_info, dict) else None,
@@ -5288,6 +5289,7 @@ def create_app(config_path: Path) -> Flask:
                 ),
                 "gripper_semantics": action_contract.get("gripper_semantics") if action_contract else None,
                 "finetuning": (action_contract or {}).get("finetuning") or FinetuningSettings.legacy().to_dict(),
+                "recap": (action_contract or {}).get("recap"),
                 "config_name": config_name,
                 "model_variant": model_variant,
                 "arm_mode": arm_mode,
@@ -5857,6 +5859,7 @@ def create_app(config_path: Path) -> Flask:
         resume_checkpoint: str | Path | None = None,
         wandb_enabled: bool = False,
         finetuning: FinetuningSettings | None = None,
+        recap_config: dict[str, Any] | None = None,
     ) -> list[str]:
         command = [
             str(runtime_config["openpi_python"]), openpi_helper_for(runtime_config), "train",
@@ -5886,6 +5889,8 @@ def create_app(config_path: Path) -> Flask:
         if wandb_enabled:
             command.append("--wandb-enabled")
         command += (finetuning or FinetuningSettings()).command_args()
+        if recap_config is not None:
+            command += ["--recap-config", json.dumps(recap_config)]
         return command
 
     def build_eval_command(
@@ -6545,6 +6550,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 contract=checkpoint_action_contract(Path(row['path'])) or row.get('action_contract') or {}
                 row['action_contract']=contract
                 row['finetuning']=contract.get('finetuning') or FinetuningSettings.legacy().to_dict()
+                row['recap']=contract.get('recap')
         from server_4090.task_scenes import annotate, bindings
         scene_bindings=bindings(config)
         from server_4090.model_identity import enrich
@@ -8075,6 +8081,21 @@ print(json.dumps(rows, ensure_ascii=False))
         finetuning = FinetuningSettings.resolve(requested_finetuning,
             (settings_source or {}).get("finetuning"), legacy=is_resume, resume=is_resume)
         finetuning.validate_model(model_variant)
+        from bimanual_vla.training.recap_settings import RecapSettings
+        saved_recap = (settings_source or {}).get("recap") or {}
+        recap_request = {"recap_" + k: v for k, v in saved_recap.items()}
+        recap_request.update({k: v for k, v in payload.items() if k.startswith("recap_")})
+        recap_settings = RecapSettings.from_request(recap_request)
+        if is_resume and recap_settings != RecapSettings(**saved_recap):
+            raise ValueError("full-state resume must retain RECAP conditioning settings")
+        recap_info = read_json(dataset_root_for_id(dataset_id)[0] / "meta/info.json") or {}
+        if recap_settings.enabled:
+            if config.get("dashboard_profile") == "simulation" or model_variant != "pi05" or arm_mode != "bimanual" or schema != "delivery":
+                raise ValueError("RECAP requires the real-robot pi05 bimanual delivery workflow")
+            if recap_info.get("recap", {}).get("version") != 1:
+                raise ValueError("dataset is missing RECAP episode annotations/outcomes")
+        elif recap_info.get("recap"):
+            raise ValueError("select RECAP training for this annotated rollout dataset")
         if not is_resume:
             initialization_marker = checkpoint_action_contract(base_checkpoint)
             if initialization_marker:
@@ -8086,6 +8107,15 @@ print(json.dumps(rows, ensure_ascii=False))
         execution_target = str(payload.get("execution_target", "local_4090") or "local_4090")
         cluster_target_config = runtime_config_for_target(execution_target)
         is_cluster_target = cluster_target_config is not None
+        recap_config = None
+        if recap_settings.enabled:
+            backend = (cluster_target_config or config).get("recap_backend", {})
+            required = {"root", "python", "siglip_path", "gemma3_path"}
+            if not required.issubset(backend) or not all(backend[k] for k in required):
+                raise ValueError("RECAP backend is not staged on this target: configure root/python/siglip_path/gemma3_path")
+            if not split.train_episodes or not split.test_episodes:
+                raise ValueError("RECAP requires separate nonempty training and heldout episode sets")
+            recap_config = {"settings": recap_settings.to_dict(), "backend": {k: backend[k] for k in required}}
         minimum_free_gpu_mib = int(config.get("training_min_free_gpu_mib", 22_500))
         allow_busy_raw = payload.get("allow_busy_gpus", config.get("allow_busy_gpus", False))
         allow_busy_gpus = (
@@ -8192,6 +8222,7 @@ print(json.dumps(rows, ensure_ascii=False))
             resume_checkpoint=(resume_checkpoint if resume_kind == "external_full_state" else None),
             wandb_enabled=bool(payload.get("wandb_enabled", False)),
             finetuning=finetuning,
+            recap_config=recap_config,
         )
         cluster_dataset_sync_command: list[str] | None = None
         remote_checkpoint_dir: str | None = None
@@ -8276,6 +8307,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 ),
                 wandb_enabled=bool(payload.get("wandb_enabled", False)),
                 finetuning=finetuning,
+                recap_config=recap_config,
             )
             slurm_command = slurm_runner_command(
                 target_name=execution_target,
@@ -8316,6 +8348,7 @@ print(json.dumps(rows, ensure_ascii=False))
             ),
             "model_variant": model_variant,
             "finetuning": finetuning.to_dict(),
+            "recap": recap_settings.to_dict() if recap_settings.enabled else None,
             "base_checkpoint": str(base_checkpoint),
             "exp_name": exp_name,
             "task_scene": scene or None,
@@ -8628,6 +8661,9 @@ print(json.dumps(rows, ensure_ascii=False))
     @app.post("/api/tasks/policy")
     def start_policy():
         payload = request.get_json(force=True)
+        denoising_steps = safe_int(
+            payload.get("denoising_steps", 5), "denoising_steps", 1, 50
+        )
         # RTC runtime values and prompt are client-owned. The Dashboard only
         # starts a Policy with the server's capability ceiling; clients send
         # their selected values at runtime and can change them without
@@ -8830,6 +8866,8 @@ print(json.dumps(rows, ensure_ascii=False))
         )
 
         telemetry_session, telemetry_dir = observations.create_session()
+        denoising_control_file = Path(telemetry_dir) / "denoising_steps.json"
+        atomic_json(denoising_control_file, {"denoising_steps": denoising_steps})
         command = [
             config["openpi_python"], openpi_helper, "serve",
             "--dataset-id", dataset_id,
@@ -8843,6 +8881,8 @@ print(json.dumps(rows, ensure_ascii=False))
             "--checkpoint", str(checkpoint),
             "--port", str(port),
             "--telemetry-dir", str(telemetry_dir),
+            "--denoising-steps", str(denoising_steps),
+            "--denoising-control-file", str(denoising_control_file),
             "--rtc-enabled" if rtc_enabled else "--no-rtc-enabled",
             "--inference-diagnostics" if inference_diagnostics_enabled else "--no-inference-diagnostics",
             "--rtc-execution-horizon", str(rtc_execution_horizon),
@@ -8878,6 +8918,7 @@ print(json.dumps(rows, ensure_ascii=False))
                 "xla_memory_fraction": policy_xla_memory_fraction,
                 "xla_preallocate": policy_xla_preallocate,
                 "port": port,
+                "denoising_steps": denoising_steps,
                 "ws_url": f"ws://{request.host.split(':')[0]}:{port}",
                 "telemetry_session": telemetry_session,
                 "telemetry_dir": str(telemetry_dir),
@@ -8890,6 +8931,24 @@ print(json.dumps(rows, ensure_ascii=False))
         )
         observations.bind_task(task)
         return jsonify(task), 201
+
+    @app.post("/api/tasks/<task_id>/denoising-steps")
+    def set_policy_denoising_steps(task_id: str):
+        payload = request.get_json(force=True)
+        steps = safe_int(payload.get("denoising_steps"), "denoising_steps", 1, 50)
+        with tasks.lock:
+            task = tasks.get(safe_name(task_id, "task id"))
+            if task.get("type") != "policy" or task.get("state") != "running":
+                raise ValueError("denoising steps can only be changed on a running policy")
+            if "--denoising-control-file" not in task.get("command", []):
+                raise ValueError("this policy predates live denoising control; restart it first")
+            control_path = Path(task["metadata"]["telemetry_dir"]) / "denoising_steps.json"
+            if not control_path.parent.is_dir():
+                raise ValueError("policy denoising control directory is missing")
+            atomic_json(control_path, {"denoising_steps": steps})
+            task["metadata"]["denoising_steps"] = steps
+            atomic_json(tasks._path(task["id"]), task)
+        return jsonify({"task_id": task["id"], "denoising_steps": steps})
 
     @app.get("/api/tasks/<task_id>/execution-control")
     def get_execution_control(task_id: str):

@@ -62,6 +62,10 @@ def solve_ik_request(solver, args, kwargs):
         # The controller clears it only after a measured, settled handoff.
         if kwargs.get("initial_joints_rad") is None:
             kwargs["initial_joints_rad"] = current.copy()
+    if fraction < 1 or progress_goal is not None:
+        # Let candidate selection enforce the same original-goal criterion as
+        # the independent final worker gate, including shrunken local targets.
+        kwargs["progress_goal"] = progress_goal if progress_goal is not None else (goal_xyz, goal_rpy)
     result = solver.solve_with_diagnostics(current, xyz, rpy, **kwargs)
     limits = np.asarray(kwargs.get("joint_limits", NOMINAL_JOINT_LIMITS_RAD))
     solution = np.asarray(result.solution_joints_rad)
@@ -87,9 +91,16 @@ def solve_ik_request(solver, args, kwargs):
         stationary = (before_pos <= kwargs["position_tolerance_m"]
                       and before_rot <= kwargs["rotation_tolerance_rad"]
                       and np.max(np.abs(solution-current)) < 1e-6)
+        def component_cap(before_error, tolerance):
+            # A component inside tolerance may trade only up to that tolerance.
+            # One already outside it may not grow beyond a tenth of tolerance:
+            # an exact cap rejected a 0.04 mm position change while rotation
+            # improved 20% with J2 pinned at its limit (2026-11-02 12:17).
+            return tolerance if before_error <= tolerance else before_error + .1 * tolerance
+
         progress = (before-after >= max(.01 * before, 1e-3)
-                    and after_pos <= max(before_pos, kwargs["position_tolerance_m"]) + 1e-6
-                    and after_rot <= max(before_rot, kwargs["rotation_tolerance_rad"]) + 1e-5)
+                    and after_pos <= component_cap(before_pos, kwargs["position_tolerance_m"]) + 1e-9
+                    and after_rot <= component_cap(before_rot, kwargs["rotation_tolerance_rad"]) + 1e-9)
         if not stationary and not progress:
             raise IKUnreachableError(
                 "IK step makes no safe progress toward original target: "
