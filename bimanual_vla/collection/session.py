@@ -78,8 +78,13 @@ class CollectionConfig:
     cam_left_wrist_device: str = DEFAULT_LEFT_WRIST_DEVICE
     cam_right_wrist_device: str = DEFAULT_RIGHT_WRIST_DEVICE
     rlsok_resolver: str | None = None
+    control_source: str = "passive"
+    quest_model_dir: str = ""
+    quest_adb_serial: str = ""
 
     def __post_init__(self):
+        if self.control_source not in ("passive", "quest_vr"):
+            raise ValueError("control_source must be passive or quest_vr")
         if self.capture_fps <= 0:
             raise ValueError("capture_fps must be positive")
         if self.camera_fps not in (15, 30):
@@ -155,6 +160,7 @@ class CollectionSession:
         gripper_command_reader: Callable[[Any], Any | None] | None = None,
         camera_verifier: Callable[[Any, int], dict[str, dict]] = verify_camera_streams,
         episode_validator: Callable[..., EpisodeStats] = validate_episode,
+        quest_controller_factory: Callable[..., Any] | None = None,
     ):
         self.config = config
         self._robot_connect = robot_connect
@@ -174,6 +180,9 @@ class CollectionSession:
         )
         self._camera_verifier = camera_verifier
         self._episode_validator = episode_validator
+        self._quest_controller_factory = quest_controller_factory
+        self.quest_controller = None
+        self._quest_episode_telemetry = "[]"
         self.state = SessionState.DISCONNECTED
         self.piper = None
         self.cameras = None
@@ -239,7 +248,21 @@ class CollectionSession:
             checks = self._camera_verifier(cameras, self.config.camera_fps)
             if hasattr(cameras, "start_background_capture"):
                 cameras.start_background_capture()
+            if self.config.control_source == "quest_vr":
+                from bimanual_vla.collection.quest import DEFAULT_MODEL_DIR
+                from bimanual_vla.collection.quest.control import QuestController
+                factory = self._quest_controller_factory or QuestController
+                arms = piper if isinstance(piper, dict) else {self.config.arm_side: piper}
+                self.quest_controller = factory(
+                    arms, self.config.quest_model_dir or DEFAULT_MODEL_DIR,
+                    self.config.quest_adb_serial)
+                if hasattr(self.quest_controller, 'enable_collection_actions'):
+                    self.quest_controller.enable_collection_actions()
+                self.quest_controller.start()
         except Exception:
+            if self.quest_controller is not None:
+                self.quest_controller.close()
+                self.quest_controller = None
             if "cameras" in locals():
                 cameras.close()
             for item in reversed(connected):
@@ -347,9 +370,18 @@ class CollectionSession:
         self.camera_checks = checks
         return checks
 
+    def request_quest_reset(self, joints=None):
+        if self.state is not SessionState.READY or self.quest_controller is None:
+            raise RuntimeError('stop and save/discard the episode before resetting')
+        self.quest_controller.request_reset(joints)
+
     def start_episode(self, task_name: str, instruction: str) -> EpisodeLabel:
         if self.state is not SessionState.READY:
             raise RuntimeError(f"cannot start an episode while session is {self.state.value}")
+        if self.quest_controller is not None:
+            self.quest_controller.check()
+            if getattr(self.quest_controller, 'resetting', False):
+                raise RuntimeError('wait for VR reset to complete before recording')
         self.label = EpisodeLabel(task_name.strip(), instruction.strip())
         self.buffer = EpisodeBuffer(
             self.config.capture_fps,
@@ -368,9 +400,13 @@ class CollectionSession:
             image_resize_mode="stretch",
         )
         self.state = SessionState.RECORDING
+        if self.quest_controller is not None:
+            self.quest_controller.begin_episode()
         return self.label
 
     def capture_once(self) -> CaptureSample:
+        if self.quest_controller is not None:
+            self.quest_controller.check()
         if self.state not in {
             SessionState.READY,
             SessionState.RECORDING,
@@ -441,6 +477,8 @@ class CollectionSession:
         if self.state is not SessionState.RECORDING:
             raise RuntimeError(f"cannot stop an episode while session is {self.state.value}")
         self.state = SessionState.REVIEW
+        if self.quest_controller is not None:
+            self._quest_episode_telemetry = self.quest_controller.end_episode()
         return self.frame_count
 
     def save_episode(
@@ -464,6 +502,14 @@ class CollectionSession:
         if path.exists():
             raise FileExistsError(f"refusing to overwrite existing episode: {path}")
         stats = None
+        save_options = {}
+        if self.quest_controller is not None:
+            from bimanual_vla.collection.quest import SOURCE_COMMIT
+            save_options["extra_payload"] = {
+                "collection_control_source": np.asarray("quest_vr"),
+                "quest_source_commit": np.asarray(SOURCE_COMMIT),
+                "quest_telemetry_json": np.asarray(self._quest_episode_telemetry),
+            }
         if validate:
             path.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
@@ -474,7 +520,7 @@ class CollectionSession:
             ) as candidate_file:
                 candidate = Path(candidate_file.name)
             try:
-                self.buffer.save(candidate, label.task_name, label.instruction, success)
+                self.buffer.save(candidate, label.task_name, label.instruction, success, **save_options)
                 stats = self._episode_validator(
                     candidate,
                     target_fps=self.config.capture_fps,
@@ -484,7 +530,7 @@ class CollectionSession:
             finally:
                 candidate.unlink(missing_ok=True)
         else:
-            self.buffer.save(path, label.task_name, label.instruction, success)
+            self.buffer.save(path, label.task_name, label.instruction, success, **save_options)
         self.episode_index += 1
         self.buffer = None
         self.label = None
@@ -505,6 +551,9 @@ class CollectionSession:
             if not discard_review:
                 raise RuntimeError("save or discard the stopped episode before disconnecting")
             self.discard_episode()
+        if self.quest_controller is not None:
+            self.quest_controller.close()
+            self.quest_controller = None
         if self.cameras is not None:
             self.cameras.close()
         if isinstance(self.piper, dict):

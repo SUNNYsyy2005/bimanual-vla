@@ -1,0 +1,26 @@
+name: quest_collection
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy=1.26
+  - scipy=1.15
+  - pinocchio=3.2.0
+  - casadi=3.6.7
+  - tk
+  - pillow
+  - pip
+  - pip:
+      - opencv-python==4.10.0.84
+      # Resolve saved RealSense identities to V4L2 nodes (USB IDs can differ).
+      - pyrealsense2==2.59.1.11053
+      - pyarrow==25.0.0
+      - piper_sdk==0.6.1
+      - python-can==4.6.1
+      # Existing hardware replay only; Quest collection does not call Ruckig.
+      - ruckig==0.12.2
+      - PyYAML
+      - websockets==15.0.1
+      - msgpack
+      - openpi-client==0.1.2
+      - pytest

@@ -957,9 +957,15 @@ class EpisodeBuffer:
             payload["eef_action_timestamp"] = action_timestamp
         return payload
 
-    def save(self, path: str | Path, task_name: str, instruction: str, success: bool) -> Path:
+    def save(self, path: str | Path, task_name: str, instruction: str, success: bool,
+             *, extra_payload: Mapping[str, Any] | None = None) -> Path:
         path = Path(path)
         payload = self.build_payload(task_name, instruction, success)
+        if extra_payload:
+            overlap = payload.keys() & extra_payload.keys()
+            if overlap:
+                raise ValueError(f"extra payload cannot overwrite contract fields: {sorted(overlap)}")
+            payload.update(extra_payload)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.tmp.npz")
         try:
