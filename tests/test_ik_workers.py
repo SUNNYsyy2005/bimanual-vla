@@ -179,6 +179,30 @@ class ShrinkRecoveryTest(unittest.TestCase):
                     with self.assertRaisesRegex(IKUnreachableError, 'no safe progress'):
                         solve_ik_request(solver, (q, np.zeros(3), np.zeros(3)), kwargs)
 
+    def test_progress_allows_small_trade_when_component_already_outside_tolerance(self):
+        from bimanual_vla.deployment.client import PiperIKSolveResult
+        from bimanual_vla.deployment.ik_workers import solve_ik_request, IKUnreachableError
+        from unittest.mock import Mock
+        # 2026-11-03 09:14 recovery leg: 53.2 -> 43.6 mm while rotation, already
+        # outside 0.02 rad, grew 0.0043 rad. Rejecting it latched a stop.
+        for after_rot, accepted in ((.025723, True), (.045, False)):
+            with self.subTest(after_rot=after_rot):
+                solver = Mock()
+                solved = np.full(6, .01)
+                solver.pose.side_effect = [
+                    (np.array([.053212, 0, 0]), Rotation.from_rotvec([0, 0, .021444]).as_matrix()),
+                    (np.array([.043576, 0, 0]), Rotation.from_rotvec([0, 0, after_rot]).as_matrix())]
+                solver.solve_with_diagnostics.return_value = PiperIKSolveResult(
+                    solution_joints_rad=solved, command_joints_rad=solved, rate_limited=False)
+                _, kwargs = self.requests()['left']
+                kwargs['progress_goal'] = (np.zeros(3), np.zeros(3))
+                if accepted:
+                    result = solve_ik_request(solver, (np.zeros(6), np.zeros(3), np.zeros(3)), kwargs)
+                    self.assertTrue(result['goal_progress']['progress'])
+                else:
+                    with self.assertRaisesRegex(IKUnreachableError, 'no safe progress'):
+                        solve_ik_request(solver, (np.zeros(6), np.zeros(3), np.zeros(3)), kwargs)
+
     def test_arrived_arm_holds_measured_joints_without_loosening_limits(self):
         from unittest.mock import Mock
         from bimanual_vla.deployment.ik_workers import solve_ik_request, IKUnreachableError

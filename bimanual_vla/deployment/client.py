@@ -130,6 +130,9 @@ DEFAULT_ARM_HOLD_TOLERANCE_RAD = 0.05
 # A stationary arm offset from its braking reference (contact, deflection)
 # is re-anchored at the measured joints after this long.
 TRACKING_LAG_REANCHOR_S = 1.0
+# Unreachable retained goals are abandoned (hold + re-infer) this many times in
+# a row before latching stop-and-restart.
+MAX_CONSECUTIVE_IK_GOAL_ABANDONS = 2
 # A closed Piper gripper may stall a few millimetres from its startup reading
 # (or report slightly negative opening); that still counts as returned.
 DEFAULT_RETURN_GRIPPER_TOLERANCE_M = 0.003
@@ -2860,6 +2863,7 @@ class ExecutionController:
         self.ik_recovery_phase_started = None
         self.ik_recovery_barrier = None
         self.ik_recovery_fault = None
+        self.ik_goal_abandon_count = 0
         self.ik_recovery_prefix_reset = False
         self.ik_recovery_braking = False
         self._recovery_settle_feedback = None
@@ -5207,8 +5211,14 @@ class ExecutionController:
                  "gripper release" if self.eef_goal_releasing else "approach")
         phase_started = (self.ik_recovery_phase_started if self.ik_recovery_phase_started is not None
                          else self.ik_recovery_started)
+        timed_out = now - phase_started > self.eef_goal_timeout_s
+        if (goal is not None and self.servo_loop is not None and not metrics.get("paused")
+                and not metrics.get("stopping") and timed_out and phase == "approach"):
+            # Creeping toward a goal blocked by a joint limit: re-infer instead.
+            return self._abandon_unreachable_goal(
+                f"original EEF goal not reached within {self.eef_goal_timeout_s:g}s", feedback_at=feedback_at)
         if (goal is None or self.servo_loop is None or metrics.get("paused") or metrics.get("stopping")
-                or now - phase_started > self.eef_goal_timeout_s):
+                or timed_out):
             self.ik_recovery_fault = (f"original EEF goal did not settle within {self.eef_goal_timeout_s:g}s; "
                                       f"phase={phase}; grippers held; stop and restart required")
             return self._block("blocked", self.ik_recovery_fault)
@@ -5357,7 +5367,7 @@ class ExecutionController:
                 requests[side] = ((joints, target_xyz, target_rpy), kwargs)
             results = solve_recovering(self._solve_ik_batch, requests)
             if time.monotonic() - self.ik_recovery_phase_started > self.eef_goal_timeout_s:
-                raise IKWorkerError("original EEF goal deadline exceeded during IK")
+                raise IKUnreachableError("original EEF goal deadline exceeded during IK")
             next_target = target.copy()
             for index, side in enumerate(sides):
                 if "recovery" in results[side]:
@@ -5372,6 +5382,9 @@ class ExecutionController:
             self.last_ik_recovery = {s: r.get("goal_progress", r.get("recovery")) for s, r in results.items()}
             self.state = "recovering"
             return False
+        except IKUnreachableError as exc:
+            return self._abandon_unreachable_goal(f"original EEF goal approach failed: {exc}",
+                                                  feedback_at=feedback_at)
         except (IKWorkerError, ExecutionBlocked, EOFError, OSError) as exc:
             self.ik_recovery_fault = f"original EEF goal approach failed: {exc}; stop and restart required"
             return self._block("blocked", self.ik_recovery_fault)
@@ -5651,31 +5664,7 @@ class ExecutionController:
                 not self.tracking_lag_active
                 and (sent_trigger or reference_trigger)
             ):
-                self.tracking_lag_active = True
-                self.tracking_lag_started_at = float(feedback_at)
-                self.tracking_lag_required_after_monotonic = time.monotonic()
-                if self.servo_loop is not None:
-                    self.servo_loop.hold()
-                    self.tracking_lag_required_after_monotonic = None
-                if self.native_loop is not None:
-                    self.native_loop.hold("tracking_lag")
-                    self._native_epoch = self.native_loop.metrics()["epoch"]
-                    self.tracking_lag_required_after_monotonic = None
-                self.tracking_lag_settle_cycles = 0
-                self.tracking_lag_settle_joints = None
-                self.tracking_lag_settle_feedback_at = None
-                self.tracking_lag_offset_since = None
-                self.ik_recovery_target = None
-                self.eef_goal_action = None
-                self.eef_goal_pose_reset_pending = False
-                self.ik_recovery_prefix_reset = True
-                self._pose_trajectories.clear()
-                self._pose_reference_at.clear()
-                self._ik_warm_starts.clear()
-                self._filtered_gripper_opening.clear()
-                self._gripper_extreme_candidate.clear()
-                self._gripper_extreme_count.clear()
-                self._gripper_extreme_latch.clear()
+                self._enter_settle_hold(feedback_at)
                 self.tracking_lag_trigger_count += 1
                 generation = pending.get("generation")
                 self.tracking_lag_trigger_generation = (
@@ -5709,6 +5698,64 @@ class ExecutionController:
                     reason,
                     self.tracking_lag_peak_error_rad,
                 )
+
+    def _enter_settle_hold(self, feedback_at):
+        """Brake, cancel recovery, and resume only from a post-settle observation."""
+        self.tracking_lag_active = True
+        self.tracking_lag_started_at = float(feedback_at)
+        self.tracking_lag_required_after_monotonic = time.monotonic()
+        if self.servo_loop is not None:
+            self.servo_loop.hold()
+            self.tracking_lag_required_after_monotonic = None
+        if self.native_loop is not None:
+            self.native_loop.hold("tracking_lag")
+            self._native_epoch = self.native_loop.metrics()["epoch"]
+            self.tracking_lag_required_after_monotonic = None
+        self.tracking_lag_settle_cycles = 0
+        self.tracking_lag_settle_joints = None
+        self.tracking_lag_settle_feedback_at = None
+        self.tracking_lag_offset_since = None
+        self.ik_recovery_target = None
+        self.eef_goal_action = None
+        self.ik_recovery_braking = False
+        self.eef_goal_releasing = False
+        self.eef_goal_pose_reset_pending = False
+        self.ik_recovery_prefix_reset = True
+        self._pose_trajectories.clear()
+        self._pose_reference_at.clear()
+        self._ik_warm_starts.clear()
+        self._filtered_gripper_opening.clear()
+        self._gripper_extreme_candidate.clear()
+        self._gripper_extreme_count.clear()
+        self._gripper_extreme_latch.clear()
+
+    def _abandon_unreachable_goal(self, reason, *, feedback_at=None):
+        """Hold and re-infer instead of latching on a locally unreachable goal.
+
+        A policy target can be reachable only on another IK branch (2026-11-03
+        09:14: J1 at its limit, exact solution 1.85 rad away). Holding (with
+        the last gripper command) and re-observing lets the policy choose a
+        reachable target. Repeated failures without a normally executed
+        command in between still latch the stop-and-restart fault.
+        """
+        self.ik_goal_abandon_count += 1
+        if self.ik_goal_abandon_count > MAX_CONSECUTIVE_IK_GOAL_ABANDONS:
+            self.ik_recovery_fault = (f"{reason}; {self.ik_goal_abandon_count} consecutive unreachable "
+                                      "goals; stop and restart required")
+            return self._block("blocked", self.ik_recovery_fault)
+        suffix_count = len(self.pending_actions)
+        self._enter_settle_hold(time.time() if feedback_at is None else feedback_at)
+        message = (f"{reason}; unreachable goal abandoned ({self.ik_goal_abandon_count}/"
+                   f"{MAX_CONSECUTIVE_IK_GOAL_ABANDONS}); waiting for stable hold and a fresh observation")
+        if suffix_count:
+            self._record_queue_drop(suffix_count, message, kind="other")
+            self.pending_actions.clear()
+        self.queued_action_index = None
+        self.hold_active = self.last_safe_target is not None
+        self.state = "holding" if self.hold_active else "blocked"
+        self.blocked_reason = message
+        logging.warning(message)
+        return False
 
     def _update_tracking_lag_settle(self, qpos, now, *, feedback_at):
         """Open the fresh-observation barrier only after the braking hold settles."""
@@ -6748,9 +6795,9 @@ class ExecutionController:
                                               braking=True, recovery={"branch_blocked": str(exc)})
                         logging.warning("IK branch blocked; braking before one measured-pose recovery: %s", exc)
                         return False
-                    self.ik_recovery_fault = str(exc) + "; stop and restart required"
-                    self.ik_recovery_prefix_reset = True
-                    raise ExecutionBlocked(self.ik_recovery_fault) from exc
+                    (self._filtered_gripper_opening, self._gripper_extreme_candidate,
+                     self._gripper_extreme_count, self._gripper_extreme_latch) = filter_snapshot
+                    return self._abandon_unreachable_goal(str(exc), feedback_at=feedback_at)
                 except (IKWorkerError, EOFError, OSError) as exc:
                     raise ExecutionBlocked(f"parallel IK: {exc}") from exc
                 recovery = {side: result.pop("recovery") for side, result in results.items()
@@ -7129,6 +7176,8 @@ class ExecutionController:
         else:
             self.state = "executing"
             self.blocked_reason = ""
+            if not goal_gate:
+                self.ik_goal_abandon_count = 0
         if goal_gate:
             self._retain_eef_goal(original_queued, recovery_target,
                 [prepared[side][1] for side in sides], braking=recovery_braking,

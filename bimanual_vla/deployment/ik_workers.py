@@ -91,16 +91,23 @@ def solve_ik_request(solver, args, kwargs):
         stationary = (before_pos <= kwargs["position_tolerance_m"]
                       and before_rot <= kwargs["rotation_tolerance_rad"]
                       and np.max(np.abs(solution-current)) < 1e-6)
-        def component_cap(before_error, tolerance):
-            # A component inside tolerance may trade only up to that tolerance.
-            # One already outside it may not grow beyond a tenth of tolerance:
-            # an exact cap rejected a 0.04 mm position change while rotation
-            # improved 20% with J2 pinned at its limit (2026-11-02 12:17).
-            return tolerance if before_error <= tolerance else before_error + .1 * tolerance
+        def bounded_trade(before_error, after_error, tolerance, other_gain):
+            # A component inside tolerance must stay inside it. One already
+            # outside may grow by at most half of the other component's gain
+            # (both in tolerance units), and never by more than one tolerance.
+            # Exact caps rejected 53.2 -> 43.6 mm for +0.004 rad
+            # (2026-11-03 09:14) and 6.599 -> 6.638 mm (2026-11-02 12:17).
+            if after_error <= tolerance:
+                return True
+            if before_error <= tolerance:
+                return False
+            return (after_error - before_error) / tolerance <= min(1., .5 * max(other_gain, 0.)) + 1e-9
 
+        position_gain = (before_pos - after_pos) / kwargs["position_tolerance_m"]
+        rotation_gain = (before_rot - after_rot) / kwargs["rotation_tolerance_rad"]
         progress = (before-after >= max(.01 * before, 1e-3)
-                    and after_pos <= component_cap(before_pos, kwargs["position_tolerance_m"]) + 1e-9
-                    and after_rot <= component_cap(before_rot, kwargs["rotation_tolerance_rad"]) + 1e-9)
+                    and bounded_trade(before_pos, after_pos, kwargs["position_tolerance_m"], rotation_gain)
+                    and bounded_trade(before_rot, after_rot, kwargs["rotation_tolerance_rad"], position_gain))
         if not stationary and not progress:
             raise IKUnreachableError(
                 "IK step makes no safe progress toward original target: "

@@ -3245,20 +3245,31 @@ class ExecutionQueueTest(unittest.TestCase):
         execution.servo_loop.hold.assert_called()
         self.assertIsNone(execution.ik_recovery_target)
 
-    def test_shrink_recovery_exhaustion_latches_stop_without_partial_publication(self):
+    def test_shrink_recovery_exhaustion_holds_for_reinference_without_partial_publication(self):
         execution, protocol, state, qpos = self.recovery_execution(exhausted=True)
         self.assertFalse(execution.execute_next(state, qpos, protocol))
         execution._servo_publish_target.assert_not_called()
         self.assertEqual(execution.ik_workers.solve.call_count, 3)
         self.assertEqual(execution.pending_actions, [])
-        self.assertEqual(execution.state, 'blocked')
-        self.assertIn('stop and restart', execution.ik_recovery_fault)
+        # An unreachable goal is abandoned: hold, then a post-settle observation.
+        self.assertIsNone(execution.ik_recovery_fault)
+        self.assertTrue(execution.tracking_lag_active)
+        self.assertIn('unreachable goal abandoned (1/2)', execution.blocked_reason)
         schedule = PeriodicSchedule(2., next_at=0.)
         self.assertFalse(execution.async_launch_due(schedule, time.monotonic()))
         launch, arrived = inference_launch(state, qpos, generation=50)
         self.assertFalse(execution.accept_inference_result(
             execution_result(np.zeros((4, 14))), launch, protocol,
             arrived_at=arrived, min_steps_override=1))
+
+    def test_repeated_unreachable_goals_latch_stop(self):
+        execution, protocol, state, qpos = self.recovery_execution(exhausted=True)
+        self.assertFalse(execution._abandon_unreachable_goal('first'))
+        self.assertFalse(execution._abandon_unreachable_goal('second'))
+        self.assertIsNone(execution.ik_recovery_fault)
+        execution._abandon_unreachable_goal('third')
+        self.assertIn('3 consecutive unreachable goals; stop and restart', execution.ik_recovery_fault)
+        self.assertEqual(execution.state, 'blocked')
 
     def test_full_ik_gripper_transition_keeps_continuous_queue(self):
         execution, protocol, state, qpos = self.recovery_execution()
@@ -3623,16 +3634,30 @@ class ExecutionQueueTest(unittest.TestCase):
             execution.configure_protocol(validate_policy_metadata(metadata, side, mode))
             self.assertEqual(execution.gripper_open_lookahead_steps, expected)
 
-    def test_shrink_recovery_timeout_cancels_target_and_holds(self):
+    def test_shrink_recovery_approach_timeout_cancels_target_and_holds_for_reinference(self):
         execution, protocol, state, qpos = self.recovery_execution()
         self.assertTrue(execution.execute_next(state, qpos, protocol))
+        self.assertFalse(execution.ik_recovery_braking)
+        execution.servo_loop.metrics.return_value = dict(fault=None, paused=False, stopping=False)
+        execution._advance_ik_recovery(qpos, execution.ik_recovery_started + 2.01,
+                                      raw_delivery_state=state, protocol=protocol)
+        self.assertIsNone(execution.ik_recovery_target)
+        self.assertIsNone(execution.ik_recovery_fault)
+        self.assertTrue(execution.tracking_lag_active)
+        self.assertIn('not reached within 2s', execution.blocked_reason)
+        execution.servo_loop.hold.assert_called_once()
+
+    def test_shrink_recovery_braking_timeout_still_latches(self):
+        execution, protocol, state, qpos = self.recovery_execution()
+        self.assertTrue(execution.execute_next(state, qpos, protocol))
+        execution.ik_recovery_braking = True
         execution.servo_loop.metrics.return_value = dict(fault=None, paused=False, stopping=False)
         execution._advance_ik_recovery(qpos, execution.ik_recovery_started + 2.01,
                                       raw_delivery_state=state, protocol=protocol)
         self.assertIsNone(execution.ik_recovery_target)
         self.assertEqual(execution.state, 'blocked')
         self.assertIn('did not settle', execution.ik_recovery_fault)
-        execution.servo_loop.hold.assert_called_once()
+        self.assertIn('phase=braking', execution.ik_recovery_fault)
 
     def test_pose_drift_during_gripper_release_brakes_without_reopening(self):
         execution, protocol, state, qpos = self.recovery_execution()
