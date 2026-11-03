@@ -1,13 +1,22 @@
 <div align="center">
-
-# bimanual-vla
-
-**Piper robot data collection, multi-node data management, SFT / RL training, and real-time deployment**
-
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-D22128.svg)](LICENSE) [![Python](https://img.shields.io/badge/Python-3.10%20%2F%203.11-3776AB?logo=python&logoColor=white)](docs/INSTALLATION.md) [![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04-E95420?logo=ubuntu&logoColor=white)](docs/INSTALLATION.md) [![LeRobot](https://img.shields.io/badge/LeRobot-v2.1-FFD21E)](https://github.com/huggingface/lerobot) [![OpenPI](https://img.shields.io/badge/OpenPI-pi0%20%7C%20pi0.5-6C5CE7)](https://github.com/Physical-Intelligence/openpi) [![RTC](https://img.shields.io/badge/Deployment-RTC_%2B_Ruckig-2E8B57)](#real-robot-deployment)
-
-[**Code**](https://github.com/SUNNYsyy2005/bimanual-vla) &nbsp;&middot;&nbsp; [**Documentation**](docs/README.md) &nbsp;&middot;&nbsp; [**Wiki Guide**](wiki/Home.md) &nbsp;&middot;&nbsp; [**Demo**](#demo) &nbsp;&middot;&nbsp; [**Models & Datasets**](#released-models-and-datasets) &nbsp;&middot;&nbsp; [**Installation**](docs/INSTALLATION.md)
-
+  <h1>bimanual-vla</h1>
+  <p><strong>End-to-end VLA learning: Piper robot data collection, Quest VR teleoperation, real-robot SFT + RECAP, simulation SFT + RLinf (LIBERO / RoboTwin), and real-time deployment.</strong></p>
+  <p>
+    <a href="https://github.com/SUNNYsyy2005/bimanual-vla/blob/master/LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache%202.0-D22128.svg" /></a>
+    <a href="https://github.com/SUNNYsyy2005/bimanual-vla/blob/master/docs/INSTALLATION.md"><img alt="Python" src="https://img.shields.io/badge/Python-3.10%20%2F%203.11-3776AB?logo=python&amp;logoColor=white" /></a>
+    <a href="https://github.com/SUNNYsyy2005/bimanual-vla/blob/master/docs/INSTALLATION.md"><img alt="Ubuntu" src="https://img.shields.io/badge/Ubuntu-22.04-E95420?logo=ubuntu&amp;logoColor=white" /></a>
+    <a href="https://github.com/huggingface/lerobot"><img alt="LeRobot" src="https://img.shields.io/badge/LeRobot-v2.1-FFD21E" /></a>
+    <a href="https://github.com/Physical-Intelligence/openpi"><img alt="OpenPI" src="https://img.shields.io/badge/OpenPI-pi0%20%7C%20pi0.5-6C5CE7" /></a>
+    <a href="#real-robot-deployment"><img alt="RTC" src="https://img.shields.io/badge/Deployment-RTC_%2B_Ruckig-2E8B57" /></a>
+  </p>
+  <p>
+    <a href="https://github.com/SUNNYsyy2005/bimanual-vla"><strong>Code</strong></a> &nbsp;·&nbsp;
+    <a href="https://github.com/SUNNYsyy2005/bimanual-vla/blob/master/docs/README.md"><strong>Documentation</strong></a> &nbsp;·&nbsp;
+    <a href="https://github.com/SUNNYsyy2005/bimanual-vla/wiki"><strong>Wiki Guide</strong></a> &nbsp;·&nbsp;
+    <a href="#demo"><strong>Demo</strong></a> &nbsp;·&nbsp;
+    <a href="#released-models-and-datasets"><strong>Models &amp; Datasets</strong></a> &nbsp;·&nbsp;
+    <a href="https://github.com/SUNNYsyy2005/bimanual-vla/blob/master/docs/INSTALLATION.md"><strong>Installation</strong></a>
+  </p>
 </div>
 
 <p align="center">
@@ -52,7 +61,7 @@ behavior depends on the active Policy contract and hardware configuration.
 ## System Overview
 
 <p align="center">
-  <img src="assets/architecture_overview_v2.png" width="100%" alt="bimanual-vla architecture: real-robot data collection, OpenPI SFT and simulation RLinf RL training, real-time deployment, and multi-node Dashboard management">
+  <img src="assets/architecture_overview_v3.svg" width="100%" alt="bimanual-vla architecture: real-robot Quest VR and RECAP, simulation LIBERO and RoboTwin SFT and RLinf training, Piper deployment, unified data management platform and Dashboard">
   <br>
   <em>Pika devices shown in the collection panel are awaiting integration（Pika 设备待接入）.</em>
 </p>
