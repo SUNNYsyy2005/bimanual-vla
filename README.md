@@ -61,7 +61,7 @@ behavior depends on the active Policy contract and hardware configuration.
 ## System Overview
 
 <p align="center">
-  <img src="assets/architecture_overview_v3.svg" width="100%" alt="bimanual-vla architecture: real-robot Quest VR and RECAP, simulation LIBERO and RoboTwin SFT and RLinf training, Piper deployment, unified data management platform and Dashboard">
+  <img src="assets/architecture_overview_v3.png" width="100%" alt="bimanual-vla architecture: real-robot Quest VR and RECAP, simulation LIBERO and RoboTwin SFT and RLinf training, Piper deployment, unified data management platform and Dashboard">
   <br>
   <em>Pika devices shown in the collection panel are awaiting integration（Pika 设备待接入）.</em>
 </p>
