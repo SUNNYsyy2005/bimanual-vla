@@ -186,7 +186,7 @@ sudo bash can_activate.sh can0 1000000
 ## 下一步工作
 
 ### GUI改进（待实现）
-根据 `GUI_IMPROVEMENT_PLAN.md`：
+根据 [`GUI_IMPROVEMENT_PLAN.md`](GUI_IMPROVEMENT_PLAN.md)：
 1. 添加独立的摄像头连接按钮
 2. CAN和摄像头可以独立连接/断开
 3. 支持无CAN硬件时测试摄像头
@@ -202,9 +202,9 @@ sudo bash can_activate.sh can0 1000000
 ## 相关文档
 
 - piper_sdk官方文档: `${PIPER_SDK_ROOT}/README.md`
-- bimanual-vla安装指南: `docs/INSTALLATION.md`
-- GUI操作指南: `docs/collection/GUI_OPERATION_GUIDE.md`
-- GUI改进计划: `GUI_IMPROVEMENT_PLAN.md`
+- bimanual-vla安装指南: [`INSTALLATION.md`](../INSTALLATION.md)
+- GUI操作指南: [`GUI_OPERATION_GUIDE.md`](../collection/GUI_OPERATION_GUIDE.md)
+- GUI改进计划: [`GUI_IMPROVEMENT_PLAN.md`](GUI_IMPROVEMENT_PLAN.md)
 
 ---
 

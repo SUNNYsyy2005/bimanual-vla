@@ -29,6 +29,7 @@ from scipy.spatial.transform import Rotation
 
 from bimanual_vla.collection.camera import CameraCapture
 from bimanual_vla.collection.can_identity import resolve_can_selector
+from bimanual_vla.hardware_config import load_hardware_config, role_selector
 from bimanual_vla.data.contract import (
     BIMANUAL,
     DEFAULT_FPS,
@@ -61,16 +62,16 @@ except ModuleNotFoundError:  # Allows schema/tests to run without the hardware S
 
 RAD_FACTOR = 57295.7795  # Piper unit: 0.001 degree -> rad
 GRIPPER_FACTOR = 1_000_000.0  # Piper unit: 0.001 mm -> metre
-DEFAULT_CAN = "can0"
-DEFAULT_LEFT_CAN = "can0"
-DEFAULT_RIGHT_CAN = "can1"
-DEFAULT_HIGH_DEVICE = "auto"
-DEFAULT_WRIST_DEVICE = "auto"
+DEFAULT_CAN = ""
+DEFAULT_LEFT_CAN = ""
+DEFAULT_RIGHT_CAN = ""
+DEFAULT_HIGH_DEVICE = ""
+DEFAULT_WRIST_DEVICE = ""
 # CameraCapture discovers and jointly allocates the two identical D405 units.
 # USB topology can change when a hub is reconnected, so stale paths are not
 # suitable defaults. The GUI records the selected by-path values after connect.
-DEFAULT_LEFT_WRIST_DEVICE = "auto"
-DEFAULT_RIGHT_WRIST_DEVICE = "auto"
+DEFAULT_LEFT_WRIST_DEVICE = ""
+DEFAULT_RIGHT_WRIST_DEVICE = ""
 DEFAULT_CAMERA_FPS = 30
 CAMERA_SOURCE_HW = (240, 424)
 PIPER_FEEDBACK_MAX_AGE_S = 0.5
@@ -631,20 +632,34 @@ def main() -> None:
     ap.add_argument("--schema", choices=(DELIVERY_SCHEMA, JOINT_SCHEMA), default=DELIVERY_SCHEMA)
     ap.add_argument("--arm-mode", choices=(SINGLE_ARM, BIMANUAL), default=SINGLE_ARM)
     ap.add_argument("--arm-side", choices=("left", "right"), default="right")
-    ap.add_argument("--can", default=DEFAULT_CAN, help="single-arm output CAN")
-    ap.add_argument("--left-can", default=DEFAULT_LEFT_CAN, help="bimanual left output CAN")
-    ap.add_argument("--right-can", default=DEFAULT_RIGHT_CAN, help="bimanual right output CAN")
-    ap.add_argument("--cam-high-device", default=DEFAULT_HIGH_DEVICE)
-    ap.add_argument("--cam-wrist-device", default=DEFAULT_WRIST_DEVICE)
-    ap.add_argument("--cam-left-wrist-device", default=DEFAULT_LEFT_WRIST_DEVICE)
-    ap.add_argument("--cam-right-wrist-device", default=DEFAULT_RIGHT_WRIST_DEVICE)
+    ap.add_argument("--hardware-config", default=None)
+    ap.add_argument("--can", default=None, help="single-arm output CAN")
+    ap.add_argument("--left-can", default=None, help="bimanual left output CAN")
+    ap.add_argument("--right-can", default=None, help="bimanual right output CAN")
+    ap.add_argument("--cam-high-device", default=None)
+    ap.add_argument("--cam-wrist-device", default=None)
+    ap.add_argument("--cam-left-wrist-device", default=None)
+    ap.add_argument("--cam-right-wrist-device", default=None)
     ap.add_argument("--fps", type=int, default=DEFAULT_FPS)
     ap.add_argument("--action-horizon", type=int, default=DEFAULT_ACTION_HORIZON)
     ap.add_argument("--camera-fps", type=int, default=DEFAULT_CAMERA_FPS)
     ap.add_argument("--out-dir", default="episodes_piper_v21")
     ap.add_argument("--task-name", default="output_arm_task")
     ap.add_argument("--instruction", default=None)
-    run(ap.parse_args())
+    args = ap.parse_args()
+    hardware = load_hardware_config(args.hardware_config)
+    args.can = args.can or role_selector(hardware, "single")
+    args.left_can = args.left_can or role_selector(hardware, "left")
+    args.right_can = args.right_can or role_selector(hardware, "right")
+    args.cam_high_device = args.cam_high_device or role_selector(hardware, "overhead")
+    args.cam_left_wrist_device = args.cam_left_wrist_device or role_selector(hardware, "left_wrist")
+    args.cam_right_wrist_device = args.cam_right_wrist_device or role_selector(hardware, "right_wrist")
+    args.cam_wrist_device = args.cam_wrist_device or (args.cam_left_wrist_device if args.arm_side == "left" else args.cam_right_wrist_device)
+    required = (("CAN", args.can), ("overhead camera", args.cam_high_device), ("wrist camera", args.cam_wrist_device)) if args.arm_mode == SINGLE_ARM else (("left CAN", args.left_can), ("right CAN", args.right_can), ("overhead camera", args.cam_high_device), ("left wrist camera", args.cam_left_wrist_device), ("right wrist camera", args.cam_right_wrist_device))
+    missing = [name for name, value in required if not str(value or "").strip()]
+    if missing:
+        ap.error("missing hardware identity for " + ", ".join(missing))
+    run(args)
 
 
 if __name__ == "__main__":

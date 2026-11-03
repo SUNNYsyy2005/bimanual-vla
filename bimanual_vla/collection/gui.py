@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from bimanual_vla.collection.can_identity import (list_can_adapters, validate_can_selector,
                                                  resolve_can_selector, resolve_can_pair, load_can_bindings, save_can_bindings)
+from bimanual_vla.hardware_config import load_hardware_config, save_hardware_config, role_selector
 
 import json
 import math
@@ -51,7 +52,7 @@ except ImportError:  # pragma: no cover - OpenCV fallback is for minimal install
 
 from bimanual_vla.collection.session import CollectionConfig, CollectionSession, SessionState
 from bimanual_vla.device_guard import DeviceCheckRejected, arm_role_request, camera_role_request, check_devices
-from bimanual_vla.collection.camera import select_video_device
+from bimanual_vla.collection.camera import select_video_device, enumerate_rgb_camera_identities
 from bimanual_vla.collection.output import (
     DEFAULT_CAN,
     DEFAULT_CAMERA_FPS,
@@ -100,6 +101,20 @@ CAN_ACTIVATE_SCRIPT = (
 RTC_CLIENT_MODULE = "bimanual_vla.deployment.client"
 DATA_UPLOAD_MODULE = "bimanual_vla.data.upload"
 EPISODE_VIEWER_MODULE = "bimanual_vla.data.viewer"
+
+
+def _hardware_set_selector(config: dict[str, object], role: str, selector: str) -> dict[str, object]:
+    """Update one identity in the shared hardware file."""
+    result = json.loads(json.dumps(config))
+    selector = str(selector or "").strip()
+    if role in {"left", "right", "single"}:
+        result.setdefault("arms", {}).setdefault(role, {})["can"] = {"selector": selector}
+    else:
+        # Camera identity is a serial/model record.  A resolved /dev/videoN
+        # node is a runtime handle and must never replace that identity.
+        if selector.lower().startswith("serial:"):
+            result.setdefault("cameras", {}).setdefault(role, {})["selector"] = selector
+    return result
 
 
 def fluid_label(label: ttk.Label) -> ttk.Label:
@@ -1050,7 +1065,8 @@ class CollectorGUI:
         self.root.title("Super GUI")
         self.root.geometry("1800x1200")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.gui_preferences = {**load_can_bindings(), **load_gui_preferences()}
+        self.hardware_config = load_hardware_config()
+        self.gui_preferences = load_gui_preferences()
 
         self.session: CollectionSession | None = None
         self.piper = None
@@ -1108,8 +1124,9 @@ class CollectorGUI:
         self.preview_key_to_slot: dict[str, str] = {}
         self.arm_mode_var = tk.StringVar(value=BIMANUAL)
         self.collection_control_source_var = tk.StringVar(value="passive")
-        self.quest_model_dir_var = tk.StringVar(value="")
-        self.quest_adb_serial_var = tk.StringVar(value="")
+        quest = self.hardware_config.get("quest", {})
+        self.quest_model_dir_var = tk.StringVar(value=str(quest.get("model_dir") or ""))
+        self.quest_adb_serial_var = tk.StringVar(value=str(quest.get("adb_serial") or ""))
         self.quest_device_status_var = tk.StringVar(value="")
         self._quest_scan_busy = False
         self._quest_serial_entries: list[ttk.Combobox] = []
@@ -1123,20 +1140,21 @@ class CollectorGUI:
         self.schema_var = tk.StringVar(value="both")
         self.dataset_schema_var = tk.StringVar(value="joint")
         self.arm_side_var = tk.StringVar(value=str(self.gui_preferences.get("collection_arm_side") or "left"))
-        self.can_var = tk.StringVar(value=str(self.gui_preferences.get("can_selector") or DEFAULT_CAN))
-        self.left_can_var = tk.StringVar(value=str(self.gui_preferences.get("left_can_selector") or DEFAULT_LEFT_CAN))
-        self.right_can_var = tk.StringVar(value=str(self.gui_preferences.get("right_can_selector") or DEFAULT_RIGHT_CAN))
-        self.high_var = tk.StringVar(value=DEFAULT_HIGH_DEVICE)
-        self.wrist_var = tk.StringVar(value=DEFAULT_WRIST_DEVICE)
+        self.left_can_var = tk.StringVar(value=role_selector(self.hardware_config, "left"))
+        self.right_can_var = tk.StringVar(value=role_selector(self.hardware_config, "right"))
+        self.can_var = tk.StringVar(value=str(self.left_can_var.get() or self.right_can_var.get()))
+        self.high_var = tk.StringVar(value=role_selector(self.hardware_config, "overhead"))
         self.left_wrist_var = tk.StringVar(
-            value=str(self.gui_preferences.get("left_wrist_device") or DEFAULT_LEFT_WRIST_DEVICE)
+            value=role_selector(self.hardware_config, "left_wrist")
         )
         self.right_wrist_var = tk.StringVar(
-            value=str(self.gui_preferences.get("right_wrist_device") or DEFAULT_RIGHT_WRIST_DEVICE)
+            value=role_selector(self.hardware_config, "right_wrist")
         )
+        self.wrist_var = tk.StringVar(value=(self.left_wrist_var.get() or self.right_wrist_var.get()))
         self.rlsok_resolver_var = tk.StringVar(
             value=str(
-                self.gui_preferences.get("rlsok_resolver")
+                self.hardware_config.get("resolver", {}).get("path")
+                or self.gui_preferences.get("rlsok_resolver")
                 or os.environ.get("BIMANUAL_VLA_RLSOK_RESOLVER", "")
             )
         )
@@ -2890,6 +2908,26 @@ class CollectorGUI:
 
     def _save_gui_preferences(self) -> None:
         self._store_eef_pose_profile()
+        hardware = self.hardware_config
+        hardware = _hardware_set_selector(hardware, "left", self.left_can_var.get())
+        hardware = _hardware_set_selector(hardware, "right", self.right_can_var.get())
+        hardware = _hardware_set_selector(hardware, "overhead", self.high_var.get())
+        hardware = _hardware_set_selector(hardware, "left_wrist", self.left_wrist_var.get())
+        hardware = _hardware_set_selector(hardware, "right_wrist", self.right_wrist_var.get())
+        for role in ("overhead", "left_wrist", "right_wrist"):
+            selector = role_selector(hardware, role)
+            if selector.lower() == "auto":
+                self.status_var.set(f"Camera {role} must use a serial/model identity, not auto")
+                return
+        hardware.setdefault("quest", {})["model_dir"] = self.quest_model_dir_var.get().strip()
+        hardware.setdefault("quest", {})["adb_serial"] = self.quest_adb_serial_var.get().strip()
+        hardware.setdefault("resolver", {})["path"] = self.rlsok_resolver_var.get().strip()
+        try:
+            save_hardware_config(hardware)
+            self.hardware_config = hardware
+        except (OSError, ValueError) as exc:
+            self.status_var.set(f"Could not save hardware configuration: {exc}")
+            return
         values: dict[str, object] = {
             "inference_eef_control_mode": self.inference_eef_control_mode_var.get(),
             "inference_eef_pose_profiles": self._eef_pose_profiles,
@@ -2968,7 +3006,6 @@ class CollectorGUI:
         if self.remember_upload_token_var.get() and self.dataset_token_var.get().strip():
             values["upload_token"] = self.dataset_token_var.get().strip()
         try:
-            save_can_bindings(values)
             save_gui_preferences(values)
         except OSError as exc:
             self.status_var.set(f"Could not save GUI preferences: {exc}")
@@ -3082,6 +3119,11 @@ class CollectorGUI:
         body.pack(fill="both", expand=True)
         body.columnconfigure(1, weight=1)
 
+        ttk.Button(
+            body, text="Configure hardware identity...",
+            command=self.open_hardware_identity_wizard,
+        ).grid(row=0, column=2, padx=(10, 0), pady=4, sticky="ew")
+
         rows = []
         if self.arm_mode == BIMANUAL:
             rows.extend(
@@ -3109,7 +3151,7 @@ class CollectorGUI:
             )
         )
         pending = {label: tk.StringVar(value=variable.get()) for label, variable in rows}
-        for row, (label, _variable) in enumerate(rows):
+        for row, (label, _variable) in enumerate(rows, start=1):
             ttk.Label(body, text=label, width=20).grid(row=row, column=0, sticky="w", pady=4)
             widget = (ttk.Combobox(body, textvariable=pending[label], width=58,
                                   values=["serial:" + r["serial"] for r in list_can_adapters() if r["serial"]])
@@ -3123,7 +3165,7 @@ class CollectorGUI:
             )
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=len(rows), column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        buttons.grid(row=len(rows) + 1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         buttons.columnconfigure(0, weight=1)
         buttons.columnconfigure(1, weight=1)
 
@@ -3170,6 +3212,117 @@ class CollectorGUI:
         dialog.bind("<Escape>", lambda _event: close_dialog())
         dialog.bind("<Return>", lambda _event: apply_settings())
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+
+    def open_hardware_identity_wizard(self) -> None:
+        """Guide first-time hardware binding by comparing before/after scans."""
+        if self.session is not None or self._inference_running() or self._replay_running():
+            messagebox.showinfo("Hardware identity", "Disconnect devices and stop inference before configuring hardware.")
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Configure hardware identity")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        body = ttk.Frame(dialog, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        roles = {
+            "Left arm CAN": "left_can", "Right arm CAN": "right_can",
+            "Overhead RGB camera": "overhead", "Left wrist RGB camera": "left_wrist",
+            "Right wrist RGB camera": "right_wrist", "Quest headset": "quest",
+        }
+        role_var = tk.StringVar(value="Overhead RGB camera")
+        status_var = tk.StringVar(value="Select a role, scan before insertion, then insert one device.")
+        result_var = tk.StringVar(value="")
+        ttk.Label(body, text="Device role").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Combobox(body, textvariable=role_var, values=tuple(roles), state="readonly", width=32).grid(
+            row=0, column=1, sticky="ew", pady=4
+        )
+        ttk.Label(body, textvariable=status_var, wraplength=500).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        ttk.Label(body, textvariable=result_var, wraplength=500).grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
+        state: dict[str, object] = {"before": None}
+
+        def scan() -> dict[str, dict[str, str]]:
+            can = {item["serial"]: item for item in list_can_adapters() if item.get("serial")}
+            cameras = {item["serial"]: item for item in enumerate_rgb_camera_identities()}
+            quest: dict[str, dict[str, str]] = {}
+            if roles[role_var.get()] == "quest":
+                try:
+                    from bimanual_vla.collection.quest.devices import discover_devices
+                    quest = {item.serial: {"serial": item.serial, "model": item.model or ""} for item in discover_devices()}
+                except Exception:
+                    quest = {}
+            kind = "can" if "CAN" in role_var.get() else "camera" if "camera" in role_var.get().lower() else "quest"
+            return can if kind == "can" else cameras if kind == "camera" else quest
+
+        def before() -> None:
+            try:
+                state["before"] = scan()
+                status_var.set("Baseline captured. Insert exactly one device, then click Detect inserted device.")
+                result_var.set(f"Existing devices: {len(state['before'])}")
+            except Exception as exc:
+                status_var.set(f"Scan failed: {exc}")
+
+        def detect() -> None:
+            before_items = state.get("before")
+            if before_items is None:
+                status_var.set("Capture the baseline before detecting an insertion.")
+                return
+            try:
+                current = scan()
+                added = [item for serial, item in current.items() if serial not in before_items]
+                if len(added) != 1:
+                    status_var.set(f"Expected one new device, found {len(added)}. Disconnect extras and retry.")
+                    result_var.set("Candidates: " + ", ".join(item.get("serial", "?") for item in added))
+                    return
+                item = added[0]
+                result_var.set(f"Detected serial={item.get('serial')} model={item.get('model') or 'unknown'}")
+                state["detected"] = item
+                status_var.set("Detection complete. Click Save identity to bind this role.")
+            except Exception as exc:
+                status_var.set(f"Detection failed: {exc}")
+
+        def save() -> None:
+            item = state.get("detected")
+            if not isinstance(item, dict):
+                status_var.set("Detect an inserted device first.")
+                return
+            role = roles[role_var.get()]
+            serial = str(item.get("serial") or "").strip()
+            if not serial:
+                status_var.set("Detected device has no stable serial; it cannot be bound safely.")
+                return
+            config = self.hardware_config
+            if role == "left_can":
+                self.left_can_var.set(f"serial:{serial}")
+                config = _hardware_set_selector(config, "left", f"serial:{serial}")
+            elif role == "right_can":
+                self.right_can_var.set(f"serial:{serial}")
+                config = _hardware_set_selector(config, "right", f"serial:{serial}")
+            elif role == "quest":
+                config = json.loads(json.dumps(config))
+                config.setdefault("quest", {})["adb_serial"] = serial
+                self.quest_adb_serial_var.set(serial)
+            else:
+                config = json.loads(json.dumps(config))
+                record = {"serial": serial, "model": str(item.get("model") or ""), "selector": f"serial:{serial}"}
+                config.setdefault("cameras", {})[role] = record
+                variable = {"overhead": self.high_var, "left_wrist": self.left_wrist_var, "right_wrist": self.right_wrist_var}[role]
+                variable.set(record["selector"])
+            save_hardware_config(config)
+            self.hardware_config = config
+            self._save_gui_preferences()
+            status_var.set("Saved to hardware.json")
+
+        actions = ttk.Frame(body)
+        actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        for column in range(4):
+            actions.columnconfigure(column, weight=1)
+        ttk.Button(actions, text="Scan before insertion", command=before).grid(row=0, column=0, sticky="ew", padx=2)
+        ttk.Button(actions, text="Detect inserted device", command=detect).grid(row=0, column=1, sticky="ew", padx=2)
+        ttk.Button(actions, text="Save identity", command=save).grid(row=0, column=2, sticky="ew", padx=2)
+        ttk.Button(actions, text="Close", command=dialog.destroy).grid(row=0, column=3, sticky="ew", padx=2)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
 
     def edit_dataset_name(self) -> None:
         """Choose an existing dataset or create a new named directory."""

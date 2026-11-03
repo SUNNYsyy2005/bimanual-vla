@@ -9,7 +9,7 @@ No training, policy service, or robot motion was started to produce this documen
 `fix_trimstart_rtc35_h200_20261021/20000` (rtc35). The saved prefix/noise ablations below use the
 older `fix_nopad_rtc_empirical_d10_20261019/20000` (d10). Their results must not be treated as
 paired experiments on the current checkpoint. The independent verification is recorded in
-[RTC normalization audit](analysis/rtc_normalization_20261022/README.md).
+[RTC normalization audit](../../analysis/rtc_normalization_20261022/README.md).
 
 ## 1. Background: how trained RTC works here
 
@@ -164,7 +164,7 @@ separate demonstration-prefix losses for supported d=0/4/5/6/7/8/10, while retai
 the historical d=0 metric. The evaluation-only API also accepts a separately supplied
 planner prefix; the normal dataset loader does not supply one and reports this explicitly.
 CPU regression tests pass, but current-checkpoint prefix evaluation results are still pending.
-See [evaluation behavior and limitations](docs/RTC_EVALUATION.md).
+See [evaluation behavior and limitations](../RTC_EVALUATION.md).
 
 ### Q7. Is RTC normalization applied at the wrong granularity? No such axis error was found in the deployed code.
 
@@ -283,15 +283,15 @@ Optional env vars (defaults in the script): `TSQ_STORAGE`, `PROBE_CHECKPOINT`, `
 
 ### 5.3 Independent verification added on 2026-10-22
 
-Full report: [RTC normalization and document audit](analysis/rtc_normalization_20261022/README.md).
+Full report: [RTC normalization and document audit](../../analysis/rtc_normalization_20261022/README.md).
 All added verification used CPU and saved data; no new model inference or robot execution was performed.
 
-- [CPU normalization/RMSNorm checks](analysis/rtc_normalization_20261022/cpu_audit.json), reproduced by
+- [CPU normalization/RMSNorm checks](../../analysis/rtc_normalization_20261022/cpu_audit.json), reproduced by
   `audit_cpu.py` in an OpenPI Conda environment with `JAX_PLATFORMS=cpu`, `--stats-dir` and `--sample`.
-- [Current-model roughness](analysis/rtc_normalization_20261022/current_roughness.json), reproduced from
+- [Current-model roughness](../../analysis/rtc_normalization_20261022/current_roughness.json), reproduced from
   deployment recordings by `current_roughness.py`.
-- [Trimmed demonstration statistics](analysis/rtc_normalization_20261022/trimmed_demo_stats.json).
-- [Old-checkpoint noise recomputation](analysis/rtc_normalization_20261022/old_noise_recheck.json),
+- [Trimmed demonstration statistics](../../analysis/rtc_normalization_20261022/trimmed_demo_stats.json).
+- [Old-checkpoint noise recomputation](../../analysis/rtc_normalization_20261022/old_noise_recheck.json),
   reproduced by `recheck_noise_cpu.py` using saved predictions and original seeds on CPU.
-- [Original jitter-probe rerun](analysis/rtc_normalization_20261022/document_probe.txt). Its defaults
+- [Original jitter-probe rerun](../../analysis/rtc_normalization_20261022/document_probe.txt). Its defaults
   combine current rtc35 normalization statistics with old d10 predictions; preserve that provenance.

@@ -19,7 +19,6 @@ import re
 import subprocess
 import time
 import logging
-import json
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from typing import Callable
@@ -39,11 +38,7 @@ except Exception:  # pragma: no cover - headless/minimal installations
 IMG_H, IMG_W = 224, 224
 
 # UNKNOWN: set correct device IDs after running `v4l2-ctl --list-devices`
-DEFAULT_CAM_IDS = {
-    "cam_high":        0,   # head / front camera
-    "cam_left_wrist":  2,   # left wrist camera
-    "cam_right_wrist": 4,   # right wrist camera
-}
+DEFAULT_CAM_IDS: dict[str, object] = {}
 
 STALE_THRESHOLD_S = 0.5   # flag image as stale if older than this
 
@@ -85,10 +80,9 @@ CAMERA_MODEL_HINTS = {
 # Physical wrist placement for the current rig. The two D405 units are
 # identical, so model matching alone cannot tell left from right. These USB
 # topology fragments are stable across normal video-node renumbering.
-CAMERA_ROLE_PATH_HINTS = {
-    "cam_left_wrist": ("usb-0:6.2:",),
-    "cam_right_wrist": ("usb-0:5.2:",),
-}
+# Role assignment is supplied by hardware.json (prefer serial selectors).  No
+# installation-specific USB topology is embedded in the package.
+CAMERA_ROLE_PATH_HINTS: dict[str, tuple[str, ...]] = {}
 COLOR_FORMAT_SCORES = {
     "MJPG": 40,
     "YUYV": 35,
@@ -301,6 +295,63 @@ def _serial_rgb_device(serial: str, *, device_root: Path = Path('/dev')) -> str:
     return _stable_video_selector(matches[0].device)
 
 
+def camera_identity(selector: object, *, device_root: Path = Path('/dev')) -> dict[str, str]:
+    """Describe a selected RGB node using physical USB identity, never its path."""
+    concrete = _concrete_video_device(selector, device_root=device_root)
+    physical = _physical_video_device(concrete)
+    serial = ""
+    serial_file = physical / "serial"
+    if serial_file.is_file():
+        try:
+            serial = serial_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+    if not serial and device_root == Path('/dev'):
+        for candidate, parent in _realsense_serial_devices().items():
+            if parent == physical:
+                serial = candidate
+                break
+    properties = ""
+    udev = _command_output(["udevadm", "info", "--query=property", f"--name={concrete}"])
+    for line in udev.splitlines():
+        if line.startswith("ID_MODEL_FROM_DATABASE=") or line.startswith("ID_MODEL="):
+            properties = line.split("=", 1)[1].strip()
+            if line.startswith("ID_MODEL_FROM_DATABASE="):
+                break
+    if not serial:
+        raise RuntimeError(f"camera {selector!s} has no stable serial identity")
+    return {"serial": serial, "model": properties}
+
+
+def enumerate_rgb_camera_identities(*, device_root: Path = Path('/dev')) -> list[dict[str, str]]:
+    """Enumerate physical cameras that expose an RGB-capable V4L2 stream.
+
+    The returned identity is stable across ``/dev/videoN`` renumbering.  A
+    camera is included only when its physical USB device has a serial and a
+    colour stream; depth/IR/metadata nodes are ignored.
+    """
+    result: dict[str, dict[str, str]] = {}
+    for candidate in _enumerate_video_candidates(device_root=device_root):
+        if candidate.format_score < 35:
+            continue
+        try:
+            identity = camera_identity(str(candidate.device), device_root=device_root)
+        except RuntimeError:
+            continue
+        item = result.setdefault(identity["serial"], {
+            "serial": identity["serial"],
+            "model": identity.get("model", ""),
+            "rgb_selector": _stable_video_selector(candidate.device),
+        })
+        # Prefer the highest quality RGB node if a camera exposes more than one.
+        if candidate.format_score > item.get("_score", 0):
+            item["rgb_selector"] = _stable_video_selector(candidate.device)
+            item["_score"] = candidate.format_score
+    for item in result.values():
+        item.pop("_score", None)
+    return sorted(result.values(), key=lambda value: value["serial"])
+
+
 def select_video_devices(
     configured_devices: dict[str, object],
     *,
@@ -317,26 +368,50 @@ def select_video_devices(
     used_devices: dict[Path, str] = {}
     pending: list[str] = []
 
-    bindings_path = Path.home() / '.config/bimanual-vla/camera_serials.json'
-    bindings = json.loads(bindings_path.read_text()) if device_root == Path('/dev') and bindings_path.is_file() else {}
+    try:
+        from bimanual_vla.hardware_config import load_hardware_config, role_selector
+        hardware_config = load_hardware_config()
+    except (OSError, ValueError, TypeError):
+        hardware_config = {}
+    bindings = {
+        key: role_selector(hardware_config, role)
+        for key, role in (("cam_high", "overhead"), ("cam_left_wrist", "left_wrist"),
+                          ("cam_right_wrist", "right_wrist"))
+    }
+    configured_models = {
+        key: str(hardware_config.get("cameras", {}).get(role, {}).get("model") or "").strip().lower()
+        for key, role in (("cam_high", "overhead"), ("cam_left_wrist", "left_wrist"),
+                          ("cam_right_wrist", "right_wrist"))
+    }
 
     for camera_key, configured_device in configured_devices.items():
-        if camera_key in bindings and not strict_explicit:
-            # A saved identity supersedes old GUI video paths after replugging.
-            configured_device = 'serial:' + str(bindings[camera_key])
+        if configured_device is None or not str(configured_device).strip() or str(configured_device).strip().lower() == "auto":
+            raise RuntimeError(
+                f"No selector configured for camera {camera_key}; set it in hardware.json "
+                "or pass an explicit camera selector."
+            )
+        configured_selector = str(bindings.get(camera_key) or "").strip()
+        if configured_selector and str(configured_device).strip().lower() in {"", "auto"} and not strict_explicit:
+            configured_device = configured_selector
         explicit = _existing_configured_device(
             configured_device,
             device_root=device_root,
         )
         if explicit is None:
-            if strict_explicit and str(configured_device).strip().lower() != "auto":
+            if strict_explicit:
                 raise RuntimeError(
                     f"Camera {camera_key} reviewed selector is unavailable"
                 )
-            pending.append(camera_key)
-            continue
+            raise RuntimeError(
+                f"Configured camera {camera_key} is unavailable; select its serial/model in Device settings"
+            )
         concrete = _concrete_video_device(explicit, device_root=device_root)
         physical = _physical_video_device(concrete)
+        expected_model = configured_models.get(camera_key, "")
+        if expected_model:
+            properties = _command_output(["udevadm", "info", "--query=property", f"--name={concrete}"]).lower()
+            if expected_model not in properties:
+                raise RuntimeError(f"Camera {camera_key} does not match configured model {expected_model!r}")
         previous_role = used_devices.get(physical)
         if previous_role is not None:
             raise RuntimeError(
@@ -449,7 +524,7 @@ class CameraCapture:
         policy_image_hw: tuple[int, int] | None = None,
         resize_mode: str = "stretch",
     ):
-        self._ids = cam_ids or dict(DEFAULT_CAM_IDS)
+        self._ids = dict(cam_ids) if cam_ids is not None else dict(DEFAULT_CAM_IDS)
         self._configured_ids = dict(self._ids)
         self._fps = fps
         self._image_hw = tuple(image_hw)

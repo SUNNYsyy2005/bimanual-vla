@@ -25,3 +25,21 @@
 - [Dashboard 运维](../server_4090/README.md)
 - [Dashboard API](../server_4090/API_USAGE.md)
 - [仿真 Dashboard](../server_4090/SIMULATION_DASHBOARD.md)
+
+## 历史报告与诊断
+
+以下文档是历史部署记录、故障诊断和参数分析，保留供追溯，不作为当前配置的
+权威入口。当前使用说明以本索引、安装指南、采集指南和部署指南为准。
+
+- [相机/状态时间偏差](archive/CAMERA_STATE_SKEW.md)
+- [本地部署总结](archive/DEPLOYMENT_SUMMARY.md)
+- [GUI 改进方案](archive/GUI_IMPROVEMENT_PLAN.md)
+- [推理界面连接按钮记录](archive/GUI_INFERENCE_CONNECT_BUTTON.md)
+- [推理功能记录](archive/INFERENCE_FEATURES.md)
+- [左臂 CAN 诊断](archive/LEFT_ARM_DIAGNOSIS.md)
+- [网络延迟分析](archive/NETWORK_LATENCY_ANALYSIS.md)
+- [Piper 连接鲁棒性记录](archive/PIPER_CONNECTION_ROBUSTNESS.md)
+- [Piper SDK 集成报告](archive/PIPER_SDK_INTEGRATION.md)
+- [Policy 延迟报告](archive/POLICY_LATENCY_REPORT.md)
+- [RTC 配置说明](archive/RTC_CONFIGURATION.md)
+- [RTC 问题与分析](archive/RTC-questions.md)

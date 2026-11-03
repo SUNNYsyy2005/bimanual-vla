@@ -70,6 +70,7 @@ from bimanual_vla.deployment.process_control import graceful_stop_signals
 from bimanual_vla.deployment.ik_workers import IKUnreachableError
 from bimanual_vla.collection.output import require_can_interface_up
 from bimanual_vla.collection.can_identity import resolve_can_selector, resolve_can_pair
+from bimanual_vla.hardware_config import load_hardware_config, role_selector
 from bimanual_vla.device_guard import DeviceCheckRejected, RuntimeDeviceGuard
 from bimanual_vla.data.action_conventions import (
     DELIVERY_CHUNK_ORIGIN_ACTION_SEMANTICS,
@@ -147,13 +148,13 @@ DEFAULT_EXTERNAL_CONTROL_HZ_THRESHOLD = 1.0
 GRIPPER_OPENING_FRACTION = NEW_GRIPPER_SEMANTICS
 GRIPPER_CLOSED_FRACTION = LEGACY_GRIPPER_SEMANTICS
 GRIPPER_OPENING_METRES = LEGACY_GRIPPER_OPENING_METRES_SEMANTICS
-DEFAULT_CAN = "can0"
-DEFAULT_LEFT_CAN = "can1"
-DEFAULT_RIGHT_CAN = "can3"
-DEFAULT_HIGH_DEVICE = "auto"
-DEFAULT_WRIST_DEVICE = "auto"
-DEFAULT_LEFT_WRIST_DEVICE = "auto"
-DEFAULT_RIGHT_WRIST_DEVICE = "auto"
+DEFAULT_CAN = ""
+DEFAULT_LEFT_CAN = ""
+DEFAULT_RIGHT_CAN = ""
+DEFAULT_HIGH_DEVICE = ""
+DEFAULT_WRIST_DEVICE = ""
+DEFAULT_LEFT_WRIST_DEVICE = ""
+DEFAULT_RIGHT_WRIST_DEVICE = ""
 CAMERA_SOURCE_HW = (240, 424)
 # 8_3_64eps full-set envelope: 18,034 frames sampled at 20 Hz. These defaults
 # include a small margin over observed maxima. They remain CLI-tightenable, and
@@ -9338,12 +9339,13 @@ def main() -> None:
             "An explicit mode fails closed if the server advertises another schema."
         ),
     )
-    parser.add_argument("--can", default=DEFAULT_CAN, help="single-arm CAN interface")
-    parser.add_argument("--left-can", default=DEFAULT_LEFT_CAN)
-    parser.add_argument("--right-can", default=DEFAULT_RIGHT_CAN)
+    parser.add_argument("--hardware-config", default=None, help="unified hardware identity JSON file")
+    parser.add_argument("--can", default=None, help="single-arm CAN interface or serial selector")
+    parser.add_argument("--left-can", default=None)
+    parser.add_argument("--right-can", default=None)
     parser.add_argument("--arm-side", choices=("left", "right", "both"), default="right")
-    parser.add_argument("--cam-high-device", default=DEFAULT_HIGH_DEVICE)
-    parser.add_argument("--cam-wrist-device", default=DEFAULT_WRIST_DEVICE, help="single-arm wrist camera")
+    parser.add_argument("--cam-high-device", default=None)
+    parser.add_argument("--cam-wrist-device", default=None, help="single-arm wrist camera")
     parser.add_argument(
         "--camera-preview",
         "--show-cameras",
@@ -9357,8 +9359,8 @@ def main() -> None:
         default=8.0,
         help="preview refresh rate; capture/inference rates are unchanged (default 8 FPS)",
     )
-    parser.add_argument("--cam-left-wrist-device", default=DEFAULT_LEFT_WRIST_DEVICE)
-    parser.add_argument("--cam-right-wrist-device", default=DEFAULT_RIGHT_WRIST_DEVICE)
+    parser.add_argument("--cam-left-wrist-device", default=None)
+    parser.add_argument("--cam-right-wrist-device", default=None)
     parser.add_argument(
         "--camera-fps",
         type=int,
@@ -9877,6 +9879,39 @@ def main() -> None:
         help="return speed percentage; default reuses --speed-pct",
     )
     args = parser.parse_args()
+    try:
+        hardware = load_hardware_config(args.hardware_config)
+    except ValueError as exc:
+        parser.error(str(exc))
+    def configured(role: str) -> str:
+        return role_selector(hardware, role)
+    # Explicit CLI selectors remain authoritative.  An omitted selector is
+    # resolved from the shared identity file; an empty identity fails closed.
+    args.can = args.can or configured("single")
+    args.left_can = args.left_can or configured("left")
+    args.right_can = args.right_can or configured("right")
+    args.cam_high_device = args.cam_high_device or configured("overhead")
+    args.cam_left_wrist_device = args.cam_left_wrist_device or configured("left_wrist")
+    args.cam_right_wrist_device = args.cam_right_wrist_device or configured("right_wrist")
+    args.cam_wrist_device = args.cam_wrist_device or (
+        args.cam_left_wrist_device if args.arm_side == "left" else args.cam_right_wrist_device
+    )
+    missing = []
+    if args.arm_mode == "bimanual":
+        for name, value in (("left CAN", args.left_can), ("right CAN", args.right_can),
+                            ("overhead camera", args.cam_high_device),
+                            ("left wrist camera", args.cam_left_wrist_device),
+                            ("right wrist camera", args.cam_right_wrist_device)):
+            if not str(value or "").strip():
+                missing.append(name)
+    else:
+        for name, value in (("CAN", args.can), ("overhead camera", args.cam_high_device),
+                            ("wrist camera", args.cam_wrist_device)):
+            if not str(value or "").strip():
+                missing.append(name)
+    if missing:
+        parser.error("missing hardware identity for " + ", ".join(missing) +
+                     "; configure Device settings or pass explicit CLI selectors")
     args.servo_backend = args.servo_backend or ("ruckig" if args.trajectory_shaping else "off")
     args.trajectory_shaping = args.servo_backend != "off"
     if args.recap_control_dir:

@@ -106,7 +106,7 @@ class CollectionConfig:
             else (self.left_can_name, self.right_can_name)
         )
         if any(not name.strip() for name in can_names):
-            raise ValueError("CAN interface names must not be empty")
+            raise ValueError("CAN identities are not configured; set them in hardware.json or pass explicit selectors")
         if len(set(can_names)) != len(can_names):
             raise ValueError("bimanual CAN interface names must be distinct")
 
