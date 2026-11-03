@@ -93,3 +93,16 @@ def test_handoff_pose_is_not_resent_after_the_resumed_policy_moved(tmp_path):
     result.hold_until_policy()
     assert quest.hold.call_count == 1
     assert result.targets is None
+
+
+def test_left_x_press_toggles_recap_ownership_on_edges(tmp_path):
+    result, quest, calls, fresh = runtime(tmp_path)
+    sample = SimpleNamespace(buttons={"X": True})
+    quest.controller.reader.snapshot.side_effect = [sample, sample, SimpleNamespace(buttons={"X": False}),
+                                                     SimpleNamespace(buttons={"X": True})]
+    assert result._poll_x_command() == "takeover"
+    # A held X is one request only.
+    assert result._poll_x_command() is None
+    assert result._poll_x_command() is None
+    result.session.owner = "human"
+    assert result._poll_x_command() == "resume"

@@ -2,6 +2,7 @@ import json
 
 import cv2
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 
 from bimanual_vla.data.recap import RecapEpisode
@@ -76,3 +77,22 @@ def test_default_rate_follows_recording_and_upsampling_is_refused(tmp_path):
     # A 20 Hz run exported at 30 fps repeats rows that are then masked invalid.
     with pytest.raises(ValueError, match="exceeds the recorded control rate"):
         load_run(run, fps=30)
+
+
+def test_export_compacts_released_clutch_gaps_without_joining_segments(tmp_path):
+    run = make_run(tmp_path / "run")
+    with np.load(run / "trajectory.npz") as source:
+        payload = {key: source[key] for key in source.files}
+    payload["recap_valid"] = payload["recap_valid"].copy()
+    payload["recap_valid"][30:35] = False
+    np.savez(run / "trajectory.npz", **payload)
+
+    output = export_runs([run], tmp_path / "dataset")
+    with np.load(output / "meta/recap/episode_000000.npz") as data:
+        annotation = RecapEpisode.from_payload(data)
+    assert annotation.valid.all()
+    assert len(set(annotation.epoch.tolist())) >= 3  # policy, first human, second human
+    assert annotation.chunk_starts(20, human_only=True).size > 0
+    # The removed hold interval cannot be reconstructed from exported rows.
+    table = pq.read_table(output / "data/chunk-000/episode_000000.parquet")
+    assert len(table) < 70

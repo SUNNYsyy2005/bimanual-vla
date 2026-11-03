@@ -1,8 +1,10 @@
 """Convert time-indexed RECAP deployment recordings into canonical LeRobot.
 
-Only explicitly labelled success/failure runs are admitted. The full episode
-is retained, including invalid/waiting rows; policy sampling uses the sidecar
-mask and never joins disconnected pieces of a trajectory.
+Only explicitly labelled success/failure runs are admitted. Deployment runs
+keep their complete timeline for audit, while the exported training episode
+removes invalid handoff/hold rows. Source segment boundaries are retained in
+the sidecar annotation, so compaction never joins two disconnected control
+segments into one policy chunk.
 """
 
 import argparse
@@ -34,7 +36,61 @@ def recorded_control_hz(path):
     return float(value)
 
 
-def load_run(path, *, fps=None, max_skew_s=.05):
+def _compact_values(annotation, values):
+    """Remove invalid resampled rows while retaining control segment bounds.
+
+    An action at frame *i* targets the next observation. The final valid row
+    before an invalid gap therefore cannot be retained: its action would
+    otherwise jump over the gap. The source index is used only to create a
+    fresh epoch at every removed interval; it is never exposed as a new
+    physical timestamp in the exported episode.
+    """
+    valid = annotation.valid.copy()
+    if len(valid) > 1:
+        # The exporter marks the terminal observation invalid because it has
+        # no following action. It is still a legitimate next-state target for
+        # the preceding row, so only real invalid gaps suppress that row.
+        next_valid = valid[1:].copy()
+        next_valid[-1] = True
+        valid[:-1] &= next_valid
+    indices = np.flatnonzero(valid)
+    if len(indices) < 2:
+        raise ValueError("RECAP recording has fewer than two valid contiguous frames")
+
+    owner = annotation.owner[indices]
+    source_epoch = annotation.epoch[indices]
+    epoch = np.empty(len(indices), dtype=np.int64)
+    epoch[0] = int(source_epoch[0])
+    for position in range(1, len(indices)):
+        previous = position - 1
+        boundary = (
+            indices[position] != indices[previous] + 1
+            or source_epoch[position] != source_epoch[previous]
+            or owner[position] != owner[previous]
+        )
+        epoch[position] = max(
+            int(source_epoch[position]),
+            int(epoch[previous]) + int(boundary),
+        )
+    compact_annotation = RecapEpisode(owner, epoch, np.ones(len(indices), dtype=bool), annotation.outcome)
+
+    compact = dict(values)
+    for key in ("states", "actions", "timestamps", "state_timestamps", "action_timestamps"):
+        compact[key] = np.asarray(values[key])[indices]
+    compact["images"] = {key: np.asarray(image)[indices] for key, image in values["images"].items()}
+    compact["image_timestamps"] = {
+        key: np.asarray(stamps)[indices] for key, stamps in values["image_timestamps"].items()
+    }
+    compact["allow_repeated_source_timestamps"] = False
+    compact["metadata"] = dict(values.get("metadata", {}),
+                                recap_compacted=True,
+                                recap_source_frame_count=int(len(annotation.owner)),
+                                recap_export_frame_count=int(len(indices)),
+                                recap_removed_invalid_frames=int(len(annotation.owner) - len(indices)))
+    return compact_annotation, compact
+
+
+def load_run(path, *, fps=None, max_skew_s=.05, compact=False):
     path = Path(path)
     control_hz = recorded_control_hz(path)
     fps = control_hz if fps is None else float(fps)
@@ -118,7 +174,7 @@ def load_run(path, *, fps=None, max_skew_s=.05):
                 cap.release()
         image_times[key] = ct[ci]
     annotation = RecapEpisode(owner, epoch, valid, outcome)
-    return metadata, annotation, dict(states=states, actions=actions, timestamps=grid,
+    values = dict(states=states, actions=actions, timestamps=grid,
         state_timestamps=times[indices],
         action_timestamps=np.r_[times[indices][1:], times[indices][-1] + 1 / fps],
         allow_repeated_source_timestamps=True,
@@ -126,6 +182,12 @@ def load_run(path, *, fps=None, max_skew_s=.05):
         instruction=metadata["instruction"], success=outcome == "success",
         metadata={"recap_source_run": str(path.resolve()), "recap_outcome": outcome,
                   "observation_resampling": "nearest; repeated source timestamps retained; invalid gaps masked"})
+    if compact:
+        annotation, values = _compact_values(annotation, values)
+        values["metadata"]["observation_resampling"] = (
+            "nearest; invalid handoff/hold rows removed; source segment boundaries retained"
+        )
+    return metadata, annotation, values
 
 
 def export_runs(runs, output, *, fps=None, arm_base_offset=None):
@@ -156,7 +218,7 @@ def _export_runs(runs, output, *, fps=None, arm_base_offset=None):
     writer = None
     contract = None
     for run in runs:
-        metadata, annotation, values = load_run(run, fps=fps)
+        metadata, annotation, values = load_run(run, fps=fps, compact=True)
         protocol = metadata["policy_protocol"]
         current_contract = {key: protocol[key] for key in (
             "schema", "contract_version", "arm_mode", "arm_side", "image_resize_mode", "camera_keys")}
@@ -182,7 +244,9 @@ def _export_runs(runs, output, *, fps=None, arm_base_offset=None):
     info_path = output / "meta/info.json"
     info = json.loads(info_path.read_text())
     info["recap"] = {"version": 1, "annotations": "meta/recap/episode_{episode_index:06d}.npz",
-                     "outcomes": ["success", "failure"], "policy_chunks_cross_handoffs": False}
+                     "outcomes": ["success", "failure"], "policy_chunks_cross_handoffs": False,
+                     "invalid_rows_compacted": True,
+                     "source_timeline_retained_in_deployment_runs": True}
     info_path.write_text(json.dumps(info, indent=2, ensure_ascii=False))
     return output
 

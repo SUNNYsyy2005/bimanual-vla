@@ -42,6 +42,8 @@ behavior depends on the active Policy contract and hardware configuration.
 
 - **End-to-end real-robot pipeline** from demonstrations to closed-loop policy execution.
 - **Multi-camera Piper collection** with GUI operation, teleoperation, replay, and episode management.
+- **Quest VR teleoperation** over ADB, with live controller diagnostics, clutch-based hand control, saved-home reset, and guarded Piper commands.
+- **VR RECAP interventions** that hand control between the policy and Quest without a second CAN writer, record intervention metadata, and export only valid human-controlled segments for training.
 - **LeRobot-compatible data** with versioned contracts, validation, conversion, and upload tools.
 - **Multi-node Dashboard** for dataset locations and transfers, checkpoint synchronization, training jobs, metrics, and evaluation videos.
 - **SFT and RL workflows**: OpenPI supervised fine-tuning with configurable full/LoRA tuning and π0.5 RTC training; RLinf integration for simulation RL training and evaluation.
@@ -142,6 +144,58 @@ bin/bimanual-vla teleop-bimanual --record --schema joint
 See the [GUI operation guide](docs/collection/GUI_OPERATION_GUIDE.md) and
 [data collection guide](docs/collection/DATA_COLLECTION_GUIDE.md) before
 connecting hardware.
+
+### Quest VR teleoperation
+
+Quest teleoperation uses the official Quest APK, ADB, the Quest project IK
+solver, and the existing Piper `JointCtrl` connection. It does not require ROS
+or a second robot-control process. Install the APK, enable Quest Developer Mode
+and USB debugging, connect the headset by USB, and verify that `adb devices`
+shows an authorized device. The complete setup and safety requirements are in
+the [Quest collection guide](docs/QUEST_COLLECTION.md).
+
+In the collection GUI, choose `quest_vr` as the control source, select the ADB
+serial, and connect the robot devices. Hold left `Y` or right `B` to engage an
+arm; release the clutch to hold the current pose and press again to re-anchor.
+The trigger controls gripper opening (`1 - trigger`). The GUI's VR input panel
+shows tracking, button, and trigger values. `Return to saved home` uses the
+shared saved pose after the safety checks described in the Quest guide.
+
+### VR RECAP policy interventions
+
+RECAP is enabled in the Model inference page with **Record human takeovers**.
+The policy must use the canonical v3 `delivery` contract with local IK and the
+Ruckig execution backend. Use **VR settings...** to choose the same Quest model
+directory and ADB serial as the collection page, then use **Connect VR** to
+discover and select the authorized headset before starting inference.
+
+After the policy has connected and published its first command, control can be
+switched in either place:
+
+- click **Take over** in the RECAP panel, or press left-hand `X` once;
+- control the robot with the normal `Y`/`B` clutches and trigger;
+- click **Resume policy**, or release and press left-hand `X` once again.
+
+The `X` shortcut is edge-triggered, so holding it does not repeat a handoff.
+It is consumed only by a running RECAP client and does not change the normal
+collection shortcuts. The GUI status follows the client owner (`policy`,
+`human`, or a transition/error state), and handoff is granted only after the
+policy servo has stopped safely and both arms have settled.
+
+Label the run as **Success** or **Failure** in the RECAP panel. Raw deployment
+recordings retain the full timeline for audit. `recap-export` removes invalid
+handoff/hold intervals from the trainable episode while preserving segment
+boundaries, so action chunks cannot cross a gap or join disconnected VR
+segments:
+
+```bash
+bin/bimanual-vla recap-export \
+  deployment_runs/RUN_SUCCESS deployment_runs/RUN_FAILURE \
+  --output datasets/recap_round_01 --fps 30
+```
+
+See the [RECAP guide](docs/RECAP.md) for export, upload, RLinf value/advantage
+stages, and the required safety and labeling rules.
 
 ## Dataset Pipeline
 

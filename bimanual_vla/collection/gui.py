@@ -1061,6 +1061,8 @@ class CollectorGUI:
         self.inference_activate_can_button: ttk.Button | None = None
         self.inference_connect_button: ttk.Button | None = None
         self.inference_device_settings_button: ttk.Button | None = None
+        self.inference_vr_settings_button: ttk.Button | None = None
+        self.inference_vr_connect_button: ttk.Button | None = None
         self.inference_swap_camera_button: ttk.Checkbutton | None = None
         self.app_mode = "collection"
         self.prepared_lerobot_path: str | None = None
@@ -1094,6 +1096,7 @@ class CollectorGUI:
         self.quest_adb_serial_var = tk.StringVar(value="")
         self.quest_device_status_var = tk.StringVar(value="")
         self._quest_scan_busy = False
+        self._quest_serial_entries: list[ttk.Combobox] = []
         self.quest_status_var = tk.StringVar(value="")
         self.quest_input_status_var = tk.StringVar(value="VR collection disconnected")
         self.quest_hand_vars = {
@@ -1212,6 +1215,7 @@ class CollectorGUI:
         self.recap_session_id = ""
         self.recap_pending_id = None
         self.recap_buttons = {}
+        self.recap_checkbutton: ttk.Checkbutton | None = None
         self.inference_return_button = None
         self.inference_return_pose_path = (
             RETURN_POSE_PATH
@@ -1366,6 +1370,7 @@ class CollectorGUI:
             value=bool(self.gui_preferences.get("swap_wrist_cameras", False))
         )
         self.device_settings_window: tk.Toplevel | None = None
+        self.quest_settings_window: tk.Toplevel | None = None
         self.task_settings_window: tk.Toplevel | None = None
         self._build_ui()
         self._disable_button_focus(self.root)
@@ -1709,6 +1714,7 @@ class CollectorGUI:
         ttk.Label(options, text="VR / ADB serial").grid(row=5, column=0, sticky="w", padx=3)
         self.quest_serial_entry = ttk.Combobox(options, textvariable=self.quest_adb_serial_var)
         self.quest_serial_entry.grid(row=5, column=1, sticky="ew", padx=3)
+        self._quest_serial_entries.append(self.quest_serial_entry)
         self.quest_refresh_button = ttk.Button(options, text="Refresh VR", command=self._refresh_quest_devices)
         self.quest_refresh_button.grid(row=5, column=2, sticky="ew", padx=3)
         ttk.Label(options, textvariable=self.quest_device_status_var, wraplength=440).grid(
@@ -1739,13 +1745,22 @@ class CollectorGUI:
         arm_data.columnconfigure(1, weight=1)
         status_line = ttk.Frame(arm_data, style="Card.TFrame")
         status_line.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 7))
-        status_line.columnconfigure(0, weight=1)
-        ttk.Label(
+        # Keep transient status text inside the collection card. Without a
+        # bounded label, a long error/connection message expands the left
+        # column and pushes the live VR panel on the right.
+        status_line.columnconfigure(0, weight=1, minsize=410)
+        status_line.columnconfigure(1, weight=0, minsize=120)
+        self.collection_status_label = ttk.Label(
             status_line,
             textvariable=self.status_var,
             style="Card.TLabel",
             font=(ui_font, 10, "bold"),
-        ).grid(row=0, column=0, sticky="w")
+            width=52,
+            anchor="w",
+            justify="left",
+            wraplength=410,
+        )
+        self.collection_status_label.grid(row=0, column=0, sticky="ew")
         ttk.Label(
             status_line,
             textvariable=self.progress_var,
@@ -2100,6 +2115,29 @@ class CollectorGUI:
             command=self.open_device_settings,
         )
         self.inference_device_settings_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        vr = ttk.LabelFrame(devices, text="VR RECAP", padding=(8, 6))
+        vr.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        vr.columnconfigure(0, weight=1)
+        ttk.Label(
+            vr,
+            textvariable=self.quest_device_status_var,
+            justify="left",
+            wraplength=420,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        self.inference_vr_connect_button = ttk.Button(
+            vr, text="Connect VR", command=self._connect_quest,
+        )
+        self.inference_vr_connect_button.grid(row=1, column=0, sticky="ew", padx=(0, 3))
+        self.inference_vr_settings_button = ttk.Button(
+            vr, text="VR settings...", command=self.open_quest_settings,
+        )
+        self.inference_vr_settings_button.grid(row=1, column=1, sticky="ew", padx=(3, 0))
+        ttk.Label(
+            vr,
+            text="The inference process owns the Quest stream during RECAP.",
+            foreground="#68707d",
+            wraplength=420,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(5, 0))
         self.inference_swap_camera_button = ttk.Checkbutton(
             devices,
             text="Swap left/right wrist cameras",
@@ -2388,8 +2426,11 @@ class CollectorGUI:
         self.inference_next_button.pack(side="left", padx=(8, 0))
         recap_frame = ttk.LabelFrame(action, text="VR RECAP", padding=6)
         recap_frame.grid(row=3, column=0, sticky="ew", pady=6)
-        ttk.Checkbutton(recap_frame, text="Record human takeovers",
-                        variable=self.recap_enabled_var).pack(anchor="w")
+        self.recap_checkbutton = ttk.Checkbutton(
+            recap_frame, text="Record human takeovers",
+            variable=self.recap_enabled_var, command=self._on_recap_enabled,
+        )
+        self.recap_checkbutton.pack(anchor="w")
         recap_buttons = ttk.Frame(recap_frame)
         recap_buttons.pack(fill="x")
         for command, label in (("takeover", "Take over"), ("resume", "Resume policy"),
@@ -2685,6 +2726,14 @@ class CollectorGUI:
             self.inference_connect_button.configure(state="disabled" if running else "normal")
         if self.inference_device_settings_button is not None:
             self.inference_device_settings_button.configure(state="disabled" if running else "normal")
+        if self.inference_vr_settings_button is not None:
+            self.inference_vr_settings_button.configure(state="disabled" if running else "normal")
+        if self.inference_vr_connect_button is not None:
+            self.inference_vr_connect_button.configure(
+                state="disabled" if running or self._quest_scan_busy else "normal"
+            )
+        if self.recap_checkbutton is not None:
+            self.recap_checkbutton.configure(state="disabled" if running else "normal")
         if self.inference_swap_camera_button is not None:
             self.inference_swap_camera_button.configure(
                 state=(
@@ -2706,6 +2755,12 @@ class CollectorGUI:
         self.device_settings_button.configure(state="normal" if enabled else "disabled")
         if self.inference_device_settings_button is not None:
             self.inference_device_settings_button.configure(state="normal" if enabled else "disabled")
+        if self.inference_vr_settings_button is not None:
+            self.inference_vr_settings_button.configure(state="normal" if enabled else "disabled")
+        if self.inference_vr_connect_button is not None:
+            self.inference_vr_connect_button.configure(
+                state="normal" if enabled and not self._quest_scan_busy else "disabled"
+            )
         dataset_state = "disabled" if self.recording else "readonly"
         self.dataset_name_entry.configure(state=dataset_state)
         self.edit_dataset_button.configure(state=dataset_state)
@@ -3823,8 +3878,27 @@ class CollectorGUI:
         for button in self.recap_buttons.values():
             button.configure(state="disabled")
 
+    def _on_recap_enabled(self):
+        """Keep the launch-time RECAP switch explicit and explain its scope."""
+        if not self.recap_enabled_var.get():
+            self.recap_status_var.set("RECAP disabled")
+            return
+        if self._inference_running():
+            self.recap_status_var.set(
+                "RECAP was not enabled when inference started; stop and restart inference"
+            )
+            return
+        if not self.quest_adb_serial_var.get().strip():
+            self.recap_status_var.set("Connect VR and select an ADB serial before starting inference")
+        else:
+            self.recap_status_var.set("RECAP enabled; start inference to open the VR controller")
+
     def _poll_recap(self):
         if getattr(self, "recap_directory", None) is None:
+            if self._inference_running() and self.recap_enabled_var.get():
+                self.recap_status_var.set(
+                    "RECAP controller is not running; restart inference with VR takeover recording enabled"
+                )
             return
         try:
             status = json.loads((pathlib.Path(self.recap_directory.name) / "status.json").read_text())
@@ -3839,14 +3913,20 @@ class CollectorGUI:
                      and status.get("ready", False)
                      and not status.get("error") and not status.get("finished"))
         owner = status.get("owner")
+        waiting_text = None
+        if not status.get("ready", False) and not self.recap_pending_id:
+            vr_status = status.get("vr_status") or "waiting for the first policy command"
+            waiting_text = f"RECAP waiting: {vr_status}"
         for command, button in self.recap_buttons.items():
             enabled = available and (command not in {"takeover", "resume"}
                                     or (command == "takeover" and owner == "policy")
                                     or (command == "resume" and owner == "human"))
             button.configure(state="normal" if enabled else "disabled")
         if not self.recap_pending_id:
-            self.recap_status_var.set(f"Owner: {owner} | Outcome: {status.get('outcome')} | "
-                                      f"{status.get('error') or status.get('vr_status', '')}")
+            self.recap_status_var.set(
+                waiting_text or f"Owner: {owner} | Outcome: {status.get('outcome')} | "
+                f"{status.get('error') or status.get('vr_status', '')}"
+            )
 
     def _finish_inference(self, return_code: int | None, requested: bool) -> None:
         process = getattr(self, "inference_process", None)
@@ -3914,7 +3994,10 @@ class CollectorGUI:
         if self._quest_scan_busy:
             return
         self._quest_scan_busy = True
-        self.quest_refresh_button.configure(state='disabled')
+        for button in (getattr(self, "quest_refresh_button", None),
+                       getattr(self, "inference_vr_connect_button", None)):
+            if button is not None:
+                button.configure(state='disabled')
         self.quest_device_status_var.set('Scanning ADB devices...')
         def worker():
             from bimanual_vla.collection.quest.devices import discover_devices
@@ -3927,8 +4010,13 @@ class CollectorGUI:
     def _finish_quest_devices(self, devices, error):
         from bimanual_vla.collection.quest.devices import select_serial
         self._quest_scan_busy = False
-        self.quest_refresh_button.configure(state='normal')
-        self.quest_serial_entry.configure(values=tuple(d.serial for d in devices))
+        for button in (getattr(self, "quest_refresh_button", None),
+                       getattr(self, "inference_vr_connect_button", None)):
+            if button is not None:
+                button.configure(state='normal')
+        serials = tuple(d.serial for d in devices)
+        for entry in getattr(self, "_quest_serial_entries", ()):
+            entry.configure(values=serials)
         if error:
             self.quest_device_status_var.set(error)
             return
@@ -3941,6 +4029,79 @@ class CollectorGUI:
             self.quest_device_status_var.set(f'Device: {device.model or "ADB device"} · {selected}')
         except RuntimeError as exc:
             self.quest_device_status_var.set(str(exc))
+
+    def _connect_quest(self):
+        """Discover and select the Quest used by the inference RECAP reader.
+
+        The deployment process owns the actual ADB stream, so the GUI performs
+        a single-device handshake here and never starts a competing reader.
+        """
+        if self._inference_running():
+            self.quest_device_status_var.set("Inference owns the VR connection")
+            return
+        # The explicit inference-page connection action also opts the next
+        # policy launch into RECAP; collection-page Refresh VR remains a
+        # discovery-only operation.
+        self.recap_enabled_var.set(True)
+        self.quest_device_status_var.set("Connecting to VR...")
+        self.recap_status_var.set("VR selected; checking the Quest connection")
+        self._refresh_quest_devices()
+
+    def open_quest_settings(self) -> None:
+        """Edit the shared Quest model/ADB settings from either UI page."""
+        if getattr(self, "quest_settings_window", None) is not None and self.quest_settings_window.winfo_exists():
+            self.quest_settings_window.lift()
+            self.quest_settings_window.focus_force()
+            return
+        if self.session is not None or self._inference_running():
+            messagebox.showinfo("VR settings", "Stop the active device or inference connection before changing VR settings.")
+            return
+        dialog = tk.Toplevel(self.root)
+        self.quest_settings_window = dialog
+        dialog.title("VR RECAP settings")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        body = ttk.Frame(dialog, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        model = tk.StringVar(value=self.quest_model_dir_var.get())
+        serial = tk.StringVar(value=self.quest_adb_serial_var.get())
+        ttk.Label(body, text="Quest model directory", width=22).grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Entry(body, textvariable=model, width=58).grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=5)
+        ttk.Label(body, text="ADB serial", width=22).grid(row=1, column=0, sticky="w", pady=5)
+        serial_box = ttk.Combobox(body, textvariable=serial, width=56,
+                                  values=self.quest_serial_entry.cget("values"))
+        serial_box.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=5)
+        self._quest_serial_entries.append(serial_box)
+        ttk.Label(body, textvariable=self.quest_device_status_var, wraplength=500).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(4, 8))
+        actions = ttk.Frame(body)
+        actions.grid(row=3, column=0, columnspan=2, sticky="ew")
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+        ttk.Button(actions, text="Connect VR", command=self._connect_quest).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4))
+
+        def close_dialog() -> None:
+            try:
+                self._quest_serial_entries.remove(serial_box)
+            except ValueError:
+                pass
+            self.quest_settings_window = None
+            dialog.destroy()
+
+        def apply() -> None:
+            self.quest_model_dir_var.set(model.get().strip())
+            self.quest_adb_serial_var.set(serial.get().strip())
+            self._save_gui_preferences()
+            close_dialog()
+
+        ttk.Button(actions, text="Apply", command=apply, style="Accent.TButton").grid(
+            row=0, column=1, sticky="ew", padx=(4, 0))
+        dialog.bind("<Return>", lambda _event: apply())
+        dialog.bind("<Escape>", lambda _event: close_dialog())
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
     def toggle_connection(self):
         if self._replay_running():

@@ -26,7 +26,6 @@ MAX_COMMAND_LEAD_RAD = .35
 DEFAULT_TELEOP_SPEED_PCT = 80
 
 
-
 class InvalidCommand(IKRejected):
     """A command rejected before any SDK write; safe to report without exiting."""
 
@@ -195,6 +194,78 @@ class QuestHardware:
                                    'VR collection/reset does not automatically enable or switch modes')
         return measured
 
+    def prepare_for_reset(self, measured, *, speed_pct=100, timeout_s=3.0):
+        """Safely adopt healthy arms for an explicit saved-home reset.
+
+        Normal VR clutch engagement still requires an already enabled
+        CAN/MOVE_J arm.  An explicit reset is different: it owns the sole
+        writer and may perform the same measured-pose enable handshake as the
+        inference return path.  The handshake is atomic at the preflight
+        boundary: faults, stale feedback, and missing driver frames are
+        rejected before any enable or mode command is sent.
+        """
+        from bimanual_vla.deployment.client import arm_status_dict, driver_enable_status_dict
+        from bimanual_vla.deployment.hardware_safety import require_can_send_healthy
+
+        if not np.isfinite(float(timeout_s)) or float(timeout_s) <= 0:
+            raise ValueError("reset enable timeout must be positive")
+        self.check_ownership()
+        require_can_send_healthy(self.arms)
+        sides = tuple(self.arms)
+        # Re-read status for every arm before writing anything.  This catches a
+        # driver fault that appeared after the control tick's initial snapshot.
+        statuses = {}
+        drivers = {}
+        for side in sides:
+            q = np.asarray(measured.get(side), dtype=float)
+            if q.shape != (7,) or not np.isfinite(q).all():
+                raise RuntimeError(f"{side}: measured pose is not a finite 7D reset hold")
+            validate_command(side, q, self.limits[side])
+            status = arm_status_dict(self.arms[side])
+            driver = driver_enable_status_dict(self.arms[side])
+            statuses[side], drivers[side] = status, driver
+            if (not status.get("feedback_fresh") or status.get("arm_status") != 0
+                    or status.get("err_code") or driver.get("faulted") is True
+                    or driver.get("healthy") is not True):
+                raise RuntimeError(f"{side}: cannot prepare reset with unhealthy hardware: "
+                                   f"{status}; {driver}")
+
+        # Arms already in the requested mode can be adopted without a mode
+        # write.  Otherwise enable and hold the measured pose before planning.
+        needs_enable = [side for side in sides if not (
+            bool(drivers[side].get("ready"))
+            and statuses[side].get("ctrl_mode") == 1
+            and statuses[side].get("mode_feed") == 1
+        )]
+        if needs_enable:
+            for side in needs_enable:
+                arm = self.arms[side]
+                arm.EnablePiper()
+                arm.ModeCtrl(1, 1, int(speed_pct), 0x00)
+                q = np.asarray(measured[side], dtype=float)
+                arm.JointCtrl(*[round(float(value) * 180000 / np.pi) for value in q[:6]])
+                arm.GripperCtrl(round(float(q[6]) * 70000), self.gripper_effort, 1, 0)
+
+            deadline = time.monotonic() + float(timeout_s)
+            while time.monotonic() < deadline:
+                all_ready = True
+                for side in sides:
+                    status = arm_status_dict(self.arms[side])
+                    driver = driver_enable_status_dict(self.arms[side])
+                    if driver.get("faulted") is True or status.get("err_code"):
+                        raise RuntimeError(f"{side}: hardware fault during reset enable: "
+                                           f"{status}; {driver}")
+                    all_ready &= bool(driver.get("ready")) and status.get("ctrl_mode") == 1 \
+                        and status.get("mode_feed") == 1
+                if all_ready:
+                    break
+                time.sleep(.02)
+            else:
+                raise RuntimeError("reset enable timed out waiting for CAN/MOVE_J")
+
+        self.enabled.update(sides)
+        return self.read()
+
     def enable(self, side, measured):
         # Keep the controller API, but only adopt a ready arm. Enabling against
         # firmware's previous target is not a safe part of a VR/reset handoff.
@@ -332,7 +403,9 @@ class QuestController:
             targets = self._requests.get_nowait()
             # Validate BOTH arms before writing any hold. Never enable one arm
             # against an old firmware target while the other is being prepared.
-            measured = self.hardware.require_ready()
+            prepare = getattr(self.hardware, "prepare_for_reset", None)
+            measured = (prepare(measured) if callable(prepare)
+                        else self.hardware.require_ready())
             holds = {s: self.held_target(s, q) for s, q in measured.items()}
             for s, q in holds.items():
                 validate_command(s, q, self.hardware.limits[s])
@@ -349,8 +422,12 @@ class QuestController:
         speed = max(np.max(abs(measured[s][:6]-r['previous'][s][:6])) / max(dt, 1e-6)
                     for s in measured)
         r['previous'], r['last'] = measured, now
-        if r['phase'] in ('moving', 'arrival') and speed > .30:
-            raise RuntimeError('reset measured joint speed exceeds 0.30 rad/s; reset aborted')
+        # Feedback is quantized by the Piper driver (one sample can jump by a
+        # few hundredths of a radian even while the commanded quintic path is
+        # limited to 0.10 rad/s). Keep a margin above that quantization while
+        # retaining a hard stop for a real runaway motion.
+        if r['phase'] in ('moving', 'arrival') and speed > .45:
+            raise RuntimeError('reset measured joint speed exceeds 0.45 rad/s; reset aborted')
         if r['phase'] == 'moving':
             elapsed = now - r['since']
             next_holds = {}

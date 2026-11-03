@@ -338,6 +338,30 @@ def test_adoption_of_unready_arm_never_enables_or_writes(status_change, driver_c
     assert not hw.enabled
 
 
+def test_explicit_reset_prepares_healthy_standby_arms_before_planning():
+    arm = Mock()
+    hw = QuestHardware({'right': arm})
+    hw.limits = {'right': np.tile([-1., 1.], (6, 1))}
+    measured = {'right': np.r_[np.zeros(6), .035]}
+    status_ready = dict(feedback_fresh=True, arm_status=0, err_code=0,
+                        ctrl_mode=1, mode_feed=1)
+    driver_standby = dict(available=True, faulted=False, healthy=True, ready=False)
+    driver_ready = dict(available=True, faulted=False, healthy=True, ready=True)
+    with patch('bimanual_vla.deployment.hardware_safety.require_can_send_healthy'), \
+            patch('bimanual_vla.deployment.client.arm_status_dict',
+                  side_effect=[status_ready, status_ready, status_ready]), \
+            patch('bimanual_vla.deployment.client.driver_enable_status_dict',
+                  side_effect=[driver_standby, driver_ready, driver_ready, driver_ready]), \
+            patch('bimanual_vla.collection.output.read_output_qpos', return_value=measured['right'].copy()):
+        result = hw.prepare_for_reset(measured, timeout_s=.1)
+    np.testing.assert_array_equal(result['right'], measured['right'])
+    arm.EnablePiper.assert_called_once_with()
+    arm.ModeCtrl.assert_called_once_with(1, 1, 100, 0)
+    arm.JointCtrl.assert_called_once()
+    arm.GripperCtrl.assert_called_once()
+    assert hw.enabled == {'right'}
+
+
 def reset_runtime(monkeypatch):
     runtime, reader, hw = controller()
     runtime.enable_collection_actions()
