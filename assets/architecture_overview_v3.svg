@@ -1,0 +1,167 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="950" viewBox="0 0 1600 950" role="img" aria-labelledby="title desc">
+<title id="title">bimanual-vla: End-to-End VLA Learning System</title>
+<desc id="desc">Real Piper bimanual collection with Quest VR and RECAP, real-robot OpenPI SFT and RECAP training, simulation LIBERO and RoboTwin SFT and RLinf reinforcement learning, real-time Piper deployment, and unified data and experiment management dashboard.</desc>
+<defs>
+  <linearGradient id="blue" x2="0" y2="1"><stop stop-color="#ebf6ff"/><stop offset="1" stop-color="#f5faff"/></linearGradient>
+  <linearGradient id="purple" x2="0" y2="1"><stop stop-color="#f7ecff"/><stop offset="1" stop-color="#fcf7ff"/></linearGradient>
+  <linearGradient id="orange" x2="0" y2="1"><stop stop-color="#fff0e5"/><stop offset="1" stop-color="#fffaf5"/></linearGradient>
+  <linearGradient id="green" x2="0" y2="1"><stop stop-color="#ecf9ed"/><stop offset="1" stop-color="#f8fdf9"/></linearGradient>
+  <linearGradient id="gold" x2="0" y2="1"><stop stop-color="#fff4dd"/><stop offset="1" stop-color="#fffaf0"/></linearGradient>
+  <marker id="arr" viewBox="0 0 10 10" markerWidth="8" markerHeight="8" refX="9" refY="5" orient="auto"><path d="M0 0 L10 5 L0 10Z" fill="#53616e"/></marker>
+  <marker id="goldarr" viewBox="0 0 10 10" markerWidth="9" markerHeight="9" refX="9" refY="5" orient="auto"><path d="M0 0 L10 5 L0 10Z" fill="#bc903c"/></marker>
+  <style>
+    .root{font-family:Arial,Helvetica,sans-serif;fill:#17212c}
+    .major{font-size:38px;font-weight:800;letter-spacing:-.5px}
+    .sub{font-size:22px}
+    .head{font-size:22px;font-weight:800;fill:white}
+    .h2{font-size:19px;font-weight:750}
+    .mid{font-size:17px;font-weight:700}
+    .small{font-size:14px}
+    .tiny{font-size:12.5px}
+    .line{fill:none;stroke:#53616e;stroke-width:2.7;marker-end:url(#arr)}
+    .platform{font-size:21px;font-weight:800;fill:#67481c}
+    .goldline{fill:none;stroke:#bc903c;stroke-width:3;marker-end:url(#goldarr)}
+  </style>
+</defs>
+<rect width="1600" height="950" fill="#ffffff"/>
+<g class="root">
+<text class="major" x="800" y="49" text-anchor="middle">bimanual-vla: End-to-End Vision-Language-Action Learning System</text>
+<text class="sub" x="800" y="84" text-anchor="middle">Real Robot  ·  Simulation (LIBERO / RoboTwin)  ·  Train  ·  Deploy</text>
+
+<!-- Data collection -->
+<rect x="30" y="118" width="445" height="645" rx="20" fill="url(#blue)" stroke="#1b6fac" stroke-width="2.2"/>
+<path d="M50 118H455Q475 118 475 138V174H30V138Q30 118 50 118Z" fill="#2175b6"/>
+<circle cx="74" cy="147" r="23" fill="#62b4ee"/><text x="74" y="154" text-anchor="middle" class="head">01</text>
+<text x="116" y="155" class="head">REAL-ROBOT DATA</text>
+<rect x="50" y="189" width="405" height="186" rx="16" fill="#fff" stroke="#7cafcf" stroke-width="1.4"/>
+<text x="252" y="219" class="h2" text-anchor="middle">Piper Bimanual + RGB Cameras</text>
+<!-- line art of two robot arms, and three cameras -->
+<rect x="83" y="329" width="108" height="17" rx="5" fill="#596c80"/>
+<rect x="315" y="329" width="108" height="17" rx="5" fill="#596c80"/>
+<path d="M135 325 L151 286 L120 265 L147 239" fill="none" stroke="#3a5062" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M364 325 L352 287 L384 267 L360 239" fill="none" stroke="#3a5062" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M147 239 l-8 -14 m8 14 l13 -9 M360 239 l-8 -13 m8 13 l13 -9" stroke="#3a5062" stroke-width="6" fill="none" stroke-linecap="round"/>
+<path d="M251 237 V325" stroke="#5b7185" stroke-width="6"/>
+<rect x="222" y="230" width="58" height="26" rx="7" fill="#7ba3c0"/><circle cx="251" cy="243" r="7" fill="#254d66"/>
+<rect x="97" y="239" width="34" height="22" rx="5" fill="#9bbbd1"/><circle cx="114" cy="250" r="6" fill="#2f5f80"/>
+<rect x="369" y="240" width="34" height="22" rx="5" fill="#9bbbd1"/><circle cx="386" cy="251" r="6" fill="#2f5f80"/>
+<text x="252" y="363" text-anchor="middle" class="tiny" fill="#56697d">Dual-arm robot · multi-view perception</text>
+<path class="line" d="M252 375V398"/>
+<rect x="53" y="402" width="399" height="65" rx="13" fill="#fff" stroke="#2b82ba" stroke-width="1.8"/>
+<text x="252" y="429" class="h2" text-anchor="middle">GUI &amp; Teleoperation</text>
+<text x="252" y="451" class="small" text-anchor="middle" fill="#52718b">Master / slave · episode replay</text>
+<path class="line" d="M252 467V485"/>
+<rect x="53" y="488" width="399" height="75" rx="13" fill="#fff" stroke="#2b82ba" stroke-width="1.8"/>
+<text x="252" y="518" class="h2" text-anchor="middle">Quest VR Teleoperation</text>
+<text x="252" y="543" class="small" text-anchor="middle" fill="#52718b">Demonstrations + RECAP takeovers</text>
+<path class="line" d="M252 563V580"/>
+<rect x="53" y="583" width="399" height="102" rx="13" fill="#fff" stroke="#2b82ba" stroke-width="1.8"/>
+<text x="252" y="619" class="h2" text-anchor="middle">LeRobot Datasets</text>
+<text x="252" y="646" class="small" text-anchor="middle">Images · State · Actions · Instructions</text>
+<text x="252" y="668" class="small" text-anchor="middle" fill="#52718b">Human intervention metadata</text>
+<rect x="60" y="712" width="385" height="30" rx="15" fill="#e2f1fd"/>
+<text x="252" y="732" text-anchor="middle" class="small" fill="#285a82">Synchronized real-robot data pipeline</text>
+
+<!-- Real robot training -->
+<rect x="500" y="118" width="645" height="295" rx="20" fill="url(#purple)" stroke="#9347ac" stroke-width="2.2"/>
+<path d="M520 118H1125Q1145 118 1145 138V174H500V138Q500 118 520 118Z" fill="#9148ae"/>
+<circle cx="545" cy="146" r="23" fill="#c393d8"/><text x="545" y="154" text-anchor="middle" class="head">02</text>
+<text x="583" y="155" class="head">REAL-ROBOT TRAINING</text>
+<rect x="522" y="187" width="602" height="41" rx="17" fill="#ead3fa"/>
+<text x="822" y="215" text-anchor="middle" class="h2" fill="#5f2e83">SFT + RECAP</text>
+<rect x="520" y="244" width="177" height="105" rx="15" fill="#fff" stroke="#9c59b6" stroke-width="1.8"/>
+<text x="608" y="278" text-anchor="middle" class="h2">OpenPI SFT</text>
+<text x="608" y="303" text-anchor="middle" class="mid">π0 / π0.5</text>
+<text x="608" y="327" text-anchor="middle" class="small" fill="#6d4c85">Full / LoRA</text>
+<path class="line" d="M697 294H725"/>
+<rect x="728" y="244" width="186" height="105" rx="15" fill="#fff" stroke="#9c59b6" stroke-width="1.8"/>
+<text x="821" y="278" text-anchor="middle" class="h2">RECAP</text>
+<text x="821" y="302" text-anchor="middle" class="mid">Human Interventions</text>
+<text x="821" y="326" text-anchor="middle" class="small" fill="#6d4c85">Advantage learning</text>
+<path class="line" d="M914 294H944"/>
+<rect x="947" y="244" width="178" height="105" rx="15" fill="#fff" stroke="#9c59b6" stroke-width="1.8"/>
+<text x="1036" y="286" text-anchor="middle" class="h2">Policy</text>
+<text x="1036" y="311" text-anchor="middle" class="h2">Checkpoints</text>
+<rect x="523" y="366" width="600" height="30" rx="15" fill="#f1e0fb"/>
+<text x="823" y="386" text-anchor="middle" class="small" fill="#6a3b89">Real-world demonstrations + human intervention data</text>
+
+<!-- Simulation training -->
+<rect x="500" y="432" width="645" height="331" rx="20" fill="url(#orange)" stroke="#e87923" stroke-width="2.2"/>
+<path d="M520 432H1125Q1145 432 1145 452V489H500V452Q500 432 520 432Z" fill="#eb7824"/>
+<circle cx="545" cy="461" r="23" fill="#ffb575"/><text x="545" y="468" text-anchor="middle" class="head">03</text>
+<text x="583" y="468" class="head">SIMULATION TRAINING</text>
+<rect x="522" y="501" width="602" height="42" rx="16" fill="#ffdbb6"/>
+<text x="823" y="529" text-anchor="middle" class="h2" fill="#843c10">SFT + RLinf</text>
+<rect x="515" y="557" width="181" height="143" rx="14" fill="#fff" stroke="#e88638" stroke-width="1.8"/>
+<text x="605" y="583" text-anchor="middle" class="mid">Benchmarks</text>
+<rect x="536" y="601" width="140" height="34" rx="16" fill="#ffe2b6"/>
+<text x="606" y="624" class="mid" text-anchor="middle">LIBERO</text>
+<rect x="536" y="641" width="140" height="34" rx="16" fill="#ffe2b6"/>
+<text x="606" y="664" class="mid" text-anchor="middle">RoboTwin</text>
+<path class="line" d="M696 629H723"/>
+<rect x="727" y="571" width="118" height="121" rx="14" fill="#fff" stroke="#e88638" stroke-width="1.8"/>
+<text x="786" y="616" class="h2" text-anchor="middle">OpenPI</text>
+<text x="786" y="643" class="h2" text-anchor="middle">SFT</text>
+<path class="line" d="M845 629H866"/>
+<rect x="869" y="571" width="119" height="121" rx="14" fill="#fff" stroke="#e88638" stroke-width="1.8"/>
+<text x="928" y="616" class="h2" text-anchor="middle">RLinf</text>
+<text x="928" y="643" class="h2" text-anchor="middle">RL</text>
+<path class="line" d="M988 629H1006"/>
+<rect x="1010" y="571" width="121" height="121" rx="14" fill="#fff" stroke="#e88638" stroke-width="1.8"/>
+<text x="1070" y="607" class="mid" text-anchor="middle">RL Models</text>
+<text x="1070" y="634" class="mid" text-anchor="middle">+ Evaluation</text>
+<text x="1070" y="659" class="tiny" text-anchor="middle" fill="#8f5129">rollouts / reward</text>
+<rect x="522" y="714" width="602" height="33" rx="16" fill="#fff0dc"/>
+<text x="823" y="736" class="small" text-anchor="middle" fill="#985422">Simulation training · benchmark evaluation · H100/H200 Slurm</text>
+
+<!-- Real-time deployment -->
+<rect x="1172" y="118" width="398" height="645" rx="20" fill="url(#green)" stroke="#4c9e56" stroke-width="2.2"/>
+<path d="M1192 118H1550Q1570 118 1570 138V174H1172V138Q1172 118 1192 118Z" fill="#3c994d"/>
+<circle cx="1217" cy="147" r="23" fill="#85ca8e"/><text x="1217" y="154" text-anchor="middle" class="head">04</text>
+<text x="1253" y="155" class="head">REAL-TIME DEPLOYMENT</text>
+<rect x="1193" y="210" width="357" height="82" rx="15" fill="#fff" stroke="#5eae6b" stroke-width="1.8"/>
+<text x="1372" y="244" class="h2" text-anchor="middle">Images + Robot State</text>
+<text x="1372" y="267" class="small" text-anchor="middle" fill="#427b4a">Multi-camera live observations</text>
+<path class="line" d="M1372 292V314"/>
+<rect x="1193" y="317" width="357" height="80" rx="15" fill="#fff" stroke="#5eae6b" stroke-width="1.8"/>
+<text x="1372" y="351" class="h2" text-anchor="middle">Policy Server</text>
+<text x="1372" y="375" class="mid" text-anchor="middle">+ Model-side RTC</text>
+<path class="line" d="M1372 397V419"/>
+<rect x="1193" y="422" width="357" height="68" rx="15" fill="#fff" stroke="#5eae6b" stroke-width="1.8"/>
+<text x="1372" y="461" class="h2" text-anchor="middle">Timed Action Queue</text>
+<path class="line" d="M1372 490V514"/>
+<rect x="1193" y="517" width="357" height="78" rx="15" fill="#fff" stroke="#5eae6b" stroke-width="1.8"/>
+<text x="1372" y="552" class="h2" text-anchor="middle">Local Safety Checks</text>
+<text x="1372" y="577" class="mid" text-anchor="middle">+ Ruckig</text>
+<path class="line" d="M1372 595V618"/>
+<rect x="1193" y="621" width="357" height="78" rx="15" fill="#fff" stroke="#5eae6b" stroke-width="1.8"/>
+<text x="1372" y="662" class="h2" text-anchor="middle">Piper Execution</text>
+<path d="M1550 660H1559V250H1550" fill="none" stroke="#508e59" stroke-width="3" marker-end="url(#arr)"/>
+<text x="1372" y="732" class="small" text-anchor="middle" fill="#478051">Closed-loop hardware execution</text>
+
+<!-- Cross workflow transitions -->
+<path class="line" d="M475 289H499"/>
+<path class="line" d="M475 626H499"/>
+<path class="line" d="M1145 295H1171"/>
+<path class="line" d="M1145 649H1171"/>
+
+<!-- Unified management platform -->
+<rect x="30" y="807" width="1540" height="117" rx="20" fill="url(#gold)" stroke="#c39235" stroke-width="2"/>
+<text x="800" y="841" class="platform" text-anchor="middle">UNIFIED DATA MANAGEMENT PLATFORM &amp; DASHBOARD</text>
+<rect x="48" y="859" width="1504" height="47" rx="11" fill="#fffef8" stroke="#dfb979" stroke-width="1.2"/>
+<g class="mid" fill="#714d1f" text-anchor="middle">
+<text x="175" y="888">Dataset Versioning</text>
+<text x="431" y="888">Sync &amp; Transfers</text>
+<text x="685" y="888">Training Jobs</text>
+<text x="931" y="888">Models &amp; Metrics</text>
+<text x="1174" y="888">Rollout Review</text>
+<text x="1420" y="888">Experiments</text>
+</g>
+<g stroke="#d9bb8c" stroke-width="1.5">
+<path d="M307 868V899 M558 868V899 M809 868V899 M1051 868V899 M1298 868V899"/>
+</g>
+<path class="goldline" d="M250 807V767"/>
+<path class="goldline" d="M822 807V767"/>
+<path class="goldline" d="M1372 807V767"/>
+</g>
+</svg>
