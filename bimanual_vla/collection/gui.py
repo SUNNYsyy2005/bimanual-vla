@@ -102,6 +102,23 @@ DATA_UPLOAD_MODULE = "bimanual_vla.data.upload"
 EPISODE_VIEWER_MODULE = "bimanual_vla.data.viewer"
 
 
+def fluid_label(label: ttk.Label) -> ttk.Label:
+    """Size a text label by the slot the layout gives it, not by its text.
+
+    A one-character request keeps changing text out of the parent's size
+    computation, and wrapping follows the allocated width, so text reflows
+    as the window scales instead of pushing neighbouring panels.  Grid it
+    with sticky="ew" (or pack with fill="x").
+    """
+    def rewrap(event: tk.Event) -> None:
+        if label.cget("wraplength") != max(1, event.width):
+            label.configure(wraplength=max(1, event.width))
+
+    label.configure(width=1)
+    label.bind("<Configure>", rewrap, add="+")
+    return label
+
+
 def load_gui_preferences(path: str | pathlib.Path = GUI_PREFERENCES_PATH) -> dict[str, object]:
     """Load non-project GUI preferences without making startup fragile."""
     try:
@@ -1032,7 +1049,6 @@ class CollectorGUI:
         self.root = root
         self.root.title("Super GUI")
         self.root.geometry("1800x1200")
-        self.root.minsize(1350, 950)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.gui_preferences = {**load_can_bindings(), **load_gui_preferences()}
 
@@ -1576,8 +1592,11 @@ class CollectorGUI:
         main = ttk.Frame(self.root, padding=16)
         main.pack(fill="both", expand=True)
         self.collection_mode_frame = main
-        main.columnconfigure(0, weight=0, minsize=570)
-        main.columnconfigure(1, weight=1)
+        # The uniform group fixes the 2:3 split to the window width, so long
+        # status text cannot widen one panel at the other's expense.
+        panel_weights = (2, 3)
+        main.columnconfigure(0, weight=panel_weights[0], uniform="panel")
+        main.columnconfigure(1, weight=panel_weights[1], uniform="panel")
         main.rowconfigure(0, weight=1)
         left = ttk.Frame(main, padding=(0, 0, 8, 0))
         right = ttk.Frame(main, padding=(8, 0, 0, 0))
@@ -1609,7 +1628,7 @@ class CollectorGUI:
         self.mode_selectors = []
         self.mode_display_vars = []
         for row, (label, variable, values) in enumerate(selectors):
-            ttk.Label(options, text=label, width=18, style="Card.TLabel").grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Label(options, text=label, style="Card.TLabel").grid(row=row, column=0, sticky="w", pady=4)
             display_to_value = dict(values)
             value_to_display = {value: display for display, value in values}
             display_var = tk.StringVar(value=value_to_display[variable.get()])
@@ -1629,7 +1648,7 @@ class CollectorGUI:
             self.mode_selectors.append(selector)
             self.mode_display_vars.append(display_var)
 
-        ttk.Label(task, text="Dataset", width=18).grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Label(task, text="Dataset").grid(row=0, column=0, sticky="w", pady=3)
         self.dataset_name_entry = ttk.Combobox(
             task,
             textvariable=self.dataset_name_var,
@@ -1640,7 +1659,7 @@ class CollectorGUI:
         self.dataset_name_entry.bind("<<ComboboxSelected>>", self._dataset_selection_changed)
         self.edit_dataset_button = ttk.Button(task, text="New", width=5, command=self.edit_dataset_name)
         self.edit_dataset_button.grid(row=0, column=2, padx=(8, 0))
-        ttk.Label(task, text="Task", width=18, style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(task, text="Task", style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Label(
             task,
             textvariable=self.task_summary_var,
@@ -1653,25 +1672,23 @@ class CollectorGUI:
             width=5,
             command=self.open_task_settings,
         ).grid(row=1, column=2, sticky="e", pady=3, padx=(8, 0))
-        ttk.Label(options, text="Instruction", width=18, style="Card.TLabel").grid(row=3, column=0, sticky="w", pady=4)
-        ttk.Label(
+        ttk.Label(options, text="Instruction", style="Card.TLabel").grid(row=3, column=0, sticky="w", pady=4)
+        fluid_label(ttk.Label(
             options,
             textvariable=self.instruction_summary_var,
             style="Secondary.Card.TLabel",
             anchor="w",
             justify="left",
-            wraplength=360,
-        ).grid(row=3, column=1, columnspan=2, sticky="ew", pady=3, padx=(8, 0))
+        )).grid(row=3, column=1, columnspan=2, sticky="ew", pady=3, padx=(8, 0))
         device_bar = ttk.Frame(options, style="Card.TFrame")
         device_bar.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         device_bar.columnconfigure(0, weight=1)
-        ttk.Label(
+        fluid_label(ttk.Label(
             device_bar,
             textvariable=self.device_summary_var,
             style="Secondary.Card.TLabel",
             justify="left",
-            wraplength=360,
-        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+        )).grid(row=0, column=0, sticky="ew", padx=(0, 10))
         self.collection_settings_button = ttk.Button(
             task, text="Settings +", command=self._toggle_collection_settings)
         self.collection_settings_button.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
@@ -1717,8 +1734,8 @@ class CollectorGUI:
         self._quest_serial_entries.append(self.quest_serial_entry)
         self.quest_refresh_button = ttk.Button(options, text="Refresh VR", command=self._refresh_quest_devices)
         self.quest_refresh_button.grid(row=5, column=2, sticky="ew", padx=3)
-        ttk.Label(options, textvariable=self.quest_device_status_var, wraplength=440).grid(
-            row=6, column=0, columnspan=3, sticky="w", padx=3)
+        fluid_label(ttk.Label(options, textvariable=self.quest_device_status_var)).grid(
+            row=6, column=0, columnspan=3, sticky="ew", padx=3)
         self.quest_controls = ttk.Frame(controls)
         self.quest_controls.grid(row=3, column=0, columnspan=3, sticky="ew", padx=3, pady=3)
         self.quest_controls.columnconfigure(0, weight=1)
@@ -1733,10 +1750,10 @@ class CollectorGUI:
         self.quest_save_pose_button.grid(row=9, column=0, columnspan=3, sticky="ew", pady=4)
         self.quest_live_card, quest_input = make_card(right, "VR input")
         self.quest_live_card.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        ttk.Label(quest_input, textvariable=self.quest_status_var, wraplength=700).pack(anchor="w")
-        ttk.Label(quest_input, textvariable=self.quest_input_status_var, wraplength=420).pack(anchor="w")
+        fluid_label(ttk.Label(quest_input, textvariable=self.quest_status_var)).pack(anchor="w", fill="x")
+        fluid_label(ttk.Label(quest_input, textvariable=self.quest_input_status_var)).pack(anchor="w", fill="x")
         for var in self.quest_hand_vars.values():
-            ttk.Label(quest_input, textvariable=var, wraplength=420).pack(anchor="w", pady=2)
+            fluid_label(ttk.Label(quest_input, textvariable=var)).pack(anchor="w", fill="x", pady=2)
         self.collection_control_source_var.trace_add('write', lambda *_: self._update_collection_source_ui())
         self._update_collection_source_ui()
 
@@ -1745,27 +1762,22 @@ class CollectorGUI:
         arm_data.columnconfigure(1, weight=1)
         status_line = ttk.Frame(arm_data, style="Card.TFrame")
         status_line.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 7))
-        # Keep transient status text inside the collection card. Without a
-        # bounded label, a long error/connection message expands the left
-        # column and pushes the live VR panel on the right.
-        status_line.columnconfigure(0, weight=1, minsize=410)
-        status_line.columnconfigure(1, weight=0, minsize=120)
-        self.collection_status_label = ttk.Label(
+        status_line.columnconfigure(0, weight=1)
+        self.collection_status_label = fluid_label(ttk.Label(
             status_line,
             textvariable=self.status_var,
             style="Card.TLabel",
             font=(ui_font, 10, "bold"),
-            width=52,
             anchor="w",
             justify="left",
-            wraplength=410,
-        )
+        ))
         self.collection_status_label.grid(row=0, column=0, sticky="ew")
+        # Progress sits below the status so the status keeps the full width.
         ttk.Label(
             status_line,
             textvariable=self.progress_var,
             style="Secondary.Card.TLabel",
-        ).grid(row=0, column=1, sticky="e")
+        ).grid(row=1, column=0, sticky="w")
         ttk.Separator(arm_data).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         self.arm_state_dimension_label = ttk.Label(
             arm_data,
@@ -1778,12 +1790,11 @@ class CollectorGUI:
         for row, side in enumerate(("left", "right"), start=3):
             side_label = ttk.Label(arm_data, text=side.capitalize(), width=7, style="Card.TLabel", font=(ui_font, 10, "bold"))
             side_label.grid(row=row, column=0, sticky="nw", pady=4)
-            value_label = ttk.Label(
+            value_label = fluid_label(ttk.Label(
                 arm_data,
                 textvariable=self.arm_state_vars[side],
                 justify="left",
-                wraplength=410,
-            )
+            ))
             value_label.grid(row=row, column=1, sticky="ew", pady=4)
             self.arm_state_labels[side] = (side_label, value_label)
 
@@ -1809,13 +1820,12 @@ class CollectorGUI:
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.listbox.configure(yscrollcommand=scrollbar.set)
         self.listbox.bind("<Double-1>", lambda _event: self.preview_selected())
-        ttk.Label(
+        fluid_label(ttk.Label(
             files,
             textvariable=self.dataset_stats_var,
             foreground="#52606d",
             justify="left",
-            wraplength=480,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        )).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         file_actions = ttk.Frame(files)
         file_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         file_actions.columnconfigure(0, weight=1)
@@ -1843,8 +1853,8 @@ class CollectorGUI:
         preview.columnconfigure(1, weight=1, uniform="wrist")
         # A 2:1 row ratio gives the full-width overhead view and the two
         # half-width wrist views approximately the same 16:9 content area.
-        preview.rowconfigure(0, weight=2, minsize=360)
-        preview.rowconfigure(1, weight=1, minsize=240)
+        preview.rowconfigure(0, weight=2, uniform="camera_row")
+        preview.rowconfigure(1, weight=1, uniform="camera_row")
         placements = {
             "high": (0, 0, 2),
             "primary_wrist": (1, 0, 1),
@@ -1867,8 +1877,9 @@ class CollectorGUI:
                 bg="#0b0b0d",
                 highlightthickness=0,
                 bd=0,
-                width=560,
-                height=315,
+                # The grid row decides the size; frames are fitted on Configure.
+                width=1,
+                height=1,
             )
             label.pack(fill="both", expand=True, padx=6, pady=(0, 6))
             image_item = label.create_image(0, 0, anchor="nw")
@@ -1895,6 +1906,11 @@ class CollectorGUI:
 
         self._build_inference_mode_ui()
         self._build_data_process_mode_ui()
+        # The smallest window still gives the form panel its natural width at
+        # the current font scaling; above that, both panels scale together.
+        self.root.update_idletasks()
+        form_width = left.winfo_reqwidth() * sum(panel_weights) / panel_weights[0]
+        self.root.minsize(math.ceil(form_width) + 2 * 16, 950)
 
     def _build_inference_mode_ui(self) -> None:
         """Build the separate policy/inference page.
@@ -1921,8 +1937,8 @@ class CollectorGUI:
             "<Configure>",
             lambda event: canvas.itemconfigure(canvas_window, width=event.width),
         )
-        frame.columnconfigure(0, weight=1)
-        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(0, weight=1, uniform="inference")
+        frame.columnconfigure(1, weight=1, uniform="inference")
         frame.rowconfigure(2, weight=1)
 
         def enable_when(widget: tk.Misc, *conditions: tuple[tk.BooleanVar, bool],
@@ -2041,12 +2057,11 @@ class CollectorGUI:
         instruction_line.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 3))
         instruction_line.columnconfigure(1, weight=1)
         ttk.Label(instruction_line, text="Instruction").grid(row=0, column=0, sticky="w")
-        ttk.Label(
+        fluid_label(ttk.Label(
             instruction_line,
             textvariable=self.instruction_summary_var,
             justify="left",
-            wraplength=310,
-        ).grid(row=0, column=1, sticky="ew", padx=(12, 8))
+        )).grid(row=0, column=1, sticky="ew", padx=(12, 8))
         ttk.Button(instruction_line, text="...", width=3, command=self.open_task_settings).grid(
             row=0, column=2, sticky="e"
         )
@@ -2072,12 +2087,11 @@ class CollectorGUI:
             text="Send detailed client diagnostics",
             variable=self.inference_send_policy_telemetry_var,
         ).pack(anchor="w")
-        ttk.Label(
+        fluid_label(ttk.Label(
             request_diagnostics,
             text="Local monitoring continues when off. Restart inference to compare latency.",
             foreground="#68707d",
-            wraplength=310,
-        ).pack(anchor="w", pady=(3, 0))
+        )).pack(anchor="w", fill="x", pady=(3, 0))
         right_panel = ttk.Frame(frame)
         right_panel.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 8))
         right_panel.columnconfigure(0, weight=1)
@@ -2085,12 +2099,11 @@ class CollectorGUI:
         devices = ttk.LabelFrame(right_panel, text="Devices", padding=12)
         devices.grid(row=0, column=0, sticky="ew")
         devices.columnconfigure(0, weight=1)
-        ttk.Label(
+        fluid_label(ttk.Label(
             devices,
             textvariable=self.device_summary_var,
             justify="left",
-            wraplength=460,
-        ).grid(row=0, column=0, sticky="w", pady=(0, 12))
+        )).grid(row=0, column=0, sticky="ew", pady=(0, 12))
         device_buttons = ttk.Frame(devices)
         device_buttons.grid(row=1, column=0, sticky="ew")
         device_buttons.columnconfigure(0, weight=1)
@@ -2118,12 +2131,11 @@ class CollectorGUI:
         vr = ttk.LabelFrame(devices, text="VR RECAP", padding=(8, 6))
         vr.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         vr.columnconfigure(0, weight=1)
-        ttk.Label(
+        fluid_label(ttk.Label(
             vr,
             textvariable=self.quest_device_status_var,
             justify="left",
-            wraplength=420,
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        )).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         self.inference_vr_connect_button = ttk.Button(
             vr, text="Connect VR", command=self._connect_quest,
         )
@@ -2132,12 +2144,11 @@ class CollectorGUI:
             vr, text="VR settings...", command=self.open_quest_settings,
         )
         self.inference_vr_settings_button.grid(row=1, column=1, sticky="ew", padx=(3, 0))
-        ttk.Label(
+        fluid_label(ttk.Label(
             vr,
             text="The inference process owns the Quest stream during RECAP.",
             foreground="#68707d",
-            wraplength=420,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        )).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(5, 0))
         self.inference_swap_camera_button = ttk.Checkbutton(
             devices,
             text="Swap left/right wrist cameras",
@@ -2294,13 +2305,13 @@ class CollectorGUI:
         )
         auto_next_check.grid(row=8, column=0, columnspan=2, sticky="w", pady=3)
         enable_when(auto_next_check, (self.inference_async_enabled_var, False))
-        ttk.Label(
+        fluid_label(ttk.Label(
             chunk_tab,
-            text="Unchecked: hold at the end of each chunk and wait for the\n"
+            text="Unchecked: hold at the end of each chunk and wait for the "
             "\"Next inference\" button before launching the next request.",
             foreground="#68707d",
             justify="left",
-        ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 3))
+        )).grid(row=9, column=0, columnspan=3, sticky="ew", pady=(0, 3))
         for variable in (self.inference_async_enabled_var, self.inference_auto_next_var):
             variable.trace_add("write", lambda *_args: self._update_mode_controls())
 
@@ -2389,8 +2400,8 @@ class CollectorGUI:
                 ("eef_goal_timeout_s", "Recovery phase timeout (s)")), start=4):
             ttk.Label(gripper_tab, text=label).grid(row=row, column=0, sticky="w", pady=5)
             ttk.Entry(gripper_tab, textvariable=self.inference_eef_goal_vars[name], width=9).grid(row=row, column=2, sticky="e")
-        ttk.Label(gripper_tab, text="Normal EEF tracking stays continuous. IK recovery holds grip until arrival; timeout stops motion.",
-                  foreground="#68707d", wraplength=390).grid(row=7, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        fluid_label(ttk.Label(gripper_tab, text="Normal EEF tracking stays continuous. IK recovery holds grip until arrival; timeout stops motion.",
+                  foreground="#68707d")).grid(row=7, column=0, columnspan=3, sticky="ew", pady=(12, 0))
 
         action = ttk.Frame(frame)
         action.grid(row=2, column=0, columnspan=2, sticky="nsew")
@@ -2439,7 +2450,7 @@ class CollectorGUI:
                                 command=lambda command=command: self._request_recap(command))
             button.pack(side="left", padx=3)
             self.recap_buttons[command] = button
-        ttk.Label(recap_frame, textvariable=self.recap_status_var, wraplength=700).pack(anchor="w")
+        fluid_label(ttk.Label(recap_frame, textvariable=self.recap_status_var)).pack(anchor="w", fill="x")
         ttk.Label(recap_frame, text="Y/B: clutch. Trigger: gripper. Release Y/B before re-engaging.",
                   foreground="#68707d").pack(anchor="w")
         ttk.Button(recap_frame, text="Export labelled episodes...", command=self._export_recap_runs).pack(anchor="w", pady=4)
@@ -4652,8 +4663,8 @@ class CollectorGUI:
                     source_aspect = source_aspects.get(key, source_aspect)
                     if getattr(self.cameras, "resize_mode", "pad") == "stretch":
                         source_aspect = 1.0
-                target_w = max(320, label.winfo_width())
-                target_h = max(180, label.winfo_height())
+                target_w = max(1, label.winfo_width())
+                target_h = max(1, label.winfo_height())
                 rgb = letterbox_preview_frame(
                     frame,
                     target_hw=(target_h, target_w),
@@ -4683,8 +4694,8 @@ class CollectorGUI:
                 if getattr(self.cameras, "resize_mode", "pad") == "stretch":
                     source_aspect = 1.0
             label = self.preview_labels.get(slot)
-            target_w = max(320, 640 if label is None else label.winfo_width())
-            target_h = max(180, 360 if label is None else label.winfo_height())
+            target_w = max(1, 640 if label is None else label.winfo_width())
+            target_h = max(1, 360 if label is None else label.winfo_height())
             rgb = letterbox_preview_frame(
                 frame,
                 target_hw=(target_h, target_w),
