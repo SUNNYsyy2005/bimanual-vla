@@ -655,6 +655,7 @@ class PiperIKSolveResult:
     accepted_rotation_tolerance_rad: float | None = None
     solve_elapsed_s: float | None = None
     selection_method: str = "regularized"
+    best_effort: bool = False
     minimum_motion_elapsed_s: float = 0.0
     minimum_motion_timed_out: bool = False
 
@@ -700,6 +701,7 @@ class PiperContinuousIK:
         joint_limits: np.ndarray | None = None,
         minimum_motion: bool = True,
         progress_goal: tuple[np.ndarray, np.ndarray] | None = None,
+        best_effort: bool = False,
     ) -> np.ndarray:
         return self.solve_with_diagnostics(
             current_joints_rad,
@@ -716,6 +718,7 @@ class PiperContinuousIK:
             joint_limits=joint_limits,
             minimum_motion=minimum_motion,
             progress_goal=progress_goal,
+            best_effort=best_effort,
         ).command_joints_rad.copy()
 
     def solve_with_diagnostics(
@@ -735,7 +738,15 @@ class PiperContinuousIK:
         joint_limits: np.ndarray | None = None,
         minimum_motion: bool = True,
         progress_goal: tuple[np.ndarray, np.ndarray] | None = None,
+        best_effort: bool = False,
     ) -> PiperIKSolveResult:
+        """Solve one continuous IK step.
+
+        ``best_effort`` (streaming): an unreachable target is not an error. The
+        result is the bounded pose closest to it, or the measured pose when no
+        bounded step gets closer, flagged ``best_effort``. Recovery legs and
+        replays keep the strict default and raise ``could not reach``.
+        """
         solve_started = time.perf_counter()
         current = np.asarray(current_joints_rad, dtype=np.float64)
         target_xyz = np.asarray(target_xyz_m, dtype=np.float64)
@@ -791,8 +802,14 @@ class PiperContinuousIK:
         # reference, not the lagging encoder pose. Never clip a solved pose.
         continuity_anchor = initial_source
         if initial_joints_rad is not None:
-            lower = np.maximum(lower, continuity_anchor - reference_joint_radius_rad)
-            upper = np.minimum(upper, continuity_anchor + reference_joint_radius_rad)
+            reference_lower = np.maximum(lower, continuity_anchor - reference_joint_radius_rad)
+            reference_upper = np.minimum(upper, continuity_anchor + reference_joint_radius_rad)
+            if best_effort and np.any(reference_lower >= reference_upper):
+                # The lagging arm is farther from the previous reference than
+                # both neighbourhoods allow: continue from measured feedback.
+                continuity_anchor = np.clip(current, lower, upper)
+            else:
+                lower, upper = reference_lower, reference_upper
         if np.any(lower >= upper):
             raise IKGeometryBlocked("continuous IK has no overlapping feedback/reference interval")
         initial = np.clip(initial_source, lower + 1e-8, upper - 1e-8)
@@ -884,7 +901,7 @@ class PiperContinuousIK:
                     item[1][0] / position_tolerance_m + item[1][1] / rotation_tolerance_rad))
         position_error, rotation_error = errors
         optimizer_success = within_tolerance(errors)
-        tolerance_relaxed = False
+        tolerance_relaxed = best_effort_used = False
         accepted_position_tolerance = position_tolerance_m
         accepted_rotation_tolerance = rotation_tolerance_rad
         solved_joint_step = float(np.max(np.abs(solved - current)))
@@ -910,6 +927,24 @@ class PiperContinuousIK:
                 tolerance_relaxed = True
                 accepted_position_tolerance = fallback_position_tolerance
                 accepted_rotation_tolerance = fallback_rotation_tolerance
+            elif best_effort:
+                # Joint limit, another IK branch, or a target outrunning the
+                # lagging arm: go as close as the bounds allow and keep
+                # streaming; the next inference sees the actual pose. Never
+                # move farther away than holding the measured pose would be.
+                def score(values):
+                    return values[0] / position_tolerance_m + values[1] / rotation_tolerance_rad
+                hold = np.clip(current, lower, upper)
+                hold_errors = pose_errors(hold)
+                if score(hold_errors) <= score((position_error, rotation_error)):
+                    solved, (position_error, rotation_error) = hold, hold_errors
+                    selection_method = "best_effort_hold"
+                else:
+                    selection_method = f"best_effort_{selection_method}"
+                solved_joint_step = float(np.max(np.abs(solved - current)))
+                tolerance_relaxed = best_effort_used = True
+                accepted_position_tolerance = position_error
+                accepted_rotation_tolerance = rotation_error
             else:
                 raise IKGeometryBlocked(
                     "continuous IK could not reach a nearby solution: "
@@ -941,6 +976,7 @@ class PiperContinuousIK:
                 accepted_rotation_tolerance_rad=accepted_rotation_tolerance,
                 solve_elapsed_s=time.perf_counter() - solve_started,
                 selection_method=selection_method,
+                best_effort=best_effort_used,
             )
 
         # Follow the regularized solution direction with a bounded 20 Hz servo
@@ -996,6 +1032,7 @@ class PiperContinuousIK:
             accepted_rotation_tolerance_rad=accepted_rotation_tolerance,
             solve_elapsed_s=time.perf_counter() - solve_started,
             selection_method=selection_method,
+            best_effort=best_effort_used,
         )
 
 
@@ -4981,6 +5018,9 @@ class ExecutionController:
 
     def _delivery_ik_kwargs(self, side):
         return {
+            # Streaming never stops for an unreachable target; recovery legs
+            # override this to keep the strict progress semantics.
+            "best_effort": True,
             "minimum_motion": bool(getattr(self.args, "ik_minimum_motion", True)),
             "reference_joint_radius_rad": float(getattr(self.args, "ik_reference_joint_radius_rad",
                                                         DEFAULT_IK_REFERENCE_JOINT_RADIUS_RAD)),
@@ -5040,6 +5080,7 @@ class ExecutionController:
         kwargs = self._delivery_ik_kwargs(side)
         if not isinstance(self.ik_solver, PiperContinuousIK):
             kwargs.pop("minimum_motion", None)
+            kwargs.pop("best_effort", None)
         solve_with_diagnostics = getattr(self.ik_solver, "solve_with_diagnostics", None)
         if callable(solve_with_diagnostics):
             solver_kwargs = dict(kwargs)
@@ -5340,6 +5381,7 @@ class ExecutionController:
                     max_rotation_step_rad=float(getattr(self.args, "max_rotation_step_rad", DEFAULT_MAX_ROTATION_STEP_RAD)))
                 self._check_eef_xyz_workspace(local[:3], side)
                 kwargs = self._delivery_ik_kwargs(side)
+                kwargs["best_effort"] = False
                 kwargs["initial_joints_rad"] = self._ik_warm_starts.get(side)
                 # Intermediate recovery references must continue advancing,
                 # even when they are inside the normal streaming pose tube.
@@ -6847,6 +6889,7 @@ class ExecutionController:
                         "optimizer_status": ik_result.optimizer_status,
                         "optimizer_nfev": ik_result.optimizer_nfev,
                         "tolerance_relaxed": ik_result.tolerance_relaxed,
+                        "best_effort": ik_result.best_effort,
                         "accepted_position_tolerance_m": ik_result.accepted_position_tolerance_m,
                         "accepted_rotation_tolerance_rad": ik_result.accepted_rotation_tolerance_rad,
                     },

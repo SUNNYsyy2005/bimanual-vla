@@ -51,5 +51,30 @@ class BoundedIKTest(unittest.TestCase):
                 self.assertLessEqual(np.max(np.abs(solved - q)), KWARGS['reference_joint_radius_rad'] + 1e-9)
 
 
+    def test_best_effort_moves_toward_unreachable_target_instead_of_raising(self):
+        q = np.array([.2, 1., -1., .1, .2, -.1])
+        xyz, rotation = self.solver.pose(q)
+        target = xyz + [2., 0., 0.]
+        rpy = Rotation.from_matrix(rotation).as_euler('xyz', degrees=True)
+        result = self.solver.solve_with_diagnostics(q, target, rpy, initial_joints_rad=q,
+                                                    best_effort=True, **KWARGS)
+        self.assertTrue(result.best_effort)
+        solved_xyz, _ = self.solver.pose(result.solution_joints_rad)
+        self.assertLess(np.linalg.norm(solved_xyz - target), np.linalg.norm(xyz - target))
+        self.assertLessEqual(np.max(np.abs(result.solution_joints_rad - q)),
+                             KWARGS['reference_joint_radius_rad'] + 1e-9)
+
+    def test_best_effort_continues_from_feedback_when_reference_is_out_of_reach(self):
+        q = np.array([.2, 1., -1., .1, .2, -.1])
+        stale = q + .8  # previous reference farther than both neighbourhoods
+        xyz, rotation = self.solver.pose(q)
+        rpy = Rotation.from_matrix(rotation).as_euler('xyz', degrees=True)
+        with self.assertRaisesRegex(Exception, 'no overlapping'):
+            self.solver.solve_with_diagnostics(q, xyz, rpy, initial_joints_rad=stale, **KWARGS)
+        result = self.solver.solve_with_diagnostics(q, xyz, rpy, initial_joints_rad=stale,
+                                                    best_effort=True, **KWARGS)
+        self.assertLess(np.max(np.abs(result.solution_joints_rad - q)), .01)
+
+
 if __name__ == "__main__":
     unittest.main()
