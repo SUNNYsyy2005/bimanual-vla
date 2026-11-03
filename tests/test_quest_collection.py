@@ -147,6 +147,8 @@ class Hardware:
     def send(self, side, target):
         validate_command(side, target, self.limits[side])
         self.sent.append((side, target.copy()))
+    def set_speed(self, side, speed_pct):
+        self.speeds = getattr(self, "speeds", []) + [(side, speed_pct, len(self.sent))]
 
 
 class Reader:
@@ -646,3 +648,36 @@ def test_failed_vr_start_closes_cameras_and_robot(tmp_path):
     assert robot.disconnected
     assert session.piper is None
     vr.close.assert_called_once()
+
+
+def test_engagement_holds_measured_pose_before_setting_teleop_speed():
+    reader, hardware = Reader(), Hardware(("right",))
+    runtime = QuestController({"right": object()}, "unused", reader=reader, hardware=hardware)
+    runtime.solvers = {"right": Solver()}
+    reader.update(False)
+    runtime.step()
+    reader.update(True)
+    runtime.step()
+    assert hardware.speeds == [("right", 80, 1)]  # speed set only after the hold was sent
+    np.testing.assert_array_equal(hardware.sent[0][1], hardware.measured["right"])
+
+
+def test_lagging_arm_is_tracked_with_bounded_lead_instead_of_rejected(monkeypatch):
+    runtime, reader, hw = controller(("right",))
+    clock = [100.]
+    monkeypatch.setattr("bimanual_vla.collection.quest.control.time.monotonic", lambda: clock[0])
+    runtime._command_at["right"] = clock[0]
+    runtime.solvers["right"].output = np.full(6, .19)
+    previous = hw.measured["right"].copy()
+    for _ in range(60):
+        clock[0] += 1 / 60
+        reader.update(True)
+        runtime.step()
+        runtime.solvers["right"].output = np.minimum(runtime.solvers["right"].output + .19, .9)
+        sent = hw.sent[-1][1]
+        # The arm never moves (measured stays 0); motion continues without a re-engage.
+        assert runtime.clutches["right"].active
+        assert np.max(np.abs(sent[:6] - hw.measured["right"][:6])) <= .35 + 1e-9
+        assert np.max(np.abs(sent[:6] - previous[:6])) <= 1.2 / 60 + 1e-9
+        previous = sent
+    assert np.max(np.abs(hw.sent[-1][1][:6])) == pytest.approx(.35)

@@ -14,6 +14,18 @@ import numpy as np
 from .input import QuestReader, adjusted_pose
 from .ik import IKRejected, QuestIK
 
+# Every writer tick moves the sent command toward the latest IK goal at this
+# joint speed, instead of jumping once per (irregularly delivered) VR sample.
+DEFAULT_TRACKING_SPEED_RAD_S = 1.2
+# A sent command never leads measured joints by more than this. A lagging arm
+# used to reject motion and force a clutch re-engage; now the command waits at
+# this bound while the arm catches up.
+MAX_COMMAND_LEAD_RAD = .35
+# MOVE_J speed set at each clutch engagement, after the measured hold is sent.
+# VR used to inherit whatever the previous tool set (1% home, 10% defaults).
+DEFAULT_TELEOP_SPEED_PCT = 80
+
+
 
 class InvalidCommand(IKRejected):
     """A command rejected before any SDK write; safe to report without exiting."""
@@ -96,8 +108,8 @@ class Clutch:
             raise IKRejected("non-finite/invalid IK output")
         if np.max(np.abs(q - self.last_q)) > .20:
             raise IKRejected("IK branch jump >0.20 rad; release and re-engage clutch")
-        if np.max(np.abs(q - measured[:6])) > .35:
-            raise IKRejected("arm tracking error >0.35 rad; release and re-engage clutch")
+        # Lag behind measured joints is bounded by the controller's command
+        # lead limit, not rejected here.
         return target, np.r_[q, opening], False
 
 
@@ -199,6 +211,18 @@ class QuestHardware:
         arm.GripperCtrl(round(float(target[6]) * 70000), self.gripper_effort, 1, 0)
         self.last_targets[side] = target.copy()
 
+    def set_speed(self, side, speed_pct):
+        """Set MOVE_J speed of an adopted arm; mode stays CAN/MOVE_J.
+
+        Call only after a hold of the measured pose was sent, so the firmware
+        target is the current pose and a speed change exposes no stale target.
+        """
+        speed = int(speed_pct)
+        if side not in self.enabled or not 1 <= speed <= 100:
+            raise ValueError(f"{side}: cannot set MOVE_J speed {speed_pct!r}")
+        self.check_ownership()
+        self.arms[side].ModeCtrl(0x01, 0x01, speed, 0x00)
+
     def emergency_stop(self):
         failures = []
         for side, arm in self.arms.items():
@@ -219,7 +243,13 @@ class QuestHardware:
 
 
 class QuestController:
-    def __init__(self, arms, model_dir, serial="", *, reader=None, hardware=None, solver_factory=QuestIK):
+    def __init__(self, arms, model_dir, serial="", *, reader=None, hardware=None, solver_factory=QuestIK,
+                 tracking_speed_rad_s=DEFAULT_TRACKING_SPEED_RAD_S, teleop_speed_pct=DEFAULT_TELEOP_SPEED_PCT):
+        if not 0 < float(tracking_speed_rad_s) <= 3. or not 1 <= int(teleop_speed_pct) <= 100:
+            raise ValueError("invalid VR tracking speed or MOVE_J speed percentage")
+        self.tracking_speed_rad_s = float(tracking_speed_rad_s)
+        self.teleop_speed_pct = int(teleop_speed_pct)
+        self._goals, self._commands, self._command_at = {}, {}, {}
         self.hardware = hardware or QuestHardware(arms)
         self.reader = reader or QuestReader(serial)
         self.model_dir = model_dir
@@ -535,12 +565,19 @@ class QuestController:
                         command_sample = latest
                         measured[side] = fresh
                     self._event(event="engaged", side=side)
-                try:
-                    self.hardware.send(side, target)
-                except InvalidCommand as exc:
-                    self._reject_motion(self.hardware.read(), exc)
-                    break
-                self.last_targets[side] = target.copy()
+                if first:
+                    # Engagement sends the measured hold immediately; later
+                    # goals are reached by _track_goals at a bounded speed.
+                    try:
+                        self.hardware.send(side, target)
+                    except InvalidCommand as exc:
+                        self._reject_motion(self.hardware.read(), exc)
+                        break
+                    self.hardware.set_speed(side, self.teleop_speed_pct)
+                    self.last_targets[side] = target.copy()
+                    self._commands[side] = target.copy()
+                    self._command_at[side] = time.monotonic()
+                self._goals[side] = target.copy()
                 self.solvers[side].accept(target[:6])
                 self.clutches[side].last_q = target[:6].copy()
                 self._holds.pop(side, None)
@@ -552,10 +589,45 @@ class QuestController:
                             measured=measured[side].tolist())
         if self._stop.is_set() or self._estop.is_set():
             return
+        self._track_goals()
         for side, target in self._holds.items():
             self.hardware.send(side, target)
         if self._hold_errors:
             self.status = "; ".join(self._hold_errors.values())
+
+    def _track_goals(self):
+        """Advance each engaged arm toward its IK goal at the tracking speed."""
+        measured = None
+        now = time.monotonic()
+        for side in list(self._goals):
+            if not self.clutches[side].active or side in self._holds or side not in self._commands:
+                for state in (self._goals, self._commands, self._command_at):
+                    state.pop(side, None)
+                continue
+            if measured is None:
+                measured = self.hardware.read()
+            goal, previous = self._goals[side], self._commands[side]
+            dt = min(max(now - self._command_at[side], 0.), .05)
+            step = goal[:6] - previous[:6]
+            largest = float(np.max(np.abs(step)))
+            if largest > self.tracking_speed_rad_s * dt:
+                step *= self.tracking_speed_rad_s * dt / largest
+            command = previous.copy()
+            command[:6] += step
+            command[6] = goal[6]
+            lead = command[:6] - measured[side][:6]
+            largest_lead = float(np.max(np.abs(lead)))
+            if largest_lead > MAX_COMMAND_LEAD_RAD:
+                command[:6] = measured[side][:6] + lead * (MAX_COMMAND_LEAD_RAD / largest_lead)
+            limits = self.hardware.limits[side]
+            command[:6] = np.clip(command[:6], limits[:, 0], limits[:, 1])
+            try:
+                self.hardware.send(side, command)
+            except InvalidCommand as exc:
+                self._reject_motion(measured, exc)
+                return
+            self._commands[side], self._command_at[side] = command, now
+            self.last_targets[side] = command.copy()
 
     def _run(self):
         try:
