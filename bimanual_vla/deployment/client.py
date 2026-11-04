@@ -127,6 +127,17 @@ DEFAULT_GRIPPER_CONFIRM_STEPS = 2
 DEFAULT_MAX_IMAGE_STATE_SKEW_S = 0.100  # Allow 100 ms to avoid frequent frame drops.
 DEFAULT_TRACKING_LAG_THRESHOLD_RAD = 0.10
 DEFAULT_TRACKING_LAG_CONFIRM_CYCLES = 3
+# Point-to-point Ruckig retargeting at the 30 Hz control rate trails its
+# reference by ~190 ms (2026-11-04 replay).  Local IK therefore solves the arm
+# pose this far ahead on the same timed chunk; queue timing, RTC offsets and
+# the gripper row are unchanged.
+DEFAULT_IK_TARGET_LEAD_S = 0.15
+# Normal actuation delay is not lag: feedback is compared with the closest
+# command issued within these windows.  Joint: firmware ~65 ms.  EEF: the whole
+# ~260 ms pipeline, so a disabled or under-delivering lead does not re-create
+# false freezes; this slow check already needs 0.5 s of sustained error.
+DEFAULT_TRACKING_JOINT_LAG_WINDOW_S = 0.10
+DEFAULT_TRACKING_REFERENCE_LAG_WINDOW_S = 0.30
 DEFAULT_ARM_HOLD_TOLERANCE_RAD = 0.05
 # A stationary arm offset from its braking reference (contact, deflection)
 # is re-anchored at the measured joints after this long.
@@ -2988,6 +2999,17 @@ class ExecutionController:
         for value in (self.tracking_lag_position_threshold_m, self.tracking_lag_rotation_threshold_rad):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError("tracking lag EEF thresholds must be finite and positive")
+        self.tracking_joint_lag_window_s = float(getattr(
+            args, "tracking_joint_lag_window_s", DEFAULT_TRACKING_JOINT_LAG_WINDOW_S))
+        self.tracking_reference_lag_window_s = float(getattr(
+            args, "tracking_reference_lag_window_s", DEFAULT_TRACKING_REFERENCE_LAG_WINDOW_S))
+        self.ik_target_lead_s = float(getattr(args, "ik_target_lead_s", DEFAULT_IK_TARGET_LEAD_S))
+        for value in (self.tracking_joint_lag_window_s, self.tracking_reference_lag_window_s,
+                      self.ik_target_lead_s):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError("tracking lag windows and IK target lead must be finite and non-negative")
+        # (command_monotonic, {side: (commanded joints, policy EEF target)})
+        self._tracking_lag_history: deque[tuple[float, dict[str, tuple[Any, Any]]]] = deque(maxlen=32)
         self.tracking_lag_last_feedback_at = None
         self.tracking_lag_settle_cycles = 0
         self.tracking_lag_settle_joints = None
@@ -3162,6 +3184,7 @@ class ExecutionController:
         self.tracking_lag_peak_error_rad = 0.0
         self.tracking_lag_trigger_generation = None
         self.tracking_lag_last_feedback_at = None
+        self._tracking_lag_history.clear()
         if protocol.schema == "delivery" and self.rtc_enabled and getattr(self.args, "pose_trajectory", False):
             logging.info("RTC continuous tracking: point-to-point EEF smoothing applies only during IK recovery")
         if self.arm_hold_targets:
@@ -3228,6 +3251,8 @@ class ExecutionController:
                 "rotation_threshold_rad": self.tracking_lag_rotation_threshold_rad,
                 "confirm_cycles": self.tracking_lag_confirm_cycles,
                 "reference_duration_s": self.tracking_reference_lag_duration_s,
+                "joint_window_s": self.tracking_joint_lag_window_s,
+                "reference_window_s": self.tracking_reference_lag_window_s,
             },
             "ik_execution": {
                 "backend": ("piper_firmware" if self.eef_control_mode == "piper_eef" else
@@ -3236,6 +3261,7 @@ class ExecutionController:
                                 if self.ik_workers is not None else {}),
                 "solver": ("firmware" if self.eef_control_mode == "piper_eef"
                            else "bounded_levenberg_marquardt"),
+                "target_lead_s": self.ik_target_lead_s,
                 "position_tolerance_m": float(getattr(self.args, "ik_position_tolerance_m", DEFAULT_IK_POSITION_TOLERANCE_M)),
                 "rotation_tolerance_rad": float(getattr(self.args, "ik_rotation_tolerance_rad", DEFAULT_IK_ROTATION_TOLERANCE_RAD)),
                 "reference_joint_radius_rad": float(getattr(
@@ -4219,6 +4245,8 @@ class ExecutionController:
                 "reference_lag_cycles": self.tracking_reference_lag_cycles,
                 "position_threshold_m": self.tracking_lag_position_threshold_m,
                 "rotation_threshold_rad": self.tracking_lag_rotation_threshold_rad,
+                "joint_window_s": self.tracking_joint_lag_window_s,
+                "reference_window_s": self.tracking_reference_lag_window_s,
                 "waiting_for_settle": self.tracking_lag_active and self.tracking_lag_required_after_monotonic is None,
                 "threshold_rad": self.tracking_lag_threshold_rad,
                 "confirm_cycles": self.tracking_lag_confirm_cycles,
@@ -5178,6 +5206,24 @@ class ExecutionController:
         for index, side in enumerate(sides):
             self._check_eef_xyz_workspace(goal[index*10:index*10+3], side)
 
+    def _ik_lead_target(self, queued, protocol, *, holding):
+        """Row on the same timed queue whose arm pose local IK solves now.
+
+        Ruckig reaches each reference after a roughly fixed delay, so the
+        pose at least ``ik_target_lead_s`` ahead (or the last queued row) is
+        solved instead of the current one.  Only the IK target changes: the
+        queue still advances on the current row, so RTC offsets, recorded
+        targets and the gripper keep their timing.  None keeps the current row.
+        """
+        if (holding or self.ik_target_lead_s <= 0 or protocol.schema != "delivery"
+                or self.servo_backend != "ruckig" or self.eef_control_mode == "piper_eef"
+                or len(self.pending_actions) < 2):
+            return None
+        index = self._first_future_target_index(
+            self.pending_actions, queued.target_monotonic + self.ik_target_lead_s)
+        lead = self.pending_actions[-1 if index is None else index]
+        return None if lead.queue_index == queued.queue_index else lead
+
     def _check_eef_xyz_workspace(self, xyz, side):
         for axis_index, axis in enumerate(("x", "y", "z")):
             bounds = (delivery_workspace_y(self.args, side) if axis == "y"
@@ -5630,6 +5676,14 @@ class ExecutionController:
         policy_position_error = max(policy_position_errors, default=0.)
         policy_rotation_error = max(policy_rotation_errors, default=0.)
         guard_joint_error = max_joint_error or 0.
+        guard_position_error = policy_position_error
+        guard_rotation_error = policy_rotation_error
+        guard_exempt_sides: list[str] = []
+        if not bool(pending.get("hold")):
+            windowed_joint, guard_position_error, guard_rotation_error, guard_exempt_sides = (
+                self._windowed_tracking_errors(pending, current_sides, qpos, delivery, protocol))
+            if windowed_joint is not None:
+                guard_joint_error = windowed_joint
         self.last_command_feedback = {
             **pending,
             "feedback_status": "complete",
@@ -5642,6 +5696,9 @@ class ExecutionController:
             ),
             "max_joint_abs_error_rad": max_joint_error,
             "tracking_guard_joint_error_rad": guard_joint_error,
+            "tracking_guard_position_error_m": guard_position_error,
+            "tracking_guard_rotation_error_rad": guard_rotation_error,
+            "tracking_guard_exempt_sides": guard_exempt_sides,
             "reference_joint_error_rad": reference_joint_error,
             "policy_position_error_m": policy_position_error,
             "policy_rotation_error_rad": policy_rotation_error,
@@ -5659,11 +5716,14 @@ class ExecutionController:
         # Keep the fast actuator guard, but allow bounded planner acceleration
         # before calling an actual EEF mismatch sustained. Never re-time
         # the RTC suffix or reset this evidence merely on a chunk boundary.
+        # The guard values compare feedback with the closest command in the
+        # normal actuation window (see _windowed_tracking_errors).
         if bool(pending.get("hold")) and not self.tracking_lag_active:
             self.tracking_lag_consecutive_cycles = 0
             self.tracking_reference_lag_since = None
             self.tracking_reference_lag_cycles = 0
             self.tracking_lag_peak_error_rad = 0.
+            self._tracking_lag_history.clear()
         if (not bool(pending.get("hold")) and (max_joint_error is not None or policy_position_errors or policy_rotation_errors)
                 and (self.tracking_lag_last_feedback_at is None
                      or feedback_at > self.tracking_lag_last_feedback_at)):
@@ -5674,12 +5734,12 @@ class ExecutionController:
                 self.tracking_reference_lag_since = None
                 self.tracking_reference_lag_cycles = 0
             self.tracking_lag_last_feedback_at = feedback_at
-            if (max_joint_error or 0.) > self.tracking_lag_threshold_rad:
+            if guard_joint_error > self.tracking_lag_threshold_rad:
                 self.tracking_lag_consecutive_cycles += 1
             elif not self.tracking_lag_active:
                 self.tracking_lag_consecutive_cycles = 0
-            reference_lag = (policy_position_error > self.tracking_lag_position_threshold_m
-                             or policy_rotation_error > self.tracking_lag_rotation_threshold_rad)
+            reference_lag = (guard_position_error > self.tracking_lag_position_threshold_m
+                             or guard_rotation_error > self.tracking_lag_rotation_threshold_rad)
             if reference_lag:
                 if self.tracking_reference_lag_since is None:
                     self.tracking_reference_lag_since = float(feedback_at)
@@ -5719,9 +5779,11 @@ class ExecutionController:
                     f"source={'sent_joint' if sent_trigger else 'policy_reference'} "
                     f"sent_cycles={self.tracking_lag_consecutive_cycles} "
                     f"reference_duration={reference_duration:.3f}s; "
-                    f"sent_joint={max_joint_error or 0.:.6f}rad "
-                    f"reference_joint={reference_joint_error:.6f}rad position={policy_position_error:.6f}m "
-                    f"rotation={policy_rotation_error:.6f}rad; waiting for stable hold"
+                    f"sent_joint={guard_joint_error:.6f}rad "
+                    f"reference_joint={reference_joint_error:.6f}rad position={guard_position_error:.6f}m "
+                    f"rotation={guard_rotation_error:.6f}rad "
+                    f"(closest command within {self.tracking_joint_lag_window_s:.3f}s joint / "
+                    f"{self.tracking_reference_lag_window_s:.3f}s EEF); waiting for stable hold"
                 )
                 if suffix_count:
                     self._record_queue_drop(suffix_count, reason, kind="other")
@@ -5742,9 +5804,81 @@ class ExecutionController:
                     self.tracking_lag_peak_error_rad,
                 )
 
+    def _windowed_tracking_errors(self, pending, current_sides, qpos, delivery, protocol):
+        """Feedback error to the closest command issued within each guard window.
+
+        The planner and firmware actuate a command after a roughly fixed
+        delay, so comparing feedback with only the newest command reports
+        normal fast motion as lag.  An arm that really falls behind or is
+        blocked still diverges from every command in the window.  A side whose
+        latest IK found no motion closer to its target (best_effort_hold) is
+        already at the closest reachable pose; its remaining EEF distance is
+        an unreachable target, not tracking lag, and is not counted.
+
+        Returns (joint error or None, position error, rotation error, exempt sides).
+        """
+        snapshot: dict[str, tuple[Any, Any]] = {}
+        exempt: list[str] = []
+        for side in current_sides:
+            issued = pending["sides"][side]
+            issued = issued if isinstance(issued, dict) else {}
+            joints = np.asarray(issued.get("commanded_joints_rad"), dtype=float)
+            target = np.asarray(issued.get("policy_eef_target"), dtype=float)
+            if (issued.get("ik_diagnostics") or {}).get("selection_method") == "best_effort_hold":
+                exempt.append(side)
+            snapshot[side] = (
+                joints.copy() if joints.shape == (6,) and np.isfinite(joints).all() else None,
+                target.copy() if (protocol.schema == "delivery" and target.shape == (10,)
+                                  and np.isfinite(target).all()) else None,
+            )
+        command_monotonic = self._finite_timing_value(pending.get("command_monotonic"))
+        if command_monotonic is None:
+            history = [(0., snapshot)]
+            command_monotonic = 0.
+        else:
+            history = self._tracking_lag_history
+            # Repeated feedback for one command must not add stale entries.
+            if history and history[-1][0] == command_monotonic:
+                history[-1] = (command_monotonic, snapshot)
+            else:
+                history.append((command_monotonic, snapshot))
+            horizon = max(self.tracking_joint_lag_window_s, self.tracking_reference_lag_window_s)
+            while history and command_monotonic - history[0][0] > horizon + 1e-9:
+                history.popleft()
+        joint_errors: list[float] = []
+        position_errors: list[float] = []
+        rotation_errors: list[float] = []
+        for index, side in enumerate(current_sides):
+            measured_joints = qpos[index * 7:index * 7 + 6]
+            measured_delivery = delivery[index * 10:(index + 1) * 10] if protocol.schema == "delivery" else None
+            measured_rotation = None
+            joint_candidates: list[float] = []
+            pose_candidates: list[tuple[float, float]] = []
+            for issued_at, entry in history:
+                age = command_monotonic - issued_at
+                joints, target = entry.get(side, (None, None))
+                if joints is not None and age <= self.tracking_joint_lag_window_s + 1e-9:
+                    joint_candidates.append(float(np.max(np.abs(measured_joints - joints))))
+                if (target is not None and side not in exempt
+                        and age <= self.tracking_reference_lag_window_s + 1e-9):
+                    if measured_rotation is None:
+                        measured_rotation = rotation_from_state(measured_delivery.copy())
+                    pose_candidates.append((
+                        float(np.linalg.norm(target[:3] - measured_delivery[:3])),
+                        float(Rotation.from_matrix(rotation_from_state(target.copy())
+                                                   @ measured_rotation.T).magnitude())))
+            if joint_candidates:
+                joint_errors.append(min(joint_candidates))
+            if pose_candidates:
+                position_errors.append(min(item[0] for item in pose_candidates))
+                rotation_errors.append(min(item[1] for item in pose_candidates))
+        return (max(joint_errors) if joint_errors else None,
+                max(position_errors, default=0.), max(rotation_errors, default=0.), exempt)
+
     def _enter_settle_hold(self, feedback_at):
         """Brake, cancel recovery, and resume only from a post-settle observation."""
         self.tracking_lag_active = True
+        self._tracking_lag_history.clear()
         self.tracking_lag_started_at = float(feedback_at)
         self.tracking_lag_required_after_monotonic = time.monotonic()
         if self.servo_loop is not None:
@@ -6608,6 +6742,7 @@ class ExecutionController:
             command_pipeline: dict[str, dict[str, Any]] = {}
             ik_requests = {}
             ik_results = {}
+            lead_queued = self._ik_lead_target(queued, protocol, holding=holding or safety_hold_only)
             for index, side in enumerate(sides):
                 qpos_slice = np.asarray(qpos_m, dtype=np.float64)[
                     index * 7 : (index + 1) * 7
@@ -6646,6 +6781,11 @@ class ExecutionController:
                         queued.absolute_target[index * 10 : (index + 1) * 10],
                         dtype=np.float64,
                     )
+                    if lead_queued is not None:
+                        # Arm pose only: the gripper keeps the current row so
+                        # it closes when the (otherwise late) arm arrives.
+                        target = target.copy()
+                        target[:9] = lead_queued.absolute_target[index * 10 : index * 10 + 9]
                     self._check_eef_xyz_workspace(target[:3], side)
                     # Receding-horizon chunks may jump farther than one local
                     # IK solve can safely cover.  Execute the bounded first
@@ -6744,6 +6884,12 @@ class ExecutionController:
                     command_pipeline[side] = {
                         "control_path": "delivery_continuous_ik_joint",
                         "policy_eef_target": original_queued.absolute_target[index*10:index*10+10].tolist(),
+                        "ik_target_lead": (None if lead_queued is None else {
+                            "lead_s": self.ik_target_lead_s,
+                            "queue_index": lead_queued.queue_index,
+                            "source_index": lead_queued.source_index,
+                            "target_offset_s": float(lead_queued.target_monotonic - queued.target_monotonic),
+                        }),
                         "pose_trajectory_bypass_reason": ("rtc_continuous_tracking" if self.rtc_enabled
                             and getattr(self.args, "pose_trajectory", False) else None),
                         "pose_trajectory": pose_metrics,
@@ -9607,6 +9753,16 @@ def main() -> None:
                         help="sustained original policy EEF target vs feedback rotation error")
     parser.add_argument("--tracking-reference-lag-duration-s", type=float, default=.5,
                         help="continuous policy/reference mismatch duration before recovery; sent-joint guard remains immediate after confirm cycles")
+    parser.add_argument("--tracking-joint-lag-window-s", type=float, default=DEFAULT_TRACKING_JOINT_LAG_WINDOW_S,
+                        help="sent-joint guard compares feedback with the closest command issued within this window "
+                             "(covers normal firmware delay; 0 = newest command only)")
+    parser.add_argument("--tracking-reference-lag-window-s", type=float,
+                        default=DEFAULT_TRACKING_REFERENCE_LAG_WINDOW_S,
+                        help="policy EEF guard compares feedback with the closest policy target issued within "
+                             "this window (0 = newest target only)")
+    parser.add_argument("--ik-target-lead-s", type=float, default=DEFAULT_IK_TARGET_LEAD_S,
+                        help="local IK solves the arm pose at least this far ahead on the timed chunk to "
+                             "offset Ruckig planning delay; queue timing, RTC and gripper are unchanged (0 = off)")
     parser.add_argument("--eef-goal-position-tolerance-m", type=float, default=.005,
                         help="measured original-goal position tolerance before gripper release")
     parser.add_argument("--eef-goal-rotation-tolerance-rad", type=float, default=.05,
@@ -10028,6 +10184,9 @@ def main() -> None:
         parser.error("latency-skip-compensation-steps must be non-negative")
     if args.actuator_delay_s < 0:
         parser.error("actuator-delay-s must be non-negative")
+    for name in ("tracking_joint_lag_window_s", "tracking_reference_lag_window_s", "ik_target_lead_s"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
+            parser.error(f"{name.replace('_', '-')} must be finite and non-negative")
     if args.trajectory_command_lookahead_rad < 0:
         parser.error("trajectory-command-lookahead-rad must be non-negative")
     if args.gripper_open_lookahead_steps < 0:
