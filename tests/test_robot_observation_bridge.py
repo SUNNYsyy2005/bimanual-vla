@@ -3304,7 +3304,7 @@ class ExecutionQueueTest(unittest.TestCase):
         execution.rtc_enabled = True
         execution.args.pose_trajectory = True
         execution.gripper_endpoint_filter = False
-        execution.args.max_translation_step_m = .008
+        execution.args.ik_projection_translation_m = .008
         for index, row in enumerate(execution.pending_actions):
             goal = row.absolute_target.copy()
             goal[[0, 10]] += .02

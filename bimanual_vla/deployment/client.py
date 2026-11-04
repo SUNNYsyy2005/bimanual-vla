@@ -132,6 +132,12 @@ DEFAULT_TRACKING_LAG_CONFIRM_CYCLES = 3
 # pose this far ahead on the same timed chunk; queue timing, RTC offsets and
 # the gripper row are unchanged.
 DEFAULT_IK_TARGET_LEAD_S = 0.15
+# Streaming local-IK targets are projected to at most this distance from the
+# measured pose.  With ~280 ms from IK reference to feedback, the former 5 cm
+# (DEFAULT_MAX_TRANSLATION_STEP_M) capped EEF tracking near 18 cm/s while the
+# policy asked for 25-30 cm/s (2026-11-04 10:33 freezes).
+DEFAULT_IK_PROJECTION_TRANSLATION_M = 0.10
+DEFAULT_IK_PROJECTION_ROTATION_RAD = 0.36
 # Normal actuation delay is not lag: feedback is compared with the closest
 # command issued within these windows.  Joint: firmware ~65 ms.  EEF: the whole
 # ~260 ms pipeline, so a disabled or under-delivering lead does not re-create
@@ -3262,6 +3268,10 @@ class ExecutionController:
                 "solver": ("firmware" if self.eef_control_mode == "piper_eef"
                            else "bounded_levenberg_marquardt"),
                 "target_lead_s": self.ik_target_lead_s,
+                "projection_translation_m": float(getattr(
+                    self.args, "ik_projection_translation_m", DEFAULT_IK_PROJECTION_TRANSLATION_M)),
+                "projection_rotation_rad": float(getattr(
+                    self.args, "ik_projection_rotation_rad", DEFAULT_IK_PROJECTION_ROTATION_RAD)),
                 "position_tolerance_m": float(getattr(self.args, "ik_position_tolerance_m", DEFAULT_IK_POSITION_TOLERANCE_M)),
                 "rotation_tolerance_rad": float(getattr(self.args, "ik_rotation_tolerance_rad", DEFAULT_IK_ROTATION_TOLERANCE_RAD)),
                 "reference_joint_radius_rad": float(getattr(
@@ -6791,16 +6801,17 @@ class ExecutionController:
                     # IK solve can safely cover.  Execute the bounded first
                     # Cartesian step. Normal RTC timing continues; sustained
                     # error to the original target is checked by the lag guard.
+                    # Per-tick joint motion stays bounded by the IK reference
+                    # radius and Ruckig limits; this bound only sets how far
+                    # ahead of the measured pose the reference may lead.
                     if self.servo_backend == "ruckig":
                         target, projected = project_delivery_target_step(
                             current_state,
                             target,
-                            max_translation_step_m=float(
-                                getattr(self.args, "max_translation_step_m", DEFAULT_MAX_TRANSLATION_STEP_M)
-                            ),
-                            max_rotation_step_rad=float(
-                                getattr(self.args, "max_rotation_step_rad", DEFAULT_MAX_ROTATION_STEP_RAD)
-                            ),
+                            max_translation_step_m=float(getattr(
+                                self.args, "ik_projection_translation_m", DEFAULT_IK_PROJECTION_TRANSLATION_M)),
+                            max_rotation_step_rad=float(getattr(
+                                self.args, "ik_projection_rotation_rad", DEFAULT_IK_PROJECTION_ROTATION_RAD)),
                         )
                     else:
                         projected = False
@@ -9763,6 +9774,11 @@ def main() -> None:
     parser.add_argument("--ik-target-lead-s", type=float, default=DEFAULT_IK_TARGET_LEAD_S,
                         help="local IK solves the arm pose at least this far ahead on the timed chunk to "
                              "offset Ruckig planning delay; queue timing, RTC and gripper are unchanged (0 = off)")
+    parser.add_argument("--ik-projection-translation-m", type=float, default=DEFAULT_IK_PROJECTION_TRANSLATION_M,
+                        help="streaming local IK (Ruckig) target is projected to at most this distance from the "
+                             "measured EEF; limits how fast the arm can follow the policy")
+    parser.add_argument("--ik-projection-rotation-rad", type=float, default=DEFAULT_IK_PROJECTION_ROTATION_RAD,
+                        help="streaming local IK (Ruckig) target rotation bound from the measured EEF")
     parser.add_argument("--eef-goal-position-tolerance-m", type=float, default=.005,
                         help="measured original-goal position tolerance before gripper release")
     parser.add_argument("--eef-goal-rotation-tolerance-rad", type=float, default=.05,
@@ -10187,6 +10203,9 @@ def main() -> None:
     for name in ("tracking_joint_lag_window_s", "tracking_reference_lag_window_s", "ik_target_lead_s"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             parser.error(f"{name.replace('_', '-')} must be finite and non-negative")
+    for name in ("ik_projection_translation_m", "ik_projection_rotation_rad"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            parser.error(f"{name.replace('_', '-')} must be finite and positive")
     if args.trajectory_command_lookahead_rad < 0:
         parser.error("trajectory-command-lookahead-rad must be non-negative")
     if args.gripper_open_lookahead_steps < 0:

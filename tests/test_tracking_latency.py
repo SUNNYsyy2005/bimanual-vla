@@ -54,6 +54,29 @@ class IKTargetLeadTest(unittest.TestCase):
         led, _, rows, requests = self.run_first_row(10.)
         np.testing.assert_allclose(requests['right'][0][1], rows[-1].absolute_target[10:13])
 
+    def test_streaming_projection_has_its_own_wider_bound(self):
+        # The 5 cm per-step check bound capped EEF tracking near 18 cm/s.
+        for bound, projected in ((None, False), (.05, True)):
+            with self.subTest(bound=bound):
+                helper = bridge.ExecutionQueueTest()
+                helper.setUp()
+                execution, protocol, state, qpos = helper.recovery_execution(full_solve=True)
+                execution.ik_target_lead_s = 0.
+                execution.args.workspace_x = execution.args.workspace_y = execution.args.workspace_z = None
+                if bound is not None:
+                    execution.args.ik_projection_translation_m = bound
+                self.assertEqual(execution.args.max_translation_step_m, .05)
+                for index, row in enumerate(execution.pending_actions):
+                    goal = row.absolute_target.copy()
+                    goal[[0, 10]] += .07
+                    execution.pending_actions[index] = replace(row, absolute_target=goal)
+                head = execution.pending_actions[0]
+                with patch('bimanual_vla.deployment.client.time.monotonic', return_value=head.target_monotonic):
+                    self.assertTrue(execution.execute_next(state, qpos, protocol))
+                for side in ('left', 'right'):
+                    trace = execution.last_actuator_command['sides'][side]['pre_ik_eef_target']
+                    self.assertEqual(trace['projected_for_local_ik'], projected)
+
 
 class WindowedTrackingGuardTest(unittest.TestCase):
     def setUp(self):
