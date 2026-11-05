@@ -138,6 +138,11 @@ DEFAULT_IK_TARGET_LEAD_S = 0.15
 # policy asked for 25-30 cm/s (2026-11-04 10:33 freezes).
 DEFAULT_IK_PROJECTION_TRANSLATION_M = 0.10
 DEFAULT_IK_PROJECTION_ROTATION_RAD = 0.36
+# Centred smoothing window (rows) for EEF chunk targets; 0 disables.  Seven
+# 30 Hz rows cut policy step noise 3.7 -> 1.6 mm. On the demonstrations it
+# moves a settled (fine) position by <= 0.38 mm and slow rows next to a stop by
+# 0.59 mm p99 / 1.36 mm max; 5 rows keeps that <= 0.94 mm (2026-11-05 check).
+DEFAULT_EEF_CHUNK_SMOOTHING_STEPS = 7
 # Normal actuation delay is not lag: feedback is compared with the closest
 # command issued within these windows.  Joint: firmware ~65 ms.  EEF: the whole
 # ~260 ms pipeline, so a disabled or under-delivering lead does not re-create
@@ -1976,6 +1981,30 @@ def check_external_control_streams(
             )
 
 
+def smooth_delivery_targets(absolute: np.ndarray, arm_count: int, window: int) -> np.ndarray:
+    """Zero-phase Savitzky-Golay smoothing of each arm's EEF pose along one chunk.
+
+    Policy chunks carry ~4 mm step-to-step sampling noise (2026-11-05: 3.7 mm
+    RMS against 0.13 mm in the demonstrations) that the arm reproduces as
+    continuous end-effector jitter. The whole chunk is known before any row is
+    executed, so a centred filter adds no lag; order 2 leaves quadratic motion
+    unchanged. Rotations are re-orthonormalised; grippers are untouched.
+    """
+    window = int(window)
+    if window < 3 or len(absolute) < window:
+        return absolute
+    from scipy.signal import savgol_filter
+    smoothed = np.array(absolute, dtype=np.float64, copy=True)
+    for arm_index in range(arm_count):
+        offset = arm_index * 10
+        smoothed[:, offset:offset + 9] = savgol_filter(
+            smoothed[:, offset:offset + 9], window, 2, axis=0, mode="interp")
+        for row in smoothed:
+            row[offset + 3:offset + 9] = matrix_to_rotation6d(
+                rotation_from_state(row[offset:offset + 10].copy()))
+    return smoothed
+
+
 def decode_action_queue(
     actions: Any,
     protocol: PolicyProtocol,
@@ -1987,12 +2016,15 @@ def decode_action_queue(
     observation_capture_monotonic: float | None = None,
     action_hz: float | None = None,
     gripper_range_tolerance: float = DEFAULT_GRIPPER_RANGE_TOLERANCE,
+    eef_smoothing_window: int = 0,
 ) -> tuple[np.ndarray, list[DecodedQueuedAction]]:
     """Decode the first action rows against one immutable inference anchor.
 
     v3 delivery rows are independently decoded by the shared root-contract
     helper. Legacy 8_3_64eps rows are first composed from one-step deltas to
     chunk-origin deltas, then passed through the same absolute-target helper.
+    Delivery targets are then smoothed over the decoded rows when
+    ``eef_smoothing_window`` >= 3 (see smooth_delivery_targets).
     """
     values = _finite_action_chunk(actions, protocol.action_dim)
     capture_monotonic = (
@@ -2045,6 +2077,8 @@ def decode_action_queue(
             absolute = chunk_origin_deltas_to_absolute_eef_targets(
                 anchor, model_actions, arm_count=arm_count
             )
+            absolute = smooth_delivery_targets(
+                np.asarray(absolute, dtype=np.float64), arm_count, eef_smoothing_window)
         elif protocol.schema == "joint":
             absolute = wire
         else:
@@ -3272,6 +3306,8 @@ class ExecutionController:
                     self.args, "ik_projection_translation_m", DEFAULT_IK_PROJECTION_TRANSLATION_M)),
                 "projection_rotation_rad": float(getattr(
                     self.args, "ik_projection_rotation_rad", DEFAULT_IK_PROJECTION_ROTATION_RAD)),
+                "chunk_smoothing_steps": int(getattr(
+                    self.args, "eef_chunk_smoothing_steps", DEFAULT_EEF_CHUNK_SMOOTHING_STEPS)),
                 "position_tolerance_m": float(getattr(self.args, "ik_position_tolerance_m", DEFAULT_IK_POSITION_TOLERANCE_M)),
                 "rotation_tolerance_rad": float(getattr(self.args, "ik_rotation_tolerance_rad", DEFAULT_IK_ROTATION_TOLERANCE_RAD)),
                 "reference_joint_radius_rad": float(getattr(
@@ -6150,6 +6186,8 @@ class ExecutionController:
                         DEFAULT_GRIPPER_RANGE_TOLERANCE,
                     )
                 ),
+                eef_smoothing_window=int(getattr(
+                    self.args, "eef_chunk_smoothing_steps", DEFAULT_EEF_CHUNK_SMOOTHING_STEPS)),
             )
         except ExecutionBlocked as exc:
             return self._reject_result(launch.generation, str(exc), arrived_at)
@@ -9798,6 +9836,9 @@ def main() -> None:
                              "measured EEF; limits how fast the arm can follow the policy")
     parser.add_argument("--ik-projection-rotation-rad", type=float, default=DEFAULT_IK_PROJECTION_ROTATION_RAD,
                         help="streaming local IK (Ruckig) target rotation bound from the measured EEF")
+    parser.add_argument("--eef-chunk-smoothing-steps", type=int, default=DEFAULT_EEF_CHUNK_SMOOTHING_STEPS,
+                        help="odd centred Savitzky-Golay window (rows) applied to each decoded EEF chunk to "
+                             "remove policy step noise without lag; 0 disables")
     parser.add_argument("--eef-goal-position-tolerance-m", type=float, default=.005,
                         help="measured original-goal position tolerance before gripper release")
     parser.add_argument("--eef-goal-rotation-tolerance-rad", type=float, default=.05,
@@ -10225,6 +10266,9 @@ def main() -> None:
     for name in ("ik_projection_translation_m", "ik_projection_rotation_rad"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"{name.replace('_', '-')} must be finite and positive")
+    if args.eef_chunk_smoothing_steps not in (0, 1) and (
+            args.eef_chunk_smoothing_steps < 3 or args.eef_chunk_smoothing_steps % 2 == 0):
+        parser.error("eef-chunk-smoothing-steps must be 0 (off) or an odd number >= 3")
     if args.trajectory_command_lookahead_rad < 0:
         parser.error("trajectory-command-lookahead-rad must be non-negative")
     if args.gripper_open_lookahead_steps < 0:
