@@ -214,6 +214,25 @@ def test_reject_both_arms_before_any_motion_when_one_ik_fails(bad):
     assert all(np.array_equal(target, hw.measured[side]) for side, target in hw.sent)
 
 
+def test_branch_jump_diagnostic_is_saved_even_without_episode(tmp_path):
+    runtime, reader, hw = controller()
+    runtime.diagnostic_path = tmp_path / "quest-diagnostics.jsonl"
+    runtime.solvers["left"].output = np.array([0., 0., 0., 0., .25, 0.])
+    reader.update(True)
+    runtime.step()
+
+    record = json.loads(runtime.diagnostic_path.read_text().strip())
+    assert record["event"] == "motion_rejected"
+    assert record["side"] == "left"
+    assert record["diagnostics"]["joint"] == 5
+    assert record["diagnostics"]["max_delta_rad"] == pytest.approx(.25)
+    assert record["diagnostics"]["joint_limit_margin_rad"][4] == pytest.approx(.75)
+    assert record["diagnostics"]["previous_accepted_q_rad"] == [0.] * 6
+    assert record["diagnostics"]["candidate_q_rad"][4] == pytest.approx(.25)
+    assert all(not clutch.active for clutch in runtime.clutches.values())
+    assert all(np.array_equal(target, hw.measured[side]) for side, target in hw.sent)
+
+
 def test_driver_limit_admission_is_atomic_across_arms():
     runtime, reader, hw = controller()
     runtime.solvers["left"].output[:] = .05
@@ -638,7 +657,7 @@ def test_session_vr_lifecycle_records_auxiliary_data_without_replacing_actions(t
     factory = Mock(return_value=vr)
     state = np.r_[np.zeros(6), .7]
     session = CollectionSession(
-        CollectionConfig(output_dir=tmp_path, schema="joint", control_source="quest_vr"),
+        CollectionConfig(output_dir=tmp_path, schema="joint", control_source="quest_vr", can_name="can0"),
         robot_connect=lambda _: robot, camera_factory=FakeCameras,
         state_reader=lambda _: (state, state), camera_verifier=lambda *_: {},
         quest_controller_factory=factory)
@@ -663,7 +682,7 @@ def test_failed_vr_start_closes_cameras_and_robot(tmp_path):
     from tests.test_piper_data_contract import FakeCameras, FakePiper
     robot, vr = FakePiper(), Mock()
     vr.start.side_effect = RuntimeError("IK dependencies absent")
-    session = CollectionSession(CollectionConfig(output_dir=tmp_path, control_source="quest_vr"),
+    session = CollectionSession(CollectionConfig(output_dir=tmp_path, control_source="quest_vr", can_name="can0"),
         robot_connect=lambda _: robot, camera_factory=FakeCameras,
         state_reader=lambda _: (np.zeros(10), np.zeros(7)), camera_verifier=lambda *_: {},
         quest_controller_factory=Mock(return_value=vr))

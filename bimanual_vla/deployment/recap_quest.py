@@ -29,6 +29,35 @@ class RecapQuest:
         self.last_sent[side] = np.asarray(target).copy()
         self.sent_at = time.monotonic()
 
+    def connection_status(self):
+        """Return lightweight headset and per-controller tracking state."""
+        reader = self.controller.reader
+        try:
+            sample = reader.snapshot()
+        except Exception as exc:
+            return {
+                "headset": "disconnected",
+                "left_controller": "disconnected",
+                "right_controller": "disconnected",
+                "detail": str(exc),
+            }
+        if sample is None:
+            process = getattr(reader, "_process", None)
+            connected = process is not None and process.poll() is None
+            state = "connected; waiting for tracking" if connected else "disconnected"
+            return {
+                "headset": "connected" if connected else "disconnected",
+                "left_controller": "waiting" if connected else "disconnected",
+                "right_controller": "waiting" if connected else "disconnected",
+                "detail": state,
+            }
+        return {
+            "headset": "connected",
+            "left_controller": "tracked" if "l" in sample.poses else "not tracked",
+            "right_controller": "tracked" if "r" in sample.poses else "not tracked",
+            "detail": "fresh tracking",
+        }
+
     def hold(self, targets):
         self.hardware.read()
         for side, target in targets.items():
@@ -54,7 +83,32 @@ class RecapQuest:
             previous, previous_at = measured, now
         raise RuntimeError("RECAP handoff: measured arms did not settle within 3 seconds")
 
+    def wait_for_tracking(self, *, timeout_s=0.8):
+        """Wait briefly for a fresh pose containing every configured controller."""
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        missing = list(self.controller.clutches)
+        while True:
+            try:
+                sample = self.controller.reader.snapshot()
+            except Exception as exc:
+                return False, str(exc)
+            if sample is not None:
+                missing = [
+                    side for side in self.controller.clutches
+                    if ("l" if side == "left" else "r") not in sample.poses
+                ]
+                if not missing:
+                    return True, "VR tracking ready"
+            if time.monotonic() >= deadline:
+                if sample is None:
+                    return False, "no fresh Quest tracking"
+                return False, "missing controller tracking: " + ", ".join(missing)
+            time.sleep(0.02)
+
     def engage(self, targets):
+        ready, reason = self.wait_for_tracking(timeout_s=0.2)
+        if not ready:
+            raise RuntimeError("RECAP takeover requires fresh tracking of both hand controllers (" + reason + ")")
         sample = self.controller.reader.snapshot()
         if sample is None or any(("l" if s == "left" else "r") not in sample.poses for s in targets):
             raise RuntimeError("RECAP takeover requires fresh tracking of both hand controllers")

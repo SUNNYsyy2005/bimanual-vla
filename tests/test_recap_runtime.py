@@ -100,9 +100,62 @@ def test_left_x_press_toggles_recap_ownership_on_edges(tmp_path):
     sample = SimpleNamespace(buttons={"X": True})
     quest.controller.reader.snapshot.side_effect = [sample, sample, SimpleNamespace(buttons={"X": False}),
                                                      SimpleNamespace(buttons={"X": True})]
-    assert result._poll_x_command() == "takeover"
+    assert result._poll_button_command() == "takeover"
     # A held X is one request only.
-    assert result._poll_x_command() is None
-    assert result._poll_x_command() is None
+    assert result._poll_button_command() is None
+    assert result._poll_button_command() is None
     result.session.owner = "human"
-    assert result._poll_x_command() == "resume"
+    assert result._poll_button_command() == "resume"
+
+
+def test_a_requires_release_after_connection_and_tracking_gap_and_beats_x(tmp_path):
+    result, quest, _, _ = runtime(tmp_path)
+    frames = [dict(A=True), dict(A=False), dict(A=True, X=True), dict(A=True),
+              None, dict(A=True), dict(A=False), dict(A=True)]
+    quest.controller.reader.snapshot.side_effect = [
+        SimpleNamespace(buttons=buttons) if buttons is not None else None for buttons in frames]
+    assert [result._poll_button_command() for _ in frames] == [
+        None, None, "stop_and_label", None, None, None, None, "stop_and_label"]
+
+
+@pytest.mark.parametrize("owner", ["policy", "human"])
+def test_a_safely_stops_current_owner_and_waits_for_gui_label(tmp_path, owner):
+    result, quest, calls, _ = runtime(tmp_path)
+    result.session.owner = owner
+    quest.controller.reader.snapshot.side_effect = [
+        SimpleNamespace(buttons={"A": False}), SimpleNamespace(buttons={"A": True})]
+    assert not result.poll(object())
+    assert result.poll(object())
+    assert result.session.finished and result.session.label_requested
+    assert result.session.owner == "hold" and result.session.outcome == "unlabelled"
+    if owner == "human":
+        quest.stop.assert_called_once()
+    else:
+        assert calls == ["policy_stopped"]
+    result.close()
+    assert result.session.outcome == "unlabelled"  # close must not convert it to aborted
+    quest.engage.assert_not_called()
+
+
+def test_a_can_stop_before_first_policy_connection_and_preempts_pending_takeover(tmp_path):
+    result, quest, _, _ = runtime(tmp_path)
+    result.execution.servo_loop = None
+    quest.controller.reader.snapshot.side_effect = [
+        SimpleNamespace(buttons={"A": False}), SimpleNamespace(buttons={"A": True})]
+    assert not result.poll(None)
+    result.mailbox.poll = Mock(return_value="takeover")
+    assert result.poll(None)
+    assert result.session.label_requested
+    quest.engage.assert_not_called()
+    quest.settle.assert_not_called()
+
+
+def test_a_stop_failure_keeps_fault_and_does_not_request_success_dialog(tmp_path):
+    result, quest, _, _ = runtime(tmp_path, safe=False)
+    result._a_ready = True
+    quest.controller.reader.snapshot.return_value = SimpleNamespace(buttons={"A": True})
+    with pytest.raises(RuntimeError, match="stop safely"):
+        result.poll(object())
+    assert result.session.error
+    assert result.session.outcome == "aborted"
+    assert not result.session.label_requested

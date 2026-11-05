@@ -12,6 +12,10 @@ import time
 import uuid
 
 
+class RecapTakeoverUnavailable(RuntimeError):
+    """A VR handoff was unavailable but policy ownership was restored."""
+
+
 def atomic_json(path, value):
     path = Path(path)
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
@@ -37,6 +41,7 @@ class RecapSession:
         self.outcome = "unlabelled"
         self.error = None
         self.finished = False
+        self.label_requested = False
 
     def _transition(self, owner):
         self.epoch += 1
@@ -51,7 +56,7 @@ class RecapSession:
     def request(self, command):
         if self.finished or self.error:
             raise RuntimeError("RECAP session is closed or faulted")
-        if command not in ("takeover", "resume", "success", "failure", "aborted"):
+        if command not in ("takeover", "resume", "success", "failure", "aborted", "stop_and_label"):
             raise ValueError("unknown RECAP command")
         if command == "takeover" and self.owner == "human":
             return
@@ -61,18 +66,38 @@ class RecapSession:
         self._transition("transition")
         try:
             (self.stop_policy if old == "policy" else self.stop_human)()
-            if command in ("success", "failure", "aborted"):
-                self.outcome = command
+            if command in ("success", "failure", "aborted", "stop_and_label"):
+                self.label_requested = command == "stop_and_label"
+                self.outcome = "unlabelled" if self.label_requested else command
                 self.finished = True
                 self._transition("hold")
             elif command == "takeover":
-                self.start_human()
+                try:
+                    self.start_human()
+                except BaseException as exc:
+                    # The policy has already been safely stopped, but VR may
+                    # lose a controller while the arms settle. Restore policy
+                    # ownership so a transient takeover failure never kills
+                    # the deployment or its recording.
+                    try:
+                        self.start_policy()
+                    except BaseException:
+                        raise
+                    self.error = None
+                    self._transition("policy")
+                    self.event(owner="policy", epoch=self.epoch,
+                               monotonic=self.barrier, outcome=self.outcome,
+                               takeover_unavailable=str(exc))
+                    raise RecapTakeoverUnavailable(str(exc)) from exc
                 self._transition("human")
             else:
                 self.start_policy()
                 # Install the barrier AFTER handoff, so pre-settle observations
                 # and all in-flight policy results are rejected.
                 self._transition("policy")
+        except RecapTakeoverUnavailable:
+            # The inner takeover transaction restored policy ownership.
+            raise
         except BaseException as exc:
             self.error = str(exc)
             self.outcome = "aborted"
@@ -81,7 +106,7 @@ class RecapSession:
 
     def status(self):
         return dict(owner=self.owner, epoch=self.epoch, outcome=self.outcome,
-                    finished=self.finished, error=self.error)
+                    finished=self.finished, error=self.error, label_requested=self.label_requested)
 
 
 class RecapMailbox:

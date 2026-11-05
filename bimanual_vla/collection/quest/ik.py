@@ -14,7 +14,9 @@ import numpy as np
 
 
 class IKRejected(RuntimeError):
-    pass
+    def __init__(self, message, *, diagnostics=None):
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 def portable_urdf(model_dir):

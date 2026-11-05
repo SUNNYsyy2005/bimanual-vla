@@ -331,12 +331,13 @@ class DeviceGuardTest(unittest.TestCase):
         camera_factory = Mock()
         with tempfile.TemporaryDirectory() as directory:
             session = CollectionSession(
-                CollectionConfig(output_dir=Path(directory), can_name="auto", rlsok_resolver="/tmp/example-resolver"),
+                CollectionConfig(output_dir=Path(directory), can_name="can1",
+                                 cam_high_device="serial:test-overhead", rlsok_resolver="/tmp/example-resolver"),
                 robot_connect=connect, camera_factory=camera_factory,
             )
             with self.assertRaisesRegex(RuntimeError, "synthetic stop"):
                 session.connect()
-            self.assertEqual(session.config.cam_high_device, "auto")
+            self.assertEqual(session.config.cam_high_device, "serial:test-overhead")
         connect.assert_called_once_with("can1")
         camera_factory.assert_not_called()
 
@@ -424,17 +425,18 @@ class DeviceGuardTest(unittest.TestCase):
 
     @patch.object(sys, "argv", [
         "rtc-client", "--arm-mode", "bimanual", "--arm-side", "both",
-        "--cam-high-device", "auto", "--cam-left-wrist-device", "auto",
-        "--cam-right-wrist-device", "auto", "--instruction", "test",
+        "--left-can", "can0", "--right-can", "can1",
+        "--cam-high-device", "serial:test-overhead", "--cam-left-wrist-device", "serial:test-left-wrist",
+        "--cam-right-wrist-device", "serial:test-right-wrist", "--instruction", "test",
         "--rlsok-resolver", "/tmp/example-resolver",
     ])
     @patch("bimanual_vla.deployment.client.run_rtc_client")
-    def test_direct_client_accepts_auto_roles_for_resolver(self, run):
+    def test_direct_client_preserves_explicit_roles_for_resolver(self, run):
         rtc_client.main()
         args = run.call_args.args[0]
         self.assertEqual(args.arm_mode, "bimanual")
         self.assertEqual(args.rlsok_resolver, "/tmp/example-resolver")
-        self.assertEqual(args.cam_left_wrist_device, "auto")
+        self.assertEqual(args.cam_left_wrist_device, "serial:test-left-wrist")
 
 
 if __name__ == "__main__":

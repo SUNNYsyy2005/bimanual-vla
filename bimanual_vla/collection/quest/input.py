@@ -1,6 +1,7 @@
 """Read the official Quest APK protocol directly through ADB, without ROS."""
 
 from dataclasses import dataclass
+import os
 import re
 import subprocess
 import threading
@@ -78,11 +79,15 @@ class QuestReader:
         self._clock_offset = 0.
 
     def start(self):
-        from .devices import discover_devices, select_serial, launch_teleop_app
-        self.serial = select_serial(discover_devices(), self.serial)
+        from .devices import launch_teleop_app, wait_for_serial
+        adb = os.environ.get("BIMANUAL_VLA_ADB", "adb")
+        # USB ADB often disappears for a few seconds while the headset changes
+        # transport mode or wakes the teleop app. Keep the explicitly selected
+        # serial and wait for that same device; never silently switch headsets.
+        self.serial = wait_for_serial(self.serial, timeout_s=12.0)
         if self.launch_app:
             launch_teleop_app(self.serial)
-        base = ["adb", "-s", self.serial]
+        base = [adb, "-s", self.serial]
         # Android's wall clock can differ from the host. Measure it before streaming.
         before = time.time()
         remote = subprocess.check_output(base + ["shell", "date", "+%s.%N"], timeout=5, text=True)

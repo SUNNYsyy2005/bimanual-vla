@@ -8355,7 +8355,26 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                 prompt_sent_revision = None
                 return execution
 
-            recap = RecapRuntime(execution, args, recorder, monitoring, reset_recap_policy)
+            try:
+                recap = RecapRuntime(execution, args, recorder, monitoring, reset_recap_policy)
+            except Exception as exc:
+                # RECAP is an optional human takeover channel.  A transient
+                # Quest/ADB failure must not abort policy inference or discard
+                # the run: keep recording and leave only takeover disabled so
+                # the GUI can still mark success/failure/aborted.
+                logging.warning(
+                    "Quest RECAP unavailable; continuing policy inference with takeover disabled: %s",
+                    exc,
+                )
+                monitoring.record("recap_unavailable", error=repr(exc))
+                recap = RecapRuntime(
+                    execution,
+                    args,
+                    recorder,
+                    monitoring,
+                    reset_recap_policy,
+                    vr_error=exc,
+                )
         cameras.open()
         camera_checks = cameras.verify()
         for key, info in camera_checks.items():

@@ -103,6 +103,55 @@ DATA_UPLOAD_MODULE = "bimanual_vla.data.upload"
 EPISODE_VIEWER_MODULE = "bimanual_vla.data.viewer"
 
 
+class _EnglishMessageBox:
+    """Message dialogs with explicit English controls.
+
+    Tk's native messagebox obtains button captions from the desktop locale.
+    That made the otherwise English GUI show garbled localized captions, so
+    all GUI messages use the same small modal dialog as confirmations.
+    """
+
+    @staticmethod
+    def _show(title: str, message: str, parent: tk.Misc | None = None) -> None:
+        owner = parent or tk._default_root
+        if owner is None:
+            return
+        dialog = tk.Toplevel(owner)
+        dialog.title(str(title))
+        dialog.transient(owner)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=str(message), justify="left", wraplength=560).pack(
+            anchor="w", fill="x"
+        )
+        ttk.Button(body, text="OK", command=dialog.destroy, style="Accent.TButton").pack(
+            anchor="e", pady=(16, 0)
+        )
+        dialog.bind("<Return>", lambda _event: dialog.destroy())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.wait_window()
+
+    def showinfo(self, title: str, message: str, **kwargs: object) -> None:
+        self._show(title, message, kwargs.get("parent"))
+
+    def showwarning(self, title: str, message: str, **kwargs: object) -> None:
+        self._show(title, message, kwargs.get("parent"))
+
+    def showerror(self, title: str, message: str, **kwargs: object) -> None:
+        self._show(title, message, kwargs.get("parent"))
+
+    def askyesno(self, title: str, message: str, **kwargs: object) -> bool:
+        return ask_english_yes_no(kwargs.get("parent") or tk._default_root, title, message)
+
+
+# Keep the existing call sites and test seams, but remove locale-dependent
+# native message boxes from the application.
+messagebox = _EnglishMessageBox()
+
+
 def _hardware_set_selector(config: dict[str, object], role: str, selector: str) -> dict[str, object]:
     """Update one identity in the shared hardware file."""
     result = json.loads(json.dumps(config))
@@ -1074,6 +1123,8 @@ class CollectorGUI:
         self.capture_thread: threading.Thread | None = None
         self.capture_stop: threading.Event | None = None
         self.can_activation_thread: threading.Thread | None = None
+        self._can_recovery_busy = False
+        self._can_recovery_last_error = ""
         self.dataset_task_thread: threading.Thread | None = None
         self.dataset_task_process: subprocess.Popen | None = None
         self.dataset_task_name: str | None = None
@@ -1245,10 +1296,17 @@ class CollectorGUI:
         self.inference_manual_trigger_path: pathlib.Path | None = None
         self.recap_enabled_var = tk.BooleanVar(value=False)
         self.recap_status_var = tk.StringVar(value="RECAP disabled")
+        self.recap_vr_connection_var = tk.StringVar(value="Headset: disconnected")
+        self.recap_left_controller_var = tk.StringVar(value="Left controller: unavailable")
+        self.recap_right_controller_var = tk.StringVar(value="Right controller: unavailable")
         self.recap_directory = None
         self.recap_session_id = ""
         self.recap_pending_id = None
         self.recap_buttons = {}
+        self._idle_quest = None
+        self._idle_quest_connecting = False
+        self._idle_quest_wanted = False
+        self._idle_quest_fault = None
         self.recap_checkbutton: ttk.Checkbutton | None = None
         self.inference_return_button = None
         self.inference_return_pose_path = (
@@ -1413,6 +1471,10 @@ class CollectorGUI:
         self._install_space_shortcut()
         self.root.after(100, self._poll_messages)
         self.root.after(0, self._refresh_quest_devices)
+        # USB-CAN names are assigned by enumeration and can change after a
+        # hot-plug. Keep the configured serial mapping alive while the GUI is
+        # idle, so reconnecting the adapters does not require restarting GUI.
+        self.root.after(1000, self._poll_can_recovery)
 
     def _build_ui(self):
         colors = {
@@ -2469,7 +2531,18 @@ class CollectorGUI:
             button.pack(side="left", padx=3)
             self.recap_buttons[command] = button
         fluid_label(ttk.Label(recap_frame, textvariable=self.recap_status_var)).pack(anchor="w", fill="x")
-        ttk.Label(recap_frame, text="Y/B: clutch. Trigger: gripper. Release Y/B before re-engaging.",
+        status_grid = ttk.Frame(recap_frame)
+        status_grid.pack(fill="x", pady=(3, 0))
+        for row, variable in enumerate((self.recap_vr_connection_var,
+                                        self.recap_left_controller_var,
+                                        self.recap_right_controller_var)):
+            ttk.Label(status_grid, textvariable=variable, anchor="w", width=34).grid(
+                row=row, column=0, sticky="w")
+        ttk.Label(recap_frame, text="Y/B: move. Trigger: gripper. Release Y/B to hold.",
+                  foreground="#68707d").pack(anchor="w")
+        ttk.Label(recap_frame, text="Idle A: saved home. Running X: takeover / resume.",
+                  foreground="#68707d").pack(anchor="w")
+        ttk.Label(recap_frame, text="Running A: stop inference and choose rollout outcome.",
                   foreground="#68707d").pack(anchor="w")
         ttk.Button(recap_frame, text="Export labelled episodes...", command=self._export_recap_runs).pack(anchor="w", pady=4)
         ttk.Button(recap_frame, text="Upload RECAP dataset...", command=self._upload_recap_dataset).pack(anchor="w")
@@ -2675,6 +2748,9 @@ class CollectorGUI:
             return
         if mode not in {"collection", "inference", "data_process"} or mode == self.app_mode:
             return
+        if CollectorGUI._idle_quest_busy(self):
+            messagebox.showwarning("Mode locked", "Disconnect idle VR before switching modes.")
+            return
         if self.recording:
             messagebox.showwarning("Mode locked", "Stop and save the current episode first.")
             return
@@ -2712,6 +2788,8 @@ class CollectorGUI:
 
     def _update_mode_controls(self) -> None:
         running = self._inference_running()
+        idle_busy = CollectorGUI._idle_quest_busy(self)
+        connecting = getattr(self, "_idle_quest_connecting", False)
         if hasattr(self, "inference_eef_mode_selector"):
             self.inference_eef_mode_selector.configure(state="disabled" if running else "readonly")
         collection_active = self.app_mode == "collection"
@@ -2731,13 +2809,13 @@ class CollectorGUI:
                 fg="#25315b" if data_process_active else "#ffffff",
             )
         if self.inference_start_button is not None:
-            self.inference_start_button.configure(state="disabled" if running else "normal")
+            self.inference_start_button.configure(state="disabled" if running or connecting else "normal")
         if self.inference_stop_button is not None:
             self.inference_stop_button.configure(state="normal" if running and not self.inference_stop_requested else "disabled")
         if getattr(self, "inference_return_button", None) is not None:
             available = (RETURN_POSE_PATH.is_file()
                          and not self.inference_stop_requested and not self.inference_return_only
-                         and not self.recording and self.piper is None)
+                         and not self.recording and self.piper is None and not connecting)
             self.inference_return_button.configure(state="normal" if available else "disabled")
         if self.inference_next_button is not None:
             manual_mode = (
@@ -2749,17 +2827,18 @@ class CollectorGUI:
             )
         if self.inference_activate_can_button is not None:
             self.inference_activate_can_button.configure(
-                state="disabled" if running or self._can_activation_running() else "normal"
+                state="disabled" if running or idle_busy or self._can_activation_running() else "normal"
             )
         if self.inference_connect_button is not None:
-            self.inference_connect_button.configure(state="disabled" if running else "normal")
+            self.inference_connect_button.configure(state="disabled" if running or idle_busy else "normal")
         if self.inference_device_settings_button is not None:
-            self.inference_device_settings_button.configure(state="disabled" if running else "normal")
+            self.inference_device_settings_button.configure(state="disabled" if running or idle_busy else "normal")
         if self.inference_vr_settings_button is not None:
-            self.inference_vr_settings_button.configure(state="disabled" if running else "normal")
+            self.inference_vr_settings_button.configure(state="disabled" if running or idle_busy else "normal")
         if self.inference_vr_connect_button is not None:
             self.inference_vr_connect_button.configure(
-                state="disabled" if running or self._quest_scan_busy else "normal"
+                text="Disconnect VR" if idle_busy else "Connect VR",
+                state="disabled" if running or connecting or self._quest_scan_busy else "normal"
             )
         if self.recap_checkbutton is not None:
             self.recap_checkbutton.configure(state="disabled" if running else "normal")
@@ -2767,13 +2846,14 @@ class CollectorGUI:
             self.inference_swap_camera_button.configure(
                 state=(
                     "normal"
-                    if self.arm_mode == BIMANUAL and self.app_mode == "inference"
+                    if self.arm_mode == BIMANUAL and self.app_mode == "inference" and not idle_busy
                     else "disabled"
                 )
             )
 
     def _set_connection_config_enabled(self, enabled: bool) -> None:
-        enabled = bool(enabled) and not self._inference_running() and not self._replay_running()
+        enabled = (bool(enabled) and not self._inference_running() and not self._replay_running()
+                   and not CollectorGUI._idle_quest_busy(self))
         selector_state = "readonly" if enabled else "disabled"
         for selector in self.mode_selectors:
             selector.configure(state=selector_state)
@@ -2795,7 +2875,7 @@ class CollectorGUI:
         self.edit_dataset_button.configure(state=dataset_state)
         self.swap_camera_button.configure(
             state="normal"
-            if self.arm_mode == BIMANUAL and not self.recording
+            if self.arm_mode == BIMANUAL and not self.recording and enabled
             else "disabled"
         )
         if self.inference_activate_can_button is not None:
@@ -3099,6 +3179,9 @@ class CollectorGUI:
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
     def open_device_settings(self) -> None:
+        if CollectorGUI._idle_quest_busy(self):
+            messagebox.showinfo("Device settings", "Disconnect idle VR before changing hardware settings.")
+            return
         if self._replay_running():
             messagebox.showwarning("Replay active", "Stop hardware replay before changing devices.")
             return
@@ -3215,7 +3298,8 @@ class CollectorGUI:
 
     def open_hardware_identity_wizard(self) -> None:
         """Guide first-time hardware binding by comparing before/after scans."""
-        if self.session is not None or self._inference_running() or self._replay_running():
+        if (self.session is not None or self._inference_running() or self._replay_running()
+                or CollectorGUI._idle_quest_busy(self)):
             messagebox.showinfo("Hardware identity", "Disconnect devices and stop inference before configuring hardware.")
             return
         dialog = tk.Toplevel(self.root)
@@ -3370,6 +3454,10 @@ class CollectorGUI:
 
     def swap_camera_roles(self) -> None:
         """Swap wrist roles without dropping the active robot connection."""
+        if CollectorGUI._idle_quest_busy(self):
+            self.swap_wrist_cameras_var.set(not self.swap_wrist_cameras_var.get())
+            messagebox.showwarning("Camera roles locked", "Disconnect idle VR before changing hardware mappings.")
+            return
         if self.arm_mode != BIMANUAL:
             self.swap_wrist_cameras_var.set(False)
             return
@@ -3494,7 +3582,7 @@ class CollectorGUI:
 
     def _can_activation_running(self) -> bool:
         thread = self.can_activation_thread
-        return thread is not None and thread.is_alive()
+        return (thread is not None and thread.is_alive()) or getattr(self, "_can_recovery_busy", False)
 
     def _configured_can_names(self) -> tuple[str, ...]:
         if self.arm_mode == BIMANUAL:
@@ -3563,6 +3651,9 @@ class CollectorGUI:
         return result["password"]
 
     def activate_can(self) -> None:
+        if CollectorGUI._idle_quest_busy(self):
+            messagebox.showwarning("Cannot activate CAN", "Disconnect idle VR before reconfiguring CAN interfaces.")
+            return
         if self._replay_running():
             messagebox.showwarning("Cannot activate CAN", "Stop hardware replay first.")
             return
@@ -3627,6 +3718,78 @@ class CollectorGUI:
         )
         password = ""
         self.can_activation_thread.start()
+
+    def _poll_can_recovery(self) -> None:
+        """Re-activate hot-plugged CAN adapters using stable serial bindings.
+
+        This runs only while no robot session or inference process owns the
+        adapters.  A remembered administrator password enables silent recovery;
+        otherwise the GUI reports the condition and the existing Activate CAN
+        dialog remains available.  No robot command is sent here.
+        """
+        try:
+            if (
+                self.piper is None
+                and not self._inference_running()
+                and not self._replay_running()
+                and not CollectorGUI._idle_quest_busy(self)
+                and self.can_activation_thread is None
+                and not self._can_recovery_busy
+            ):
+                selectors = (
+                    (self.left_can_var.get(), self.right_can_var.get())
+                    if self.arm_mode == BIMANUAL else (self.can_var.get(),)
+                )
+                names = (
+                    resolve_can_pair(*selectors)
+                    if len(selectors) == 2
+                    else (resolve_can_selector(selectors[0]),)
+                )
+                statuses = []
+                for name in names:
+                    status_output = subprocess.run(
+                        ["ip", "-details", "link", "show", name],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=5.0,
+                    )
+                    if status_output.returncode != 0:
+                        raise RuntimeError(
+                            (status_output.stderr or status_output.stdout).strip()
+                            or f"cannot inspect {name}"
+                        )
+                    statuses.append(parse_can_link_status(status_output.stdout, name))
+                needs_activation = any(
+                    not status["up"] or status["bitrate"] != CAN_BITRATE
+                    for status in statuses
+                )
+                if needs_activation:
+                    if not self.can_admin_password:
+                        self.status_var.set(
+                            "CAN adapters need activation after hot-plug; click Activate CAN"
+                        )
+                        return
+                    self._can_recovery_busy = True
+
+                    def recover() -> None:
+                        try:
+                            statuses = activate_can_interfaces(names, self.can_admin_password)
+                            self.messages.put(("can_recovery_done", statuses))
+                        except Exception as exc:
+                            self.messages.put(("can_recovery_error", str(exc)))
+
+                    threading.Thread(
+                        target=recover,
+                        name="can-hotplug-recovery",
+                        daemon=True,
+                    ).start()
+        except (OSError, RuntimeError, ValueError):
+            # During the unplug interval no serial selector resolves. Retry on
+            # the next poll after udev has finished creating the interface.
+            pass
+        finally:
+            self.root.after(1000, self._poll_can_recovery)
 
     def _append_inference_log(self, line: str) -> None:
         widget = self.inference_log_widget
@@ -3867,6 +4030,9 @@ class CollectorGUI:
         self._launch_inference_process(command, endpoint, device_check=device_check)
 
     def _launch_inference_process(self, command, endpoint, *, device_check=None):
+        if CollectorGUI._idle_quest_busy(self) and not self._stop_idle_quest():
+            self.inference_return_only = False
+            return
         if self.inference_log_widget is not None:
             self.inference_log_widget.configure(state="normal")
             self.inference_log_widget.delete("1.0", "end")
@@ -3887,6 +4053,9 @@ class CollectorGUI:
             )
         except OSError as exc:
             self.inference_process = None
+            self.inference_return_only = False
+            if getattr(self, "_idle_quest_wanted", False):
+                self.root.after(250, self._start_idle_quest)
             messagebox.showerror("Cannot start inference", str(exc))
             return
         process = self.inference_process
@@ -4057,8 +4226,45 @@ class CollectorGUI:
         else:
             self.recap_status_var.set("RECAP enabled; start inference to open the VR controller")
 
+    def _set_recap_device_status(self, status: dict | None = None) -> None:
+        status = status or {}
+        headset = str(status.get("vr_connection") or "disconnected")
+        tracking = status.get("controller_tracking") or {}
+        left = str(tracking.get("left") or "unavailable")
+        right = str(tracking.get("right") or "unavailable")
+        if hasattr(self, "recap_vr_connection_var"):
+            self.recap_vr_connection_var.set(f"Headset: {headset}")
+            self.recap_left_controller_var.set(f"Left controller: {left}")
+            self.recap_right_controller_var.set(f"Right controller: {right}")
+
     def _poll_recap(self):
+        if not self._inference_running():
+            if CollectorGUI._idle_quest_busy(self):
+                self._poll_idle_quest()
+                return
+            # There is no deployment-owned stream while inference is idle.
+            # Discovering an authorized headset must not depend on status.json.
+            for button in getattr(self, "recap_buttons", {}).values():
+                button.configure(state="disabled")
+            selected = self.quest_adb_serial_var.get().strip()
+            cached = getattr(self, "_recap_adb_status", None)
+            if (cached is not None and cached[0] == selected
+                    and time.monotonic() - cached[1] < 8):
+                self._set_recap_device_status(cached[2])
+            else:
+                self._set_recap_device_status({
+                    "vr_connection": "checking ADB",
+                    "controller_tracking": {"left": "not monitored (inference idle)",
+                                            "right": "not monitored (inference idle)"},
+                })
+            if (self.recap_enabled_var.get()
+                    and not getattr(self, "_quest_scan_busy", False)
+                    and time.monotonic() - getattr(self, "_recap_adb_scan_at", 0) >= 3):
+                self._recap_adb_scan_at = time.monotonic()
+                self._refresh_quest_devices()
+            return
         if getattr(self, "recap_directory", None) is None:
+            self._set_recap_device_status({"vr_connection": "starting RECAP"})
             if self._inference_running() and self.recap_enabled_var.get():
                 self.recap_status_var.set(
                     "RECAP controller is not running; restart inference with VR takeover recording enabled"
@@ -4067,9 +4273,14 @@ class CollectorGUI:
         try:
             status = json.loads((pathlib.Path(self.recap_directory.name) / "status.json").read_text())
         except (OSError, ValueError):
+            self._set_recap_device_status({"vr_connection": "waiting for RECAP status"})
             return
         if status.get("session_id") != self.recap_session_id:
             return
+        if time.time() - status.get("timestamp", 0) >= 2:
+            status = {**status, "vr_connection": "RECAP status stale",
+                      "controller_tracking": {"left": "unknown", "right": "unknown"}}
+        self._set_recap_device_status(status)
         if status.get("request_id") == self.recap_pending_id:
             self.recap_pending_id = None
         available = (self._inference_running() and not self.recap_pending_id
@@ -4082,9 +4293,15 @@ class CollectorGUI:
             vr_status = status.get("vr_status") or "waiting for the first policy command"
             waiting_text = f"RECAP waiting: {vr_status}"
         for command, button in self.recap_buttons.items():
-            enabled = available and (command not in {"takeover", "resume"}
-                                    or (command == "takeover" and owner == "policy")
-                                    or (command == "resume" and owner == "human"))
+            if command in {"takeover", "resume"}:
+                enabled = (
+                    available
+                    and bool(status.get("vr_available", True))
+                    and ((command == "takeover" and owner == "policy")
+                         or (command == "resume" and owner == "human"))
+                )
+            else:
+                enabled = available
             button.configure(state="normal" if enabled else "disabled")
         if not self.recap_pending_id:
             self.recap_status_var.set(
@@ -4121,10 +4338,38 @@ class CollectorGUI:
             self.inference_status_var.set("Returned to saved home" if return_code == 0 else "Return failed; see log")
         self._set_connection_config_enabled(True)
         self._update_mode_controls()
+        if return_code == 0 and not was_return_only:
+            CollectorGUI._label_stopped_recap(self)
         if return_code == 0 and return_after_stop:
             self.root.after(250, self.return_inference_to_initial)
         elif return_code == 0 and restart_requested:
             self.root.after(250, self.start_inference)
+        elif return_code == 0 and getattr(self, "_idle_quest_wanted", False):
+            self.root.after(250, self._start_idle_quest)
+        elif return_code != 0:
+            self._idle_quest_wanted = False
+
+    def _label_stopped_recap(self):
+        directory = getattr(self, "recap_directory", None)
+        if directory is None:
+            return
+        try:
+            status = json.loads((pathlib.Path(directory.name) / "status.json").read_text())
+        except (OSError, ValueError):
+            return
+        if (status.get("session_id") != self.recap_session_id or not status.get("finished")
+                or not status.get("label_requested") or status.get("error")):
+            return
+        from bimanual_vla.collection.recap_gui import choose_rollout_outcome
+        try:
+            outcome = choose_rollout_outcome(self.root, status.get("recording") or "",
+                                              show_error=messagebox.showerror)
+        except (OSError, ValueError) as exc:
+            self.recap_status_var.set(f"Cannot label stopped rollout: {exc}")
+            messagebox.showerror("Cannot label stopped rollout", str(exc))
+            return
+        if outcome:
+            self.recap_status_var.set(f"Rollout saved: {outcome}")
 
     def _finish_can_activation(
         self,
@@ -4174,6 +4419,21 @@ class CollectorGUI:
     def _finish_quest_devices(self, devices, error):
         from bimanual_vla.collection.quest.devices import select_serial
         self._quest_scan_busy = False
+        # Cache the actual ADB result for the idle RECAP panel. Controller
+        # tracking is only monitored by the deployment process during inference.
+        requested = self.quest_adb_serial_var.get().strip()
+        matched = next((d for d in devices if d.serial == requested), None)
+        if not requested:
+            ready = [d for d in devices if d.state == "device"]
+            matched = ready[0] if len(ready) == 1 else None
+        connection = ("scan failed" if error else
+                      "connected (ADB)" if matched is not None and matched.state == "device" else
+                      matched.state if matched is not None else "disconnected")
+        self._recap_adb_status = (matched.serial if matched else requested, time.monotonic(), {
+            "vr_connection": connection,
+            "controller_tracking": {"left": "not monitored (inference idle)",
+                                    "right": "not monitored (inference idle)"},
+        })
         for button in (getattr(self, "quest_refresh_button", None),
                        getattr(self, "inference_vr_connect_button", None)):
             if button is not None:
@@ -4187,7 +4447,8 @@ class CollectorGUI:
         try:
             # Read the field now, not when scanning began: preserve user edits.
             selected = select_serial(devices, self.quest_adb_serial_var.get())
-            if self.piper is None and not self._inference_running() and not self._replay_running():
+            if (self.piper is None and not self._inference_running() and not self._replay_running()
+                    and not CollectorGUI._idle_quest_busy(self)):
                 self.quest_adb_serial_var.set(selected)
             device = next(d for d in devices if d.serial == selected)
             self.quest_device_status_var.set(f'Device: {device.model or "ADB device"} · {selected}')
@@ -4195,21 +4456,117 @@ class CollectorGUI:
             self.quest_device_status_var.set(str(exc))
 
     def _connect_quest(self):
-        """Discover and select the Quest used by the inference RECAP reader.
-
-        The deployment process owns the actual ADB stream, so the GUI performs
-        a single-device handshake here and never starts a competing reader.
-        """
+        """Toggle idle teleoperation; inference owns VR while it is running."""
         if self._inference_running():
             self.quest_device_status_var.set("Inference owns the VR connection")
             return
-        # The explicit inference-page connection action also opts the next
-        # policy launch into RECAP; collection-page Refresh VR remains a
-        # discovery-only operation.
+        if CollectorGUI._idle_quest_busy(self):
+            self._idle_quest_wanted = False
+            self._stop_idle_quest()
+            return
+        self._idle_quest_wanted = True
         self.recap_enabled_var.set(True)
-        self.quest_device_status_var.set("Connecting to VR...")
-        self.recap_status_var.set("VR selected; checking the Quest connection")
-        self._refresh_quest_devices()
+        self._start_idle_quest()
+
+    def _idle_quest_busy(self):
+        return (getattr(self, "_idle_quest", None) is not None
+                or getattr(self, "_idle_quest_connecting", False))
+
+    def _start_idle_quest(self):
+        if (not self._idle_quest_wanted or self._inference_running()
+                or CollectorGUI._idle_quest_busy(self)):
+            return
+        if self.app_mode != "inference":
+            self._idle_quest_wanted = False
+            return
+        if (self.piper is not None or self.recording or self._replay_running()
+                or self._can_activation_running()):
+            self._idle_quest_wanted = False
+            self.recap_status_var.set("Idle VR unavailable: disconnect other hardware owners first")
+            return
+        from bimanual_vla.deployment.idle_quest import IdleQuestSession
+        self._idle_quest = IdleQuestSession(
+            arms=arm_role_request(self.arm_mode, self.arm_side, single=self.can_var.get().strip(),
+                                  left=self.left_can_var.get().strip(), right=self.right_can_var.get().strip()),
+            cameras=camera_role_request(self.arm_mode, self.arm_side, overhead=self.high_var.get().strip(),
+                                        wrist=self.wrist_var.get().strip(),
+                                        left_wrist=self.left_wrist_var.get().strip(),
+                                        right_wrist=self.right_wrist_var.get().strip()),
+            arm_mode=self.arm_mode, arm_side=self.arm_side,
+            model_dir=self.quest_model_dir_var.get().strip(), serial=self.quest_adb_serial_var.get().strip(),
+            resolver=self.rlsok_resolver_var.get().strip())
+        self._idle_quest_connecting = True
+        self._idle_quest_fault = None
+        self.recap_status_var.set("Connecting idle VR; release Y/B and A")
+        self._set_connection_config_enabled(False)
+        session = self._idle_quest
+        def worker():
+            error = None
+            try:
+                session.start()
+            except Exception as exc:
+                error = str(exc)
+            self.messages.put(("idle_quest_connected", error))
+        threading.Thread(target=worker, name="idle-quest-connect", daemon=True).start()
+
+    def _finish_idle_quest(self, error):
+        self._idle_quest_connecting = False
+        if error is not None:
+            self._idle_quest_wanted = False
+            self._stop_idle_quest()
+            self.recap_status_var.set(f"Idle VR connection failed: {error}")
+            return
+        self.quest_adb_serial_var.set(self._idle_quest.controller.reader.serial)
+        self.quest_device_status_var.set("VR connected for idle teleoperation")
+        self.recap_status_var.set("Idle VR ready: hold Y/B to move; press A for saved home")
+        self._update_mode_controls()
+
+    def _stop_idle_quest(self):
+        if self._idle_quest_connecting:
+            messagebox.showwarning("VR connecting", "Wait for the VR connection to finish before changing control ownership.")
+            return False
+        try:
+            if self._idle_quest is not None:
+                self._idle_quest.close()
+        except Exception as exc:
+            self._idle_quest_fault = str(exc)
+            self._idle_quest_wanted = False
+            self.recap_status_var.set(f"Cannot release idle VR: {exc}")
+            messagebox.showerror("VR still owns hardware", str(exc))
+            return False
+        self._idle_quest = None
+        self._idle_quest_fault = None
+        self._set_recap_device_status()
+        self.recap_status_var.set("Idle VR disconnected")
+        self._set_connection_config_enabled(True)
+        return True
+
+    def _poll_idle_quest(self):
+        for button in self.recap_buttons.values():
+            button.configure(state="disabled")
+        if self._idle_quest_connecting:
+            self._set_recap_device_status({"vr_connection": "connecting idle VR"})
+            return
+        if self._idle_quest_fault:
+            self._set_recap_device_status({"vr_connection": "idle VR fault; disconnect required"})
+            return
+        try:
+            session = self._idle_quest
+            session.controller.check()
+            self._set_recap_device_status(session.connection_status())
+            self.recap_status_var.set(f"Idle VR: {session.controller.status}")
+            while True:
+                try:
+                    action = session.controller.ui_actions.get_nowait()
+                except queue.Empty:
+                    break
+                if action == "return_saved_home":
+                    self.return_inference_to_initial()
+                    break
+        except Exception as exc:
+            self._idle_quest_wanted = False
+            self._stop_idle_quest()
+            self.recap_status_var.set(f"Idle VR stopped: {exc}")
 
     def open_quest_settings(self) -> None:
         """Edit the shared Quest model/ADB settings from either UI page."""
@@ -4217,7 +4574,7 @@ class CollectorGUI:
             self.quest_settings_window.lift()
             self.quest_settings_window.focus_force()
             return
-        if self.session is not None or self._inference_running():
+        if self.session is not None or self._inference_running() or CollectorGUI._idle_quest_busy(self):
             messagebox.showinfo("VR settings", "Stop the active device or inference connection before changing VR settings.")
             return
         dialog = tk.Toplevel(self.root)
@@ -4244,9 +4601,6 @@ class CollectorGUI:
         actions.grid(row=3, column=0, columnspan=2, sticky="ew")
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
-        ttk.Button(actions, text="Connect VR", command=self._connect_quest).grid(
-            row=0, column=0, sticky="ew", padx=(0, 4))
-
         def close_dialog() -> None:
             try:
                 self._quest_serial_entries.remove(serial_box)
@@ -4261,6 +4615,13 @@ class CollectorGUI:
             self._save_gui_preferences()
             close_dialog()
 
+        def connect() -> None:
+            apply()
+            self._connect_quest()
+
+        ttk.Button(actions, text="Connect VR", command=connect).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4))
+
         ttk.Button(actions, text="Apply", command=apply, style="Accent.TButton").grid(
             row=0, column=1, sticky="ew", padx=(4, 0))
         dialog.bind("<Return>", lambda _event: apply())
@@ -4268,6 +4629,9 @@ class CollectorGUI:
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
     def toggle_connection(self):
+        if CollectorGUI._idle_quest_busy(self):
+            messagebox.showwarning("VR active", "Disconnect idle VR before connecting collection devices.")
+            return
         if self._replay_running():
             messagebox.showwarning("Replay active", "Stop hardware replay before changing devices.")
             return
@@ -4768,6 +5132,8 @@ class CollectorGUI:
                     self.quest_status_var.set(payload[0])
                 elif kind == "quest_devices":
                     self._finish_quest_devices(payload[0], payload[1])
+                elif kind == "idle_quest_connected":
+                    self._finish_idle_quest(payload[0])
                 elif kind == "error":
                     self.status_var.set(f"Collection error: {payload[0]}")
                     if self.recording:
@@ -4777,6 +5143,19 @@ class CollectorGUI:
                     self._finish_can_activation(True, payload[0])
                 elif kind == "can_activation_error":
                     self._finish_can_activation(False, payload[0])
+                elif kind == "can_recovery_done":
+                    self._can_recovery_busy = False
+                    statuses = payload[0]
+                    self.status_var.set(
+                        "CAN hot-plug recovery complete: "
+                        + ", ".join(f"{name}=UP" for name in statuses)
+                    )
+                elif kind == "can_recovery_error":
+                    self._can_recovery_busy = False
+                    message = str(payload[0])
+                    if message != self._can_recovery_last_error:
+                        self._can_recovery_last_error = message
+                        self.status_var.set(f"CAN hot-plug recovery pending: {message}")
                 elif kind == "dataset_log":
                     line = payload[0]
                     self._append_dataset_log(line)
@@ -5269,6 +5648,8 @@ class CollectorGUI:
             return result
 
         def blocking_reason():
+            if CollectorGUI._idle_quest_busy(self):
+                return "Disconnect idle VR before hardware replay."
             if self.recording:
                 return "Stop and save the current episode before hardware replay."
             if self._inference_running() or self._can_activation_running():
@@ -5351,6 +5732,10 @@ class CollectorGUI:
         self.status_var.set("Disconnected")
 
     def close(self):
+        self._idle_quest_wanted = False
+        if CollectorGUI._idle_quest_busy(self):
+            if not self._stop_idle_quest():
+                return
         if self._replay_running():
             self.replay_dialog.stop()
             messagebox.showinfo("Stopping replay", "Wait for hardware replay to stop before exiting.")

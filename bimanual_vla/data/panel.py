@@ -14,6 +14,7 @@ from typing import Callable, Iterable
 
 import numpy as np
 
+from bimanual_vla.data.action_conventions import rotation6d_to_matrix
 from bimanual_vla.data.analysis import (
     AnalysisData,
     compute_metrics,
@@ -70,20 +71,46 @@ PLOT_GROUPS = {
     "Trajectory": ("Position", *MOTION_VIEWS, "Tracking error"),
     "Chunk boundaries": tuple(CHUNK_VIEWS),
     "Timing": ("Inference latency", "Control interval"),
-    "End effector": ("3D trajectory",),
+    "End effector": ("3D trajectory", "EEF tracking"),
 }
+
+
+def _has_eef_tracking(data: AnalysisData | None) -> bool:
+    return (data is not None and data.eef_measured.ndim == 2
+            and data.eef_target.shape == data.eef_measured.shape
+            and data.eef_measured.shape[1] in (10, 20))
+
+
+def _eef_sides(data: AnalysisData) -> tuple[str, ...]:
+    if data.eef_measured.shape[1] == 20:
+        return ("left", "right")
+    side = str(data.metadata.get("arm_side") or "right").lower()
+    return (side if side in {"left", "right"} else "right",)
+
+
+def _eef_signal_options(data: AnalysisData) -> tuple[str, ...]:
+    """Compact EEF views that compare complete pose components at once."""
+    options = []
+    for side in _eef_sides(data):
+        title = side.title()
+        options.extend((f"{title} position error", f"{title} position (XYZ)",
+                        f"{title} orientation error", f"{title} gripper"))
+    return tuple(options)
+
+
 TRAJECTORY_VIEWS = frozenset(PLOT_GROUPS["Trajectory"])
 
 
 def available_plot_groups(data: AnalysisData | None) -> dict[str, tuple[str, ...]]:
     """Only offer charts backed by the selected source's recording format."""
+    eef_views = PLOT_GROUPS["End effector"] if _has_eef_tracking(data) else ("3D trajectory",)
     if data is not None and data.kind == "episode":
         return {
             "Trajectory": ("Position", *MOTION_VIEWS, "Tracking error"),
             "Timing": ("Control interval",),
-            "End effector": PLOT_GROUPS["End effector"],
+            "End effector": eef_views,
         }
-    return PLOT_GROUPS
+    return {**PLOT_GROUPS, "End effector": eef_views}
 
 
 def _episode_motion_series(
@@ -889,6 +916,8 @@ class DataProcessPanel(ttk.Frame):
                 options = ("Joint L2 norm", *motion_joint_names(self.data))
         elif plot in {"Position", "Tracking error"}:
             options = self.data.names or ("No joints",)
+        elif plot == "EEF tracking":
+            options = _eef_signal_options(self.data) or ("No EEF data",)
         elif plot == "3D trajectory":
             options = ("Both arms", "Left arm", "Right arm")
         else:
@@ -1003,6 +1032,48 @@ class DataProcessPanel(ttk.Frame):
             return [("Control interval", np.diff(data.timestamps[start : end + 1]) * 1000.0, "#1a73e8")], x, "milliseconds"
         if plot == "3D trajectory":
             return [], times, "meters"
+        if plot == "EEF tracking":
+            if not _has_eef_tracking(data):
+                return [], times, "EEF pose"
+            sides = _eef_sides(data)
+            side_index = next((index for index, side in enumerate(sides) if signal.startswith(side.title())), 0)
+            side = sides[side_index]
+            base = side_index * 10
+            measured = data.eef_measured[start : end + 1, base : base + 10]
+            target = data.eef_target[start : end + 1, base : base + 10]
+            self.chart_series_x = []
+            self.chart_series_dash_patterns = []
+            if "position (XYZ)" in signal:
+                series = []
+                for component, axis in enumerate(("X", "Y", "Z")):
+                    series.extend(((f"{side.title()} {axis} measured", measured[:, component], "#68707d"),
+                                   (f"{side.title()} {axis} target", target[:, component], "#e76f51")))
+                    self.chart_series_x.extend((times, times))
+                    self.chart_series_dash_patterns.extend((None, (5, 3)))
+                return series, np.concatenate(self.chart_series_x), "meters"
+            if "position error" in signal:
+                error = np.linalg.norm(target[:, :3] - measured[:, :3], axis=1)
+                self.chart_series_x = [times]
+                self.chart_series_dash_patterns = [None]
+                return [(f"{side.title()} position error", error, "#7c4dff")], times, "meters (L2 error)"
+            if "orientation error" in signal:
+                error = np.full(len(measured), np.nan, dtype=np.float64)
+                valid = np.isfinite(measured[:, 3:9]).all(axis=1) & np.isfinite(target[:, 3:9]).all(axis=1)
+                if np.any(valid):
+                    try:
+                        measured_rot = rotation6d_to_matrix(measured[valid, 3:9])
+                        target_rot = rotation6d_to_matrix(target[valid, 3:9])
+                        relative = np.einsum("nij,njk->nik", np.swapaxes(measured_rot, 1, 2), target_rot)
+                        error[valid] = np.arccos(np.clip((np.trace(relative, axis1=1, axis2=2) - 1.0) / 2.0, -1.0, 1.0))
+                    except ValueError:
+                        pass
+                self.chart_series_x = [times]
+                self.chart_series_dash_patterns = [None]
+                return [(f"{side.title()} orientation error", error, "#7c4dff")], times, "radians (geodesic error)"
+            self.chart_series_x = [times, times]
+            self.chart_series_dash_patterns = [None, (5, 3)]
+            return [(f"{side.title()} gripper measured", measured[:, 9], "#68707d"),
+                    (f"{side.title()} gripper target", target[:, 9], "#e76f51")], times, "opening fraction"
         desired = data.desired[start : end + 1]
         measured = data.measured[start : end + 1]
         index = 0 if signal_index is None else signal_index

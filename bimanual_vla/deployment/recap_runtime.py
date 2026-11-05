@@ -5,7 +5,7 @@ import time
 import numpy as np
 
 from bimanual_vla.collection.quest import DEFAULT_MODEL_DIR
-from .recap import RecapMailbox, RecapSession
+from .recap import RecapMailbox, RecapSession, RecapTakeoverUnavailable
 from .recap_quest import RecapQuest
 
 
@@ -19,23 +19,46 @@ def _command_opening_fraction(opening_m):
 
 
 class RecapRuntime:
-    def __init__(self, execution, args, recorder, monitoring, reset_policy):
+    def __init__(self, execution, args, recorder, monitoring, reset_policy, *, vr_error=None):
         self.execution, self.args = execution, args
         self.recorder, self.monitoring = recorder, monitoring
         self.reset_policy = reset_policy
         self.sides = tuple(execution.pipers)
-        self.quest = RecapQuest(execution.pipers, args.recap_quest_model_dir or DEFAULT_MODEL_DIR,
-                                args.recap_adb_serial, gripper_effort=args.gripper_effort)
+        self.vr_error = str(vr_error) if vr_error else None
+        self.quest = None
+        if self.vr_error is None:
+            self.quest = RecapQuest(
+                execution.pipers,
+                args.recap_quest_model_dir or DEFAULT_MODEL_DIR,
+                args.recap_adb_serial,
+                gripper_effort=args.gripper_effort,
+            )
         self.targets = None
         self.protocol = None
         # X is a RECAP-only toggle. Track the edge rather than the level so a
         # held button cannot issue takeover/resume repeatedly while the
         # handoff is settling.
         self._x_down = False
+        self._a_ready = False
+        self._finishing_for_label = False
+        self._vr_status_override = None
         self.mailbox = RecapMailbox(args.recap_control_dir, args.recap_session_id)
         self.session = RecapSession(stop_policy=self.stop_policy, start_human=self.start_human,
                                    stop_human=self.stop_human, start_policy=self.start_policy,
                                    event=self.event)
+        self.publish()
+
+    def _disable_vr(self, error):
+        """Drop a lost Quest link while leaving policy recording alive."""
+        if self.quest is None:
+            return
+        self.vr_error = str(error)
+        try:
+            self.quest.close()
+        except Exception:
+            pass
+        self.quest = None
+        self.monitoring.record("recap_unavailable", error=repr(error), runtime=True)
         self.publish()
 
     def event(self, **event):
@@ -45,10 +68,43 @@ class RecapRuntime:
     def publish(self):
         servo = self.execution.servo_loop
         has_command = servo is not None and servo.last_published_command() is not None
-        self.mailbox.publish(self.session, vr_status=self.quest.controller.status,
+        if self.quest is not None:
+            try:
+                connection = self.quest.connection_status()
+            except Exception as exc:
+                connection = {"headset": "unknown", "left_controller": "unknown",
+                              "right_controller": "unknown", "detail": str(exc)}
+            if not isinstance(connection, dict) or not all(
+                key in connection for key in ("headset", "left_controller", "right_controller")
+            ):
+                # Keep lightweight test/adaptor doubles compatible with the
+                # runtime while real RecapQuest always supplies this mapping.
+                connection = {"headset": "connected", "left_controller": "unknown",
+                              "right_controller": "unknown", "detail": "status unavailable"}
+        else:
+            connection = {
+                "headset": "disconnected",
+                "left_controller": "unavailable",
+                "right_controller": "unavailable",
+                "detail": str(self.vr_error or "VR takeover disabled"),
+            }
+        vr_status = (
+            self._vr_status_override
+            or (self.quest.controller.status if self.quest is not None else None)
+            or f"VR takeover unavailable: {self.vr_error}"
+        )
+        self.mailbox.publish(self.session, vr_status=vr_status,
+                             vr_available=self.quest is not None,
+                             vr_connection=connection["headset"],
+                             controller_tracking={
+                                 "left": connection["left_controller"],
+                                 "right": connection["right_controller"],
+                             },
+                             vr_connection_detail=connection.get("detail", ""),
                              recording=str(self.recorder.run_dir or ""),
-                             ready=(self.protocol is not None and (self.targets is not None
-                                    or has_command)))
+                             ready=(self.protocol is not None and (
+                                 self.quest is None or self.targets is not None or has_command
+                             )))
 
     def stop_policy(self):
         controller = self.execution
@@ -57,6 +113,8 @@ class RecapRuntime:
         if not controller.close_servo():
             raise RuntimeError("policy servo did not stop safely; RECAP takeover refused")
         controller.close_ik_workers()
+        if self.quest is None or self._finishing_for_label:
+            return
         command = servo.last_published_command() if servo is not None else None
         self.quest.hardware.read()
         if command is not None:
@@ -72,9 +130,13 @@ class RecapRuntime:
         self.quest.settle(self.targets)
 
     def start_human(self):
+        if self.quest is None:
+            raise RuntimeError("VR takeover is unavailable: " + str(self.vr_error))
         self.quest.engage(self.targets)
 
     def stop_human(self):
+        if self.quest is None:
+            raise RuntimeError("VR takeover is unavailable: " + str(self.vr_error))
         self.targets = self.quest.stop()
 
     def start_policy(self):
@@ -85,28 +147,68 @@ class RecapRuntime:
 
     def poll(self, protocol):
         self.protocol = protocol
-        button_command = self._poll_x_command()
+        try:
+            button_command = self._poll_button_command()
+        except Exception as exc:
+            # ADB/logcat can disappear after policy startup. This only removes
+            # the optional human takeover channel; policy control and recording
+            # remain active and the GUI can still submit a final label.
+            self._disable_vr(exc)
+            button_command = None
         command = self.mailbox.poll()
-        if command is None:
+        if button_command == "stop_and_label":
             command = button_command
-            if command is not None and protocol is None:
+        elif command is None:
+            command = button_command
+            if command is not None and protocol is None and command != "stop_and_label":
                 # A button edge before policy startup is consumed safely; the
                 # operator can release and press X again after startup.
                 command = None
         if command is not None:
-            if protocol is None:
+            if protocol is None and command != "stop_and_label":
                 raise RuntimeError("RECAP requires a connected policy and completed startup")
-            self.session.request(command)
+            if command == "takeover" and self.quest is not None:
+                ready, reason = self.quest.wait_for_tracking(timeout_s=0.8)
+                if not ready:
+                    # Do not stop policy ownership until VR is actually ready.
+                    # A momentary loss of one controller must be retryable and
+                    # must not abort an otherwise healthy deployment.
+                    self._vr_status_override = "Takeover waiting for both controllers: " + reason
+                    self.monitoring.record("recap_takeover_deferred", reason=reason)
+                    self.publish()
+                    return self.session.finished
+                self._vr_status_override = None
+            try:
+                self._finishing_for_label = command == "stop_and_label"
+                self.session.request(command)
+            except RecapTakeoverUnavailable as exc:
+                self._vr_status_override = "Takeover unavailable; policy resumed: " + str(exc)
+                self.monitoring.record("recap_takeover_deferred", reason=str(exc), recovered=True)
+                self.recorder.update_metadata({"recap": dict(version=1, **self.session.status())})
+                self.publish()
+                return self.session.finished
+            finally:
+                self._finishing_for_label = False
             self.recorder.update_metadata({"recap": dict(version=1, **self.session.status())})
         self.publish()
         return self.session.finished
 
-    def _poll_x_command(self):
-        """Return the RECAP command generated by a fresh left-X press."""
+    def _poll_button_command(self):
+        """X toggles ownership; A stops for labelling, after a fresh release."""
+        if self.quest is None:
+            return None
         sample = self.quest.controller.reader.snapshot()
         pressed = bool(sample is not None and sample.buttons.get("X", False))
         rising = pressed and not self._x_down
         self._x_down = pressed
+        if sample is None or "A" not in sample.buttons:
+            self._a_ready = False
+        elif not sample.buttons["A"]:
+            self._a_ready = True
+        else:
+            ready, self._a_ready = self._a_ready, False
+            if ready:
+                return "stop_and_label"
         if not rising:
             return None
         if self.session.owner == "policy":
@@ -119,6 +221,8 @@ class RecapRuntime:
         return self.session.accepts_policy(completion.launch.captured_monotonic)
 
     def step_human(self, protocol):
+        if self.quest is None:
+            raise RuntimeError("VR takeover is unavailable")
         sent = self.quest.step()
         from .client import read_output_state
         states = [read_output_state(self.execution.pipers[s], max_feedback_age_s=self.args.max_feedback_age_s)
@@ -138,6 +242,8 @@ class RecapRuntime:
         )
 
     def hold_until_policy(self):
+        if self.quest is None:
+            return
         if self.execution.servo_loop is not None:
             # The resumed policy owns the arms. The handoff pose is stale from
             # now on: a later servo restart (e.g. reconnect) must not drive the
@@ -148,7 +254,7 @@ class RecapRuntime:
 
     def close(self):
         try:
-            if self.session.owner == "human":
+            if self.session.owner == "human" and self.quest is not None:
                 self.stop_human()
             if not self.session.finished:
                 self.session.outcome = "aborted"
@@ -157,4 +263,5 @@ class RecapRuntime:
             self.recorder.update_metadata({"recap": dict(version=1, **self.session.status())})
             self.publish()
         finally:
-            self.quest.close()
+            if self.quest is not None:
+                self.quest.close()

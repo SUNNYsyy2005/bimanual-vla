@@ -105,8 +105,23 @@ class Clutch:
         q = np.asarray(solver.solve(target, opening * .07), dtype=float)
         if q.shape != (6,) or not np.isfinite(q).all():
             raise IKRejected("non-finite/invalid IK output")
-        if np.max(np.abs(q - self.last_q)) > .20:
-            raise IKRejected("IK branch jump >0.20 rad; release and re-engage clutch")
+        joint_delta = q - self.last_q
+        if np.max(np.abs(joint_delta)) > .20:
+            joint = int(np.argmax(np.abs(joint_delta)))
+            raise IKRejected(
+                "IK branch jump >0.20 rad; release and re-engage clutch",
+                diagnostics={
+                    "joint": joint + 1,
+                    "max_delta_rad": float(abs(joint_delta[joint])),
+                    "joint_delta_rad": joint_delta.tolist(),
+                    "previous_accepted_q_rad": self.last_q.tolist(),
+                    "candidate_q_rad": q.tolist(),
+                    "measured_q_rad": np.asarray(measured[:6], dtype=float).tolist(),
+                    "hand_delta_translation_m": float(np.linalg.norm(delta[:3, 3])),
+                    "hand_delta_rotation_rad": float(angle),
+                    "target_pose": target.tolist(),
+                },
+            )
         # Lag behind measured joints is bounded by the controller's command
         # lead limit, not rejected here.
         return target, np.r_[q, opening], False
@@ -194,7 +209,7 @@ class QuestHardware:
                                    'VR collection/reset does not automatically enable or switch modes')
         return measured
 
-    def prepare_for_reset(self, measured, *, speed_pct=100, timeout_s=3.0):
+    def prepare_for_reset(self, measured, *, speed_pct=100, timeout_s=3.0, sides=None):
         """Safely adopt healthy arms for an explicit saved-home reset.
 
         Normal VR clutch engagement still requires an already enabled
@@ -211,7 +226,9 @@ class QuestHardware:
             raise ValueError("reset enable timeout must be positive")
         self.check_ownership()
         require_can_send_healthy(self.arms)
-        sides = tuple(self.arms)
+        sides = tuple(self.arms) if sides is None else tuple(sides)
+        if not sides or any(side not in self.arms for side in sides):
+            raise ValueError("invalid arms for measured-pose enable")
         # Re-read status for every arm before writing anything.  This catches a
         # driver fault that appeared after the control tick's initial snapshot.
         statuses = {}
@@ -330,6 +347,8 @@ class QuestController:
         self._stop, self._estop = threading.Event(), threading.Event()
         self._estop_lock, self._estop_sent = threading.Lock(), False
         self._thread = None
+        # Enabled by start() for live Quest sessions, including idle teleoperation.
+        self.diagnostic_path = None
         self.error = None
         self.status = "Waiting for fresh Quest tracking; release Y/B before engagement"
         self._record_lock = threading.Lock()
@@ -493,6 +512,7 @@ class QuestController:
                             for side in self.clutches}
             self.hardware.wait_for_feedback()
             self.reader.start()
+            self.diagnostic_path = Path.home() / ".local/state/bimanual-vla/quest-diagnostics.jsonl"
             self._thread = threading.Thread(target=self._run, name="quest-joint-writer", daemon=True)
             self._thread.start()
         except BaseException:
@@ -512,7 +532,7 @@ class QuestController:
         return json.dumps(events, separators=(",", ":"))
 
     def _event(self, **event):
-        event["time"] = time.time()
+        event.setdefault("time", time.time())
         with self._record_lock:
             if self._events is not None:
                 self._events.append(event)
@@ -546,11 +566,33 @@ class QuestController:
                 self._set_hold(side, measured[side])
             clutch.disengage()
 
-    def _reject_motion(self, measured, exc):
+    def _reject_motion(self, measured, exc, *, side=None, sample=None):
         self._hold(measured)
         self.status = str(exc)
         logging.warning("Quest motion held/rejected: %s", exc)
-        self._event(event="motion_rejected", reason=str(exc))
+        record = {"event": "motion_rejected", "reason": str(exc), "time": time.time()}
+        if side is not None:
+            record["side"] = side
+        if sample is not None:
+            record["vr_source_time"] = float(sample.source_time)
+            record["vr_sequence"] = int(sample.sequence)
+        diagnostics = getattr(exc, "diagnostics", None)
+        if diagnostics is not None:
+            record["diagnostics"] = diagnostics
+            if side in self.hardware.limits:
+                limits = np.asarray(self.hardware.limits[side], dtype=float)
+                candidate = np.asarray(diagnostics["candidate_q_rad"], dtype=float)
+                record["diagnostics"]["joint_limit_margin_rad"] = np.minimum(
+                    candidate - limits[:, 0], limits[:, 1] - candidate
+                ).tolist()
+        self._event(**record)
+        if self.diagnostic_path is not None:
+            try:
+                self.diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.diagnostic_path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+            except OSError as write_error:
+                logging.warning("Could not save Quest diagnostic: %s", write_error)
 
     def step(self):
         measured = self.hardware.read()
@@ -595,7 +637,7 @@ class QuestController:
                     elif was_active:
                         self._set_hold(side, measured[side])
             except IKRejected as exc:
-                self._reject_motion(measured, exc)
+                self._reject_motion(measured, exc, side=side, sample=sample)
                 commands.clear()
             # Check freshness, stop requests and hardware again AFTER solving.
             if (time.monotonic() - sample.received_monotonic > self.reader.max_age_s

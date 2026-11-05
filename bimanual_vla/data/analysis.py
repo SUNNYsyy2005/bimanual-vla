@@ -123,6 +123,12 @@ class AnalysisData:
     jitter_events: tuple[dict[str, Any], ...] = ()
     command_joints_rad: np.ndarray = field(default_factory=lambda: np.empty((0, 0)))
     command_monotonic_timestamp: np.ndarray = field(default_factory=lambda: np.empty(0))
+    # Absolute EEF pose channels are recorded for delivery/EEF control runs.
+    # They remain separate from ``desired`` because that field stores the raw
+    # policy action (usually a delta) rather than the target sent to the EEF
+    # controller.
+    eef_measured: np.ndarray = field(default_factory=lambda: np.empty((0, 0)))
+    eef_target: np.ndarray = field(default_factory=lambda: np.empty((0, 0)))
     model_joint_cache: dict[str, np.ndarray | None] = field(default_factory=dict, compare=False, repr=False)
 
     @property
@@ -170,6 +176,8 @@ def _load_episode(path: Path) -> AnalysisData:
             dtype=np.float64,
         ).reshape(-1)
         names = _names(archive["state_names"] if "state_names" in archive else None, width)
+        eef_measured = measured.copy() if width in (10, 20) and any("eef_x" in name for name in names) else np.empty((0, 0))
+        eef_target = desired.copy() if desired.ndim == 2 and desired.shape[1] == width and eef_measured.size else np.empty((0, 0))
         metadata = {
             key: _metadata_value(archive[key])
             for key in (
@@ -204,6 +212,8 @@ def _load_episode(path: Path) -> AnalysisData:
         execution_states=tuple("recorded" for _ in range(count)),
         names=names,
         metadata=metadata,
+        eef_measured=eef_measured,
+        eef_target=eef_target,
     )
 
 
@@ -212,8 +222,16 @@ def _load_deployment(path: Path) -> AnalysisData:
         timestamps = np.asarray(archive["timestamp"], dtype=np.float64).reshape(-1)
         measured = np.asarray(archive["qpos"], dtype=np.float64)
         desired = np.asarray(archive["command_action"], dtype=np.float64)
+        delivery_state = np.asarray(archive["delivery_state"], dtype=np.float64) if "delivery_state" in archive else np.empty((0, 0))
+        absolute_target = np.asarray(archive["command_absolute_target"], dtype=np.float64) if "command_absolute_target" in archive else np.empty((0, 0))
         count = min(len(timestamps), len(measured), len(desired))
         timestamps, measured, desired = timestamps[:count], measured[:count], desired[:count]
+        eef_measured = delivery_state[:count] if delivery_state.ndim == 2 and len(delivery_state) >= count else np.empty((0, 0))
+        eef_target = absolute_target[:count] if absolute_target.ndim == 2 and len(absolute_target) >= count else np.empty((0, 0))
+        if eef_measured.ndim != 2 or eef_measured.shape[1] not in (10, 20):
+            eef_measured = np.empty((0, 0))
+        if eef_target.ndim != 2 or eef_target.shape != eef_measured.shape:
+            eef_target = np.empty((0, 0))
         command_sent = np.asarray(
             archive["command_sent"] if "command_sent" in archive else np.isfinite(desired).all(axis=1),
             dtype=bool,
@@ -289,6 +307,8 @@ def _load_deployment(path: Path) -> AnalysisData:
         jitter_events=tuple(sorted(jitter_events, key=lambda event: float(event["timestamp"]))),
         command_joints_rad=command_joints,
         command_monotonic_timestamp=command_times,
+        eef_measured=eef_measured,
+        eef_target=eef_target,
     )
 
 

@@ -1,7 +1,9 @@
 """Bounded ADB discovery shared by the GUI and Quest readers."""
 from dataclasses import dataclass
+import os
 import shutil
 import subprocess
+import time
 
 
 @dataclass(frozen=True)
@@ -11,6 +13,30 @@ class ADBDevice:
     model: str = ''
 
 
+def adb_executable() -> str:
+    """Return the ADB binary used by every Quest operation.
+
+    The GUI is often launched from a shell that has the Conda environment on
+    PATH, while a deployment command may invoke the environment's Python by
+    absolute path. Resolve the tool explicitly so both launch modes use the
+    same ADB server and platform-tools installation.
+    """
+    configured = os.environ.get("BIMANUAL_VLA_ADB", "").strip()
+    if configured:
+        path = os.path.expanduser(configured)
+        if not os.path.isfile(path) or not os.access(path, os.X_OK):
+            raise RuntimeError(f"configured ADB executable is not runnable: {path}")
+        return path
+    found = shutil.which("adb")
+    if found:
+        # Keep the command name stable for callers/tests and let the shell
+        # resolve the same ADB server selected by the user's environment.
+        return "adb"
+    raise RuntimeError(
+        "adb not found; add Android platform-tools to PATH or set BIMANUAL_VLA_ADB"
+    )
+
+
 def launch_teleop_app(serial):
     """Bring the installed official app forward without resetting it or the HMD."""
     if not serial.strip():
@@ -18,7 +44,8 @@ def launch_teleop_app(serial):
     component = 'com.rail.oculus.teleop/.MainActivity'
     try:
         result = subprocess.run(
-            ['adb', '-s', serial, 'shell', 'am', 'start', '-n', component],
+            [os.environ.get("BIMANUAL_VLA_ADB", "adb"), '-s', serial,
+             'shell', 'am', 'start', '-n', component],
             capture_output=True, text=True, timeout=5, check=True)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError('VR app launch timed out; check the app and headset dialogs') from exc
@@ -35,10 +62,9 @@ def launch_teleop_app(serial):
 
 
 def discover_devices():
-    if not shutil.which('adb'):
-        raise RuntimeError('adb not found; use an environment with Android Platform Tools installed')
+    adb = adb_executable()
     try:
-        result = subprocess.run(['adb', 'devices', '-l'], capture_output=True,
+        result = subprocess.run([adb, 'devices', '-l'], capture_output=True,
                                 text=True, timeout=5, check=True)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError('ADB device scan timed out; check USB and refresh') from exc
@@ -53,6 +79,24 @@ def discover_devices():
         model = next((f.split(':', 1)[1] for f in fields[2:] if f.startswith('model:')), '')
         devices.append(ADBDevice(fields[0], state, model.replace('_', ' ')))
     return devices
+
+
+def wait_for_serial(serial: str = "", *, timeout_s: float = 12.0, poll_s: float = 0.5) -> str:
+    """Wait for the selected headset, or the sole authorized headset, to reappear."""
+    requested = serial.strip()
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    last_error = ""
+    while True:
+        devices = discover_devices()
+        try:
+            return select_serial(devices, requested)
+        except RuntimeError as exc:
+            last_error = str(exc)
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Quest serial {requested} did not become ready within {timeout_s:.1f}s: {last_error}"
+            )
+        time.sleep(max(0.05, float(poll_s)))
 
 
 def select_serial(devices, requested=''):
