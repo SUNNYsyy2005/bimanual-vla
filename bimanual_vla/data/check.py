@@ -366,8 +366,18 @@ def check_dataset(root: Path) -> list[str]:
             if not name or name not in table.column_names:
                 continue
             values = np.asarray(table[name].to_numpy(zero_copy_only=False), dtype=np.float64)
-            if not np.isfinite(values).all() or not _strict_increasing(values, legacy=contract["legacy"]):
-                errors.append(f"{path}: {name} must be finite and strictly increasing")
+            # Compacted RECAP rows have distinct robot observations but may
+            # reuse a nearest camera frame. Acquisition timestamps must remain
+            # real and nondecreasing; robot state/action times stay strict.
+            recap = info.get("recap") or {}
+            repeated_image = (recap.get("version") == 1
+                              and recap.get("invalid_rows_compacted") is True
+                              and name in (timestamps.get("images") or {}).values())
+            increasing = (np.all(np.diff(values) >= 0) if repeated_image
+                          else _strict_increasing(values, legacy=contract["legacy"]))
+            if not np.isfinite(values).all() or not increasing:
+                order = "nondecreasing" if repeated_image else "strictly increasing"
+                errors.append(f"{path}: {name} must be finite and {order}")
 
         episode_index = np.asarray(table["episode_index"].to_numpy(zero_copy_only=False), dtype=np.int64)
         frame_index = np.asarray(table["frame_index"].to_numpy(zero_copy_only=False), dtype=np.int64)

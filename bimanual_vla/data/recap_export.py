@@ -81,7 +81,13 @@ def _compact_values(annotation, values):
     compact["image_timestamps"] = {
         key: np.asarray(stamps)[indices] for key, stamps in values["image_timestamps"].items()
     }
-    compact["allow_repeated_source_timestamps"] = False
+    # Distinct control ticks may legitimately share the nearest camera frame
+    # when acquisition and control clocks differ slightly. Preserve that real
+    # image timestamp, while still rejecting repeated robot state/action times.
+    for key in ("state_timestamps", "action_timestamps"):
+        if np.any(np.diff(compact[key]) <= 0):
+            raise ValueError(f"compacted {key} must be strictly increasing")
+    compact["allow_repeated_source_timestamps"] = True
     compact["metadata"] = dict(values.get("metadata", {}),
                                 recap_compacted=True,
                                 recap_source_frame_count=int(len(annotation.owner)),

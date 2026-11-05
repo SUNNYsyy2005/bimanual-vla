@@ -3,6 +3,7 @@ import json
 import cv2
 import numpy as np
 import pyarrow.parquet as pq
+import pyarrow as pa
 import pytest
 
 from bimanual_vla.data.recap import RecapEpisode
@@ -96,3 +97,50 @@ def test_export_compacts_released_clutch_gaps_without_joining_segments(tmp_path)
     # The removed hold interval cannot be reconstructed from exported rows.
     table = pq.read_table(output / "data/chunk-000/episode_000000.parquet")
     assert len(table) < 70
+
+
+def test_export_preserves_reused_camera_timestamps_without_repeating_control_states(tmp_path):
+    from bimanual_vla.data.check import check_dataset
+    run = make_run(tmp_path / "run")
+    path = run / "videos/timestamps.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    # A missing acquisition tick makes nearest-neighbor resampling reuse an
+    # actual image; the robot states are still distinct control observations.
+    rows = [row for row in rows if row["camera"] != "cam_high" or row["frame_index"] % 7 != 3]
+    path.write_text("\n".join(json.dumps(row) for row in rows))
+    _, annotation, values = load_run(run, compact=True)
+    assert np.any(np.diff(values["image_timestamps"]["cam_high"]) == 0)
+    assert np.all(np.diff(values["state_timestamps"]) > 0)
+    assert np.all(np.diff(values["action_timestamps"]) > 0)
+    output = export_runs([run], tmp_path / "dataset")
+    table = pq.read_table(output / "data/chunk-000/episode_000000.parquet")
+    assert len(table) == len(annotation.owner)
+    with np.load(output / "meta/recap/episode_000000.npz") as data:
+        saved = RecapEpisode.from_payload(data)
+    assert saved.chunk_starts(50, human_only=True).size > 0
+    assert check_dataset(output) == []
+
+    parquet = output / "data/chunk-000/episode_000000.parquet"
+    # Accepting a reused image never admits repeated robot observations.
+    states = table["state_timestamp"].to_pylist()
+    states[1] = states[0]
+    changed = table.set_column(table.schema.get_field_index("state_timestamp"),
+                               "state_timestamp", pa.array(states, type=pa.float64()))
+    pq.write_table(changed, parquet)
+    assert any("state_timestamp must be finite and strictly increasing" in error for error in check_dataset(output))
+
+    image_name = "image_timestamp.cam_high"
+    images = table[image_name].to_pylist()
+    images[1] = images[0] - .1
+    changed = table.set_column(table.schema.get_field_index(image_name),
+                               image_name, pa.array(images, type=pa.float64()))
+    pq.write_table(changed, parquet)
+    assert any(image_name + " must be finite and nondecreasing" in error for error in check_dataset(output))
+
+    # Ordinary canonical exports retain their original strict timestamp rule.
+    pq.write_table(table, parquet)
+    info_path = output / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    del info["recap"]
+    info_path.write_text(json.dumps(info))
+    assert any(image_name + " must be finite and strictly increasing" in error for error in check_dataset(output))
