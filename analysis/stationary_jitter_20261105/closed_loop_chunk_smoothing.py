@@ -1,13 +1,13 @@
 """Closed-loop EEF jitter with the client's chunk smoothing, from re-decoded chunks.
 
-Usage: python -I closed_loop_chunk_smoothing.py RUN_DIR SIDE START END [WINDOW ...]
+Usage: python -I closed_loop_chunk_smoothing.py RUN_DIR SIDE START END [SHORT[+LONG] ...]
 
 Every executed chunk is re-decoded with decode_action_queue from its logged
-raw actions and inference anchor, with eef_smoothing_window=WINDOW. Each
+raw actions and inference anchor, with eef_smoothing_window=SHORT and eef_still_window=LONG. Each
 control tick takes the executed (generation, queue index) row from the run's
 trajectory, and the row 0.15 s ahead in the same chunk as the IK lead target,
 then streams them through bounded LM IK -> Ruckig -> 65 ms firmware delay.
-Reports Ruckig-command EEF jitter (0.4 s centred high-pass) for one arm.
+Reports Ruckig-command EEF motion per band (jitter_bands.py) for one arm.
 """
 from collections import deque
 from dataclasses import replace
@@ -25,10 +25,11 @@ from bimanual_vla.deployment.client import (  # noqa: E402
     DEFAULT_IK_TARGET_LEAD_S, PiperContinuousIK, decode_action_queue, project_delivery_target_step,
     rotation_from_state, validate_policy_metadata)
 from bimanual_vla.deployment.servo import RuckigJointPlanner, ServoConfig  # noqa: E402
-from jitter_layers import pose_series, residual  # noqa: E402
+from jitter_bands import band_rms  # noqa: E402
+from jitter_layers import pose_series  # noqa: E402
 
 RUN, SIDE, START, END = Path(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
-WINDOWS = [int(x) for x in sys.argv[5:]] or [0, 5, 7]
+WINDOWS = sys.argv[5:] or ['0', '7', '7+31']
 rc = json.loads((RUN/'metadata.json').read_text())['runtime_configuration']
 limits = np.array(rc['effective_joint_limits_rad']['left' if SIDE == 0 else 'right'])
 servo = replace(ServoConfig(**{k: v for k, v in rc['servo'].items() if k in ServoConfig.__dataclass_fields__}),
@@ -51,13 +52,15 @@ lead_rows = int(np.ceil(DEFAULT_IK_TARGET_LEAD_S * protocol.action_hz - 1e-9))
 start_row = min(rows, key=lambda r: abs(r['monotonic_timestamp'] - t0 - START))
 q0 = np.array(start_row['qpos'][SIDE*7:SIDE*7+6])
 ik = PiperContinuousIK()
-for window in WINDOWS:
+for config in WINDOWS:
+    window, _, still = config.partition('+')
+    window, still = int(window), int(still or 0)
     chunks = {}
     for record in records:
         z = np.load(RUN/record['action_file'])
         _, decoded = decode_action_queue(z['raw_actions'], protocol, z['raw_delivery_state'], z['qpos'],
                                          generation=record['generation'], observation_capture_monotonic=0.,
-                                         eef_smoothing_window=window)
+                                         eef_smoothing_window=window, eef_still_window=still)
         chunks[record['generation']] = np.array([d.absolute_target[SIDE*10:SIDE*10+10] for d in decoded])
 
     def targets_at(time_s):
@@ -81,7 +84,6 @@ for window in WINDOWS:
         for _ in range(3):
             planner.advance(); command.append(planner.position.copy()); history.append((time_s, planner.position.copy()))
             time_s += .01
-    xyz, rotation = pose_series(np.array(command))
-    pos, ang = residual(xyz, rotation, 40)
-    print(f"window {window:2d}: command EEF jitter {np.sqrt(np.mean(pos[40:]**2))*1000:4.2f} mm / "
-          f"{np.degrees(np.sqrt(np.mean(ang[40:]**2))):4.2f} deg")
+    xyz, _ = pose_series(np.array(command))
+    bands = band_rms(xyz)
+    print(f"{config:6s}: Ruckig command EEF " + " | ".join(f"{name} {value:4.2f} mm" for name, value in bands.items()))

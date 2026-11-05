@@ -7,7 +7,8 @@ from scipy.spatial.transform import Rotation
 
 from bimanual_vla.data.action_conventions import matrix_to_rotation6d
 from bimanual_vla.deployment.client import (
-    DEFAULT_EEF_CHUNK_SMOOTHING_STEPS, decode_action_queue, rotation_from_state, smooth_delivery_targets)
+    DEFAULT_EEF_CHUNK_SMOOTHING_STEPS, DEFAULT_EEF_STILL_SMOOTHING_STEPS, decode_action_queue, rotation_from_state,
+    smooth_delivery_targets)
 from tests import test_robot_observation_bridge as bridge
 
 
@@ -42,6 +43,41 @@ class SmoothDeliveryTargetsTest(unittest.TestCase):
         absolute = chunk(np.zeros((5, 3)), np.zeros((5, 3)), np.zeros(5))
         self.assertIs(smooth_delivery_targets(absolute, 1, 0), absolute)
         self.assertIs(smooth_delivery_targets(absolute, 1, 7), absolute)
+
+
+class StillWindowSmoothingTest(unittest.TestCase):
+    """Long filter only where the plan stays still (2026-11-05 0.5-3 Hz wobble)."""
+
+    def smooth(self, absolute, still=DEFAULT_EEF_STILL_SMOOTHING_STEPS):
+        return smooth_delivery_targets(absolute, 1, DEFAULT_EEF_CHUNK_SMOOTHING_STEPS,
+                                       still_window=still, action_hz=30.)
+
+    def test_wobble_around_a_still_pose_is_removed(self):
+        t = np.arange(50) / 30
+        centre = np.array([.1, .3, .25])
+        wobble = .0025 * np.stack([np.sin(2 * np.pi * 2.0 * t), np.cos(2 * np.pi * 2.6 * t), 0 * t], 1)
+        absolute = chunk(centre + wobble, np.tile([0, 0, .5], (50, 1)), np.full(50, .5))
+        short_only = np.linalg.norm(self.smooth(absolute, still=0)[10:31, :3] - centre, axis=1).max()
+        still = np.linalg.norm(self.smooth(absolute)[10:31, :3] - centre, axis=1).max()
+        self.assertGreater(short_only, .0015)
+        self.assertLess(still, .4 * short_only)
+
+    def test_stop_position_and_approach_keep_the_short_filter(self):
+        # 5 cm/s approach that stops at row 20: the stop corner is inside the
+        # long window, so neither the approach nor the stop may move > 1.5 mm.
+        t = np.arange(50) / 30
+        x = .1 + .05 * np.minimum(t, 20 / 30)
+        absolute = chunk(np.stack([x, np.full(50, .3), np.full(50, .25)], 1), np.tile([0, 0, .5], (50, 1)), np.full(50, .5))
+        moved = np.linalg.norm(self.smooth(absolute)[:, :3] - absolute[:, :3], axis=1)
+        self.assertLess(moved[10:45].max(), .0015)
+        self.assertLess(moved[35:45].max(), 1e-4)  # settled rows stay on the stop
+
+    def test_moving_plan_is_left_to_the_short_filter(self):
+        t = np.arange(50) / 30
+        rng = np.random.default_rng(2)
+        pos = np.stack([.1 + .1 * t, np.full(50, .3), np.full(50, .25)], 1) + rng.normal(0, .002, (50, 3))
+        absolute = chunk(pos, np.tile([0, 0, .5], (50, 1)), np.full(50, .5))
+        np.testing.assert_allclose(self.smooth(absolute), self.smooth(absolute, still=0), atol=1e-12)
 
 
 class ControllerSmoothingTest(unittest.TestCase):

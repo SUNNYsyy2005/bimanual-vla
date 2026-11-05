@@ -143,6 +143,13 @@ DEFAULT_IK_PROJECTION_ROTATION_RAD = 0.36
 # moves a settled (fine) position by <= 0.38 mm and slow rows next to a stop by
 # 0.59 mm p99 / 1.36 mm max; 5 rows keeps that <= 0.94 mm (2026-11-05 check).
 DEFAULT_EEF_CHUNK_SMOOTHING_STEPS = 7
+# While the plan should be still, the policy wobbles 2-3 mm at 0.5-3 Hz
+# (demonstrations: 0). A 31-row (~1 s) filter is blended in only where the
+# planned speed stays < 1 cm/s and < 0.1 rad/s over the whole window: wobble
+# 2.9 -> 1.0 mm / 0.47 -> 0.18 deg, demonstrated motion moved <= 2.64 mm.
+DEFAULT_EEF_STILL_SMOOTHING_STEPS = 31
+DEFAULT_EEF_STILL_SPEED_M_S = 0.01
+DEFAULT_EEF_STILL_ANGULAR_SPEED_RAD_S = 0.10
 # Normal actuation delay is not lag: feedback is compared with the closest
 # command issued within these windows.  Joint: firmware ~65 ms.  EEF: the whole
 # ~260 ms pipeline, so a disabled or under-delivering lead does not re-create
@@ -1981,7 +1988,10 @@ def check_external_control_streams(
             )
 
 
-def smooth_delivery_targets(absolute: np.ndarray, arm_count: int, window: int) -> np.ndarray:
+def smooth_delivery_targets(absolute: np.ndarray, arm_count: int, window: int, *,
+                            still_window: int = 0, still_speed_m_s: float = .01,
+                            still_angular_speed_rad_s: float = .1,
+                            action_hz: float = DEFAULT_ACTION_HZ) -> np.ndarray:
     """Zero-phase Savitzky-Golay smoothing of each arm's EEF pose along one chunk.
 
     Policy chunks carry ~4 mm step-to-step sampling noise (2026-11-05: 3.7 mm
@@ -1989,16 +1999,41 @@ def smooth_delivery_targets(absolute: np.ndarray, arm_count: int, window: int) -
     continuous end-effector jitter. The whole chunk is known before any row is
     executed, so a centred filter adds no lag; order 2 leaves quadratic motion
     unchanged. Rotations are re-orthonormalised; grippers are untouched.
+
+    While the plan should be still the policy also wobbles back and forth at
+    0.5-3 Hz (2-3 mm), which only a ~1 s window removes. ``still_window`` rows
+    of smoothing are therefore blended in only where the planned speed stays
+    below ``still_speed_m_s`` / ``still_angular_speed_rad_s`` (full weight;
+    none above twice that) over the whole window around the row, so a stop
+    corner inside the window keeps the short filter and the stop position.
     """
     window = int(window)
+    still_window = int(still_window)
     if window < 3 or len(absolute) < window:
         return absolute
     from scipy.signal import savgol_filter
     smoothed = np.array(absolute, dtype=np.float64, copy=True)
     for arm_index in range(arm_count):
         offset = arm_index * 10
-        smoothed[:, offset:offset + 9] = savgol_filter(
-            smoothed[:, offset:offset + 9], window, 2, axis=0, mode="interp")
+        pose = smoothed[:, offset:offset + 9].copy()
+        smoothed[:, offset:offset + 9] = savgol_filter(pose, window, 2, axis=0, mode="interp")
+        if still_window >= 3 and len(pose) >= still_window:
+            strong = savgol_filter(pose, still_window, 2, axis=0, mode="interp")
+            rate = savgol_filter(pose, still_window, 2, deriv=1, delta=1. / float(action_hz),
+                                 axis=0, mode="interp")
+            half = still_window // 2
+
+            def window_max(values):
+                padded = np.pad(values, half, mode="edge")
+                return np.lib.stride_tricks.sliding_window_view(padded, still_window).max(axis=1)
+
+            linear = window_max(np.linalg.norm(rate[:, :3], axis=1))
+            angular = window_max(np.maximum(np.linalg.norm(rate[:, 3:6], axis=1),
+                                            np.linalg.norm(rate[:, 6:9], axis=1)))
+            weight = np.minimum(
+                np.clip((2 * still_speed_m_s - linear) / still_speed_m_s, 0., 1.),
+                np.clip((2 * still_angular_speed_rad_s - angular) / still_angular_speed_rad_s, 0., 1.))
+            smoothed[:, offset:offset + 9] += weight[:, None] * (strong - smoothed[:, offset:offset + 9])
         for row in smoothed:
             row[offset + 3:offset + 9] = matrix_to_rotation6d(
                 rotation_from_state(row[offset:offset + 10].copy()))
@@ -2017,6 +2052,9 @@ def decode_action_queue(
     action_hz: float | None = None,
     gripper_range_tolerance: float = DEFAULT_GRIPPER_RANGE_TOLERANCE,
     eef_smoothing_window: int = 0,
+    eef_still_window: int = 0,
+    eef_still_speed_m_s: float = .01,
+    eef_still_angular_speed_rad_s: float = .1,
 ) -> tuple[np.ndarray, list[DecodedQueuedAction]]:
     """Decode the first action rows against one immutable inference anchor.
 
@@ -2078,7 +2116,9 @@ def decode_action_queue(
                 anchor, model_actions, arm_count=arm_count
             )
             absolute = smooth_delivery_targets(
-                np.asarray(absolute, dtype=np.float64), arm_count, eef_smoothing_window)
+                np.asarray(absolute, dtype=np.float64), arm_count, eef_smoothing_window,
+                still_window=eef_still_window, still_speed_m_s=eef_still_speed_m_s,
+                still_angular_speed_rad_s=eef_still_angular_speed_rad_s, action_hz=target_hz)
         elif protocol.schema == "joint":
             absolute = wire
         else:
@@ -3308,6 +3348,12 @@ class ExecutionController:
                     self.args, "ik_projection_rotation_rad", DEFAULT_IK_PROJECTION_ROTATION_RAD)),
                 "chunk_smoothing_steps": int(getattr(
                     self.args, "eef_chunk_smoothing_steps", DEFAULT_EEF_CHUNK_SMOOTHING_STEPS)),
+                "still_smoothing": {
+                    "steps": int(getattr(self.args, "eef_still_smoothing_steps", DEFAULT_EEF_STILL_SMOOTHING_STEPS)),
+                    "speed_m_s": float(getattr(self.args, "eef_still_speed_m_s", DEFAULT_EEF_STILL_SPEED_M_S)),
+                    "angular_speed_rad_s": float(getattr(
+                        self.args, "eef_still_angular_speed_rad_s", DEFAULT_EEF_STILL_ANGULAR_SPEED_RAD_S)),
+                },
                 "position_tolerance_m": float(getattr(self.args, "ik_position_tolerance_m", DEFAULT_IK_POSITION_TOLERANCE_M)),
                 "rotation_tolerance_rad": float(getattr(self.args, "ik_rotation_tolerance_rad", DEFAULT_IK_ROTATION_TOLERANCE_RAD)),
                 "reference_joint_radius_rad": float(getattr(
@@ -6188,6 +6234,12 @@ class ExecutionController:
                 ),
                 eef_smoothing_window=int(getattr(
                     self.args, "eef_chunk_smoothing_steps", DEFAULT_EEF_CHUNK_SMOOTHING_STEPS)),
+                eef_still_window=int(getattr(
+                    self.args, "eef_still_smoothing_steps", DEFAULT_EEF_STILL_SMOOTHING_STEPS)),
+                eef_still_speed_m_s=float(getattr(
+                    self.args, "eef_still_speed_m_s", DEFAULT_EEF_STILL_SPEED_M_S)),
+                eef_still_angular_speed_rad_s=float(getattr(
+                    self.args, "eef_still_angular_speed_rad_s", DEFAULT_EEF_STILL_ANGULAR_SPEED_RAD_S)),
             )
         except ExecutionBlocked as exc:
             return self._reject_result(launch.generation, str(exc), arrived_at)
@@ -8719,6 +8771,7 @@ def run_rtc_client(args: argparse.Namespace) -> None:
                                 args.arm_side,
                                 args.arm_mode,
                                 output_mode,
+                                allow_execution=bool(args.allow_execution),
                             )
                             if protocol.image_resize_mode not in {"pad", "stretch"}:
                                 raise RuntimeError("unsupported policy image resize mode")
@@ -9839,6 +9892,14 @@ def main() -> None:
     parser.add_argument("--eef-chunk-smoothing-steps", type=int, default=DEFAULT_EEF_CHUNK_SMOOTHING_STEPS,
                         help="odd centred Savitzky-Golay window (rows) applied to each decoded EEF chunk to "
                              "remove policy step noise without lag; 0 disables")
+    parser.add_argument("--eef-still-smoothing-steps", type=int, default=DEFAULT_EEF_STILL_SMOOTHING_STEPS,
+                        help="odd long window (rows) blended in where the planned EEF stays still, removing "
+                             "the policy's 0.5-3 Hz wobble; 0 disables")
+    parser.add_argument("--eef-still-speed-m-s", type=float, default=DEFAULT_EEF_STILL_SPEED_M_S,
+                        help="planned EEF speed below which the long still-window filter applies fully "
+                             "(none above twice this)")
+    parser.add_argument("--eef-still-angular-speed-rad-s", type=float, default=DEFAULT_EEF_STILL_ANGULAR_SPEED_RAD_S,
+                        help="planned EEF angular speed limit for the still-window filter")
     parser.add_argument("--eef-goal-position-tolerance-m", type=float, default=.005,
                         help="measured original-goal position tolerance before gripper release")
     parser.add_argument("--eef-goal-rotation-tolerance-rad", type=float, default=.05,
@@ -10269,6 +10330,12 @@ def main() -> None:
     if args.eef_chunk_smoothing_steps not in (0, 1) and (
             args.eef_chunk_smoothing_steps < 3 or args.eef_chunk_smoothing_steps % 2 == 0):
         parser.error("eef-chunk-smoothing-steps must be 0 (off) or an odd number >= 3")
+    if args.eef_still_smoothing_steps not in (0, 1) and (
+            args.eef_still_smoothing_steps < 3 or args.eef_still_smoothing_steps % 2 == 0):
+        parser.error("eef-still-smoothing-steps must be 0 (off) or an odd number >= 3")
+    for name in ("eef_still_speed_m_s", "eef_still_angular_speed_rad_s"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            parser.error(f"{name.replace('_', '-')} must be finite and positive")
     if args.trajectory_command_lookahead_rad < 0:
         parser.error("trajectory-command-lookahead-rad must be non-negative")
     if args.gripper_open_lookahead_steps < 0:
