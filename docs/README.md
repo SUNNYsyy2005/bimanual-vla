@@ -2,6 +2,9 @@
 
 > [**图文 Wiki（仓库内页面源文件）**](../wiki/Home.md) · [GitHub Wiki 发布说明](WIKI_PUBLISHING.md)
 
+## 正式版本
+
+- [v1.0.0：首个正式版本、功能范围与真机验证状态](releases/v1.0.0.md)
 
 ## 安装
 
@@ -12,6 +15,8 @@
 - [GUI 操作手册](collection/GUI_OPERATION_GUIDE.md)
 - [数据采集指南](collection/DATA_COLLECTION_GUIDE.md)
 - [Piper 数据合同](collection/PIPER_DATA_CONTRACT.md)
+- [Quest VR 遥操](QUEST_COLLECTION.md)
+- [人工接管与 RECAP：采集、导出及训练](RECAP.md)
 - [π0.5 Piper 动作设计](collection/PI05_PIPER_7D_10D_DATA_ACTION_DESIGN.md)
 
 ## 训练与部署

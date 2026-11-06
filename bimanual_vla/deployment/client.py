@@ -1376,6 +1376,7 @@ def validate_policy_metadata(
     arm_side: str,
     arm_mode: str = "single",
     output_mode: str = "auto",
+    *, allow_execution: bool = True,
 ) -> PolicyProtocol:
     """Validate server dimensions/cameras before any robot command is possible.
 
@@ -1385,6 +1386,11 @@ def validate_policy_metadata(
     An explicit mode never reinterprets an untrusted 7D vector locally: a
     mismatch is rejected before observations or robot commands are accepted.
     """
+    if metadata.get("deployment_ready") is False and (
+        allow_execution or metadata.get("shadow_compatible") is not True
+    ):
+        reason = str(metadata.get("deployment_reason") or "policy is not validated for robot execution")
+        raise RuntimeError(f"policy deployment_ready=false: {reason}")
     output_mode = str(output_mode or "auto").strip().lower()
     if output_mode not in {"auto", "joint", "delivery"}:
         raise ValueError(
@@ -1763,6 +1769,7 @@ def connect_policy(
     arm_side: str,
     arm_mode: str = "single",
     output_mode: str = "auto",
+    *, allow_execution: bool = True,
 ) -> tuple[Any, PolicyProtocol]:
     """Create the official OpenPI client and validate the server handshake."""
     from bimanual_vla.deployment.transport import TimedWebsocketClientPolicy
@@ -1774,7 +1781,9 @@ def connect_policy(
         metadata = policy.get_server_metadata()
         if not isinstance(metadata, dict):
             raise RuntimeError(f"invalid policy metadata: {type(metadata).__name__}")
-        protocol = validate_policy_metadata(metadata, arm_side, arm_mode, output_mode)
+        protocol = validate_policy_metadata(
+            metadata, arm_side, arm_mode, output_mode, allow_execution=allow_execution,
+        )
     except Exception:
         close_policy(policy)
         raise

@@ -761,6 +761,15 @@ class EnableHoldTest(unittest.TestCase):
 
 
 class MetadataCompatibilityTest(unittest.TestCase):
+    def test_explicitly_unready_policy_is_rejected_before_contract_admission(self):
+        metadata = dict(
+            BIMANUAL_DELIVERY_METADATA,
+            deployment_ready=False,
+            deployment_reason="EEF-to-joint bridge has not been validated",
+        )
+        with self.assertRaisesRegex(RuntimeError, "deployment_ready=false.*EEF-to-joint bridge"):
+            validate_policy_metadata(metadata, "both", "bimanual")
+
     def test_output_mode_locks_server_schema_without_reinterpreting_actions(self):
         self.assertEqual(
             validate_policy_metadata(JOINT_METADATA, "right", output_mode="auto").schema,

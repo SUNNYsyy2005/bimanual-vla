@@ -2,6 +2,7 @@
   <h1>bimanual-vla</h1>
   <p><strong>End-to-end VLA learning: Piper robot data collection, Quest VR teleoperation, real-robot SFT + RECAP, simulation SFT + RLinf (LIBERO / RoboTwin), and real-time deployment.</strong></p>
   <p>
+    <a href="https://github.com/SUNNYsyy2005/bimanual-vla/tree/v1.0.0"><img alt="Release: v1.0.0" src="https://img.shields.io/badge/Release-v1.0.0-blue" /></a>
     <a href="https://github.com/SUNNYsyy2005/bimanual-vla/blob/master/LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache%202.0-D22128.svg" /></a>
     <a href="https://github.com/SUNNYsyy2005/bimanual-vla/blob/master/docs/INSTALLATION.md"><img alt="Python" src="https://img.shields.io/badge/Python-3.10%20%2F%203.11-3776AB?logo=python&amp;logoColor=white" /></a>
     <a href="https://github.com/SUNNYsyy2005/bimanual-vla/blob/master/docs/INSTALLATION.md"><img alt="Ubuntu" src="https://img.shields.io/badge/Ubuntu-22.04-E95420?logo=ubuntu&amp;logoColor=white" /></a>
@@ -47,12 +48,35 @@ The workflow supports single-arm and bimanual Piper operation, joint-space and
 end-effector (`delivery`) data contracts, and GUI/CLI workflows. Deployment
 behavior depends on the active Policy contract and hardware configuration.
 
+## v1.0.0 — First Stable Release
+
+The first stable release supports **joint-angle and end-effector pose control**,
+**Quest VR and master/slave-arm teleoperation**, **human takeover during policy
+execution**, and **RECAP recording, export, and offline training integration**.
+
+Joint-angle and end-effector pose policy execution have completed real-robot
+testing. The previously observed policy-execution jitter has been resolved in
+the tested configuration, as confirmed by the robot operator on November 6, 2026.
+
+| Capability | v1.0.0 support |
+|---|---|
+| Robot control | Joint-angle targets and end-effector pose targets, for single-arm and bimanual Piper workflows |
+| Teleoperation | Master/slave arms and Quest VR controllers |
+| Human intervention | Policy takeover/resume, multiple clutch segments, and GUI/controller status synchronization |
+| RECAP data | Policy and human segments, success/failure labels, segment-aware export, and timestamp validation |
+| RECAP training | RLinf returns, value learning, and advantage labels with the existing OpenPI/JAX policy adapter |
+
+See the [v1.0.0 release notes](docs/releases/v1.0.0.md) for validation scope and
+known issues, including initialization after hardware zero recalibration.
+
 ## Highlights
 
 - **End-to-end real-robot pipeline** from demonstrations to closed-loop policy execution.
 - **Multi-camera Piper collection** with GUI operation, teleoperation, replay, and episode management.
 - **Quest VR teleoperation** over ADB, with live controller diagnostics, clutch-based hand control, saved-home reset, and guarded Piper commands.
-- **VR RECAP interventions** that hand control between the policy and Quest without a second CAN writer, record intervention metadata, and export only valid human-controlled segments for training.
+- **Joint-angle and end-effector pose control**, with real-robot-tested policy execution and resolved deployment jitter in the validated configuration.
+- **Master/slave-arm and Quest VR teleoperation** for collecting demonstrations.
+- **VR RECAP interventions** that hand control between the policy and Quest without a second CAN writer, record intervention metadata, and export valid policy and human segments while preserving their boundaries.
 - **LeRobot-compatible data** with versioned contracts, validation, conversion, and upload tools.
 - **Multi-node Dashboard** for dataset locations and transfers, checkpoint synchronization, training jobs, metrics, and evaluation videos.
 - **SFT and RL workflows**: OpenPI supervised fine-tuning with configurable full/LoRA tuning and π0.5 RTC training; RLinf integration for simulation RL training and evaluation.
@@ -93,8 +117,12 @@ validation rules, transport fields, and server operations live in
 | Camera source rate | Typically `30 FPS` |
 
 Depth is available on the camera hardware but is not part of the current
-training contract. Stable `/dev/v4l/by-path` camera selectors are recommended
-because `/dev/videoN` indices can change after USB reconnection.
+training contract. Configure arm roles and camera identities in the shared
+hardware configuration through the GUI. Serial-based selectors resolve the
+appropriate CAN interface and RGB camera stream after USB reconnection;
+changing `/dev/videoN` indices do not define device identity. Explicit CLI
+selectors remain available as overrides. See the
+[hardware configuration guide](docs/INSTALLATION.md).
 
 ### Compute
 
@@ -191,8 +219,13 @@ collection shortcuts. The GUI status follows the client owner (`policy`,
 `human`, or a transition/error state), and handoff is granted only after the
 policy servo has stopped safely and both arms have settled.
 
-Label the run as **Success** or **Failure** in the RECAP panel. Raw deployment
-recordings retain the full timeline for audit. `recap-export` removes invalid
+After stopping inference, choose **Success**, **Failure**, or **Abort** before
+starting the next run. Pressing right-hand `A` during inference also stops the
+run and opens the outcome dialog after recording finalization. The label is
+saved immediately; export is a separate operation. With VR connected and
+inference idle, `Y`/`B` provide manual control and `A` requests the saved home.
+
+Raw deployment recordings retain the full timeline for audit. `recap-export` removes invalid
 handoff/hold intervals from the trainable episode while preserving segment
 boundaries, so action chunks cannot cross a gap or join disconnected VR
 segments:
@@ -343,16 +376,19 @@ bin/bimanual-vla rtc-client \
   --port 8000 \
   --arm-mode bimanual \
   --arm-side both \
-  --left-can can0 \
-  --right-can can1 \
-  --cam-high-device auto \
-  --cam-left-wrist-device auto \
-  --cam-right-wrist-device auto \
+  --left-can serial:LEFT_CAN_SERIAL \
+  --right-can serial:RIGHT_CAN_SERIAL \
+  --cam-high-device serial:OVERHEAD_CAMERA_SERIAL \
+  --cam-left-wrist-device serial:LEFT_WRIST_CAMERA_SERIAL \
+  --cam-right-wrist-device serial:RIGHT_WRIST_CAMERA_SERIAL \
   --instruction "pick up the cube" \
   --hz 4 \
   --control-hz 20 \
   --rtc-enabled
 ```
+
+Replace the serial placeholders with the identities assigned in the hardware
+configuration, or launch from the GUI to generate these arguments.
 
 > [!CAUTION]
 > Real motion requires the local `--allow-execution` flag and valid robot,

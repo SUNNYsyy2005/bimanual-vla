@@ -1,0 +1,143 @@
+{
+  "validated": true,
+  "model_representation": "xyz_rpy_xyz_rad_opening_m",
+  "gripper_max_m": 0.07,
+  "confirmed_output": {
+    "source": "user confirmation 2026-11-05",
+    "order": ["left_x", "left_y", "left_z", "left_roll", "left_pitch", "left_yaw", "left_gripper", "right_x", "right_y", "right_z", "right_roll", "right_pitch", "right_yaw", "right_gripper"],
+    "position_unit": "metres",
+    "rpy_unit": "radians",
+    "gripper_unit": "metres"
+  },
+  "confirmation_source": "User confirmed both state and action use per-arm native Piper SDK absolute EEF and opening feedback, 2026-11-05",
+  "confirmed_sdk_contract": {
+    "state_action_same_layout": true,
+    "coordinate_frame": "each_arm_sdk_base",
+    "reference_point": "sdk_native_tcp",
+    "position_semantics": "absolute_m",
+    "orientation_semantics": "piper_sdk_rpy_xyz_rad",
+    "gripper_semantics": "absolute_opening_m",
+    "gripper_closed_m": 0,
+    "gripper_open_m": 0.07
+  },
+  "kinematics_validation": {
+    "source_log": "monitoring_data/20261105_095313_19bba18f/events.jsonl",
+    "samples": 10,
+    "max_position_error_m": 0.0007669740082333342,
+    "max_rotation_error_rad": 0.0025336631093074847
+  },
+  "transforms": {
+    "model_arm_order": [
+      "left",
+      "right"
+    ],
+    "model_base_from_client_base": [
+      [
+        [
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ],
+      [
+        [
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    ],
+    "client_tool_from_model_tool": [
+      [
+        [
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ],
+      [
+        [
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    ]
+  }
+}
