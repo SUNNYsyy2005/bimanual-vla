@@ -40,7 +40,8 @@ class OpenPITrainingTest(unittest.TestCase):
         plain_params = original.init(jax.random.key(0), x, None)
         np.testing.assert_allclose(adapted.apply(plain_params, x, None)[0], original.apply(plain_params, x, None)[0])
 
-    def tiny_model(self, *, rtc=2, llm_lora=False, expert="full", resize="pad", weights=None, train_vision=False, train_llm=False):
+    def tiny_model(self, *, rtc=2, llm_lora=False, expert="full", resize="pad", weights=None, train_vision=False, train_llm=False,
+                   pad_mask=False, loss_dim=2):
         class TinyVision(nn.Module):
             @nn.compact
             def __call__(self, images, train=False):
@@ -53,12 +54,12 @@ class OpenPITrainingTest(unittest.TestCase):
                                 num_kv_heads=1, head_dim=4, lora_configs=lora)
 
         config = PiperPi0Config(pi05=True, dtype="float32", action_dim=4, action_horizon=5,
-                                max_token_len=2, loss_action_dim=2,
+                                max_token_len=2, loss_action_dim=loss_dim,
                                 paligemma_variant="gemma_2b_lora" if llm_lora else "gemma_2b",
                                 action_expert_variant="gemma_300m_lora" if expert == "lora" else "gemma_300m",
                                 llm_lora_enabled=llm_lora, rtc_training_max_delay=rtc,
                                 image_resize_mode=resize, rtc_training_delay_weights=weights,
-                                train_vision=train_vision, train_llm=train_llm)
+                                train_vision=train_vision, train_llm=train_llm, action_pad_mask=pad_mask)
         with patch.object(gemma, "get_config", tiny_config), patch.object(gemma, "PALIGEMMA_VOCAB_SIZE", 32), patch.object(pi0._siglip, "Module", lambda **kw: TinyVision()):
             model = config.create(jax.random.key(1))
         obs = model_lib.Observation(images={"base_0_rgb": jnp.zeros((2, 4, 4, 3))},
@@ -66,6 +67,24 @@ class OpenPITrainingTest(unittest.TestCase):
                                     state=jnp.zeros((2, 4)), tokenized_prompt=None,
                                     tokenized_prompt_mask=None)
         return config, model, obs
+
+    def test_padded_rows_are_not_supervised_and_carrier_channel_is_cleared(self):
+        with self.assertRaisesRegex(ValueError, "unused padded action channel"):
+            self.tiny_model(pad_mask=True, loss_dim=4)
+        _, model, obs = self.tiny_model(rtc=0, pad_mask=True)
+        actions = jax.random.normal(jax.random.key(3), (2, 5, 4)).at[..., 2:].set(0.)
+        flagged = actions.at[0, 3:, -1].set(1.)  # sample 0: rows 3-4 padded by LeRobot
+        rng = jax.random.key(5)
+        with patch.object(model_lib, "preprocess_observation", lambda rng, obs, **kw: obs):
+            masked = np.asarray(model.compute_loss_per_dim(rng, obs, flagged))
+            model.action_pad_mask = False
+            plain = np.asarray(model.compute_loss_per_dim(rng, obs, actions))
+            model.action_pad_mask = True
+            np.testing.assert_array_equal(masked[0, 3:], 0)
+            self.assertGreater(plain[0, 3:, :2].min(), 0)
+            # Unpadded rows see exactly the unmasked inputs and targets.
+            np.testing.assert_allclose(masked[0, :3], plain[0, :3], rtol=0, atol=0)
+            np.testing.assert_allclose(masked[1], plain[1], rtol=0, atol=0)
 
     def test_stretch_training_with_weighted_prefix(self):
         _, model, obs = self.tiny_model(resize="stretch", weights=(0,0,1))

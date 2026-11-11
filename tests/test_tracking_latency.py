@@ -30,8 +30,10 @@ class IKTargetLeadTest(unittest.TestCase):
 
     def test_ik_solves_the_lead_pose_without_changing_queue_rtc_or_gripper(self):
         plain, protocol, rows, plain_requests = self.run_first_row(0.)
-        led, _, _, led_requests = self.run_first_row(.05)
-        expected = next(row for row in rows if row.target_monotonic >= rows[0].target_monotonic + .05)
+        # A lead between rows: on an exact row boundary the selection depends
+        # on float rounding at the current time.monotonic() magnitude.
+        led, _, _, led_requests = self.run_first_row(.07)
+        expected = next(row for row in rows if row.target_monotonic >= rows[0].target_monotonic + .07)
         self.assertNotEqual(expected.queue_index, rows[0].queue_index)
         for index, side in enumerate(('left', 'right')):
             np.testing.assert_allclose(plain_requests[side][0][1], rows[0].absolute_target[index*10:index*10+3])

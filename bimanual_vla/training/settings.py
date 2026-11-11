@@ -17,10 +17,15 @@ class FinetuningSettings:
     image_resize_mode: str = "pad"
     train_vision: bool = False
     train_llm: bool = False
+    # Exclude LeRobot's end-of-episode padded action rows from the loss.
+    # Checkpoints saved before this field existed trained without it.
+    action_pad_mask: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.train_vision, bool) or not isinstance(self.train_llm, bool):
             raise ValueError("train_vision and train_llm must be booleans")
+        if not isinstance(self.action_pad_mask, bool):
+            raise ValueError("action_pad_mask must be a boolean")
         if self.train_llm and self.llm_lora:
             raise ValueError("full LLM training and LLM LoRA are mutually exclusive")
         if self.image_resize_mode not in {"pad", "stretch"}:
@@ -44,13 +49,14 @@ class FinetuningSettings:
 
     @classmethod
     def legacy(cls) -> "FinetuningSettings":
-        return cls(action_expert_tuning="lora", llm_lora=True)
+        return cls(action_expert_tuning="lora", llm_lora=True, action_pad_mask=False)
 
     @classmethod
     def resolve(cls, requested: Mapping[str, Any], saved: Mapping[str, Any] | None = None,
                 *, legacy: bool = False, resume: bool = False) -> "FinetuningSettings":
         defaults = cls.legacy() if legacy else cls()
-        previous = cls(**dict(saved)) if saved else defaults
+        # A saved marker without the field predates padded-row masking.
+        previous = cls(**{"action_pad_mask": False, **dict(saved)}) if saved else defaults
         values = previous.to_dict()
         values.update({key: value for key, value in requested.items()
                        if key in values and value is not None})
@@ -68,5 +74,6 @@ class FinetuningSettings:
             args += ["--rtc-training-delay-weights", json.dumps(self.rtc_training_delay_weights)]
         args += ["--image-resize-mode", self.image_resize_mode,
                  "--train-vision" if self.train_vision else "--no-train-vision",
-                 "--train-llm" if self.train_llm else "--no-train-llm"]
+                 "--train-llm" if self.train_llm else "--no-train-llm",
+                 "--action-pad-mask" if self.action_pad_mask else "--no-action-pad-mask"]
         return args

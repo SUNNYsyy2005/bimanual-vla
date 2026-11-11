@@ -8068,7 +8068,7 @@ print(json.dumps(rows, ensure_ascii=False))
         weights = requested_finetuning["rtc_training_delay_weights"]
         if isinstance(weights, str):
             requested_finetuning["rtc_training_delay_weights"] = json.loads(weights) if weights.strip() else None
-        for key in ("llm_lora", "rtc_training", "train_vision", "train_llm"):
+        for key in ("llm_lora", "rtc_training", "train_vision", "train_llm", "action_pad_mask"):
             value = requested_finetuning[key]
             if value is not None and not isinstance(value, bool):
                 if str(value).strip().lower() not in {"true", "false", "1", "0"}:

@@ -807,6 +807,7 @@ H100/H200 Slurm 示例：
 - `rtc_training`：布尔值，默认 `false`；设为 `true` 启用 Pi05 干净动作前缀训练 RTC，仅支持 JAX/Orbax 路径；
 - `rtc_training_max_delay`：1–49 个 action 步，默认 8。训练随机采样 0 到该上限的干净前缀，前缀不计入 loss；20 Hz 下 8 步为 400 ms；
 - `rtc_training_delay_weights`：可选数组，长度必须为 `rtc_training_max_delay + 1`，依次对应 0 到上限的采样权重；必须非负、有限且总和大于零。省略时均匀采样，零权重的步数不会被采样。例如上限 10 时可传 `[39,0,0,0,0,574,873,275,101,32,22]`；
+- `action_pad_mask`：布尔值，新实验默认 `true`。LeRobot 在 episode 末尾用最后一帧动作补齐 50 步 chunk，并给出 `action_is_pad`；OpenPI 的 repack 原本会丢掉这个标记，导致补齐行也参与 loss（`pick_place_clean_delivery_20261025` 中占监督行的 3.15%，其中 19 个被裁剪截断的臂-episode 在运动中被“冻住”）。开启后补齐行不计入 loss，标记借用 32 维动作里最后一个零填充通道传到 loss，网络输入与关闭时完全相同。2026-11-11 之前的 checkpoint 没有该字段，按 `false` 处理，续训保持原目标；
 - `image_resize_mode`：`stretch` 直接缩放、保留全画面且不补黑边；`pad` 保留旧版等比例补边。API 兼容默认值为 `pad`，新实验 GUI 默认选 `stretch`。该设置随 checkpoint 保存。新采集/导出在生成时完成 224×224 图像准备；stretch 模型输入仅校验尺寸，不在训练时补边、裁剪或缩放。推理客户端在采集时直接生成 224×224；已有视频内的黑边需要预先处理。`stretch` 训练只保留颜色增强，不做几何裁剪或旋转；
 - `gpu_ids`：本地 4×4090 用，如 `"0,1"`；
 - `cluster_gpus` / `gpu_count`：Slurm 目标用，表示申请卡数；

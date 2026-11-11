@@ -79,11 +79,17 @@ class PiperPi0Config(pi0_config.Pi0Config):
     train_llm: bool = False
     rtc_training_max_delay: int = 0
     rtc_training_delay_weights: tuple[float, ...] | None = None
+    # Upstream train_step only passes (observation, actions). The data
+    # pipeline therefore writes LeRobot's per-row padding flag into the last
+    # action channel, which is zero padding outside loss_action_dim.
+    action_pad_mask: bool = False
 
     def create(self, rng):
         validate_delay_weights(self.rtc_training_delay_weights, self.rtc_training_max_delay)
         if self.loss_action_dim is not None and not 1 <= self.loss_action_dim <= self.action_dim:
             raise ValueError("physical action loss dimension must fit the model head")
+        if self.action_pad_mask and (self.loss_action_dim or self.action_dim) >= self.action_dim:
+            raise ValueError("action padding mask needs an unused padded action channel")
         if not 0 <= self.rtc_training_max_delay < self.action_horizon:
             raise ValueError("training RTC delay must leave at least one predicted action")
         if self.rtc_training_max_delay:
@@ -118,6 +124,7 @@ class PiperPi0(pi0.Pi0):
         self.loss_action_dim = config.loss_action_dim or config.action_dim
         self.rtc_training_max_delay = config.rtc_training_max_delay
         self.rtc_training_delay_weights = config.rtc_training_delay_weights
+        self.action_pad_mask = config.action_pad_mask
 
     def embed_suffix(self, obs, noisy_actions, timestep):
         if timestep.ndim == 1:
@@ -147,6 +154,13 @@ class PiperPi0(pi0.Pi0):
                 jitter = augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5)
                 images[key] = 2 * jax.vmap(jitter)(keys, image / 2 + 0.5) - 1
             observation = dataclasses.replace(observation, images=images)
+        padded = None
+        if self.action_pad_mask:
+            # Rows LeRobot filled past the episode end repeat the last action;
+            # like LeRobot Pi0, they are not supervised. Clear the carrier
+            # channel so the network input matches the unmasked path.
+            padded = actions[..., -1] > 0.5
+            actions = actions.at[..., -1].set(0.0)
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, actions.shape[:-2]) * 0.999 + 0.001
         delays = (sample_rtc_delays(delay_rng, actions.shape[:-2], self.rtc_training_max_delay,
@@ -174,6 +188,8 @@ class PiperPi0(pi0.Pi0):
         # Keep the BxTxD evaluation API, with a mean equivalent to averaging
         # over only the predicted postfix for each sample.
         weights = (~prefix).astype(losses.dtype) * (self.action_horizon / (self.action_horizon - delays))[:, None]
+        if padded is not None:
+            weights = weights * (~padded).astype(losses.dtype)
         return losses * weights[..., None]
 
     def compute_loss(self, rng, observation, actions, *, train=False):

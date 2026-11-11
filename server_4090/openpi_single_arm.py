@@ -1347,7 +1347,55 @@ class PiperInputs(transforms.DataTransformFn):
             output["actions"] = actions
         if "prompt" in data:
             output["prompt"] = data["prompt"]
+        if ACTION_PAD_KEY in data:
+            output[ACTION_PAD_KEY] = np.asarray(data[ACTION_PAD_KEY], dtype=bool)
         return output
+
+
+# LeRobot clamps action queries past the episode end to the last frame and
+# reports them as ``<key>_is_pad``. OpenPI's repack drops that flag; these
+# transforms carry it to PiperPi0.compute_loss_per_dim.
+ACTION_PAD_KEY = "action_is_pad"
+
+
+@dataclasses.dataclass(frozen=True)
+class KeepActionPadFlag(transforms.DataTransformFn):
+    """Run the repack transform, keeping the padding flag it would discard."""
+
+    repack: Any
+    source_key: str
+
+    def __call__(self, data: dict) -> dict:
+        output = self.repack(data)
+        if self.source_key in data:
+            output[ACTION_PAD_KEY] = np.asarray(data[self.source_key], dtype=bool)
+        return output
+
+
+@dataclasses.dataclass(frozen=True)
+class EncodeActionPadMask(transforms.DataTransformFn):
+    """Store the per-row padding flag in an unused zero-padded action channel.
+
+    Runs after PadStatesAndActions (and normalization), so the channel is
+    beyond the physical actions and never normalized. Inference inputs carry
+    no flag and pass through unchanged.
+    """
+
+    channel: int
+
+    def __call__(self, data: dict) -> dict:
+        padded = data.pop(ACTION_PAD_KEY, None)
+        if padded is None or "actions" not in data:
+            return data
+        actions = np.array(data["actions"], dtype=np.float32, copy=True)
+        padded = np.asarray(padded, dtype=bool)
+        if padded.shape != actions.shape[:-1] or not 0 <= self.channel < actions.shape[-1]:
+            raise ValueError(f"action padding flag {padded.shape} does not match actions {actions.shape}")
+        if np.any(actions[..., self.channel] != 0):
+            raise ValueError("action padding flag channel must be unused zero padding")
+        actions[..., self.channel] = padded
+        data["actions"] = actions
+        return data
 
 
 def _fallback_absolute_eef_targets_to_chunk_origin(
@@ -1519,6 +1567,7 @@ class RemoveStrings(transforms.DataTransformFn):
 class PiperDataConfig(training_config.DataConfigFactory):
     contract: DatasetContract | None = None
     default_prompt: str | None = None
+    action_pad_mask: bool = False
 
     def create(self, assets_dirs: Path, model_config) -> training_config.DataConfig:
         if self.contract is None:
@@ -1542,7 +1591,10 @@ class PiperDataConfig(training_config.DataConfigFactory):
             }
             action_sequence_keys = ("action",)
 
-        repack = transforms.Group(inputs=[transforms.RepackTransform(repack_mapping)])
+        repack_step = transforms.RepackTransform(repack_mapping)
+        if self.action_pad_mask:
+            repack_step = KeepActionPadFlag(repack_step, f"{action_sequence_keys[0]}_is_pad")
+        repack = transforms.Group(inputs=[repack_step])
         robot_transforms = transforms.Group(
             inputs=[PiperInputs(contract=self.contract)],
             outputs=[PiperOutputs(action_dim=self.contract.model_action_dim)],
@@ -1585,6 +1637,9 @@ class PiperDataConfig(training_config.DataConfigFactory):
                 PreparedImages(step.height, step.width) if isinstance(step, transforms.ResizeImages) else step
                 for step in model_transforms.inputs
             ])
+        if self.action_pad_mask:
+            model_transforms = dataclasses.replace(model_transforms, inputs=[
+                *model_transforms.inputs, EncodeActionPadMask(channel=int(model_config.action_dim) - 1)])
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack,
@@ -1667,6 +1722,7 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
         train_llm=settings.train_llm,
         rtc_training_max_delay=settings.rtc_training_max_delay if settings.rtc_training else 0,
         rtc_training_delay_weights=settings.rtc_training_delay_weights if settings.rtc_training else None,
+        action_pad_mask=settings.action_pad_mask,
     )
     params_path = base_checkpoint / "params"
     if args.command == "train" and not params_path.exists():
@@ -1678,6 +1734,7 @@ def build_config(args: argparse.Namespace) -> training_config.TrainConfig:
         repo_id=args.dataset_id,
         contract=contract,
         base_config=training_config.DataConfig(prompt_from_task=True),
+        action_pad_mask=settings.action_pad_mask,
     )
     wire_action_convention = (
         JOINT_RAW_ACTION_CONVENTION
@@ -3857,6 +3914,9 @@ def add_common(parser: argparse.ArgumentParser) -> None:
                         help="JSON weights for delay 0..max; omitted means uniform")
     parser.add_argument("--rtc-training-max-delay", type=int, default=None,
                         help="maximum clean-prefix length in 20 Hz action steps; new-run default 8")
+    parser.add_argument("--action-pad-mask", action=argparse.BooleanOptionalAction, default=None,
+                        help="exclude LeRobot end-of-episode padded action rows from the loss; "
+                             "new-run default on, checkpoints without the setting keep it off")
     parser.add_argument("--dataset-id", required=True)
     parser.add_argument("--arm-mode", choices=("auto", "single", "bimanual"), default="auto")
     parser.add_argument("--arm-side", choices=("left", "right", "both"), default="right")
