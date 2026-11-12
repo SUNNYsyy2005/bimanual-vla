@@ -2169,6 +2169,11 @@ def _require_extended_contract_fields(
 
 def run_train(args: argparse.Namespace) -> None:
     config = build_config(args)
+    from bimanual_vla.training.ema import POLICY as ema_policy, install_training_ema
+    config = dataclasses.replace(config, policy_metadata={
+        **config.policy_metadata,
+        "ema_update_policy": ema_policy if config.ema_decay is not None else "disabled",
+    })
     dataset_info = json.loads((_dataset_root() / args.dataset_id / "meta/info.json").read_text())
     if dataset_info.get("recap") and not config.policy_metadata.get("recap"):
         raise ValueError("annotated RECAP rollouts require RECAP conditioning settings")
@@ -2213,6 +2218,7 @@ def run_train(args: argparse.Namespace) -> None:
         _install_external_full_state_resume(
             train_module, config, Path(args.resume_checkpoint)
         )
+    install_training_ema(train_module, config)
     train_module.main(config)
 
 
